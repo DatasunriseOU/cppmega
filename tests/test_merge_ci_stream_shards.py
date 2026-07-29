@@ -151,7 +151,12 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
-def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+def _empty_inventory_template(
+    tmp_path: Path,
+    *,
+    repo_key: str = "owner/repo",
+) -> tuple[Path, dict[str, Any]]:
+    owner, name = repo_key.split("/", 1)
     path = tmp_path / "inventory-template.sqlite3"
     connection = sqlite3.connect(path)
     try:
@@ -175,14 +180,14 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                 )
             )
         run_keys_sha256 = _hash_lines(
-            f"owner/repo\t{run_id}\t1\t{metadata_sha256}"
+            f"{repo_key}\t{run_id}\t1\t{metadata_sha256}"
             for run_id, _raw, metadata_sha256, _metadata in run_rows
         )
         metadata = {
             "schema": INVENTORY_SCHEMA,
             "repo_list_path": "/frozen/repositories.json",
             "repo_list_sha256": "1" * 64,
-            "repo_scope_sha256": _hash_lines(("owner/repo",)),
+            "repo_scope_sha256": _hash_lines((repo_key,)),
             "repo_count": "1",
             "original_repo_count": "1",
             "unresolved_count": "0",
@@ -203,8 +208,9 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
         connection.execute(
             """
             INSERT INTO repos(repo_key,owner,name,canonical,ordinal)
-            VALUES ('owner/repo','owner','repo','owner/repo',0)
-            """
+            VALUES (?,?,?,?,0)
+            """,
+            (repo_key, owner, name, repo_key),
         )
         window_id = int(
             connection.execute(
@@ -215,12 +221,12 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                   distinct_items,duplicate_items,run_keys_sha256,
                   created_at,updated_at
                 ) VALUES (
-                  'owner/repo',1780272000,1785542400,NULL,0,'done',
+                  ?,1780272000,1785542400,NULL,0,'done',
                   3,1,1,3,3,0,?,
                   '2026-07-26T09:00:00Z','2026-07-26T09:00:00Z'
                 )
                 """,
-                (run_keys_sha256,),
+                (repo_key, run_keys_sha256),
             ).lastrowid
         )
         for run_id, raw, metadata_sha256, run_metadata in run_rows:
@@ -234,7 +240,7 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    "owner/repo",
+                    repo_key,
                     run_id,
                     1,
                     run_metadata["created_at"],
@@ -261,7 +267,7 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                   window_id,repo_key,run_id,run_attempt,metadata_sha256
                 ) VALUES (?,?,?,?,?)
                 """,
-                (window_id, "owner/repo", run_id, 1, metadata_sha256),
+                (window_id, repo_key, run_id, 1, metadata_sha256),
             )
         connection.execute(
             """
@@ -275,6 +281,20 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
                 "3" * 64,
                 run_keys_sha256,
                 "2026-07-26T09:00:00Z",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO request_ledger(
+              requested_at,repo_key,window_id,endpoint,page_no,per_page,
+              attempt,http_status,outcome,latency_ms
+            ) VALUES (?,?,?,?,1,100,1,200,'success',1)
+            """,
+            (
+                "2026-07-26T09:00:00Z",
+                repo_key,
+                window_id,
+                f"/repos/{repo_key}/actions/runs",
             ),
         )
         connection.commit()
@@ -724,6 +744,29 @@ def _record(
     provenance["run_id"] = run_id
     provenance["run_attempt"] = 1
     return text, provenance
+
+
+def _record_for_repo(
+    text: str,
+    *,
+    repo_key: str,
+    run_id: int,
+    archive_member: str,
+) -> tuple[str, dict[str, Any]]:
+    record = _record(
+        text,
+        run_id=run_id,
+        archive_member=archive_member,
+    )
+    provenance = record[1]
+    for key in (
+        "repository",
+        "repository_requested",
+        "source_repository",
+        "repository_scope_key",
+    ):
+        provenance[key] = repo_key
+    return record
 
 
 def _record_with_source_binding(
@@ -1228,6 +1271,50 @@ def _anchor_and_time_subset(
         ),
     )
     return anchor, _make_time_subset(subset, anchor)
+
+
+def _production_shard_for_repo(
+    tmp_path: Path,
+    tokenizer: ExactTokenizer,
+    *,
+    label: str,
+    repo_key: str,
+    user_version: int = 0,
+) -> BuiltShard:
+    inventory_root = tmp_path / f"{label}-inventory"
+    inventory_root.mkdir()
+    inventory, inventory_receipt = _empty_inventory_template(
+        inventory_root,
+        repo_key=repo_key,
+    )
+    shard = _build_shard(
+        tmp_path / f"{label}-shard",
+        tokenizer,
+        inventory,
+        inventory_receipt,
+        [
+            _record_for_repo(
+                f"run {run_id}",
+                repo_key=repo_key,
+                run_id=run_id,
+                archive_member=f"{run_id}.txt",
+            )
+            for run_id in (100, 200, 300)
+        ],
+    )
+    if user_version:
+        with sqlite3.connect(shard.inventory) as connection:
+            connection.execute(f"PRAGMA user_version={user_version}")
+        assert shard.inventory_receipt is not None
+        _write_json(
+            shard.inventory_receipt,
+            InventoryDB(
+                shard.inventory,
+                initialize_schema=False,
+            ).completion_receipt(),
+        )
+    _promote_to_exhaustive_receipt(shard)
+    return shard
 
 
 def _update_time_subset_meta(
@@ -1820,6 +1907,13 @@ def test_continuation_clone_rejects_unrelated_repository_scope_before_partial(
             )
         connection.execute(
             """
+            UPDATE request_ledger
+            SET repo_key='other/repo',
+                endpoint='/repos/other/repo/actions/runs'
+            """
+        )
+        connection.execute(
+            """
             UPDATE inventory_meta SET value=?
             WHERE key='repo_scope_sha256'
             """,
@@ -2171,6 +2265,142 @@ def test_newer_rerun_continues_base_through_clone_merge_and_export(
         merge_receipt=final_union / "merge_receipt.json",
     )
     assert exported["production_complete"] is True
+
+
+def test_production_merge_composes_disjoint_inventory_scopes(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    shards = [
+        _production_shard_for_repo(
+            tmp_path,
+            exact_tokenizer,
+            label="base",
+            repo_key="owner/base",
+        ),
+        _production_shard_for_repo(
+            tmp_path,
+            exact_tokenizer,
+            label="supplemental",
+            repo_key="owner/supplemental",
+        ),
+    ]
+    manifest = tmp_path / "disjoint-production-manifest.json"
+    destination = tmp_path / "disjoint-production-union"
+    build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": label,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for label, shard in zip(
+                ("base", "supplemental"),
+                shards,
+                strict=True,
+            )
+        ],
+    )
+
+    merged = merge_shards(manifest)
+
+    assert merged["production_complete"] is True
+    assert merged["inventory"]["policy"] == (
+        "disjoint-completed-production-inventory-union-v1"
+    )
+    with sqlite3.connect(destination / "inventory.sqlite3") as inventory:
+        assert inventory.execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 2
+        assert inventory.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 6
+        assert inventory.execute(
+            "SELECT id FROM request_ledger ORDER BY id"
+        ).fetchall() == [(1,), (2,)]
+        assert inventory.execute(
+            """
+            SELECT COUNT(*) FROM request_ledger request
+            JOIN search_windows window ON window.id=request.window_id
+            WHERE request.repo_key=window.repo_key
+            """
+        ).fetchone()[0] == 2
+    with sqlite3.connect(destination / "fetch_state.sqlite3") as state:
+        assert state.execute(
+            "SELECT COUNT(DISTINCT repo) FROM attempts"
+        ).fetchone()[0] == 2
+        assert state.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 6
+    fetch_receipt = json.loads(
+        (destination / "fetch_receipt.json").read_text(encoding="utf-8")
+    )
+    assert fetch_receipt["inventory_binding"]["repo_count"] == 2
+    assert fetch_receipt["exhaustive_coverage"]["missing_attempt_count"] == 0
+    assert merged["store_conservation"]["equations"]["tokens"] is True
+    exported = export_store(
+        store_root=destination / "content_store",
+        store_receipt=destination / "store_receipt.json",
+        fetch_state=destination / "fetch_state.sqlite3",
+        tokenizer_json=TOKENIZER_JSON,
+        output=tmp_path / "disjoint-case5",
+        completion_mode=COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        inventory=destination / "inventory.sqlite3",
+        inventory_receipt=destination / "inventory_receipt.json",
+        fetch_receipt=destination / "fetch_receipt.json",
+        merge_receipt=destination / "merge_receipt.json",
+    )
+    assert exported["production_complete"] is True
+
+
+def test_production_merge_rejects_overlapping_inventory_scopes(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    shards = [
+        _production_shard_for_repo(
+            tmp_path,
+            exact_tokenizer,
+            label="first",
+            repo_key="owner/shared",
+        ),
+        _production_shard_for_repo(
+            tmp_path,
+            exact_tokenizer,
+            label="second",
+            repo_key="owner/shared",
+            user_version=1,
+        ),
+    ]
+    manifest = tmp_path / "overlap-production-manifest.json"
+    destination = tmp_path / "overlap-production-union"
+    build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": label,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for label, shard in zip(("first", "second"), shards, strict=True)
+        ],
+    )
+
+    with pytest.raises(MergeError, match="overlapping repository scope"):
+        merge_shards(manifest)
+
+    assert not destination.exists()
 
 
 def test_production_merge_and_export_require_and_preserve_exhaustive_v4(

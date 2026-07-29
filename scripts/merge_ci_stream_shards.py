@@ -14,14 +14,16 @@ and their external source-ID maps commit together through an attached SQLite
 transaction.  The destination fetch-state itself remains the exact standard
 v3 schema; merge maps and progress never leak into that schema.
 
-One completed full inventory is the publication anchor.  Additional inputs
-may either name the same byte-identical completed inventory or use the exact
-``cppmega_ci_inventory_time_shard_v1`` projection produced for time-sharded
-fetching.  A time shard is accepted only after every authoritative GitHub run
-field is proven byte-for-byte identical to the anchor.  The local
-``first_seen_at`` observation time may differ when the same immutable run was
-discovered by independent inventory workers; both values remain validated and
-bound into the proof.  A time shard need not cover its whole declared window.
+One completed full inventory is normally the publication anchor.  Production
+may instead compose multiple completed coverage inventories only when their
+repository scopes are exactly disjoint and their interval/producer semantics
+match.  Additional inputs for the single-anchor form may name the same
+byte-identical inventory or use the exact ``cppmega_ci_inventory_time_shard_v1``
+projection produced for time-sharded fetching.  A time shard is accepted only
+after every authoritative GitHub run field is proven byte-for-byte identical
+to the anchor.  The local ``first_seen_at`` observation time may differ when
+the same immutable run was discovered by independent inventory workers; both
+values remain validated and bound into the proof.
 """
 
 from __future__ import annotations
@@ -93,6 +95,7 @@ from scripts.ci_stream_inventory import (  # noqa: E402
     InventoryError,
     RECEIPT_SCHEMA as INVENTORY_RECEIPT_SCHEMA,
     _SCHEMA_SQL as INVENTORY_SQL,
+    _hash_lines as _inventory_hash_lines,
     format_utc_instant,
     parse_utc_instant,
     verify_inventory_completion_receipt,
@@ -127,6 +130,9 @@ ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v2"
 MEMBER_MAP_SCHEMA = "cppmega_ci_stream_member_resolution_v1"
 TIME_SHARD_INVENTORY_SCHEMA = "cppmega_ci_inventory_time_shard_v1"
 INVENTORY_BINDING_SCHEMA = "cppmega_ci_stream_union_inventory_binding_v2"
+COMPOSITE_INVENTORY_BINDING_SCHEMA = (
+    "cppmega_ci_stream_union_inventory_binding_v3"
+)
 
 _INVENTORY_NAME = "inventory.sqlite3"
 _INVENTORY_RECEIPT_NAME = "inventory_receipt.json"
@@ -488,7 +494,7 @@ class MigrationAudit:
 
 @dataclass(frozen=True)
 class InventoryContract:
-    anchor: SourceAudit
+    anchors: tuple[SourceAudit, ...]
     binding: dict[str, Any]
 
 
@@ -3922,7 +3928,175 @@ def _prove_exact_subset(
     }
 
 
+def _completed_inventory_repositories(
+    audit: SourceAudit,
+) -> list[tuple[str, str, str, str, int]]:
+    connection = sqlite3.connect(
+        f"{audit.spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    try:
+        rows = connection.execute(
+            """
+            SELECT repo_key,owner,name,canonical,ordinal
+            FROM repos ORDER BY ordinal
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    return [
+        (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            int(row[4]),
+        )
+        for row in rows
+    ]
+
+
+def _disjoint_inventory_contract(
+    audits: Sequence[SourceAudit],
+    anchors: Sequence[SourceAudit],
+) -> InventoryContract:
+    if len(anchors) < 2 or len(anchors) != len(audits):
+        raise MergeError(
+            "multiple distinct production inventories cannot be mixed with "
+            "seed or time-subset lineage"
+        )
+    if any(
+        audit.spec.role != "coverage"
+        or audit.inventory_role != "anchor_candidate"
+        for audit in audits
+    ):
+        raise MergeError(
+            "every distinct production inventory must be a completed "
+            "coverage shard"
+        )
+
+    first_receipt = anchors[0].inventory_receipt
+    assert first_receipt is not None
+    shared_fields = {
+        key: first_receipt[key]
+        for key in (
+            "interval",
+            "script_sha256",
+            "metadata_encoding",
+            "binding_upgrades",
+        )
+    }
+    repo_keys: list[str] = []
+    seen_repo_keys: set[str] = set()
+    per_repo_ledger: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
+    run_count = 0
+    expected_attempt_count = 0
+    ordinal_offset = 0
+    for anchor in anchors:
+        receipt = anchor.inventory_receipt
+        assert receipt is not None
+        if any(receipt[key] != value for key, value in shared_fields.items()):
+            raise MergeError(
+                "distinct production inventories have incompatible interval "
+                "or producer semantics"
+            )
+        repositories = _completed_inventory_repositories(anchor)
+        overlap = sorted(
+            repo_key
+            for repo_key, _owner, _name, _canonical, _ordinal in repositories
+            if repo_key in seen_repo_keys
+        )
+        if overlap:
+            raise MergeError(
+                "distinct production inventories have overlapping repository "
+                f"scope: {overlap[:10]}"
+            )
+        source_ledger = receipt.get("per_repo_ledger")
+        if (
+            not isinstance(source_ledger, list)
+            or len(source_ledger) != len(repositories)
+        ):
+            raise MergeError(
+                f"{anchor.spec.shard_id} inventory repository ledger is invalid"
+            )
+        for index, (repository, raw_ledger) in enumerate(
+            zip(repositories, source_ledger, strict=True)
+        ):
+            repo_key, _owner, _name, canonical, ordinal = repository
+            ledger = _require_mapping(
+                raw_ledger,
+                where=f"{anchor.spec.shard_id} per_repo_ledger[{index}]",
+            )
+            if (
+                ordinal != index
+                or ledger.get("repo") != repo_key
+                or ledger.get("canonical") != canonical
+                or ledger.get("ordinal") != ordinal
+            ):
+                raise MergeError(
+                    f"{anchor.spec.shard_id} repository scope and ledger differ"
+                )
+            repo_keys.append(repo_key)
+            seen_repo_keys.add(repo_key)
+            per_repo_ledger.append(
+                {
+                    **ledger,
+                    "ordinal": ordinal_offset + ordinal,
+                }
+            )
+        repo_list = _require_mapping(
+            receipt.get("repo_list"),
+            where=f"{anchor.spec.shard_id} repo_list",
+        )
+        sources.append(
+            {
+                "source_id": anchor.spec.shard_id,
+                "role": "disjoint_coverage_anchor",
+                "original_inventory_path": anchor.spec.original_inventory,
+                "staged_inventory_path": str(anchor.spec.inventory.path),
+                "manifest_inventory_sha256": anchor.spec.inventory.sha256,
+                "artifact_sha256": anchor.inventory_file.sha256,
+                "artifact_byte_size": anchor.inventory_file.size,
+                "receipt_sha256": anchor.spec.inventory.receipt.sha256,
+                "proof": {
+                    **anchor.inventory_proof,
+                    "repo_count": len(repositories),
+                    "repo_scope_sha256": repo_list["scope_sha256"],
+                    "expected_attempt_count": receipt[
+                        "expected_attempt_count"
+                    ],
+                },
+                "source_state_joined_attempts": anchor.state_counts[
+                    "inventory_joined_attempts"
+                ],
+            }
+        )
+        ordinal_offset += len(repositories)
+        run_count += int(receipt["run_count"])
+        expected_attempt_count += int(receipt["expected_attempt_count"])
+
+    binding = {
+        "schema": COMPOSITE_INVENTORY_BINDING_SCHEMA,
+        "policy": "disjoint-completed-production-inventory-union-v1",
+        "coverage_semantics": "exact-disjoint-repository-scope-union",
+        "source_count": len(anchors),
+        "repo_count": len(repo_keys),
+        "repo_scope_sha256": _inventory_hash_lines(repo_keys),
+        "run_count": run_count,
+        "expected_attempt_count": expected_attempt_count,
+        "per_repo_ledger_sha256": _sha256_bytes(
+            _canonical_json_bytes(per_repo_ledger)
+        ),
+        **shared_fields,
+        "sources": sources,
+    }
+    binding["binding_sha256"] = _sha256_bytes(_canonical_json_bytes(binding))
+    return InventoryContract(anchors=tuple(anchors), binding=binding)
+
+
 def _validate_cross_source_contracts(
+    manifest: Manifest,
     audits: Sequence[SourceAudit],
 ) -> InventoryContract:
     anchor_candidates = [
@@ -3935,6 +4109,65 @@ def _validate_cross_source_contracts(
         for audit in audits
         if audit.inventory_role == "exact_subset_candidate"
     ]
+    first = audits[0]
+    semantic_settings = {
+        key: value
+        for key, value in cast(
+            Mapping[str, Any],
+            first.state_binding["settings"],
+        ).items()
+        if key
+        not in {
+            "inventory_path",
+            "content_store_path",
+            "content_store_script_sha256",
+            "created_at",
+        }
+    }
+    for audit in audits[1:]:
+        candidate_settings = {
+            key: value
+            for key, value in cast(
+                Mapping[str, Any],
+                audit.state_binding["settings"],
+            ).items()
+            if key
+            not in {
+                "inventory_path",
+                "content_store_path",
+                "content_store_script_sha256",
+                "created_at",
+            }
+        }
+        if candidate_settings != semantic_settings:
+            raise MergeError("source fetch-state semantic settings conflict")
+
+    anchor_signatures = {
+        (
+            candidate.inventory_file.sha256,
+            _sha256_bytes(
+                _canonical_json_bytes(
+                    _inventory_logical_projection(
+                        cast(
+                            Mapping[str, Any],
+                            candidate.inventory_receipt,
+                        )
+                    )
+                )
+            ),
+        )
+        for candidate in anchor_candidates
+    }
+    if len(anchor_signatures) > 1:
+        if (
+            manifest.completion_mode
+            != COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        ):
+            raise MergeError(
+                "multiple distinct completed inventory anchors are ambiguous"
+            )
+        return _disjoint_inventory_contract(audits, anchor_candidates)
+
     if subsets:
         subset_source_paths = {
             str(audit.inventory_proof["source_inventory_path"])
@@ -3970,39 +4203,6 @@ def _validate_cross_source_contracts(
             raise MergeError(
                 "multiple distinct completed inventory anchors are ambiguous"
             )
-
-    first = audits[0]
-    semantic_settings = {
-        key: value
-        for key, value in cast(
-            Mapping[str, Any],
-            first.state_binding["settings"],
-        ).items()
-        if key
-        not in {
-            "inventory_path",
-            "content_store_path",
-            "content_store_script_sha256",
-            "created_at",
-        }
-    }
-    for audit in audits[1:]:
-        candidate_settings = {
-            key: value
-            for key, value in cast(
-                Mapping[str, Any],
-                audit.state_binding["settings"],
-            ).items()
-            if key
-            not in {
-                "inventory_path",
-                "content_store_path",
-                "content_store_script_sha256",
-                "created_at",
-            }
-        }
-        if candidate_settings != semantic_settings:
-            raise MergeError("source fetch-state semantic settings conflict")
 
     subset_proofs = {
         audit.spec.shard_id: _prove_exact_subset(audit, anchor)
@@ -4086,7 +4286,7 @@ def _validate_cross_source_contracts(
         "sources": source_bindings,
     }
     binding["binding_sha256"] = _sha256_bytes(_canonical_json_bytes(binding))
-    return InventoryContract(anchor=anchor, binding=binding)
+    return InventoryContract(anchors=(anchor,), binding=binding)
 
 
 def _validate_output_geometry(manifest: Manifest) -> Path:
@@ -4659,29 +4859,305 @@ def _load_destination_store_receipt(partial: Path) -> dict[str, Any]:
     return value
 
 
+def _copy_attached_inventory_table(
+    connection: sqlite3.Connection,
+    table: str,
+    *,
+    transforms: Mapping[str, str] | None = None,
+    order_by: str | None = None,
+) -> None:
+    transforms = {} if transforms is None else transforms
+    source_columns = [
+        str(row[1])
+        for row in connection.execute(
+            f'PRAGMA source.table_info("{table}")'
+        )
+    ]
+    destination_columns = [
+        str(row[1])
+        for row in connection.execute(
+            f'PRAGMA main.table_info("{table}")'
+        )
+    ]
+    if not source_columns or source_columns != destination_columns:
+        raise MergeError(
+            f"composite inventory table {table} differs from its destination"
+        )
+    columns = ",".join(f'"{column}"' for column in source_columns)
+    projection_parts = []
+    for column in source_columns:
+        expression = transforms.get(column, f'"{column}"')
+        projection_parts.append(f'{expression} AS "{column}"')
+    projection = ",".join(projection_parts)
+    ordering = "" if order_by is None else f" ORDER BY {order_by}"
+    connection.execute(
+        f'INSERT INTO main."{table}" ({columns}) '
+        f'SELECT {projection} FROM source."{table}"{ordering}'
+    )
+
+
+def _build_composite_inventory(
+    temporary: Path,
+    manifest: Manifest,
+    inventory_contract: InventoryContract,
+) -> None:
+    anchors = inventory_contract.anchors
+    if len(anchors) < 2:
+        raise AssertionError("composite inventory requires multiple anchors")
+    source_meta: list[dict[str, str]] = []
+    for anchor in anchors:
+        connection = sqlite3.connect(
+            f"{anchor.spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+        try:
+            source_meta.append(
+                {
+                    str(row[0]): str(row[1])
+                    for row in connection.execute(
+                        "SELECT key,value FROM inventory_meta"
+                    )
+                }
+            )
+        finally:
+            connection.close()
+    metadata = dict(source_meta[0])
+    metadata.update(
+        {
+            "repo_list_path": str(manifest.path),
+            "repo_list_sha256": manifest.sha256,
+            "repo_scope_sha256": str(
+                inventory_contract.binding["repo_scope_sha256"]
+            ),
+            "repo_count": str(inventory_contract.binding["repo_count"]),
+            "original_repo_count": str(
+                inventory_contract.binding["repo_count"]
+            ),
+            "unresolved_count": "0",
+            "smoke": "0",
+            "max_repos": "",
+            "created_at": min(item["created_at"] for item in source_meta),
+        }
+    )
+
+    connection = sqlite3.connect(temporary, timeout=60.0, uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout=60000")
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.executescript(INVENTORY_SQL)
+        connection.executemany(
+            "INSERT INTO inventory_meta(key,value) VALUES (?,?)",
+            sorted(metadata.items()),
+        )
+        connection.commit()
+
+        repo_offset = 0
+        window_offset = 0
+        request_offset = 0
+        for index, anchor in enumerate(anchors):
+            source_uri = (
+                f"{anchor.spec.inventory.path.as_uri()}"
+                "?mode=ro&immutable=1"
+            )
+            connection.execute("ATTACH DATABASE ? AS source", (source_uri,))
+            try:
+                connection.execute("PRAGMA defer_foreign_keys=ON")
+                connection.execute("BEGIN IMMEDIATE")
+                if index == 0:
+                    for table in (
+                        "inventory_upgrades",
+                        "inventory_binding_upgrades",
+                    ):
+                        _copy_attached_inventory_table(
+                            connection,
+                            table,
+                            order_by="id",
+                        )
+                _copy_attached_inventory_table(
+                    connection,
+                    "repos",
+                    transforms={"ordinal": f'"ordinal"+{repo_offset}'},
+                    order_by="ordinal",
+                )
+                _copy_attached_inventory_table(
+                    connection,
+                    "search_windows",
+                    transforms={
+                        "id": f'"id"+{window_offset}',
+                        "parent_id": (
+                            "CASE WHEN \"parent_id\" IS NULL THEN NULL "
+                            f'ELSE "parent_id"+{window_offset} END'
+                        ),
+                    },
+                    order_by="id",
+                )
+                _copy_attached_inventory_table(connection, "runs")
+                for table in (
+                    "window_runs",
+                    "window_pages",
+                    "window_convergence",
+                    "convergence_passes",
+                    "convergence_pass_pages",
+                    "convergence_runs",
+                    "convergence_pass_runs",
+                    "window_union_closures",
+                ):
+                    _copy_attached_inventory_table(
+                        connection,
+                        table,
+                        transforms={
+                            "window_id": f'"window_id"+{window_offset}'
+                        },
+                    )
+                _copy_attached_inventory_table(
+                    connection,
+                    "request_ledger",
+                    transforms={
+                        "id": f'"id"+{request_offset}',
+                        "window_id": f'"window_id"+{window_offset}',
+                    },
+                    order_by="id",
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute("DETACH DATABASE source")
+            repo_offset = int(
+                connection.execute("SELECT COUNT(*) FROM repos").fetchone()[0]
+            )
+            window_offset = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM search_windows"
+                ).fetchone()[0]
+            )
+            request_offset = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM request_ledger"
+                ).fetchone()[0]
+            )
+        for table in (
+            "inventory_upgrades",
+            "inventory_binding_upgrades",
+            "search_windows",
+            "request_ledger",
+        ):
+            maximum = connection.execute(
+                f'SELECT MAX(id) FROM "{table}"'
+            ).fetchone()[0]
+            connection.execute(
+                "DELETE FROM sqlite_sequence WHERE name=?",
+                (table,),
+            )
+            if maximum is not None:
+                connection.execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES (?,?)",
+                    (table, int(maximum)),
+                )
+        connection.commit()
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise MergeError("composite inventory foreign-key check failed")
+        integrity = connection.execute("PRAGMA integrity_check").fetchall()
+        if [str(row[0]) for row in integrity] != ["ok"]:
+            raise MergeError("composite inventory integrity check failed")
+    finally:
+        connection.close()
+    _fsync_file(temporary)
+
+
+def _validate_inventory_receipt_contract(
+    receipt: Mapping[str, Any],
+    manifest: Manifest,
+    inventory_contract: InventoryContract,
+) -> None:
+    if len(inventory_contract.anchors) == 1:
+        source_receipt = inventory_contract.anchors[0].inventory_receipt
+        assert source_receipt is not None
+        if (
+            _inventory_logical_projection(receipt)
+            != _inventory_logical_projection(source_receipt)
+        ):
+            raise MergeError(
+                "validated union inventory differs from source receipt"
+            )
+        return
+
+    binding = inventory_contract.binding
+    repo_list = _require_mapping(
+        receipt.get("repo_list"),
+        where="composite inventory repo_list",
+    )
+    expected = {
+        "repo_count": binding["repo_count"],
+        "repo_scope_sha256": binding["repo_scope_sha256"],
+        "run_count": binding["run_count"],
+        "expected_attempt_count": binding["expected_attempt_count"],
+        "per_repo_ledger_sha256": binding["per_repo_ledger_sha256"],
+        "interval": binding["interval"],
+        "script_sha256": binding["script_sha256"],
+        "metadata_encoding": binding["metadata_encoding"],
+        "binding_upgrades": binding["binding_upgrades"],
+    }
+    actual = {
+        "repo_count": repo_list.get("repos"),
+        "repo_scope_sha256": repo_list.get("scope_sha256"),
+        "run_count": receipt.get("run_count"),
+        "expected_attempt_count": receipt.get("expected_attempt_count"),
+        "per_repo_ledger_sha256": receipt.get("per_repo_ledger_sha256"),
+        "interval": receipt.get("interval"),
+        "script_sha256": receipt.get("script_sha256"),
+        "metadata_encoding": receipt.get("metadata_encoding"),
+        "binding_upgrades": receipt.get("binding_upgrades"),
+    }
+    if (
+        actual != expected
+        or repo_list.get("path") != str(manifest.path)
+        or repo_list.get("sha256") != manifest.sha256
+        or repo_list.get("original_repos") != binding["repo_count"]
+        or repo_list.get("unresolved") != 0
+        or receipt.get("production_complete") is not True
+        or receipt.get("source_snapshot_stable") is not True
+    ):
+        raise MergeError(
+            "validated composite inventory differs from its disjoint sources"
+        )
+
+
 def _copy_and_validate_inventory(
     partial: Path,
     manifest: Manifest,
     inventory_contract: InventoryContract,
     journal: sqlite3.Connection,
 ) -> None:
-    anchor = inventory_contract.anchor
+    anchors = inventory_contract.anchors
     destination = partial / _INVENTORY_NAME
     if not destination.exists():
         temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
         try:
-            with anchor.spec.inventory.path.open("rb") as source:
-                with temporary.open("xb") as target:
-                    shutil.copyfileobj(source, target, 1024 * 1024)
-                    target.flush()
-                    os.fsync(target.fileno())
-            os.replace(temporary, destination)
-            _fsync_directory(partial)
+            if len(anchors) == 1:
+                with anchors[0].spec.inventory.path.open("rb") as source:
+                    with temporary.open("xb") as target:
+                        shutil.copyfileobj(source, target, 1024 * 1024)
+                        target.flush()
+                        os.fsync(target.fileno())
+            else:
+                _build_composite_inventory(
+                    temporary,
+                    manifest,
+                    inventory_contract,
+                )
+            _install_file_no_replace(temporary, destination)
         finally:
             if temporary.exists():
                 temporary.unlink()
     copied = _snapshot_file(destination, label="destination inventory")
-    if copied.sha256 != anchor.inventory_file.sha256:
+    if (
+        len(anchors) == 1
+        and copied.sha256 != anchors[0].inventory_file.sha256
+    ):
         raise MergeError("destination inventory copy differs from frozen source")
     try:
         inventory_receipt = InventoryDB(
@@ -4699,10 +5175,11 @@ def _copy_and_validate_inventory(
     database_artifact["path"] = str(
         manifest.destination / _INVENTORY_NAME
     )
-    assert anchor.inventory_receipt is not None
-    expected = _inventory_logical_projection(anchor.inventory_receipt)
-    if _inventory_logical_projection(inventory_receipt) != expected:
-        raise MergeError("validated union inventory differs from source receipt")
+    _validate_inventory_receipt_contract(
+        inventory_receipt,
+        manifest,
+        inventory_contract,
+    )
     _require_frozen_sqlite(destination, label="destination inventory")
     _write_json(partial / _INVENTORY_RECEIPT_NAME, inventory_receipt)
     _set_journal_phase(journal, "state")
@@ -5972,13 +6449,16 @@ def _validate_destination_inventory(
     manifest: Manifest,
     inventory_contract: InventoryContract,
 ) -> None:
-    anchor = inventory_contract.anchor
+    anchors = inventory_contract.anchors
     path = partial / _INVENTORY_NAME
     _require_frozen_sqlite(path, label="destination inventory")
     snapshot = _snapshot_file(path, label="destination inventory")
     if (
-        snapshot.sha256 != anchor.inventory_file.sha256
-        or snapshot.size != anchor.inventory_file.size
+        len(anchors) == 1
+        and (
+            snapshot.sha256 != anchors[0].inventory_file.sha256
+            or snapshot.size != anchors[0].inventory_file.size
+        )
     ):
         raise MergeError("destination inventory differs from its frozen source")
     try:
@@ -5989,6 +6469,11 @@ def _validate_destination_inventory(
     except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
         raise MergeError("destination inventory failed final validation") from exc
     computed["database"] = str(manifest.destination / _INVENTORY_NAME)
+    _validate_inventory_receipt_contract(
+        computed,
+        manifest,
+        inventory_contract,
+    )
     declared, _raw = _load_json(
         partial / _INVENTORY_RECEIPT_NAME,
         where="destination inventory receipt",
@@ -7533,13 +8018,15 @@ def merge_shards(
             coverage = [
                 audit for audit in audits if audit.spec.role == "coverage"
             ]
-            if len(coverage) != 1:
+            if not coverage:
                 raise MergeError(
-                    "production exhaustive merge requires exactly one v4 "
-                    "coverage shard; v3 threshold shards may appear only as "
-                    "verified seed lineage"
+                    "production exhaustive merge requires at least one v4 "
+                    "coverage shard"
                 )
-        inventory_contract = _validate_cross_source_contracts(audits)
+        inventory_contract = _validate_cross_source_contracts(
+            manifest,
+            audits,
+        )
         phase = _journal_phase(journal)
         if phase == "store":
             _reject_migration_output_aliases(
