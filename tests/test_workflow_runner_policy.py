@@ -217,6 +217,15 @@ def test_fa2_wheel_build_uses_upstream_arch_knob_and_exact_kernel_trim() -> None
     assert '[[ "$after" -ne 8 || -n "$unexpected" ]]' in workflow
 
 
+def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "NVTE_CUDA_ARCHS='90;100;120'" in workflow
+    assert " CUDAARCHS=" not in workflow
+
+
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     tilelang_commit = "8fdff5aa10f4265a4cb0e114d4c62613f3982180"
     tvm_commit = "36105156803007279d6ff481621b083441503cde"
