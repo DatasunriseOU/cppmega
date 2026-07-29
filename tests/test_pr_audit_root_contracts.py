@@ -141,6 +141,9 @@ def test_pr_store_preserves_root_metadata_and_normalizes_new_discussion_rows(tmp
 
 
 def test_pr_rendering_keeps_metadata_and_exact_constituent_provenance(tmp_path):
+    membership_mod = importlib.import_module(
+        "cppmega.data.pr_primary_membership"
+    )
     store_mod = importlib.import_module("scripts.pr_ingest.pr_store")
     render_mod = importlib.import_module("scripts.pr_ingest.render_discussion")
     export_mod = importlib.import_module("scripts.pr_ingest.export_pr_parquet")
@@ -171,6 +174,23 @@ def test_pr_rendering_keeps_metadata_and_exact_constituent_provenance(tmp_path):
         assert "APPROVED" in discussion
         assert "#99 Parser bug" in discussion
 
+        conn.execute(
+            f"""
+            CREATE TEMP TABLE {membership_mod.PRIMARY_PR_MEMBERSHIP_TABLE} (
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                PRIMARY KEY(repo, pr_number)
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO {membership_mod.PRIMARY_PR_MEMBERSHIP_TABLE}(
+                repo, pr_number
+            ) VALUES (?, ?)
+            """,
+            ("owner/repo", 11),
+        )
         output = tmp_path / "pr.jsonl"
         assert export_mod._write_pr_jsonl(
             conn,

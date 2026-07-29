@@ -53,6 +53,7 @@ from cppmega.data.nanochat_pipeline.packed_rows_schema import (
     PACK_ID_COLUMN,
     ROW_PLATFORM_IDS_COLUMN,
     SOURCE_DOC_IDS_COLUMN,
+    SOURCE_COMMIT_HASHES_COLUMN,
     SOURCE_FILEPATH_STABLE_IDS_COLUMN,
     SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN,
     SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
@@ -277,6 +278,7 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_REPO_STABLE_IDS_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_FILEPATH_STABLE_IDS_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN, pa.list_(pa.int32())),
+        pa.field(SOURCE_COMMIT_HASHES_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_PR_NUMBERS_COLUMN, pa.list_(pa.int64())),
         pa.field(SOURCE_HAS_PR_DISCUSSIONS_COLUMN, pa.list_(pa.bool_())),
         pa.field(SOURCE_PR_DISCUSSION_CHARS_COLUMN, pa.list_(pa.int32())),
@@ -1564,6 +1566,7 @@ def _materialize_packed_row(
     source_repo_stable_ids: list[str | None] = []
     source_filepath_stable_ids: list[str | None] = []
     source_file_local_commit_indices: list[int | None] = []
+    source_commit_hashes: list[str | None] = []
     source_pr_numbers: list[int | None] = []
     source_has_pr_discussions: list[bool] = []
     source_pr_discussion_chars: list[int] = []
@@ -1616,6 +1619,7 @@ def _materialize_packed_row(
         source_file_local_commit_indices.append(
             doc.chronology.get(FILE_LOCAL_COMMIT_INDEX_COLUMN)
         )
+        source_commit_hashes.append(doc.chronology.get(COMMIT_HASH_COLUMN))
         source_pr_numbers.append(doc.chronology.get(PR_NUMBER_COLUMN))
         source_has_pr_discussions.append(
             bool(doc.chronology.get(HAS_PR_DISCUSSION_COLUMN, False))
@@ -1770,6 +1774,7 @@ def _materialize_packed_row(
         SOURCE_REPO_STABLE_IDS_COLUMN: source_repo_stable_ids,
         SOURCE_FILEPATH_STABLE_IDS_COLUMN: source_filepath_stable_ids,
         SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN: source_file_local_commit_indices,
+        SOURCE_COMMIT_HASHES_COLUMN: source_commit_hashes,
         SOURCE_PR_NUMBERS_COLUMN: source_pr_numbers,
         SOURCE_HAS_PR_DISCUSSIONS_COLUMN: source_has_pr_discussions,
         SOURCE_PR_DISCUSSION_CHARS_COLUMN: source_pr_discussion_chars,
@@ -1888,6 +1893,10 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN: [
                     int(item) if item is not None else None
                     for item in row.get(SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN, [])
+                ],
+                SOURCE_COMMIT_HASHES_COLUMN: [
+                    None if item is None else str(item)
+                    for item in row.get(SOURCE_COMMIT_HASHES_COLUMN, [])
                 ],
                 SOURCE_PR_NUMBERS_COLUMN: [
                     int(item) if item is not None else None

@@ -4,7 +4,10 @@
 This is the standalone PR stream companion to the commit pipeline. Commit docs
 already inject ``record['pr_discussion']`` at the head of PRE/POST/diff samples;
 this script emits the same PR discussion content as its own document stream for
-curriculum mixes that want explicit ``pr`` batches.
+curriculum mixes that want explicit ``pr`` batches. A PR is eligible only when
+an exact per-document sidecar in the verified primary commit composition binds
+it by an attached discussion or merge SHA. Merely existing in the GraphQL scan
+does not make a PR trainable.
 
 The output is intentionally compatible with the existing conveyor layout:
 
@@ -37,6 +40,16 @@ from cppmega.data.symbol_identity import (  # noqa: E402
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
 )
+from cppmega.data.pr_primary_membership import (  # noqa: E402
+    build_primary_pr_membership,
+    count_primary_pr_keys,
+    iter_primary_pr_keys,
+    verify_primary_pr_membership_binding,
+)
+from cppmega.data.source_conveyor_composition import (  # noqa: E402
+    SourceComposition,
+    load_source_composition,
+)
 from scripts.pr_ingest.pr_store import connect, get_by_pr  # noqa: E402
 from scripts.pr_ingest.render_discussion import render_discussion  # noqa: E402
 
@@ -45,8 +58,8 @@ DEFAULT_STORE = REPO_ROOT / "outputs" / "pr_ingest" / "prs.sqlite"
 DEFAULT_REPO_LIST = REPO_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "reindexed_pr"
 ZSTD_LEVELS = (1024, 2048, 4096, 8192, 16384)
-EXPORT_MANIFEST_SCHEMA = "cppmega_pr_parquet_export_manifest_v2"
-EXPORT_RECEIPT_SCHEMA = "cppmega_pr_case5_export_v1"
+EXPORT_MANIFEST_SCHEMA = "cppmega_pr_parquet_export_manifest_v3"
+EXPORT_RECEIPT_SCHEMA = "cppmega_pr_case5_export_v2"
 
 
 def _sha256_file(path: Path) -> str:
@@ -114,6 +127,38 @@ def _revalidate_pr_completion(
     )
 
 
+def _resolve_source_composition(
+    args: argparse.Namespace,
+    *,
+    lengths: tuple[int, ...],
+    supplied: SourceComposition | None,
+) -> SourceComposition:
+    if supplied is not None:
+        return supplied
+    raw_plan = getattr(args, "source_composition", None)
+    raw_code_root = getattr(args, "code_root", None)
+    raw_commit_root = getattr(args, "commit_root", None)
+    missing = [
+        option
+        for option, value in (
+            ("--source-composition", raw_plan),
+            ("--code-root", raw_code_root),
+            ("--commit-root", raw_commit_root),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "primary-scoped PR export requires " + ", ".join(missing)
+        )
+    return load_source_composition(
+        Path(raw_plan),
+        buckets=lengths,
+        code_root=Path(raw_code_root),
+        commit_root=Path(raw_commit_root),
+    )
+
+
 def _comment_safe(text: str) -> str:
     return text.replace("*/", "* /")
 
@@ -156,15 +201,13 @@ def _iter_pr_keys(
     offset: int,
     limit: int | None,
 ):
-    sql = "SELECT repo, pr_number FROM prs WHERE scan_id=?"
-    params: list[object] = [scan_id]
-    if repo:
-        sql += " AND repo=?"
-        params.append(repo)
-    sql += " ORDER BY repo, pr_number LIMIT ? OFFSET ?"
-    params.append(-1 if limit is None else int(limit))
-    params.append(int(offset))
-    yield from conn.execute(sql, params)
+    yield from iter_primary_pr_keys(
+        conn,
+        repo=repo,
+        scan_id=scan_id,
+        offset=offset,
+        limit=limit,
+    )
 
 
 def _count_pr_keys(
@@ -175,15 +218,13 @@ def _count_pr_keys(
     offset: int,
     limit: int | None,
 ) -> int:
-    sql = "SELECT COUNT(*) AS n FROM (SELECT 1 FROM prs WHERE scan_id=?"
-    params: list[object] = [scan_id]
-    if repo:
-        sql += " AND repo=?"
-        params.append(repo)
-    sql += " ORDER BY repo, pr_number LIMIT ? OFFSET ?)"
-    params.append(-1 if limit is None else int(limit))
-    params.append(int(offset))
-    return int(conn.execute(sql, params).fetchone()["n"])
+    return count_primary_pr_keys(
+        conn,
+        repo=repo,
+        scan_id=scan_id,
+        offset=offset,
+        limit=limit,
+    )
 
 
 def _write_pr_jsonl(
@@ -304,16 +345,23 @@ def _shard_name(repo: str | None, scan_id: str, offset: int) -> str:
 def _manifest_input(
     args: argparse.Namespace,
     binding: dict[str, object],
+    primary_membership: dict[str, object],
     lengths: tuple[int, ...],
 ) -> dict[str, object]:
     return {
         "pr_completion": binding,
+        "primary_membership": primary_membership,
         "exporter_script_sha256": _sha256_file(Path(__file__).resolve()),
         "pr_completion_receipt": str(
             Path(args.pr_completion_receipt).resolve()
         ),
         "pr_store": str(Path(args.store).resolve()),
         "repo_list": str(Path(args.repo_list).resolve()),
+        "source_composition": str(
+            Path(args.source_composition).resolve()
+        ),
+        "code_root": str(Path(args.code_root).resolve()),
+        "commit_root": str(Path(args.commit_root).resolve()),
         "repo": args.repo,
         "start_offset": int(args.offset),
         "target_lengths": list(lengths),
@@ -386,6 +434,7 @@ def _publish_complete_receipt(
     manifest_path: Path,
     manifest: dict,
     binding: dict[str, object],
+    primary_membership: dict[str, object],
     scan_id: str,
     target_lengths: tuple[int, ...],
     selected_pr_count: int,
@@ -447,6 +496,7 @@ def _publish_complete_receipt(
         "source": "pr",
         "scan_id": scan_id,
         "pr_completion": binding,
+        "primary_membership": primary_membership,
         "exporter_script_sha256": _sha256_file(Path(__file__).resolve()),
         "target_lengths": list(target_lengths),
         "selected_pr_count": selected_pr_count,
@@ -458,6 +508,7 @@ def _publish_complete_receipt(
         "artifacts": artifacts,
         "validation": {
             "exact_scan_membership": True,
+            "exact_primary_commit_membership": True,
             "input_revalidated_after_export": True,
             "document_conservation": True,
             "all_requested_buckets_present": True,
@@ -482,6 +533,9 @@ def export_pr_parquet(
     *,
     completion_binding: dict[str, object] | None = None,
     revalidate_at_finish: bool = True,
+    source_composition: SourceComposition | None = None,
+    primary_membership: dict[str, object] | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
     store = Path(args.store)
     if not store.exists():
@@ -496,12 +550,31 @@ def export_pr_parquet(
         else _load_pr_completion(args)
     )
     scan_id = str(binding["scan_id"])
+    composition = _resolve_source_composition(
+        args,
+        lengths=lengths,
+        supplied=source_composition,
+    )
+    commit_root = Path(args.commit_root)
 
     pipeline = _load_pipeline()
     sr, route_by_fit, _recompress_zstd_max = pipeline
     materialize_budget = sr.lossless_materialize_budget(lengths)
-    conn = connect(str(store), create=False, readonly=True)
+    owns_connection = connection is None
+    conn = (
+        connect(str(store), create=False, readonly=True)
+        if connection is None
+        else connection
+    )
     try:
+        if primary_membership is None:
+            primary_membership = build_primary_pr_membership(
+                conn,
+                source_composition=composition,
+                commit_root=commit_root,
+                buckets=lengths,
+                scan_id=scan_id,
+            )
         shard_name = _shard_name(args.repo, scan_id, int(args.offset))
         with tempfile.TemporaryDirectory(prefix="pr_parquet_export_") as tmp:
             work = Path(tmp)
@@ -538,11 +611,14 @@ def export_pr_parquet(
                     shard_name, packed, length, output_root, pipeline=pipeline,
                 )
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
+    assert primary_membership is not None
     result = {
         "source": "pr",
         "store": str(store),
         "pr_completion": binding,
+        "primary_membership": primary_membership,
         "scan_id": scan_id,
         "output_root": str(output_root),
         "shard": shard_name,
@@ -552,10 +628,20 @@ def export_pr_parquet(
     }
     if revalidate_at_finish:
         _revalidate_pr_completion(args, binding)
+        verify_primary_pr_membership_binding(
+            primary_membership,
+            source_composition=composition,
+            commit_root=commit_root,
+            buckets=lengths,
+        )
     return result
 
 
-def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
+def export_pr_parquet_batches(
+    args: argparse.Namespace,
+    *,
+    source_composition: SourceComposition | None = None,
+) -> dict:
     store = Path(args.store)
     if not store.exists():
         raise FileNotFoundError(f"--store does not exist: {store}")
@@ -566,15 +652,16 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
         raise ValueError("--target-lengths produced no lengths")
     binding = _load_pr_completion(args)
     scan_id = str(binding["scan_id"])
+    composition = _resolve_source_composition(
+        args,
+        lengths=lengths,
+        supplied=source_composition,
+    )
+    commit_root = Path(args.commit_root)
     manifest_path = (
         Path(args.manifest)
         if args.manifest
         else Path(args.output_root) / "_done.json"
-    )
-    expected_input = _manifest_input(args, binding, lengths)
-    manifest = _load_manifest(
-        manifest_path,
-        expected_input=expected_input,
     )
     resume = not args.no_resume
     batch_size = int(args.batch_size)
@@ -584,8 +671,26 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
 
     complete = False
     result: dict[str, object]
+    primary_membership: dict[str, object] | None = None
     conn = connect(str(store), create=False, readonly=True)
     try:
+        primary_membership = build_primary_pr_membership(
+            conn,
+            source_composition=composition,
+            commit_root=commit_root,
+            buckets=lengths,
+            scan_id=scan_id,
+        )
+        expected_input = _manifest_input(
+            args,
+            binding,
+            primary_membership,
+            lengths,
+        )
+        manifest = _load_manifest(
+            manifest_path,
+            expected_input=expected_input,
+        )
         selected_pr_count = _count_pr_keys(
             conn,
             repo=args.repo,
@@ -596,12 +701,13 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
         global_selection = args.repo is None and int(args.offset) == 0
         if (
             global_selection
-            and selected_pr_count != int(binding["stored_pr_count"])
+            and selected_pr_count
+            != int(primary_membership["selected_pr_count"])
         ):
             raise RuntimeError(
-                "verified PR scan selection count differs from its completion "
+                "primary PR selection count differs from its membership "
                 f"receipt: selected={selected_pr_count} "
-                f"receipt={binding['stored_pr_count']}"
+                f"receipt={primary_membership['selected_pr_count']}"
             )
         offset = int(args.offset)
         max_shards = args.max_shards
@@ -637,6 +743,9 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
                         shard_args,
                         completion_binding=binding,
                         revalidate_at_finish=False,
+                        source_composition=composition,
+                        primary_membership=primary_membership,
+                        connection=conn,
                     )
                 except Exception as exc:
                     manifest.setdefault("failed", {})[done_key] = {
@@ -670,6 +779,7 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
             "source": "pr",
             "store": str(store),
             "pr_completion": binding,
+            "primary_membership": primary_membership,
             "scan_id": scan_id,
             "output_root": str(Path(args.output_root)),
             "manifest": str(manifest_path),
@@ -686,6 +796,13 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
     finally:
         conn.close()
         _revalidate_pr_completion(args, binding)
+        if primary_membership is not None:
+            verify_primary_pr_membership_binding(
+                primary_membership,
+                source_composition=composition,
+                commit_root=commit_root,
+                buckets=lengths,
+            )
     if complete:
         manifest["completed_pr_count"] = selected_pr_count
         if global_selection:
@@ -696,6 +813,7 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
                 manifest_path=manifest_path,
                 manifest=manifest,
                 binding=binding,
+                primary_membership=primary_membership,
                 scan_id=scan_id,
                 target_lengths=lengths,
                 selected_pr_count=selected_pr_count,
@@ -719,6 +837,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Verified cppmega_pr_completion_v2 receipt binding the exact scan.",
     )
     p.add_argument("--repo-list", default=str(DEFAULT_REPO_LIST))
+    p.add_argument(
+        "--source-composition",
+        required=True,
+        help=(
+            "Verified cppmega_source_conveyor_composition_plan_v1 whose "
+            "allowlisted primary commit shards define PR membership."
+        ),
+    )
+    p.add_argument(
+        "--code-root",
+        required=True,
+        help="Code parquet root required to verify the source composition.",
+    )
+    p.add_argument(
+        "--commit-root",
+        required=True,
+        help="Commit parquet root scanned for exact per-document PR membership.",
+    )
     p.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     p.add_argument("--target-lengths", default=",".join(str(x) for x in ZSTD_LEVELS))
     p.add_argument("--repo", default=None, help="Optional owner/repo filter.")

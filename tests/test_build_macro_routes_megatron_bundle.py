@@ -10,6 +10,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega.data.nanochat_pipeline.packed_rows_schema import (
+    NUM_DOCS_COLUMN,
+    SOURCE_COMMIT_HASHES_COLUMN,
+    SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+    SOURCE_PR_NUMBERS_COLUMN,
+)
+from cppmega.data.pr_primary_membership import (
+    PRIMARY_PR_MEMBERSHIP_POLICY,
+    PRIMARY_PR_MEMBERSHIP_SCHEMA,
+    primary_commit_artifact_binding,
+)
+from cppmega.data.source_conveyor_composition import SourceComposition
 import scripts.data.build_macro_routes_megatron_bundle as builder
 from scripts.canonical_parquet_ledger import CanonicalParquetLedgerWriter
 from scripts.data.build_macro_routes_megatron_bundle import (
@@ -501,8 +513,87 @@ def _write_pr_export(
     root: Path,
     *,
     buckets: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384),
-) -> Path:
+) -> tuple[Path, SourceComposition, Path]:
     scan_id = "1" * 64
+    commit_root = root.parent / "commits"
+    composition_allowlist: dict[tuple[str, int], dict[str, int]] = {}
+    for bucket in buckets:
+        commit_bucket = commit_root / str(bucket)
+        commit_bucket.mkdir(parents=True, exist_ok=True)
+        commit_parquet = commit_bucket / "primary.parquet"
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        "repo": "owner/repo",
+                        NUM_DOCS_COLUMN: 1,
+                        SOURCE_PR_NUMBERS_COLUMN: [1],
+                        SOURCE_COMMIT_HASHES_COLUMN: ["6" * 40],
+                        SOURCE_HAS_PR_DISCUSSIONS_COLUMN: [True],
+                    }
+                ],
+                schema=pa.schema(
+                    [
+                        pa.field("repo", pa.string()),
+                        pa.field(NUM_DOCS_COLUMN, pa.int32()),
+                        pa.field(
+                            SOURCE_PR_NUMBERS_COLUMN,
+                            pa.list_(pa.int64()),
+                        ),
+                        pa.field(
+                            SOURCE_COMMIT_HASHES_COLUMN,
+                            pa.list_(pa.string()),
+                        ),
+                        pa.field(
+                            SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+                            pa.list_(pa.bool_()),
+                        ),
+                    ]
+                ),
+            ),
+            commit_parquet,
+            compression="zstd",
+        )
+        composition_allowlist[("code", bucket)] = {"unused.parquet": 1}
+        composition_allowlist[("commits", bucket)] = {
+            commit_parquet.name: 1
+        }
+    composition = SourceComposition(
+        allowlist=composition_allowlist,
+        receipt={
+            "schema": "cppmega_source_conveyor_composition_v1",
+            "status": "complete",
+            "plan_sha256": "7" * 64,
+        },
+        plan_path=root.parent / "source_composition.json",
+        dedup_receipt_path=root.parent / "dedup.json",
+        run_files=(),
+    )
+    membership = {
+        "schema": PRIMARY_PR_MEMBERSHIP_SCHEMA,
+        "policy": PRIMARY_PR_MEMBERSHIP_POLICY,
+        "scan_id": scan_id,
+        "commit_artifacts": primary_commit_artifact_binding(
+            source_composition=composition,
+            commit_root=commit_root,
+            buckets=buckets,
+        ),
+        "rows": len(buckets),
+        "source_docs": len(buckets),
+        "source_docs_with_pr_number": len(buckets),
+        "source_docs_with_commit_sha": len(buckets),
+        "selected_pr_count": 1,
+        "sha_only_matched_source_docs": 0,
+        "unmatched_commit_sha_source_docs": 0,
+        "selected_membership_sha256": "8" * 64,
+        "validation": {
+            "source_composition_complete": True,
+            "exact_allowlisted_commit_artifacts": True,
+            "exact_source_doc_shapes": True,
+            "exact_scan_membership": True,
+            "direct_pr_sha_conflicts": 0,
+        },
+    }
     artifacts: list[dict[str, object]] = []
     for bucket in buckets:
         bucket_root = root / str(bucket)
@@ -554,6 +645,7 @@ def _write_pr_export(
         "source": "pr",
         "scan_id": scan_id,
         "pr_completion": completion,
+        "primary_membership": membership,
         "exporter_script_sha256": hashlib.sha256(exporter.read_bytes()).hexdigest(),
         "target_lengths": list(buckets),
         "selected_pr_count": 1,
@@ -565,6 +657,7 @@ def _write_pr_export(
         "artifacts": artifacts,
         "validation": {
             "exact_scan_membership": True,
+            "exact_primary_commit_membership": True,
             "input_revalidated_after_export": True,
             "document_conservation": True,
             "all_requested_buckets_present": True,
@@ -573,7 +666,7 @@ def _write_pr_export(
     }
     receipt_path = root / "export_receipt.json"
     receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
-    return receipt_path
+    return receipt_path, composition, commit_root
 
 
 def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
@@ -627,12 +720,14 @@ def test_pr_export_allowlist_binds_exact_scan_and_every_artifact(
     tmp_path: Path,
 ) -> None:
     pr_root = tmp_path / "pr"
-    receipt_path = _write_pr_export(pr_root)
+    receipt_path, composition, commit_root = _write_pr_export(pr_root)
 
     allowed, metadata = _load_pr_export_allowlist(
         receipt_path,
         pr_root,
         (1024, 2048, 4096, 8192, 16384),
+        source_composition=composition,
+        commit_root=commit_root,
     )
 
     assert metadata["schema"] == builder.PR_EXPORT_SCHEMA
@@ -654,6 +749,8 @@ def test_pr_export_allowlist_binds_exact_scan_and_every_artifact(
             receipt_path,
             pr_root,
             (1024, 2048, 4096, 8192, 16384),
+            source_composition=composition,
+            commit_root=commit_root,
         )
 
 

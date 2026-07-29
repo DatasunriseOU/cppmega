@@ -60,6 +60,11 @@ from cppmega.data.source_conveyor_composition import (  # noqa: E402
     SourceComposition,
     load_source_composition,
 )
+from cppmega.data.pr_primary_membership import (  # noqa: E402
+    PRIMARY_PR_MEMBERSHIP_POLICY,
+    PRIMARY_PR_MEMBERSHIP_SCHEMA,
+    verify_primary_pr_membership_binding,
+)
 from cppmega.data.ci_training_scope import (  # noqa: E402
     PRIMARY_ROUTE as CI_PRIMARY_ROUTE,
     training_scope_policy,
@@ -91,7 +96,7 @@ PRODUCTION_CI_COMPLETION_MODE = "inventory-exhaustive"
 PRODUCTION_CI_MERGE_RECEIPT_SCHEMA = (
     "cppmega_ci_stream_shard_union_receipt_v3"
 )
-PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v1"
+PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v2"
 BUNDLE_KNOWN_LIMITATIONS: tuple[str, ...] = ()
 DTYPE_SIZES = {
     "uint8": 1,
@@ -1512,6 +1517,9 @@ def _load_pr_export_allowlist(
     manifest_path: Path,
     pr_root: Path,
     buckets: tuple[int, ...],
+    *,
+    source_composition: SourceComposition,
+    commit_root: Path,
 ) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
     """Validate one exact-scan PR CASE5 export and return its shard allowlist."""
 
@@ -1552,6 +1560,7 @@ def _load_pr_export_allowlist(
     validation = receipt.get("validation")
     required_validation = (
         "exact_scan_membership",
+        "exact_primary_commit_membership",
         "input_revalidated_after_export",
         "document_conservation",
         "all_requested_buckets_present",
@@ -1561,6 +1570,22 @@ def _load_pr_export_allowlist(
         validation.get(field) is not True for field in required_validation
     ):
         raise RuntimeError(f"{manifest_path}: PR export validation is not green")
+    primary_membership = receipt.get("primary_membership")
+    if (
+        not isinstance(primary_membership, dict)
+        or primary_membership.get("schema") != PRIMARY_PR_MEMBERSHIP_SCHEMA
+        or primary_membership.get("policy") != PRIMARY_PR_MEMBERSHIP_POLICY
+        or primary_membership.get("scan_id") != receipt.get("scan_id")
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: primary PR membership binding is missing"
+        )
+    verify_primary_pr_membership_binding(
+        primary_membership,
+        source_composition=source_composition,
+        commit_root=commit_root,
+        buckets=buckets,
+    )
     completion = receipt.get("pr_completion")
     if (
         not isinstance(completion, dict)
@@ -1593,7 +1618,9 @@ def _load_pr_export_allowlist(
         or isinstance(selected_pr_count, bool)
         or selected_pr_count < 1
         or rendered_docs != selected_pr_count
-        or completion.get("stored_pr_count") != selected_pr_count
+        or primary_membership.get("selected_pr_count") != selected_pr_count
+        or not isinstance(completion.get("stored_pr_count"), int)
+        or int(completion["stored_pr_count"]) < selected_pr_count
     ):
         raise RuntimeError(
             f"{manifest_path}: PR document/scan conservation failed"
@@ -1704,6 +1731,7 @@ def _load_pr_export_allowlist(
         "repo_list_sha256": completion["repo_list_sha256"],
         "expected_repos_sha256": completion["expected_repos_sha256"],
         "scan_id": completion["scan_id"],
+        "primary_membership_sha256": _canonical_sha256(primary_membership),
     }
     source_inventory_sha256 = _canonical_sha256(source_binding)
     metadata: dict[str, object] = {
@@ -1720,6 +1748,7 @@ def _load_pr_export_allowlist(
         },
         "producer_script_sha256": exporter_sha256,
         "source_completion": completion,
+        "primary_membership": primary_membership,
         "export_manifest": {
             "path": str(expected_done_path),
             "sha256": str(export_manifest["sha256"]),
@@ -2784,6 +2813,8 @@ def _assert_build_plan_inputs(
         args.pr_manifest.resolve(),
         args.pr_root.resolve(),
         buckets,
+        source_composition=source_composition,
+        commit_root=args.commit_root,
     )
     actual = _create_build_plan(
         args=args,
@@ -2974,8 +3005,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "explicit cppmega_pr_case5_export_v1 receipt binding scan "
-            "membership, input hashes, document conservation and every shard"
+            "explicit cppmega_pr_case5_export_v2 receipt binding primary "
+            "commit membership, input hashes, document conservation and every shard"
         ),
     )
     parser.add_argument(
@@ -3118,6 +3149,8 @@ def _load_snapshot_inputs(
         args.pr_manifest.resolve(),
         args.pr_root.resolve(),
         buckets,
+        source_composition=source_composition,
+        commit_root=args.commit_root,
     )
     overlap = set(allowlist).intersection(ci_allowlist)
     if overlap:

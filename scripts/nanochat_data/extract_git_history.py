@@ -129,11 +129,6 @@ CPP_EXTENSIONS = {
 
 # Files/paths to skip
 SKIP_PATTERNS = {
-    "test/",
-    "tests/",
-    "testing/",
-    "unittest/",
-    "benchmarks/",
     "third_party/",
     "3rdparty/",
     "vendor/",
