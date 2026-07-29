@@ -1,4 +1,4 @@
-"""Exact, receipt-bound quarantine for source paths that are not source code.
+"""Exact, receipt-bound quarantine for non-parser inputs and crash fixtures.
 
 The quarantine is deliberately narrow: it only accepts files whose relative
 path, byte size, SHA-256 digest, and independently verifiable format all match a
@@ -32,6 +32,10 @@ _ENTRY_KEYS = frozenset(
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _FORMAT_RE = re.compile(r"[a-z0-9][a-z0-9_.+-]*")
 _SUPPORTED_CLASSIFICATION_FORMATS = {
+    (
+        "deliberate_compiler_crash_fixture",
+        "clang_debug_crash_pragma",
+    ),
     ("mislabeled_non_cpp", "xml_utf16le"),
 }
 
@@ -149,28 +153,61 @@ def _sha256_file(path: Path) -> str:
 
 
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
-    if entry.detected_format != "xml_utf16le":
-        raise SourceQuarantineError(
-            f"unsupported detected format at runtime: {entry.detected_format}"
-        )
-    with path.open("rb") as source:
-        prefix = source.read(8192)
-    if not prefix.startswith(b"\xff\xfe"):
-        raise SourceQuarantineError(
-            f"{entry.relative_path}: declared xml_utf16le but UTF-16LE BOM is absent"
-        )
-    if len(prefix) % 2:
-        prefix = prefix[:-1]
-    try:
-        decoded = prefix.decode("utf-16")
-    except UnicodeDecodeError as exc:
-        raise SourceQuarantineError(
-            f"{entry.relative_path}: declared xml_utf16le but prefix is invalid: {exc}"
-        ) from exc
-    if not decoded.lstrip("\ufeff \t\r\n").startswith(("<", "<?xml")):
-        raise SourceQuarantineError(
-            f"{entry.relative_path}: declared xml_utf16le but XML prefix is absent"
-        )
+    if entry.detected_format == "xml_utf16le":
+        with path.open("rb") as source:
+            prefix = source.read(8192)
+        if not prefix.startswith(b"\xff\xfe"):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared xml_utf16le but UTF-16LE BOM "
+                "is absent"
+            )
+        if len(prefix) % 2:
+            prefix = prefix[:-1]
+        try:
+            decoded = prefix.decode("utf-16")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared xml_utf16le but prefix is "
+                f"invalid: {exc}"
+            ) from exc
+        if not decoded.lstrip("\ufeff \t\r\n").startswith(("<", "<?xml")):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared xml_utf16le but XML prefix "
+                "is absent"
+            )
+        return
+
+    if entry.detected_format == "clang_debug_crash_pragma":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_debug_crash_pragma "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        required_lines = {
+            "// RUN: not --crash %clang_cc1 %s 2>&1 | FileCheck %s",
+            "// REQUIRES: crash-recovery",
+            "// CHECK: prag\\",
+            "// CHECK-NEXT: ma",
+        }
+        if not required_lines.issubset(decoded.splitlines()):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_debug_crash_pragma "
+                "but the Clang crash-test contract is incomplete"
+            )
+        crash_pragma = "#prag\\\nma clang __debug crash\n"
+        if decoded.count(crash_pragma) != 1:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_debug_crash_pragma "
+                "but the deliberate crash signature is absent or ambiguous"
+            )
+        return
+
+    raise SourceQuarantineError(
+        f"unsupported detected format at runtime: {entry.detected_format}"
+    )
 
 
 @dataclass

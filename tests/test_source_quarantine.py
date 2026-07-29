@@ -17,6 +17,7 @@ from tools.clang_indexer.source_quarantine import (
 
 PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
+RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
 
 
 def _xml_bytes() -> bytes:
@@ -26,6 +27,24 @@ def _xml_bytes() -> bytes:
     ).encode("utf-16")
 
 
+def _clang_crash_fixture_bytes() -> bytes:
+    return (
+        b"// RUN: not --crash %clang_cc1 %s 2>&1 | FileCheck %s\n"
+        b"// REQUIRES: crash-recovery\n"
+        b"\n"
+        b"// FIXME: CHECKs might be incompatible to win32.\n"
+        b"// Stack traces also require back traces.\n"
+        b"// REQUIRES: shell, backtrace\n"
+        b"\n"
+        b"#prag\\\n"
+        b"ma clang __debug crash\n"
+        b"\n"
+        b"// CHECK: prag\\\n"
+        b"// CHECK-NEXT: ma\n"
+        b"\n"
+    )
+
+
 def _write_manifest(
     path: Path,
     payload: bytes,
@@ -33,6 +52,8 @@ def _write_manifest(
     sha256: str | None = None,
     classification: str = "mislabeled_non_cpp",
     detected_format: str = "xml_utf16le",
+    relative_path: str = RELATIVE_XML,
+    reason: str = "fixture XML stored under a .cc suffix",
 ) -> None:
     path.write_text(
         json.dumps(
@@ -41,12 +62,12 @@ def _write_manifest(
                 "entries": [
                     {
                         "project_id": PROJECT_ID,
-                        "relative_path": RELATIVE_XML,
+                        "relative_path": relative_path,
                         "size_bytes": len(payload),
                         "sha256": sha256 or hashlib.sha256(payload).hexdigest(),
                         "classification": classification,
                         "detected_format": detected_format,
-                        "reason": "fixture XML stored under a .cc suffix",
+                        "reason": reason,
                     }
                 ],
             },
@@ -137,6 +158,82 @@ def test_quarantine_hash_mismatch_fails_without_filtering(
 
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
     with pytest.raises(SourceQuarantineError, match="SHA-256 mismatch"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_crash_fixture_bytes()
+    candidate = tmp_path / RELATIVE_CRASH_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_crash_fixture",
+        detected_format="clang_debug_crash_pragma",
+        relative_path=RELATIVE_CRASH_FIXTURE,
+        reason="fixture deliberately crashes Clang",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == (
+        "deliberate_compiler_crash_fixture"
+    )
+    assert receipt["entries"][0]["detected_format"] == (
+        "clang_debug_crash_pragma"
+    )
+
+
+def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
+    payload = _clang_crash_fixture_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "google/filament"
+    )
+
+    assert len(payload) == 271
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_crash_fixture"
+    assert entry["detected_format"] == "clang_debug_crash_pragma"
+
+
+def test_clang_crash_quarantine_requires_independent_fixture_signature(
+    tmp_path: Path,
+) -> None:
+    payload = b"int main(void) { return 0; }\n"
+    candidate = tmp_path / RELATIVE_CRASH_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_crash_fixture",
+        detected_format="clang_debug_crash_pragma",
+        relative_path=RELATIVE_CRASH_FIXTURE,
+        reason="forged crash fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(
+        SourceQuarantineError,
+        match="crash-test contract is incomplete",
+    ):
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
