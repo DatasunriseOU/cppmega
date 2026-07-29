@@ -4,10 +4,11 @@
 # Identical to docker/Dockerfile except:
 #   - flash-attn-4 upgraded from 4.0.0b19 to 4.0.0b23
 #   - apache-tvm-ffi upgraded from 0.1.9 to >=0.1.12,<0.2
-#   - TileLang from DatasunriseOU/tilelang@5952468a (supports tvm-ffi >=0.1.12)
-#     wheel: tilelang-0.1.9+cuda.git5952468a-cp38-abi3-linux_x86_64.whl:
+#   - TileLang from DatasunriseOU/tilelang@8fdff5aa (supports tvm-ffi >=0.1.12)
+#     wheel: tilelang-0.1.9-cp38-abi3-linux_x86_64.whl:
 #     the fork carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix, via
-#     vendored TVM DatasunriseOU/tvm@9b0a1667) which resolves the previous
+#     vendored TVM DatasunriseOU/tvm@36105156), restores the nvbench CUDA
+#     header needed by the TVM runtime, and resolves the previous
 #     '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
 #     under tvm-ffi >=0.1.10, and removes the apache-tvm-ffi<0.1.10 cap.
 #

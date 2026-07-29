@@ -161,15 +161,17 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - 5952468a carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
-            #   - vendored TVM submodule (DatasunriseOU/tvm@9b0a1667) includes
+            #   - 8fdff5aa carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - vendored TVM submodule (DatasunriseOU/tvm@36105156) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
+            #   - the same TVM pin restores nvbench/l2_cache_flush.h, which
+            #     TileLang's CUDA runtime still compiles.
             #   - upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12,
             #     incompatible with FA4 beta23's >=0.1.12 floor.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: 5952468a
+            ref: 8fdff5aa10f4265a4cb0e114d4c62613f3982180
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda
@@ -377,28 +379,42 @@ jobs:
                   f"torch CUDA build drifted: observed={torch.version.cuda!r} "
                   "expected='13.2'"
               )
-          spec = find_spec("nvidia.cudnn")
-          locations = list(spec.submodule_search_locations or ()) if spec else []
-          if len(locations) != 1:
-              raise SystemExit(f"unable to resolve nvidia.cudnn root: {locations!r}")
-          cudnn_path = Path(locations[0]).resolve()
+          def resolve_package_root(module: str) -> Path:
+              spec = find_spec(module)
+              locations = list(spec.submodule_search_locations or ()) if spec else []
+              if len(locations) != 1:
+                  raise SystemExit(
+                      f"unable to resolve {module} root: {locations!r}"
+                  )
+              return Path(locations[0]).resolve()
+
+          cudnn_path = resolve_package_root("nvidia.cudnn")
           if not (cudnn_path / "include/cudnn.h").is_file():
               raise SystemExit(f"cuDNN header is missing below {cudnn_path}")
           if not any((cudnn_path / "lib").glob("libcudnn.so.9*")):
               raise SystemExit(f"cuDNN runtime is missing below {cudnn_path}")
+          nccl_path = resolve_package_root("nvidia.nccl")
+          if not (nccl_path / "include/nccl.h").is_file():
+              raise SystemExit(f"NCCL header is missing below {nccl_path}")
+          if not any((nccl_path / "lib").glob("libnccl.so.2*")):
+              raise SystemExit(f"NCCL runtime is missing below {nccl_path}")
           github_env = Path(os.environ["GITHUB_ENV"])
           with github_env.open("a", encoding="utf-8") as stream:
               stream.write(f"CUDNN_PATH={cudnn_path}\n")
+              stream.write(f"NCCL_PATH={nccl_path}\n")
               stream.write(
-                  f"CPATH={cudnn_path / 'include'}:"
+                  f"CPATH={nccl_path / 'include'}:"
+                  f"{cudnn_path / 'include'}:"
                   f"{os.environ.get('CPATH', '')}\n"
               )
               stream.write(
-                  f"LIBRARY_PATH={cudnn_path / 'lib'}:"
+                  f"LIBRARY_PATH={nccl_path / 'lib'}:"
+                  f"{cudnn_path / 'lib'}:"
                   f"{os.environ.get('LIBRARY_PATH', '')}\n"
               )
               stream.write(
                   "LD_LIBRARY_PATH="
+                  f"{nccl_path / 'lib'}:"
                   f"{cudnn_path / 'lib'}:"
                   f"{os.environ.get('LD_LIBRARY_PATH', '')}\n"
               )
@@ -406,7 +422,7 @@ jobs:
               f"torch={torch.__version__} cuda={torch.version.cuda} "
               f"cudnn={observed['nvidia-cudnn-cu13']} "
               f"nccl={observed['nvidia-nccl-cu13']} "
-              f"CUDNN_PATH={cudnn_path}"
+              f"CUDNN_PATH={cudnn_path} NCCL_PATH={nccl_path}"
           )
           PY
 
