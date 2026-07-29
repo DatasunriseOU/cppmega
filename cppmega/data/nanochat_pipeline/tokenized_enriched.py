@@ -619,6 +619,17 @@ def _domain_kind_from_doc(doc: dict[str, Any]) -> DomainKind | None:
     return domain
 
 
+def materialized_marker_token_overhead(doc: dict[str, Any]) -> int:
+    """Return the exact BOS/domain-marker tokens added during materialization."""
+
+    embedded_spans = normalize_embedded_domain_spans(
+        doc.get("embedded_domain_spans", []),
+        source_length=len(doc.get("text", "")),
+    )
+    top_level_pair = 2 if _domain_kind_from_doc(doc) is not None else 0
+    return 1 + 2 * len(embedded_spans) + top_level_pair
+
+
 def _shift_token_index_for_pair(value: int, *, start_at: int, end_at: int) -> int:
     value_i = int(value)
     return value_i + int(value_i >= start_at) + int(value_i >= end_at)
@@ -1125,6 +1136,14 @@ def materialize_tokenized_enriched_batch(
         domain = _domain_kind_from_doc(doc)
         if domain is not None:
             _insert_domain_delimiters(row, domain=domain)
+        raw_token_count = len(token_ids) - 1
+        actual_overhead = len(row[TOKEN_IDS_COLUMN]) - raw_token_count
+        expected_overhead = materialized_marker_token_overhead(doc)
+        if actual_overhead != expected_overhead:
+            raise AssertionError(
+                "materialized marker overhead does not match the delimiter contract: "
+                f"{actual_overhead} != {expected_overhead}"
+            )
         changed_chunk_ids, changed_chunk_spans = _changed_chunk_metadata(
             cast(list[int], row[TOKEN_CHUNK_STARTS_COLUMN]),
             cast(list[int], row[TOKEN_CHUNK_ENDS_COLUMN]),

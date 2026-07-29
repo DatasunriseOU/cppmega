@@ -96,6 +96,7 @@ from cppmega.data.nanochat_pipeline.tokenized_enriched import (
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
+    materialized_marker_token_overhead,
     materialize_tokenized_enriched_batch,
 )
 from cppmega.data.nanochat_pipeline.tokenized_enriched_schema import (
@@ -1628,18 +1629,107 @@ def process_record(record: dict, tokenizer, max_tokens: int) -> list:
     )
 
 
+def _validate_lossless_refinement(
+    parent: dict,
+    children: list[dict],
+) -> None:
+    if "".join(str(child.get("text", "")) for child in children) != str(
+        parent.get("text", "")
+    ):
+        raise ValueError("fixed-shape refinement did not preserve source text exactly")
+
+    parent_source_text = parent.get("source_text")
+    if isinstance(parent_source_text, str) and "".join(
+        str(child.get("source_text", "")) for child in children
+    ) != parent_source_text:
+        raise ValueError(
+            "fixed-shape refinement did not preserve source_text exactly"
+        )
+
+    for field in ("structure_ids", *_CHAR_LEVEL_METADATA_FIELDS):
+        parent_values = list(parent.get(field, []))
+        child_values = [
+            value
+            for child in children
+            for value in child.get(field, [])
+        ]
+        if child_values != parent_values:
+            raise ValueError(
+                f"fixed-shape refinement did not preserve {field} exactly"
+            )
+
+
+def _refine_for_fixed_shape(
+    doc: dict,
+    tokenizer,
+    fixed_shape_max_tokens: int,
+) -> list[dict]:
+    """Losslessly re-split a row until BOS and all delimiters fit the bucket."""
+
+    if fixed_shape_max_tokens <= 0:
+        raise ValueError(
+            "fixed_shape_max_tokens must be positive, got "
+            f"{fixed_shape_max_tokens}"
+        )
+    raw_token_count = count_tokens(str(doc.get("text", "")), tokenizer)
+    candidate = dict(doc)
+    candidate["actual_token_count"] = raw_token_count
+    marker_overhead = materialized_marker_token_overhead(candidate)
+    if raw_token_count + marker_overhead <= fixed_shape_max_tokens:
+        return [candidate]
+
+    raw_budget = fixed_shape_max_tokens - marker_overhead
+    if raw_budget <= 0:
+        raise ValueError(
+            "fixed-shape token budget cannot fit mandatory BOS/domain markers: "
+            f"limit={fixed_shape_max_tokens} overhead={marker_overhead}"
+        )
+    children = chunk_document_exact(
+        candidate,
+        tokenizer,
+        max_tokens=raw_budget,
+    )
+    parent_text_length = len(str(candidate.get("text", "")))
+    if len(children) < 2 or any(
+        len(str(child.get("text", ""))) >= parent_text_length
+        for child in children
+    ):
+        raise ValueError(
+            "fixed-shape refinement made no strict lossless split progress"
+        )
+    _validate_lossless_refinement(candidate, children)
+
+    refined: list[dict] = []
+    for child in children:
+        refined.extend(
+            _refine_for_fixed_shape(
+                child,
+                tokenizer,
+                fixed_shape_max_tokens,
+            )
+        )
+    _validate_lossless_refinement(candidate, refined)
+    return refined
+
+
 def process_record_with_policy(
     record: dict,
     tokenizer,
     max_tokens: int,
     *,
     overflow_policy: str = "split",
+    fixed_shape_max_tokens: int | None = None,
 ) -> list[dict]:
     """Apply full processing pipeline with explicit handling for oversized docs."""
     if overflow_policy not in _OVERFLOW_POLICIES:
         raise ValueError(
             f"Unsupported overflow_policy={overflow_policy!r}; "
             f"expected one of {_OVERFLOW_POLICIES}"
+        )
+    if fixed_shape_max_tokens is not None and fixed_shape_max_tokens <= 0:
+        raise ValueError(
+            "fixed_shape_max_tokens must be positive, got "
+            f"{fixed_shape_max_tokens}"
         )
 
     text = record.get("text", "")
@@ -1826,9 +1916,20 @@ def process_record_with_policy(
                 record.get("filepath", ""),
                 max_tokens,
             )
-        return docs
+    else:
+        docs = chunk_document_exact(combined, tokenizer, max_tokens=max_tokens)
 
-    return chunk_document_exact(combined, tokenizer, max_tokens=max_tokens)
+    if fixed_shape_max_tokens is None:
+        return docs
+    return [
+        refined
+        for doc in docs
+        for refined in _refine_for_fixed_shape(
+            doc,
+            tokenizer,
+            fixed_shape_max_tokens,
+        )
+    ]
 
 
 def _open_jsonl(path: str | os.PathLike[str]):
@@ -1847,6 +1948,7 @@ def _convert_local_jsonl_to_parquet_path(
     overflow_policy: str = "split",
     dry_run: bool = False,
     materialize_tokenized_enriched: bool = False,
+    fixed_shape_max_tokens: int | None = None,
     local_batch_size: int = 512,
     memory_limit_gb: float = 10.0,
     default_repo: str | None = None,
@@ -1857,6 +1959,16 @@ def _convert_local_jsonl_to_parquet_path(
             f"Unsupported overflow_policy={overflow_policy!r}; "
             f"expected one of {_OVERFLOW_POLICIES}"
         )
+    if fixed_shape_max_tokens is not None:
+        if fixed_shape_max_tokens <= 0:
+            raise ValueError(
+                "fixed_shape_max_tokens must be positive, got "
+                f"{fixed_shape_max_tokens}"
+            )
+        if not materialize_tokenized_enriched:
+            raise ValueError(
+                "fixed_shape_max_tokens requires materialize_tokenized_enriched"
+            )
 
     source = Path(input_path)
     target = Path(output_path)
@@ -1864,6 +1976,11 @@ def _convert_local_jsonl_to_parquet_path(
         "schema": _MATERIALIZE_SPLIT_STATS_SCHEMA,
         "overflow_policy": overflow_policy,
         "max_tokens": int(max_tokens),
+        "fixed_shape_max_tokens": (
+            None
+            if fixed_shape_max_tokens is None
+            else int(fixed_shape_max_tokens)
+        ),
         "docs_in": 0,
         "docs_out": 0,
         "source_docs_emitted": 0,
@@ -1906,6 +2023,18 @@ def _convert_local_jsonl_to_parquet_path(
             materialized_lengths = [
                 len(row.get(TOKEN_IDS_COLUMN, [])) for row in tokenized_rows
             ]
+            if fixed_shape_max_tokens is not None:
+                overlong_lengths = [
+                    length
+                    for length in materialized_lengths
+                    if length > fixed_shape_max_tokens
+                ]
+                if overlong_lengths:
+                    raise ValueError(
+                        "materialized token row exceeds fixed-shape limit: "
+                        f"max={max(overlong_lengths)} "
+                        f"limit={fixed_shape_max_tokens}"
+                    )
             stats["materialized_rows"] = int(stats["materialized_rows"]) + len(
                 materialized_lengths
             )
@@ -1945,6 +2074,7 @@ def _convert_local_jsonl_to_parquet_path(
                     tokenizer,
                     max_tokens,
                     overflow_policy=overflow_policy,
+                    fixed_shape_max_tokens=fixed_shape_max_tokens,
                 )
                 # V7-G02: prefer the helper's stable signature so the
                 # same logical document gets the same id even if
@@ -2099,6 +2229,7 @@ def convert_local_jsonl_to_parquet(
     overflow_policy: str = "split",
     dry_run: bool = False,
     materialize_tokenized_enriched: bool = False,
+    fixed_shape_max_tokens: int | None = None,
     local_batch_size: int = 512,
     memory_limit_gb: float = 10.0,
     default_repo: str | None = None,
@@ -2116,6 +2247,7 @@ def convert_local_jsonl_to_parquet(
         "overflow_policy": overflow_policy,
         "dry_run": dry_run,
         "materialize_tokenized_enriched": materialize_tokenized_enriched,
+        "fixed_shape_max_tokens": fixed_shape_max_tokens,
         "local_batch_size": local_batch_size,
         "memory_limit_gb": memory_limit_gb,
         "default_repo": default_repo,
@@ -2383,6 +2515,15 @@ def main():
         help="Also emit token_ids and token-level enriched metadata columns.",
     )
     parser.add_argument(
+        "--fixed-shape-max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum final token_ids length after BOS and all domain delimiters. "
+            "Requires --materialize-tokenized-enriched in local mode."
+        ),
+    )
+    parser.add_argument(
         "--overflow-policy",
         choices=_OVERFLOW_POLICIES,
         default="split",
@@ -2431,6 +2572,16 @@ def main():
         parser.error("--stats-file cannot be combined with --dry-run")
     if args.local_batch_size <= 0:
         parser.error("--local-batch-size must be positive")
+    if args.fixed_shape_max_tokens is not None:
+        if args.fixed_shape_max_tokens <= 0:
+            parser.error("--fixed-shape-max-tokens must be positive")
+        if not args.materialize_tokenized_enriched:
+            parser.error(
+                "--fixed-shape-max-tokens requires "
+                "--materialize-tokenized-enriched"
+            )
+        if not local_mode:
+            parser.error("--fixed-shape-max-tokens is only supported in local mode")
     if not local_mode and not args.output_prefix:
         args.output_prefix = default_output_prefix
 
@@ -2443,6 +2594,7 @@ def main():
             overflow_policy=args.overflow_policy,
             dry_run=args.dry_run,
             materialize_tokenized_enriched=args.materialize_tokenized_enriched,
+            fixed_shape_max_tokens=args.fixed_shape_max_tokens,
             local_batch_size=args.local_batch_size,
             memory_limit_gb=args.memory_limit_gb,
             default_repo=args.default_repo or None,
