@@ -30,7 +30,9 @@ SCHEMA_VERSION = "cppmega.repository-ci.v1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HOSTS_CONFIG = REPO_ROOT / "configs" / "ci" / "hosts.json"
 DEFAULT_LANES_CONFIG = REPO_ROOT / "configs" / "ci" / "lanes.json"
-DEFAULT_RECEIPT_BASE = Path(tempfile.gettempdir()) / "cppmega-repository-ci"
+DEFAULT_RECEIPT_BASE = (
+    REPO_ROOT / "outputs" / "ci_diagnostics" / "repository-ci"
+)
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 _SAFE_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")

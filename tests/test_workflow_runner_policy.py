@@ -151,7 +151,7 @@ def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
             "--completions",
             "evals/domain_routed_gold_completions.jsonl",
             "--out",
-            "/tmp/cppmega-domain-routed-codegen.json",
+            "outputs/ci_diagnostics/domain-routed-codegen.json",
         ]
 
 

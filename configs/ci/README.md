@@ -19,7 +19,7 @@ run tests:
 ```bash
 python3 scripts/ci/run_repository_ci.py run \
   --dry-run \
-  --receipt-dir /tmp/cppmega-repository-ci
+  --receipt-dir outputs/ci_diagnostics/repository-ci
 ```
 
 Run one selected lane after its preflight passes:
@@ -29,7 +29,7 @@ python3 scripts/ci/run_repository_ci.py run \
   --host local-macos \
   --lane macos-contracts \
   --ref HEAD \
-  --receipt-dir /tmp/cppmega-repository-ci
+  --receipt-dir outputs/ci_diagnostics/repository-ci
 ```
 
 Run the focused companion `cppmega.mlx` lane directly against its local
@@ -41,7 +41,7 @@ python3 scripts/ci/run_repository_ci.py lane \
   --lane macos-cppmega-mlx-contracts \
   --repo-root /path/to/cppmega_mlx \
   --python /path/to/cppmega_mlx/.venv/bin/python \
-  --receipt-dir /tmp/cppmega-repository-ci/cppmega-mlx
+  --receipt-dir /path/to/cppmega_mlx/outputs/ci_diagnostics/repository-ci
 ```
 
 The companion invocation does not install or update that worktree's
