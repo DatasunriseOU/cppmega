@@ -41,8 +41,11 @@ from scripts.ci_stream_receipts import finalize_fetch_receipts
 from scripts.ci_log_sidecars import _repo_source_binding
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
+    SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+    SOURCE_BINDING_PROJECTION_SCHEMA,
     target_parser_script_sha256,
 )
+from scripts.canonical_parquet_ledger import iter_canonical_parquet_ledger
 from scripts.clone_ci_stream_union_for_resume import (
     CloneError,
     _snapshot_tree,
@@ -2297,10 +2300,12 @@ def test_merge_to_export_executes_current_semantics_through_unknown_lineage(
     ]
     assert projection["selection_counts"] == {"current_audit": 1}
     records = [
-        json.loads(line)
-        for line in (output / projection["ledger_artifact"])
-        .read_text(encoding="utf-8")
-        .splitlines()
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            output / projection["ledger_artifact"],
+            expected_domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+            expected_record_schema=SOURCE_BINDING_PROJECTION_SCHEMA,
+        )
     ]
     assert {record["input_parser_sha256"] for record in records} == {
         current
@@ -2378,10 +2383,12 @@ def test_merge_preserves_shortcut_dag_but_export_executes_only_known_semantics(
         "legacy_projection": 1,
     }
     records = [
-        json.loads(line)
-        for line in (output / projection["ledger_artifact"])
-        .read_text(encoding="utf-8")
-        .splitlines()
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            output / projection["ledger_artifact"],
+            expected_domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+            expected_record_schema=SOURCE_BINDING_PROJECTION_SCHEMA,
+        )
     ]
     assert {record["input_parser_sha256"] for record in records} == {
         LEGACY_PARSER_SHA256,

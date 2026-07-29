@@ -33,10 +33,16 @@ from scripts.ci_content_store import (
     _hash_records,
     hash_token_sequence,
 )
+from scripts.canonical_parquet_ledger import (
+    CanonicalParquetLedgerError,
+    CanonicalParquetLedgerWriter,
+    iter_canonical_parquet_ledger,
+)
 from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
     MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
     SOURCE_BINDING_PROJECTION_SCHEMA,
     target_parser_script_sha256,
 )
@@ -52,6 +58,7 @@ from scripts.export_ci_content_store_case5 import (
     BUCKETS,
     EXPORT_SCHEMA,
     OCCURRENCE_SCHEMA,
+    REPRESENTATIVE_LEDGER_SCHEMA,
     REPRESENTATIVE_METADATA_SCHEMA,
     TRAINING_SIDECAR_SCHEMA,
     ExportError,
@@ -325,6 +332,22 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _read_parquet_ledger(
+    path: Path,
+    *,
+    domain: str | None = None,
+    schema: str | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            path,
+            expected_domain=domain,
+            expected_record_schema=schema,
+        )
+    ]
+
+
 def _run_metadata(provenance: dict[str, Any]) -> dict[str, Any]:
     workflow = provenance["workflow"]
     return {
@@ -426,6 +449,8 @@ def _fixture_parser_sidecar(
         "provenance": {},
         "classifications": {
             "languages": [{"name": value} for value in sorted(languages)],
+            "shell_dialects": [],
+            "sql_dialects": [],
             "build_systems": [{"name": value} for value in sorted(build_systems)],
             "toolchains": [{"name": value} for value in sorted(toolchains)],
             "platform": platform,
@@ -787,6 +812,59 @@ def _assert_balanced_case5_row(row: dict[str, Any], *, bucket: int) -> None:
     assert stack == []
 
 
+def test_canonical_parquet_ledger_is_bounded_zstd_and_logically_hashed(
+    tmp_path: Path,
+) -> None:
+    records = [
+        {"schema": "fixture_v1", "value": 1},
+        {"schema": "fixture_v1", "value": "two"},
+    ]
+    path = tmp_path / "ledger.parquet"
+    writer = CanonicalParquetLedgerWriter(
+        path,
+        domain="fixture-domain-v1",
+        max_record_bytes=128,
+        row_group_rows=1,
+    )
+    for record in records:
+        writer.append(record)
+    writer.close()
+
+    assert writer.logical_sha256 == _hash_records(
+        "fixture-domain-v1",
+        iter(records),
+    )
+    assert [
+        value
+        for value, _encoded in iter_canonical_parquet_ledger(
+            path,
+            expected_domain="fixture-domain-v1",
+            expected_record_schema="fixture_v1",
+            max_record_bytes=128,
+        )
+    ] == records
+    metadata = pq.ParquetFile(path).metadata
+    assert metadata.num_rows == 2
+    assert {
+        str(
+            metadata.row_group(row_group).column(column).compression
+        )
+        for row_group in range(metadata.num_row_groups)
+        for column in range(metadata.num_columns)
+    } == {"ZSTD"}
+
+    oversized = CanonicalParquetLedgerWriter(
+        tmp_path / "oversized.parquet",
+        max_record_bytes=8,
+    )
+    with pytest.raises(
+        CanonicalParquetLedgerError,
+        match="record exceeds",
+    ):
+        oversized.append({"too": "large"})
+    oversized.close()
+
+
 def test_tiny_end_to_end_selects_stable_token_sequence_representative(
     tmp_path: Path,
     exact_tokenizer: ExactTokenizer,
@@ -795,9 +873,22 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
     token_rows = exact_tokenizer.encode_batch(texts)
     assert token_rows[0] == token_rows[1]
     records = [
-        (text, _provenance(text, archive_member=f"job-{index}.txt"))
+        (text, _provenance(text, archive_member=f"0_job-{index}.txt"))
         for index, text in enumerate(texts)
     ]
+    records[0][1]["workflow"]["actor"] = {"login": "linux-builder", "id": 1}
+    records[0][1]["job"] = {
+        "id": 1001,
+        "name": "linux",
+        "labels": ["ubuntu-24.04", "x64"],
+    }
+    records[1][1]["run_id"] = 101
+    records[1][1]["workflow"]["actor"] = {"login": "windows-builder", "id": 2}
+    records[1][1]["job"] = {
+        "id": 1002,
+        "name": "windows",
+        "labels": ["windows-2025", "x64"],
+    }
     store_root, receipt_path, fetch_state = _build_store(
         tmp_path, exact_tokenizer, records
     )
@@ -816,16 +907,20 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
     assert receipt["representatives"]["count"] == 1
     assert receipt["counts"]["payload_tokens"] == len(token_rows[0])
     assert receipt["case5_contract"]["overflow_rows"] == 0
+    assert receipt["case5_contract"]["parquet_compression"] == {
+        "codec": "zstd",
+        "level": 9,
+    }
+    assert receipt["validation"]["all_case5_parquet_zstd"] is True
     assert (
         receipt["case5_contract"]["parquet_layout"]
         == "bucket-first-split-in-filename-v1"
     )
-    ledger = [
-        json.loads(line)
-        for line in (output / receipt["representatives"]["ledger_artifact"])
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    ledger = _read_parquet_ledger(
+        output / receipt["representatives"]["ledger_artifact"],
+        domain="cppmega-ci-case5-representative-ledger-v1",
+        schema=REPRESENTATIVE_LEDGER_SCHEMA,
+    )
     expected_content = min(
         hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts
     )
@@ -848,6 +943,26 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
         == hashlib.sha256(ledger_bytes).hexdigest()
     )
     assert (output / "export_receipt.json").is_file()
+    occurrence_receipt = receipt["occurrence_metadata"]
+    assert occurrence_receipt["count"] == 2
+    occurrence_records = [
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            output / occurrence_receipt["artifact"],
+            expected_domain=occurrence_receipt["logical_domain"],
+            expected_record_schema=occurrence_receipt["schema"],
+        )
+    ]
+    assert {
+        (
+            record["workflow"]["actor"]["login"],
+            tuple(record["runner_evidence"]["os_label_evidence"]),
+        )
+        for record in occurrence_records
+    } == {
+        ("linux-builder", ("ubuntu-24.04",)),
+        ("windows-builder", ("windows-2025",)),
+    }
 
     parquet_artifacts = [
         artifact
@@ -878,7 +993,7 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
         }
     }
     assert normalized["schema"] == EXPORT_SCHEMA
-    assert len(normalized["provenance_artifacts"]) == 6
+    assert len(normalized["provenance_artifacts"]) == 7
 
 
 def test_nested_zip_binary_garbage_is_conserved_but_not_trained(
@@ -924,21 +1039,37 @@ def test_nested_zip_binary_garbage_is_conserved_but_not_trained(
     }
     assert receipt["representatives"]["count"] == 1
     excluded_path = output / eligibility["excluded_occurrences"]["ledger"]
-    excluded = [json.loads(line) for line in excluded_path.read_text().splitlines()]
+    excluded = _read_parquet_ledger(
+        excluded_path,
+        domain="cppmega-ci-case5-excluded-opaque-artifact-ledger-v1",
+        schema="cppmega_ci_case5_excluded_opaque_artifact_v1",
+    )
     assert len(excluded) == 1
     assert excluded[0]["archive_member"].endswith("/runner.zip")
     assert excluded[0]["exact_token_count"] == opaque_tokens
     assert excluded[0]["decode_evidence"]["invalid_ratio_ppm_floor"] == 400_000
-    representatives = [
-        json.loads(line)
-        for line in (output / receipt["representatives"]["ledger_artifact"])
-        .read_text()
-        .splitlines()
-    ]
+    representatives = _read_parquet_ledger(
+        output / receipt["representatives"]["ledger_artifact"],
+        domain="cppmega-ci-case5-representative-ledger-v1",
+        schema=REPRESENTATIVE_LEDGER_SCHEMA,
+    )
     assert (
         representatives[0]["representative_content_sha256"]
         == hashlib.sha256(eligible_text.encode()).hexdigest()
     )
+    occurrence_receipt = receipt["occurrence_metadata"]
+    occurrence_records = [
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            output / occurrence_receipt["artifact"],
+            expected_domain=occurrence_receipt["logical_domain"],
+            expected_record_schema=occurrence_receipt["schema"],
+        )
+    ]
+    assert {
+        record["case5_eligibility"]["status"]
+        for record in occurrence_records
+    } == {"eligible", "excluded_opaque"}
 
 
 def test_opaque_tokens_cannot_satisfy_the_eligible_target(
@@ -1225,9 +1356,12 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
     metadata_receipt = receipt["representative_metadata"]
     assert metadata_receipt["schema"] == REPRESENTATIVE_METADATA_SCHEMA
     assert metadata_receipt["count"] == 1
-    metadata = json.loads(
-        (output / metadata_receipt["artifact"]).read_text(encoding="utf-8")
+    metadata = _read_parquet_ledger(
+        output / metadata_receipt["artifact"],
+        schema=metadata_receipt["schema"],
     )
+    assert len(metadata) == 1
+    metadata = metadata[0]
     assert metadata["run"]["run_id"] == 100
     assert metadata["run"]["run_attempt"] == 1
     assert metadata["run"]["metadata_evidence"]["exact_attempt_match"] is True
@@ -1267,7 +1401,17 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
         "message",
     }.intersection(all_keys(metadata))
     classifications = metadata["derived_classifications"]
+    assert classifications["scope_contract"] == {
+        "workflow_job_runner": "exact-occurrence-api-metadata",
+        "parser_classifications": "archive-member",
+        "training_sidecars": "chunk-local",
+        "derived_values": (
+            "typed union; evidence_source identifies member versus chunk scope"
+        ),
+    }
     assert classifications["language"]["status"] == "resolved"
+    assert classifications["shell_dialect"]["status"] == "unresolved"
+    assert classifications["sql_dialect"]["status"] == "unresolved"
     assert {
         (item["extension"], item["language"])
         for item in classifications["language"]["source_extension_evidence"]
@@ -1275,11 +1419,41 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
     assert classifications["source_extension"]["values"] == [".C"]
     assert classifications["system"]["values"] == ["linux"]
     assert classifications["platform"]["value"]["architecture_labels"] == ["x64"]
+    assert classifications["platform"]["completeness"] == "complete"
     assert classifications["runner"]["value"]["runner_name"] == ("GitHub Actions 1001")
     assert classifications["build_system"]["status"] == "unresolved"
     assert classifications["test"]["value"]["framework"]["values"] == ["pytest"]
     assert classifications["tool"]["values"] == ["clang", "clang++"]
     assert classifications["action_kind"]["values"] == ["compile"]
+    occurrence_receipt = receipt["occurrence_metadata"]
+    assert occurrence_receipt["count"] == 1
+    occurrence_path = output / occurrence_receipt["artifact"]
+    occurrence_records = list(
+        iter_canonical_parquet_ledger(
+            occurrence_path,
+            expected_domain=occurrence_receipt["logical_domain"],
+            expected_record_schema=occurrence_receipt["schema"],
+        )
+    )
+    assert len(occurrence_records) == 1
+    occurrence_metadata = occurrence_records[0][0]
+    assert occurrence_metadata["scope"] == (
+        "one-record-per-frozen-cas-occurrence"
+    )
+    assert occurrence_metadata["case5_eligibility"] == {
+        "status": "eligible",
+        "reason": None,
+    }
+    parquet_metadata = pq.ParquetFile(occurrence_path).metadata
+    assert {
+        str(
+            parquet_metadata.row_group(row_group)
+            .column(column)
+            .compression
+        )
+        for row_group in range(parquet_metadata.num_row_groups)
+        for column in range(parquet_metadata.num_columns)
+    } == {"ZSTD"}
 
 
 def test_legacy_source_bindings_require_authorization_and_export_as_overlay(
@@ -1385,15 +1559,20 @@ def test_legacy_source_bindings_require_authorization_and_export_as_overlay(
         "projected_binding_count": 1,
     }
     assert projection["change_counts"] == {"modified": 1}
-    ledger = json.loads(
-        (output / projection["ledger_artifact"]).read_text(encoding="utf-8")
-    )
+    ledger = _read_parquet_ledger(
+        output / projection["ledger_artifact"],
+        domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+        schema=SOURCE_BINDING_PROJECTION_SCHEMA,
+    )[0]
     assert ledger["old_binding"]["repository"] == "fork/base"
     assert ledger["projected_binding"]["repository"] == "owner/base"
     assert ledger["projected_binding"]["source_path"] == "build/src/main.cpp"
 
     metadata_path = output / receipt["representative_metadata"]["artifact"]
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = _read_parquet_ledger(
+        metadata_path,
+        schema=receipt["representative_metadata"]["schema"],
+    )[0]
     projected_action = metadata["training_sidecars"]["build_actions"][0]
     assert projected_action["repository_source_bindings"][0]["repository"] == (
         "owner/base"
@@ -1556,12 +1735,11 @@ def test_mixed_parser_generation_store_routes_legacy_and_current_actions(
         "current_audit": 1,
         "legacy_projection": 1,
     }
-    records = [
-        json.loads(line)
-        for line in (output / projection["ledger_artifact"])
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    records = _read_parquet_ledger(
+        output / projection["ledger_artifact"],
+        domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+        schema=SOURCE_BINDING_PROJECTION_SCHEMA,
+    )
     assert {record["mode"] for record in records} == {
         "current_audit",
         "legacy_projection",
@@ -1573,14 +1751,10 @@ def test_mixed_parser_generation_store_routes_legacy_and_current_actions(
         ("current_audit", "unchanged"),
         ("legacy_projection", "modified"),
     }
-    metadata = [
-        json.loads(line)
-        for line in (
-            output / receipt["representative_metadata"]["artifact"]
-        )
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    metadata = _read_parquet_ledger(
+        output / receipt["representative_metadata"]["artifact"],
+        schema=receipt["representative_metadata"]["schema"],
+    )
     assert {
         item["training_sidecars"]["build_actions"][0][
             "source_binding_projection"
@@ -1685,10 +1859,13 @@ def test_parser_binding_history_disconnected_from_current_fails_closed(
 def test_projection_writer_rejects_rows_the_consumer_cannot_read(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "source_binding_projection.jsonl"
+    path = tmp_path / "source_binding_projection.parquet"
     writer = _source_binding_projection_writer(path)
     try:
-        with pytest.raises(ExportError, match="record exceeds"):
+        with pytest.raises(
+            CanonicalParquetLedgerError,
+            match="record exceeds",
+        ):
             writer.append(
                 {
                     "source_input": (
@@ -1700,7 +1877,7 @@ def test_projection_writer_rejects_rows_the_consumer_cannot_read(
         writer.close()
 
     assert writer.count == 0
-    assert path.read_bytes() == b""
+    assert pq.ParquetFile(path).metadata.num_rows == 0
 
 
 def test_split_contract_declares_and_uses_the_exact_hash_projection() -> None:
@@ -2500,12 +2677,9 @@ def test_over_16k_mixed_domain_fragments_are_balanced_and_conserved(
         output=output,
     )
 
-    fragments = [
-        json.loads(line)
-        for line in (output / receipt["fragment_ledger"]["artifact"])
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    fragments = _read_parquet_ledger(
+        output / receipt["fragment_ledger"]["artifact"],
+    )
     assert len(fragments) > 1
     assert sum(item["payload_tokens"] for item in fragments) == len(payload_ids)
     assert [(item["payload_start"], item["payload_end"]) for item in fragments] == [

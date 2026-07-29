@@ -476,6 +476,45 @@ def test_package_inventory_rows_are_not_build_actions() -> None:
     _assert_conserved(result)
 
 
+def test_shell_and_sql_dialects_require_retained_command_evidence() -> None:
+    result = canonicalize_ci_log(
+        _timestamped(
+            "##[group]Run psql -f schema.sql",
+            "  shell: /usr/bin/bash -e {0}",
+            "[command]psql -f schema.sql",
+            "[command]PGPASSWORD=secret /usr/bin/psql -c 'select 1'",
+            "mysql  Ver 8.4.0 for macos14.0 on arm64 (Homebrew)",
+            "##[group]Run sqlite3 app.db < schema.sql",
+            "  shell: /usr/bin/zsh -e {0}",
+            "[command]sqlite3 app.db < schema.sql",
+            "[command]echo mysql",
+            "[command]docker run mysql:8",
+            "[command]printf 'psql'",
+        )
+    )
+
+    classes = result["sidecar"]["classifications"]
+    assert {item["name"] for item in classes["shell_dialects"]} == {
+        "bash",
+        "zsh",
+    }
+    assert {item["name"] for item in classes["sql_dialects"]} == {
+        "postgresql",
+        "sqlite",
+    }
+    assert "mysql" not in {
+        item["name"] for item in classes["sql_dialects"]
+    }
+    sql_entities = [
+        entity
+        for entity in result["sidecar"]["entities"]
+        if entity["kind"] == "sql_dialect"
+    ]
+    assert {entity["text"] for entity in sql_entities} == {"psql", "sqlite3"}
+    assert all(entity["domain"] == "SQL" for entity in sql_entities)
+    _assert_conserved(result)
+
+
 def test_package_version_parser_is_linear_and_rejects_ambiguous_suffixes() -> None:
     assert _is_package_version("v4.3.2")
     assert _is_package_version("3.22.1-1ubuntu1.22.04.2")
