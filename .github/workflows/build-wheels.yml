@@ -77,8 +77,8 @@ jobs:
             # MAX_JOBS=1 NVCC_THREADS=2 — without these, ninja saturates the
             # 4-core / 7 GB runner and the job gets cancelled at ~1h30m with
             # nothing useful in the logs. TE core CMake ignores
-            # TORCH_CUDA_ARCH_LIST, so CUDAARCHS pins the intended 3 families.
-            extra_env: "NVTE_FRAMEWORK=pytorch MAX_JOBS=1 NVCC_THREADS=2 CUDAARCHS='90;100;120'"
+            # TORCH_CUDA_ARCH_LIST; v2.16 reads NVTE_CUDA_ARCHS instead.
+            extra_env: "NVTE_FRAMEWORK=pytorch MAX_JOBS=1 NVCC_THREADS=2 NVTE_CUDA_ARCHS='90;100;120'"
           - name: flash_attn
             # Public upstream builds the FA2 cuda kernels + FA4 cute python
             # module in one wheel. cppmega-specific build trimming stays below
