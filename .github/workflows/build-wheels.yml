@@ -104,7 +104,8 @@ jobs:
             submodules: "false"
             patch: upstream_prs/flash_attn_setup_sm120f.patch
             arch_override: "12.1"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=1"
+            # Upstream FA2 ignores TORCH_CUDA_ARCH_LIST and reads this knob.
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=1 FLASH_ATTN_CUDA_ARCHS=120"
           - name: flash_attn_3
             # Hopper FA3 path from upstream flash-attention (subdir hopper/). Trimmed to
             # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
@@ -491,11 +492,22 @@ jobs:
           # dispatcher stops referencing run_mha_fwd_splitkv_dispatch<>.
           # Survivors: flash_{fwd,bwd}_hdim{64,128}_bf16{,_causal}_sm80.cu = 8.
           before=$(grep -c '_sm80\.cu' setup.py || true)
-          sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim[0-9]+_fp16(_causal)?_sm80\.cu/d' setup.py
-          sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim(32|96|192|256)_bf16(_causal)?_sm80\.cu/d' setup.py
-          sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split_hdim(64|128)_bf16(_causal)?_sm80\.cu/d' setup.py
+          sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd)_hdim[0-9]+_fp16(_causal)?_sm80\.cu/d' setup.py
+          sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd)_hdim(32|96|192|256)_bf16(_causal)?_sm80\.cu/d' setup.py
+          # Upstream renamed this family from fwd_split to fwd_split_align.
+          sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split(_align)?_hdim[0-9]+_(fp16|bf16)(_causal)?_sm80\.cu/d' setup.py
           after=$(grep -c '_sm80\.cu' setup.py || true)
           echo "trimmed $((before - after)) kernel sources ($before → $after)"
+          unexpected=$(
+            grep '_sm80\.cu' setup.py |
+              grep -Ev 'csrc/flash_attn/src/flash_(fwd|bwd)_hdim(64|128)_bf16(_causal)?_sm80\.cu' ||
+              true
+          )
+          if [[ "$after" -ne 8 || -n "$unexpected" ]]; then
+            echo "::error::FA2 trim did not leave the exact 8-source training matrix."
+            grep '_sm80\.cu' setup.py || true
+            exit 1
+          fi
           # 2) Restrict HEADDIM_SWITCH to {64,128} and FP16_SWITCH to bf16
           # only. Append #undef + new definitions at end of static_switch.h
           # — any subsequent #include picks up the override. Without these,
