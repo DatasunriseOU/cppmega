@@ -263,6 +263,55 @@ def test_windows_1252_sql_is_decoded_without_replacement(tmp_path: Path) -> None
     assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
 
 
+@pytest.mark.parametrize(
+    ("filename", "codec", "source_encoding", "text"),
+    [
+        ("big5.sql", "big5", "big5", "-- 中文\nSELECT 1;\n"),
+        ("euc_cn.sql", "euc_cn", "euc-cn", "-- 中文\nSELECT 1;\n"),
+        ("euc_jp.sql", "euc_jp", "euc-jp", "-- 日本語\nSELECT 1;\n"),
+        ("euc_kr.sql", "euc_kr", "euc-kr", "-- 한국어\nSELECT 1;\n"),
+        ("gb18030.sql", "gb18030", "gb18030", "-- 中文编码\nSELECT 1;\n"),
+        ("sjis.sql", "shift_jis", "shift-jis", "-- 日本語\nSELECT 1;\n"),
+    ],
+)
+def test_filename_declared_legacy_sql_round_trips_in_bounded_chunks(
+    tmp_path: Path,
+    filename: str,
+    codec: str,
+    source_encoding: str,
+    text: str,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    sql = text * 12
+    encoded = sql.encode(codec)
+    path = tmp_path / filename
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=32))
+
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {source_encoding}
+    assert b"".join(chunk.text.encode(codec) for chunk in chunks) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
+
+
+def test_filename_declared_euc_tw_sql_uses_strict_native_round_trip(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    encoded = b"-- \xc4\xe3\xc5\xc6\nSELECT 1;\n"
+    path = tmp_path / "euc_tw.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path))
+
+    assert [chunk.text for chunk in chunks] == ["-- 中文\nSELECT 1;\n"]
+    assert chunks[0].source_encoding == "euc-tw"
+    assert (chunks[0].byte_start, chunks[0].byte_end) == (0, len(encoded))
+
+
 def test_single_trailing_nul_is_explicit_in_source_provenance(
     tmp_path: Path,
 ) -> None:

@@ -18,6 +18,15 @@
       "classification": "deliberate_compiler_crash_fixture",
       "detected_format": "clang_debug_crash_pragma",
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "xemu-project/xemu",
+      "relative_path": "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/PoliciesP1234subsubCAP123P12CertreversecrossCertificatePair.cp",
+      "size_bytes": 955,
+      "sha256": "8734808c3859f30101cb1934bf7d71d153430dd85ae357d41c1641fc7a8addfe",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "asn1_der_x509_certificate_pair",
+      "reason": "DER X.509 CertificatePair test vector stored under a .cp suffix"
     }
   ]
 }
