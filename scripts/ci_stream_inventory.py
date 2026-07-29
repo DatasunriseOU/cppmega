@@ -2902,6 +2902,13 @@ class InventoryDB:
         total = page.total_count
         if total > GITHUB_FILTER_LIMIT:
             raise ValueError("dense response must be split before storing a page")
+        recorded_total = row["expected_total"]
+        if recorded_total is not None and int(recorded_total) != total:
+            raise PaginationDrift(
+                f"total_count changed for window {window_id}: "
+                f"{recorded_total} -> {total}",
+                observed_total=total,
+            )
         expected_pages = max(1, math.ceil(total / per_page))
         if page_no < 1 or page_no > expected_pages:
             raise MalformedAPIError(

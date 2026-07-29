@@ -415,6 +415,59 @@ class DuplicatePageAPI(DatasetAPI):
         return response
 
 
+class PageCountShrinkAPI(DatasetAPI):
+    """Shrink the parent listing on page three, then expose a stable snapshot."""
+
+    def __init__(self, start: int):
+        current = [
+            *[_run(run_id, start + 1) for run_id in range(1, 51)],
+            *[_run(run_id, start + 2) for run_id in range(51, 96)],
+        ]
+        super().__init__(current)
+        self.start = start
+        self.old = [
+            *current,
+            *[_run(run_id, start + 3) for run_id in range(96, 206)],
+        ]
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> ci.HTTPResponse:
+        start, end, page, per_page = self._query(url)
+        if start != self.start or end != self.start + 4:
+            return super().__call__(method, url, headers, timeout)
+
+        assert method == "GET"
+        assert timeout > 0
+        assert headers["Authorization"].startswith("Bearer ")
+        selected = self.old if page < 3 else self.runs
+        offset = (page - 1) * per_page
+        page_runs = selected[offset : offset + per_page]
+        self.calls.append(
+            {
+                "start": start,
+                "end": end,
+                "page": page,
+                "per_page": per_page,
+                "authorization": headers["Authorization"],
+            }
+        )
+        return ci.HTTPResponse(
+            status=200,
+            headers={"X-RateLimit-Remaining": "4999"},
+            body=json.dumps(
+                {
+                    "total_count": len(selected),
+                    "workflow_runs": page_runs,
+                }
+            ).encode(),
+        )
+
+
 class CrossWindowDuplicateAPI(DatasetAPI):
     def __init__(self, start: int):
         self.start = start
@@ -510,6 +563,50 @@ def test_cross_page_duplicate_invalidates_leaf_and_recovers_by_split(
         assert conn.execute(
             "SELECT COUNT(*) FROM search_windows WHERE status='split'"
         ).fetchone()[0] == 1
+
+
+def test_page_three_total_shrink_recovers_without_malformed_dead_end(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    api = PageCountShrinkAPI(start)
+    inventory = _inventory(tmp_path, api)
+
+    inventory.run()
+    receipt = inventory.write_completion_receipt(tmp_path / "receipt.json")
+
+    assert receipt["enumeration_complete"] is True
+    assert receipt["source_snapshot_stable"] is True
+    assert receipt["production_complete"] is True
+    assert receipt["run_count"] == 95
+    assert [call["page"] for call in api.calls[:3]] == [1, 2, 3]
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM request_ledger
+            WHERE outcome='pagination_drift_split'
+              AND error_class='PaginationDrift'
+            """
+        ).fetchone() == (1,)
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM request_ledger
+            WHERE outcome='window_error'
+              AND error_class='MalformedAPIError'
+            """
+        ).fetchone() == (0,)
+        assert conn.execute(
+            """
+            SELECT status,expected_total,pages_done
+            FROM search_windows ORDER BY depth,start_epoch
+            """
+        ).fetchall() == [
+            ("split", 95, 0),
+            ("done", 50, 1),
+            ("done", 45, 1),
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM window_pages").fetchone() == (2,)
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone() == (95,)
 
 
 def test_split_parent_count_drift_is_explicit_and_not_production_complete(
