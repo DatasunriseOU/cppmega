@@ -651,6 +651,155 @@ def test_split_parent_count_drift_is_explicit_and_not_production_complete(
     }
 
 
+def test_split_parent_drift_reconciles_a_stable_observed_union(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    source = SplitCountDriftAPI(start)
+    inventory = _inventory(tmp_path, source)
+
+    inventory.run()
+    inventory.client.requester = DatasetAPI(source.runs[:-1])
+    receipt_path = tmp_path / "receipt.json"
+    receipt = inventory.write_completion_receipt(
+        receipt_path,
+        reconcile_source_drift=True,
+        reconciliation_workers=1,
+    )
+
+    assert receipt["production_complete"] is True
+    assert receipt["source_snapshot_stable"] is True
+    assert receipt["source_snapshot_mode"] == "reconciled-observed-union"
+    reconciliation = receipt["source_drift_reconciliation"]
+    assert reconciliation["two_pass_exact"] is True
+    assert reconciliation["observed_union_complete"] is True
+    assert reconciliation["new_current_run_count"] == 0
+    assert reconciliation["root_count"] == 1
+    assert reconciliation["stored_run_count"] == 100
+    assert reconciliation["current_run_count"] == 99
+    assert reconciliation["retained_upstream_deleted_count"] == 1
+    verified, _receipt_sha256 = ci.verify_inventory_completion_receipt(
+        tmp_path / "inventory.sqlite",
+        receipt_path,
+    )
+    assert verified == receipt
+
+
+def test_split_parent_reconciliation_appends_stable_live_delta(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    source = SplitCountDriftAPI(start)
+    inventory = _inventory(tmp_path, source)
+
+    inventory.run()
+    inventory.client.requester = DatasetAPI(
+        [*source.runs[:-1], _run(101, start + 2)]
+    )
+    receipt_path = tmp_path / "receipt.json"
+    receipt = inventory.write_completion_receipt(
+        receipt_path,
+        reconcile_source_drift=True,
+        reconciliation_workers=1,
+    )
+
+    reconciliation = receipt["source_drift_reconciliation"]
+    assert receipt["run_count"] == 101
+    assert reconciliation["stored_run_count"] == 100
+    assert reconciliation["current_run_count"] == 100
+    assert reconciliation["retained_upstream_deleted_count"] == 1
+    assert reconciliation["new_current_run_count"] == 1
+    assert reconciliation["observed_union_run_count"] == 101
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM runs"
+        ).fetchone()[0] == 101
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM runs run
+            WHERE NOT EXISTS (
+                SELECT 1 FROM window_runs linked
+                WHERE linked.repo_key=run.repo_key
+                  AND linked.run_id=run.run_id
+                  AND linked.run_attempt=run.run_attempt
+            )
+            """
+        ).fetchone()[0] == 1
+    verified, _receipt_sha256 = ci.verify_inventory_completion_receipt(
+        tmp_path / "inventory.sqlite",
+        receipt_path,
+    )
+    assert verified == receipt
+    from scripts import ci_stream_fetch as fetch
+
+    fetch_state = object.__new__(fetch.FetchState)
+    fetch_state.inventory_path = tmp_path / "inventory.sqlite"
+    inventory_connection = fetch_state._inventory_connection()
+    try:
+        rows = fetch_state._fetch_inventory_page(
+            inventory_connection,
+            row_limit=200,
+            cursor=None,
+        )
+    finally:
+        inventory_connection.close()
+    assert len(rows) == 101
+    assert {int(row["run_id"]) for row in rows} == set(range(1, 102))
+
+    def refuse_network(
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> ci.HTTPResponse:
+        raise AssertionError("persisted reconciliation unexpectedly hit GitHub")
+
+    inventory.client.requester = refuse_network
+    repeated = inventory.write_completion_receipt(
+        tmp_path / "receipt-repeated.json",
+        reconcile_source_drift=True,
+        reconciliation_workers=1,
+    )
+    assert repeated["source_drift_reconciliation"] == reconciliation
+
+    forged, _metadata_sha, _key = inventory.db._normalize_run(
+        "owner/repo",
+        _run(102, start + 2),
+        start_epoch=start,
+        end_epoch=start + 4,
+    )
+    connection = inventory.db.connect()
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO runs(
+                    repo_key,run_id,run_attempt,created_at,updated_at,
+                    run_started_at,status,conclusion,workflow_id,
+                    workflow_name,event,head_branch,head_sha,run_number,
+                    html_url,api_url,metadata_blob,metadata_sha256,
+                    first_seen_at
+                ) VALUES (
+                    :repo_key,:run_id,:run_attempt,:created_at,:updated_at,
+                    :run_started_at,:status,:conclusion,:workflow_id,
+                    :workflow_name,:event,:head_branch,:head_sha,
+                    :run_number,:html_url,:api_url,:metadata_blob,
+                    :metadata_sha256,:first_seen_at
+                )
+                """,
+                {**forged, "first_seen_at": "2026-07-29T00:00:00Z"},
+            )
+    finally:
+        connection.close()
+    with pytest.raises(
+        ci.CompletionError,
+        match="unlinked inventory runs differ",
+    ):
+        inventory.db.completion_receipt(
+            source_drift_reconciliation=reconciliation,
+        )
+
+
 def test_cross_window_overlap_still_fails_closed(tmp_path: Path) -> None:
     start = ci.parse_utc_instant(START)
     cross_window_dir = tmp_path / "window"

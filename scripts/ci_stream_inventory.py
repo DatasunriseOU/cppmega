@@ -48,10 +48,14 @@ from scripts.ci_zlib_evidence import (
 )
 
 
-SCHEMA_VERSION = "cppmega_ci_stream_inventory_v3"
-RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v5"
+SCHEMA_VERSION = "cppmega_ci_stream_inventory_v4"
+RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v6"
+SOURCE_DRIFT_RECONCILIATION_SCHEMA = (
+    "cppmega_ci_source_drift_reconciliation_v1"
+)
 PROGRESS_SCHEMA = "cppmega_ci_stream_inventory_progress_v3"
-PREVIOUS_SCHEMA_VERSION = "cppmega_ci_stream_inventory_v2"
+PREVIOUS_SCHEMA_VERSION = "cppmega_ci_stream_inventory_v3"
+LEGACY_SCHEMA_VERSION = "cppmega_ci_stream_inventory_v2"
 GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_PER_PAGE = 100
 GITHUB_FILTER_LIMIT = 1000
@@ -491,6 +495,246 @@ def parse_utc_instant(value: str) -> int:
 
 def format_utc_instant(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_projection_digests(
+    repo_key: str,
+    members: Mapping[tuple[int, int], str],
+) -> tuple[str, str]:
+    ordered = sorted(members.items())
+    membership_sha256 = _hash_lines(
+        f"{repo_key}\t{run_id}\t{run_attempt}"
+        for (run_id, run_attempt), _metadata_sha256 in ordered
+    )
+    metadata_sha256 = _hash_lines(
+        f"{repo_key}\t{run_id}\t{run_attempt}\t{metadata_sha256}"
+        for (run_id, run_attempt), metadata_sha256 in ordered
+    )
+    return membership_sha256, metadata_sha256
+
+
+def _minimal_source_drift_roots(
+    connection: sqlite3.Connection,
+) -> list[dict[str, int | str]]:
+    rows = connection.execute(
+        """
+        WITH child_totals AS (
+          SELECT parent_id,SUM(expected_total) AS child_total,
+                 COUNT(*) AS child_count
+          FROM search_windows
+          WHERE parent_id IS NOT NULL
+          GROUP BY parent_id
+        ),
+        drift AS (
+          SELECT parent.id,parent.repo_key,parent.start_epoch,
+                 parent.end_epoch,parent.expected_total AS parent_total,
+                 children.child_total
+          FROM search_windows parent
+          JOIN child_totals children ON children.parent_id=parent.id
+          WHERE parent.status='split'
+            AND children.child_count=2
+            AND parent.expected_total!=children.child_total
+        )
+        SELECT drift.*
+        FROM drift
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM drift ancestor
+          WHERE ancestor.repo_key=drift.repo_key
+            AND ancestor.id!=drift.id
+            AND ancestor.start_epoch<=drift.start_epoch
+            AND ancestor.end_epoch>=drift.end_epoch
+        )
+        ORDER BY drift.repo_key,drift.start_epoch,drift.end_epoch,drift.id
+        """
+    ).fetchall()
+    return [
+        {
+            "window_id": int(row["id"]),
+            "repo": str(row["repo_key"]),
+            "start_epoch": int(row["start_epoch"]),
+            "end_epoch": int(row["end_epoch"]),
+            "parent_total": int(row["parent_total"]),
+            "child_total": int(row["child_total"]),
+        }
+        for row in rows
+    ]
+
+
+def _source_count_drift_summary(
+    connection: sqlite3.Connection,
+) -> dict[str, int | str]:
+    rows = connection.execute(
+        """
+        WITH child_totals AS (
+          SELECT parent_id,SUM(expected_total) AS child_total,
+                 COUNT(*) AS child_count
+          FROM search_windows
+          WHERE parent_id IS NOT NULL
+          GROUP BY parent_id
+        )
+        SELECT parent.repo_key,parent.start_epoch,parent.end_epoch,
+               parent.expected_total AS parent_total,children.child_total
+        FROM search_windows parent
+        JOIN child_totals children ON children.parent_id=parent.id
+        WHERE parent.status='split'
+          AND children.child_count=2
+          AND parent.expected_total!=children.child_total
+        ORDER BY parent.repo_key,parent.start_epoch,parent.end_epoch,parent.id
+        """
+    ).fetchall()
+    lines = sorted(
+        f"S\t{row['repo_key']}\t{row['start_epoch']}\t{row['end_epoch']}\t"
+        f"{row['parent_total']}\t{row['child_total']}\t"
+        f"{int(row['parent_total']) - int(row['child_total'])}"
+        for row in rows
+    )
+    parent_total = sum(int(row["parent_total"]) for row in rows)
+    child_total = sum(int(row["child_total"]) for row in rows)
+    return {
+        "windows": len(rows),
+        "parent_total": parent_total,
+        "child_total": child_total,
+        "net_parent_minus_children": parent_total - child_total,
+        "absolute_delta": sum(
+            abs(int(row["parent_total"]) - int(row["child_total"]))
+            for row in rows
+        ),
+        "sha256": _hash_lines(lines),
+        "semantics": (
+            "GitHub total_count observations at each split parent "
+            "versus its later child enumeration; nonzero means the "
+            "source cardinality changed or pagination contradicted "
+            "itself during inventory; zero means no such "
+            "contradiction was observed, not proof of an atomic "
+            "GitHub snapshot"
+        ),
+    }
+
+
+def _stored_reconciliation_members(
+    connection: sqlite3.Connection,
+    root: Mapping[str, int | str],
+) -> dict[tuple[int, int], str]:
+    rows = connection.execute(
+        """
+        SELECT run_id,run_attempt,metadata_sha256
+        FROM runs run
+        WHERE repo_key=? AND created_at>=? AND created_at<?
+          AND EXISTS (
+              SELECT 1 FROM window_runs linked
+              WHERE linked.repo_key=run.repo_key
+                AND linked.run_id=run.run_id
+                AND linked.run_attempt=run.run_attempt
+          )
+        ORDER BY run_id,run_attempt
+        """,
+        (
+            root["repo"],
+            format_utc_instant(int(root["start_epoch"])),
+            format_utc_instant(int(root["end_epoch"])),
+        ),
+    ).fetchall()
+    return {
+        (int(row["run_id"]), int(row["run_attempt"])): str(
+            row["metadata_sha256"]
+        )
+        for row in rows
+    }
+
+
+def _load_source_drift_proofs(
+    connection: sqlite3.Connection,
+) -> dict[int, dict[str, Any]]:
+    proofs: dict[int, dict[str, Any]] = {}
+    for row in connection.execute(
+        """
+        SELECT window_id,proof_blob,proof_raw_size,proof_sha256,
+               producer_script_sha256,completed_at
+        FROM source_drift_reconciliations
+        ORDER BY window_id
+        """
+    ):
+        window_id = int(row["window_id"])
+        blob = row["proof_blob"]
+        if not isinstance(blob, bytes):
+            raise CompletionError(
+                "source-drift reconciliation proof is not a BLOB"
+            )
+        try:
+            raw = strict_bounded_zlib_decode(
+                blob,
+                expected_raw_size=int(row["proof_raw_size"]),
+                expected_sha256=str(row["proof_sha256"]),
+                max_raw_size=MAX_RUN_METADATA_BYTES,
+                max_compressed_size=MAX_RUN_METADATA_COMPRESSED_BYTES,
+                where="source-drift reconciliation proof",
+            )
+            proof = json.loads(raw)
+        except (
+            ZlibEvidenceError,
+            UnicodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise CompletionError(
+                "source-drift reconciliation proof is corrupt"
+            ) from exc
+        if (
+            not isinstance(proof, dict)
+            or _canonical_json(proof).encode("utf-8") != raw
+            or proof.get("window_id") != window_id
+            or proof.get("producer_script_sha256")
+            != row["producer_script_sha256"]
+            or proof.get("completed_at") != row["completed_at"]
+            or window_id in proofs
+        ):
+            raise CompletionError(
+                "source-drift reconciliation proof is not canonically bound"
+            )
+        proofs[window_id] = proof
+    return proofs
+
+
+def _source_drift_reconciliation_payload(
+    *,
+    script_sha256: str,
+    source_count_drift: Mapping[str, Any],
+    roots: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if not roots or any(
+        root.get("producer_script_sha256") != script_sha256
+        for root in roots
+    ):
+        raise CompletionError(
+            "source-drift roots do not share their bound producer"
+        )
+    return {
+        "schema": SOURCE_DRIFT_RECONCILIATION_SCHEMA,
+        "created_at": max(str(root["completed_at"]) for root in roots),
+        "producer_script_sha256": script_sha256,
+        "semantics": (
+            "two exact repeated live enumerations were unioned with the "
+            "frozen observed membership; upstream deletions remain retained "
+            "and stable new runs are appended"
+        ),
+        "source_count_drift_sha256": source_count_drift["sha256"],
+        "source_count_drift_windows": source_count_drift["windows"],
+        "root_count": len(roots),
+        "stored_run_count": sum(int(root["stored_count"]) for root in roots),
+        "current_run_count": sum(int(root["current_count"]) for root in roots),
+        "retained_upstream_deleted_count": sum(
+            int(root["retained_upstream_deleted_count"]) for root in roots
+        ),
+        "new_current_run_count": sum(
+            int(root["new_current_count"]) for root in roots
+        ),
+        "observed_union_run_count": sum(
+            int(root["observed_union_count"]) for root in roots
+        ),
+        "two_pass_exact": True,
+        "observed_union_complete": True,
+        "roots": [dict(root) for root in roots],
+    }
 
 
 def _normalize_owner_repo(value: str) -> tuple[str, str]:
@@ -1214,6 +1458,14 @@ CREATE TABLE IF NOT EXISTS window_union_closures (
     run_keys_sha256 TEXT NOT NULL,
     closed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_drift_reconciliations (
+    window_id INTEGER PRIMARY KEY REFERENCES search_windows(id),
+    proof_blob BLOB NOT NULL,
+    proof_raw_size INTEGER NOT NULL CHECK(proof_raw_size >= 0),
+    proof_sha256 TEXT NOT NULL,
+    producer_script_sha256 TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS request_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requested_at TEXT NOT NULL,
@@ -1424,6 +1676,7 @@ _LOGICAL_TABLE_ORDER = (
         "window_id,pass_no,repo_key,run_id,run_attempt",
     ),
     ("window_union_closures", "window_id"),
+    ("source_drift_reconciliations", "window_id"),
     ("request_ledger", "id"),
     ("sqlite_sequence", "name"),
 )
@@ -1753,7 +2006,10 @@ class InventoryDB:
                     upgrade_v1 = (
                         current_schema == "cppmega_ci_stream_inventory_v1"
                     )
-                    upgrade_v2 = current_schema == PREVIOUS_SCHEMA_VERSION
+                    schema_upgrade = current_schema in {
+                        LEGACY_SCHEMA_VERSION,
+                        PREVIOUS_SCHEMA_VERSION,
+                    }
                     same_schema_upgrade = (
                         current_schema == SCHEMA_VERSION
                         and previous_script != script_sha256
@@ -1763,13 +2019,13 @@ class InventoryDB:
                         )
                     )
                     upgrade_reason: str | None = None
-                    if upgrade_v2:
+                    if schema_upgrade:
                         if (
                             allow_script_upgrade_from_sha256
                             != previous_script
                         ):
                             raise BindingError(
-                                "inventory v2 to v3 migration requires "
+                                "inventory schema migration requires "
                                 "--allow-inventory-script-upgrade-from-sha256 "
                                 "to match the exact bound producer"
                             )
@@ -1831,7 +2087,7 @@ class InventoryDB:
                             )
                     ignored_upgrade_keys = (
                         {"schema", "script_sha256"}
-                        if upgrade_v1 or upgrade_v2
+                        if upgrade_v1 or schema_upgrade
                         else {"script_sha256"}
                         if same_schema_upgrade
                         else set()
@@ -1850,7 +2106,7 @@ class InventoryDB:
                         raise BindingError(
                             f"resume binding mismatch in {self.path}: {rendered}"
                         )
-                    if upgrade_v1 or upgrade_v2 or same_schema_upgrade:
+                    if upgrade_v1 or schema_upgrade or same_schema_upgrade:
                         self._backfill_binding_upgrade_history_locked(
                             conn,
                             current_schema=str(current_schema),
@@ -3447,6 +3703,185 @@ class InventoryDB:
                 f"{where}.head_sha is not a lowercase 40-hex commit"
             )
 
+    def store_source_drift_reconciliation(
+        self,
+        roots: Sequence[Mapping[str, Any]],
+        new_runs: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not roots:
+            raise CompletionError("source-drift reconciliation has no roots")
+        encoded_roots: dict[int, tuple[bytes, bytes, str, str]] = {}
+        for root in roots:
+            window_id = root.get("window_id")
+            completed_at = _require_canonical_utc(
+                root.get("completed_at"),
+                where="source-drift reconciliation completed_at",
+            )
+            producer = root.get("producer_script_sha256")
+            if (
+                isinstance(window_id, bool)
+                or not isinstance(window_id, int)
+                or window_id < 1
+                or not isinstance(producer, str)
+                or re.fullmatch(r"[0-9a-f]{64}", producer) is None
+                or window_id in encoded_roots
+            ):
+                raise CompletionError(
+                    "source-drift reconciliation root binding is invalid"
+                )
+            raw = _canonical_json(dict(root)).encode("utf-8")
+            if len(raw) > MAX_RUN_METADATA_BYTES:
+                raise CompletionError(
+                    "source-drift reconciliation proof exceeds its "
+                    "versioned raw-byte bound"
+                )
+            blob = zlib.compress(raw, 6)
+            if len(blob) > MAX_RUN_METADATA_COMPRESSED_BYTES:
+                raise CompletionError(
+                    "source-drift reconciliation proof exceeds its "
+                    "versioned compressed-byte bound"
+                )
+            encoded_roots[window_id] = (
+                raw,
+                blob,
+                str(producer),
+                completed_at,
+            )
+
+        records: dict[tuple[str, int, int], Mapping[str, Any]] = {}
+        for record in new_runs:
+            key = (
+                str(record["repo_key"]),
+                int(record["run_id"]),
+                int(record["run_attempt"]),
+            )
+            if key in records:
+                raise CompletionError(
+                    "source-drift reconciliation repeats a new run"
+                )
+            records[key] = record
+
+        conn = self.connect()
+        try:
+            with self._write_lock, conn:
+                existing_proofs = {
+                    int(row["window_id"]): row
+                    for row in conn.execute(
+                        """
+                        SELECT window_id,proof_blob,proof_raw_size,
+                               proof_sha256,producer_script_sha256,
+                               completed_at
+                        FROM source_drift_reconciliations
+                        ORDER BY window_id
+                        """
+                    )
+                }
+                if existing_proofs and set(existing_proofs) != set(
+                    encoded_roots
+                ):
+                    raise CompletionError(
+                        "persisted source-drift reconciliation roots differ "
+                        "from the stable live proof"
+                    )
+
+                now = _utc_now()
+                for (repo_key, run_id, run_attempt), record in records.items():
+                    same_run = list(
+                        conn.execute(
+                            """
+                            SELECT run_attempt,metadata_sha256
+                            FROM runs
+                            WHERE repo_key=? AND run_id=?
+                            ORDER BY run_attempt
+                            """,
+                            (repo_key, run_id),
+                        )
+                    )
+                    if same_run:
+                        if (
+                            len(same_run) != 1
+                            or int(same_run[0]["run_attempt"]) != run_attempt
+                            or str(same_run[0]["metadata_sha256"])
+                            != record["metadata_sha256"]
+                        ):
+                            raise CompletionError(
+                                "source-drift reconciliation changed an "
+                                f"existing attempt ceiling for {repo_key}#{run_id}"
+                            )
+                        linked = conn.execute(
+                            """
+                            SELECT 1 FROM window_runs
+                            WHERE repo_key=? AND run_id=? AND run_attempt=?
+                            LIMIT 1
+                            """,
+                            (repo_key, run_id, run_attempt),
+                        ).fetchone()
+                        if linked is not None:
+                            raise CompletionError(
+                                "source-drift reconciliation classified an "
+                                "already linked run as new"
+                            )
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO runs(
+                            repo_key,run_id,run_attempt,created_at,updated_at,
+                            run_started_at,status,conclusion,workflow_id,
+                            workflow_name,event,head_branch,head_sha,run_number,
+                            html_url,api_url,metadata_blob,metadata_sha256,
+                            first_seen_at
+                        ) VALUES (
+                            :repo_key,:run_id,:run_attempt,:created_at,:updated_at,
+                            :run_started_at,:status,:conclusion,:workflow_id,
+                            :workflow_name,:event,:head_branch,:head_sha,
+                            :run_number,:html_url,:api_url,:metadata_blob,
+                            :metadata_sha256,:first_seen_at
+                        )
+                        """,
+                        {**record, "first_seen_at": now},
+                    )
+
+                for window_id, (
+                    raw,
+                    blob,
+                    producer,
+                    completed_at,
+                ) in encoded_roots.items():
+                    existing = existing_proofs.get(window_id)
+                    proof_sha256 = _sha256_bytes(raw)
+                    if existing is not None:
+                        if (
+                            existing["proof_blob"] != blob
+                            or int(existing["proof_raw_size"]) != len(raw)
+                            or str(existing["proof_sha256"]) != proof_sha256
+                            or str(existing["producer_script_sha256"])
+                            != producer
+                            or str(existing["completed_at"]) != completed_at
+                        ):
+                            raise CompletionError(
+                                "persisted source-drift reconciliation proof "
+                                f"differs for window {window_id}"
+                            )
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO source_drift_reconciliations(
+                            window_id,proof_blob,proof_raw_size,proof_sha256,
+                            producer_script_sha256,completed_at
+                        ) VALUES (?,?,?,?,?,?)
+                        """,
+                        (
+                            window_id,
+                            sqlite3.Binary(blob),
+                            len(raw),
+                            proof_sha256,
+                            producer,
+                            completed_at,
+                        ),
+                    )
+        finally:
+            conn.close()
+
     @staticmethod
     def _validate_request_ledger(
         conn: sqlite3.Connection,
@@ -3644,6 +4079,33 @@ class InventoryDB:
                         f"{table} metadata BLOB exceeds the versioned "
                         "compressed-byte bound or is not a BLOB"
                     )
+            invalid_reconciliation = conn.execute(
+                """
+                SELECT window_id FROM source_drift_reconciliations
+                WHERE typeof(proof_blob)!='blob'
+                   OR length(proof_blob)>?
+                   OR typeof(proof_raw_size)!='integer'
+                   OR proof_raw_size<0
+                   OR proof_raw_size>?
+                   OR typeof(proof_sha256)!='text'
+                   OR length(proof_sha256)!=64
+                   OR proof_sha256 GLOB '*[^0-9a-f]*'
+                   OR typeof(producer_script_sha256)!='text'
+                   OR length(producer_script_sha256)!=64
+                   OR producer_script_sha256 GLOB '*[^0-9a-f]*'
+                   OR typeof(completed_at)!='text'
+                LIMIT 1
+                """,
+                (
+                    MAX_RUN_METADATA_COMPRESSED_BYTES,
+                    MAX_RUN_METADATA_BYTES,
+                ),
+            ).fetchone()
+            if invalid_reconciliation is not None:
+                raise CompletionError(
+                    "source-drift reconciliation proof exceeds its "
+                    "versioned bounds or has invalid storage"
+                )
             integrity_cursor = conn.execute("PRAGMA integrity_check")
             integrity_first = integrity_cursor.fetchone()
             integrity_second = integrity_cursor.fetchone()
@@ -3849,12 +4311,21 @@ class InventoryDB:
                 ) not in {
                     (
                         "cppmega_ci_stream_inventory_v1",
+                        LEGACY_SCHEMA_VERSION,
+                    ),
+                    (
+                        "cppmega_ci_stream_inventory_v1",
                         PREVIOUS_SCHEMA_VERSION,
                     ),
                     (
                         "cppmega_ci_stream_inventory_v1",
                         SCHEMA_VERSION,
                     ),
+                    (
+                        LEGACY_SCHEMA_VERSION,
+                        PREVIOUS_SCHEMA_VERSION,
+                    ),
+                    (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION),
                     (PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION),
                     (SCHEMA_VERSION, SCHEMA_VERSION),
                 }:
@@ -4843,21 +5314,32 @@ class InventoryDB:
                         f"{overlap['run_attempt']}"
                     )
 
-            unlinked = int(
-                conn.execute(
+            unlinked_runs = [
+                {
+                    "repo": str(row["repo_key"]),
+                    "run_id": int(row["run_id"]),
+                    "run_attempt": int(row["run_attempt"]),
+                    "metadata_sha256": str(row["metadata_sha256"]),
+                }
+                for row in conn.execute(
                     """
-                    SELECT COUNT(*) FROM runs r
+                    SELECT repo_key,run_id,run_attempt,metadata_sha256
+                    FROM runs r
                     WHERE NOT EXISTS (
                         SELECT 1 FROM window_runs wr
                         WHERE wr.repo_key=r.repo_key
                           AND wr.run_id=r.run_id
                           AND wr.run_attempt=r.run_attempt
                     )
+                    ORDER BY repo_key,run_id,run_attempt
                     """
-                ).fetchone()[0]
+                )
+            ]
+            unlinked_run_set_sha256 = _hash_lines(
+                f"{row['repo']}\t{row['run_id']}\t{row['run_attempt']}\t"
+                f"{row['metadata_sha256']}"
+                for row in unlinked_runs
             )
-            if unlinked:
-                raise CompletionError(f"database contains {unlinked} unlinked runs")
 
             duplicate_run = conn.execute(
                 """
@@ -5045,6 +5527,8 @@ class InventoryDB:
                     binding_upgrades
                 ),
                 "source_count_drift": source_count_drift,
+                "unlinked_run_count": len(unlinked_runs),
+                "unlinked_run_set_sha256": unlinked_run_set_sha256,
             }
             return {
                 "meta": meta,
@@ -5063,6 +5547,8 @@ class InventoryDB:
                 "request_count": request_count,
                 "binding_upgrades": binding_upgrades,
                 "source_count_drift": source_count_drift,
+                "unlinked_runs": unlinked_runs,
+                "unlinked_run_set_sha256": unlinked_run_set_sha256,
             }
         except sqlite3.Error as exc:
             raise CompletionError(
@@ -5071,23 +5557,382 @@ class InventoryDB:
         finally:
             conn.close()
 
+    def _validate_source_drift_reconciliation(
+        self,
+        validated: Mapping[str, Any],
+        value: object,
+        *,
+        immutable: bool = False,
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise CompletionError(
+                "source-drift reconciliation must be an object"
+            )
+        expected_top_fields = {
+            "schema",
+            "created_at",
+            "producer_script_sha256",
+            "semantics",
+            "source_count_drift_sha256",
+            "source_count_drift_windows",
+            "root_count",
+            "stored_run_count",
+            "current_run_count",
+            "retained_upstream_deleted_count",
+            "new_current_run_count",
+            "observed_union_run_count",
+            "two_pass_exact",
+            "observed_union_complete",
+            "roots",
+        }
+        if set(value) != expected_top_fields:
+            raise CompletionError(
+                "source-drift reconciliation has extra/missing fields"
+            )
+        if value.get("schema") != SOURCE_DRIFT_RECONCILIATION_SCHEMA:
+            raise CompletionError(
+                "source-drift reconciliation schema is unsupported"
+            )
+        created_at = _require_canonical_utc(
+            value.get("created_at"),
+            where="source-drift reconciliation created_at",
+        )
+        meta = validated["meta"]
+        producer_script_sha256 = value.get("producer_script_sha256")
+        allowed_producers = {meta["script_sha256"]}
+        for upgrade in validated["binding_upgrades"]:
+            allowed_producers.add(str(upgrade["from_script_sha256"]))
+            allowed_producers.add(str(upgrade["to_script_sha256"]))
+        if (
+            not isinstance(producer_script_sha256, str)
+            or producer_script_sha256 not in allowed_producers
+        ):
+            raise CompletionError(
+                "source-drift reconciliation producer is outside the "
+                "audited inventory producer chain"
+            )
+        semantics = (
+            "two exact repeated live enumerations were unioned with the "
+            "frozen observed membership; upstream deletions remain retained "
+            "and stable new runs are appended"
+        )
+        if value.get("semantics") != semantics:
+            raise CompletionError(
+                "source-drift reconciliation semantics are invalid"
+            )
+        drift = validated["source_count_drift"]
+        if (
+            value.get("source_count_drift_sha256") != drift["sha256"]
+            or value.get("source_count_drift_windows") != drift["windows"]
+        ):
+            raise CompletionError(
+                "source-drift reconciliation differs from SQLite drift"
+            )
+        raw_roots = value.get("roots")
+        if not isinstance(raw_roots, list):
+            raise CompletionError(
+                "source-drift reconciliation roots must be a list"
+            )
+
+        connection = self.connect(
+            readonly=True,
+            immutable=immutable,
+        )
+        try:
+            expected_roots = _minimal_source_drift_roots(connection)
+            if not expected_roots:
+                raise CompletionError(
+                    "source-drift reconciliation exists without SQLite drift"
+                )
+            if len(raw_roots) != len(expected_roots):
+                raise CompletionError(
+                    "source-drift reconciliation root count differs from SQLite"
+                )
+            proof_rows = _load_source_drift_proofs(connection)
+            expected_window_ids = {
+                int(root["window_id"]) for root in expected_roots
+            }
+            if set(proof_rows) != expected_window_ids:
+                raise CompletionError(
+                    "persisted source-drift proof roots differ from SQLite "
+                    "drift roots"
+                )
+            validated_roots: list[dict[str, Any]] = []
+            new_union_members: dict[tuple[str, int, int], str] = {}
+            previous_interval: tuple[str, int] | None = None
+            for index, (raw_root, expected_root) in enumerate(
+                zip(raw_roots, expected_roots, strict=True)
+            ):
+                if not isinstance(raw_root, dict):
+                    raise CompletionError(
+                        f"source-drift reconciliation root {index} is not an object"
+                    )
+                repo_key = str(expected_root["repo"])
+                start_epoch = int(expected_root["start_epoch"])
+                end_epoch = int(expected_root["end_epoch"])
+                if (
+                    previous_interval is not None
+                    and previous_interval[0] == repo_key
+                    and previous_interval[1] > start_epoch
+                ):
+                    raise CompletionError(
+                        "source-drift reconciliation roots overlap"
+                    )
+                previous_interval = (repo_key, end_epoch)
+                persisted_root = proof_rows[
+                    int(expected_root["window_id"])
+                ]
+                _require_exact_json(
+                    raw_root,
+                    persisted_root,
+                    where=f"source-drift reconciliation roots[{index}]",
+                )
+                stored = _stored_reconciliation_members(
+                    connection,
+                    expected_root,
+                )
+                raw_members = raw_root.get("current_members")
+                if not isinstance(raw_members, list):
+                    raise CompletionError(
+                        f"source-drift reconciliation root {index} members "
+                        "must be a list"
+                    )
+                current: dict[tuple[int, int], str] = {}
+                canonical_members: list[list[int | str]] = []
+                for member_index, member in enumerate(raw_members):
+                    if not isinstance(member, list) or len(member) != 3:
+                        raise CompletionError(
+                            "source-drift reconciliation member must be "
+                            "[run_id,run_attempt,metadata_sha256]"
+                        )
+                    run_id, run_attempt, metadata_sha256 = member
+                    if (
+                        isinstance(run_id, bool)
+                        or not isinstance(run_id, int)
+                        or run_id < 1
+                        or isinstance(run_attempt, bool)
+                        or not isinstance(run_attempt, int)
+                        or run_attempt < 1
+                        or not isinstance(metadata_sha256, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256)
+                        is None
+                    ):
+                        raise CompletionError(
+                            "source-drift reconciliation contains an invalid "
+                            f"member at root {index}, index {member_index}"
+                        )
+                    key = (run_id, run_attempt)
+                    if key in current:
+                        raise CompletionError(
+                            "source-drift reconciliation contains duplicate "
+                            f"member {repo_key}#{run_id}/{run_attempt}"
+                        )
+                    current[key] = metadata_sha256
+                    canonical_members.append(
+                        [run_id, run_attempt, metadata_sha256]
+                    )
+                canonical_members.sort(key=lambda member: (member[0], member[1]))
+                if raw_members != canonical_members:
+                    raise CompletionError(
+                        "source-drift reconciliation members are not canonical"
+                    )
+                new_keys = set(current).difference(stored)
+                retained_keys = set(stored).difference(current)
+                stored_membership_sha, stored_metadata_sha = (
+                    _run_projection_digests(repo_key, stored)
+                )
+                current_membership_sha, current_metadata_sha = (
+                    _run_projection_digests(repo_key, current)
+                )
+                observed_union = dict(stored)
+                observed_union.update(
+                    (key, current[key]) for key in new_keys
+                )
+                (
+                    observed_union_membership_sha,
+                    _observed_union_metadata_sha,
+                ) = _run_projection_digests(repo_key, observed_union)
+                metadata_changed = sum(
+                    stored[key] != metadata_sha256
+                    for key, metadata_sha256 in current.items()
+                    if key in stored
+                )
+                raw_passes = raw_root.get("passes")
+                if not isinstance(raw_passes, list) or len(raw_passes) != 2:
+                    raise CompletionError(
+                        "source-drift reconciliation requires two exact passes"
+                    )
+                validated_passes: list[dict[str, Any]] = []
+                for pass_number, raw_pass in enumerate(raw_passes, start=1):
+                    if not isinstance(raw_pass, dict):
+                        raise CompletionError(
+                            "source-drift reconciliation pass is not an object"
+                        )
+                    expected_pass_fields = {
+                        "pass",
+                        "page_observation_count",
+                        "request_count",
+                        "membership_sha256",
+                        "metadata_sha256",
+                        "page_ledger_sha256",
+                    }
+                    if set(raw_pass) != expected_pass_fields:
+                        raise CompletionError(
+                            "source-drift reconciliation pass has "
+                            "extra/missing fields"
+                        )
+                    page_count = raw_pass.get("page_observation_count")
+                    request_count = raw_pass.get("request_count")
+                    page_ledger_sha = raw_pass.get("page_ledger_sha256")
+                    if (
+                        raw_pass.get("pass") != pass_number
+                        or isinstance(page_count, bool)
+                        or not isinstance(page_count, int)
+                        or page_count < 1
+                        or isinstance(request_count, bool)
+                        or not isinstance(request_count, int)
+                        or request_count < page_count
+                        or raw_pass.get("membership_sha256")
+                        != current_membership_sha
+                        or raw_pass.get("metadata_sha256")
+                        != current_metadata_sha
+                        or not isinstance(page_ledger_sha, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", page_ledger_sha)
+                        is None
+                    ):
+                        raise CompletionError(
+                            "source-drift reconciliation pass proof is invalid"
+                        )
+                    validated_passes.append(dict(raw_pass))
+                expected_interval = {
+                    "start": format_utc_instant(start_epoch),
+                    "end": format_utc_instant(end_epoch),
+                    "semantics": "[start,end)",
+                }
+                root_completed_at = _require_canonical_utc(
+                    raw_root.get("completed_at"),
+                    where=(
+                        f"source-drift reconciliation roots[{index}] "
+                        "completed_at"
+                    ),
+                )
+                expected_value = {
+                    "window_id": int(expected_root["window_id"]),
+                    "completed_at": root_completed_at,
+                    "producer_script_sha256": producer_script_sha256,
+                    "repo": repo_key,
+                    "interval": expected_interval,
+                    "parent_total": int(expected_root["parent_total"]),
+                    "child_total": int(expected_root["child_total"]),
+                    "stored_count": len(stored),
+                    "stored_membership_sha256": stored_membership_sha,
+                    "stored_metadata_sha256": stored_metadata_sha,
+                    "current_count": len(current),
+                    "current_membership_sha256": current_membership_sha,
+                    "current_metadata_sha256": current_metadata_sha,
+                    "retained_upstream_deleted_count": len(retained_keys),
+                    "new_current_count": len(new_keys),
+                    "observed_union_count": len(observed_union),
+                    "observed_union_membership_sha256": (
+                        observed_union_membership_sha
+                    ),
+                    "metadata_changed_count": metadata_changed,
+                    "current_members": canonical_members,
+                    "passes": validated_passes,
+                }
+                _require_exact_json(
+                    raw_root,
+                    expected_value,
+                    where=f"source-drift reconciliation roots[{index}]",
+                )
+                validated_roots.append(expected_value)
+                for run_id, run_attempt in new_keys:
+                    union_key = (repo_key, run_id, run_attempt)
+                    if union_key in new_union_members:
+                        raise CompletionError(
+                            "source-drift reconciliation repeats a new run "
+                            "across roots"
+                        )
+                    new_union_members[union_key] = current[
+                        (run_id, run_attempt)
+                    ]
+        finally:
+            connection.close()
+
+        unlinked_members = {
+            (
+                str(row["repo"]),
+                int(row["run_id"]),
+                int(row["run_attempt"]),
+            ): str(row["metadata_sha256"])
+            for row in validated["unlinked_runs"]
+        }
+        if unlinked_members != new_union_members:
+            raise CompletionError(
+                "unlinked inventory runs differ from the stable live "
+                "source-drift delta"
+            )
+        expected_created_at = max(
+            str(root["completed_at"]) for root in validated_roots
+        )
+        if created_at != expected_created_at:
+            raise CompletionError(
+                "source-drift reconciliation created_at differs from its "
+                "last completed root"
+            )
+        expected_value = _source_drift_reconciliation_payload(
+            script_sha256=producer_script_sha256,
+            source_count_drift=drift,
+            roots=validated_roots,
+        )
+        _require_exact_json(
+            value,
+            expected_value,
+            where="source-drift reconciliation",
+        )
+        return expected_value
+
     def completion_receipt(
         self,
         *,
         allow_nonproduction: bool = False,
+        source_drift_reconciliation: object = None,
     ) -> dict[str, Any]:
         self._freeze_for_receipt()
         validated = self._validate_and_digests()
         meta = validated["meta"]
         smoke = meta["smoke"] == "1"
+        drift_windows = validated["source_count_drift"]["windows"]
+        reconciliation: dict[str, Any] | None = None
+        if drift_windows:
+            if source_drift_reconciliation is not None:
+                reconciliation = self._validate_source_drift_reconciliation(
+                    validated,
+                    source_drift_reconciliation,
+                )
+        elif source_drift_reconciliation is not None:
+            raise CompletionError(
+                "source-drift reconciliation was supplied without SQLite drift"
+            )
+        unlinked_run_count = len(validated["unlinked_runs"])
         source_snapshot_stable = (
-            validated["source_count_drift"]["windows"] == 0
+            drift_windows == 0
+            and unlinked_run_count == 0
+        ) or reconciliation is not None
+        source_snapshot_mode = (
+            "reconciled-observed-union"
+            if reconciliation is not None
+            else "count-consistent-enumeration"
+            if source_snapshot_stable
+            else "unreconciled-source-drift"
         )
         production_complete = not smoke and source_snapshot_stable
         if not production_complete and not allow_nonproduction:
             reason = (
                 "smoke inventory"
                 if smoke
+                else "unlinked runs lack a source-drift reconciliation"
+                if unlinked_run_count
                 else "source count drift prevents a stable production snapshot"
             )
             raise CompletionError(
@@ -5120,6 +5965,7 @@ class InventoryDB:
             "completed_at": _utc_now(),
             "enumeration_complete": True,
             "source_snapshot_stable": source_snapshot_stable,
+            "source_snapshot_mode": source_snapshot_mode,
             "production_complete": production_complete,
             "mode": (
                 "production"
@@ -5167,6 +6013,7 @@ class InventoryDB:
             "db_logical_sha256": validated["db_logical_sha256"],
             "binding_upgrades": validated["binding_upgrades"],
             "source_count_drift": validated["source_count_drift"],
+            "source_drift_reconciliation": reconciliation,
         }
         if _sha256_file(database_path) != artifact_sha256:
             raise CompletionError(
@@ -5253,6 +6100,7 @@ def verify_inventory_completion_receipt(
         "completed_at",
         "enumeration_complete",
         "source_snapshot_stable",
+        "source_snapshot_mode",
         "production_complete",
         "mode",
         "database",
@@ -5273,6 +6121,7 @@ def verify_inventory_completion_receipt(
         "db_logical_sha256",
         "binding_upgrades",
         "source_count_drift",
+        "source_drift_reconciliation",
     }
     if set(value) != expected_top_fields:
         raise CompletionError(
@@ -5330,10 +6179,40 @@ def verify_inventory_completion_receipt(
             snapshot_before.st_mtime_ns,
             snapshot_before.st_ctime_ns,
         )
-        validated = InventoryDB(
+        snapshot_inventory = InventoryDB(
             snapshot,
             initialize_schema=False,
-        )._validate_and_digests(immutable=True)
+        )
+        validated = snapshot_inventory._validate_and_digests(
+            immutable=True
+        )
+        drift_windows = validated["source_count_drift"]["windows"]
+        reconciliation: dict[str, Any] | None = None
+        raw_reconciliation = value.get("source_drift_reconciliation")
+        if drift_windows:
+            if raw_reconciliation is not None:
+                reconciliation = (
+                    snapshot_inventory._validate_source_drift_reconciliation(
+                        validated,
+                        raw_reconciliation,
+                        immutable=True,
+                    )
+                )
+        elif raw_reconciliation is not None:
+            raise CompletionError(
+                "inventory receipt reconciles nonexistent source drift"
+            )
+        database_stable = (
+            drift_windows == 0
+            and not validated["unlinked_runs"]
+        ) or reconciliation is not None
+        source_snapshot_mode = (
+            "reconciled-observed-union"
+            if reconciliation is not None
+            else "count-consistent-enumeration"
+            if database_stable
+            else "unreconciled-source-drift"
+        )
         snapshot_after = snapshot.stat()
         if snapshot_identity != (
             snapshot_after.st_dev,
@@ -5364,7 +6243,6 @@ def verify_inventory_completion_receipt(
         )
     _require_safe_checkpoint_sidecars(database)
     meta = validated["meta"]
-    database_stable = validated["source_count_drift"]["windows"] == 0
     database_production = meta["smoke"] == "0" and database_stable
     expected_mode = (
         "production"
@@ -5378,6 +6256,7 @@ def verify_inventory_completion_receipt(
         "completed_at": completed_at,
         "enumeration_complete": True,
         "source_snapshot_stable": database_stable,
+        "source_snapshot_mode": source_snapshot_mode,
         "production_complete": database_production,
         "mode": expected_mode,
         "database": str(original),
@@ -5419,6 +6298,7 @@ def verify_inventory_completion_receipt(
         "db_logical_sha256": validated["db_logical_sha256"],
         "binding_upgrades": validated["binding_upgrades"],
         "source_count_drift": validated["source_count_drift"],
+        "source_drift_reconciliation": reconciliation,
     }
     try:
         _require_exact_json(
@@ -5429,6 +6309,7 @@ def verify_inventory_completion_receipt(
     except CompletionError as exc:
         if (
             value.get("source_snapshot_stable") is not database_stable
+            or value.get("source_snapshot_mode") != source_snapshot_mode
             or value.get("production_complete") is not database_production
             or value.get("mode") != expected_mode
         ):
@@ -5751,14 +6632,377 @@ class GitHubActionsInventory:
             ) from errors[0][1]
         return self.db.progress()
 
+    def _enumerate_reconciliation_window(
+        self,
+        repo: Repo,
+        start_epoch: int,
+        end_epoch: int,
+        *,
+        evidence_lines: list[str],
+        request_counter: list[int],
+        page_counter: list[int],
+    ) -> dict[tuple[int, int], tuple[str, dict[str, Any]]]:
+        def ledger(**fields: Any) -> None:
+            request_counter[0] += 1
+            evidence_lines.append(
+                "R\t"
+                + "\t".join(
+                    (
+                        str(fields.get("endpoint") or ""),
+                        str(fields.get("page") or ""),
+                        str(fields.get("attempt") or ""),
+                        str(fields.get("http_status") or ""),
+                        str(fields.get("outcome") or ""),
+                    )
+                )
+            )
+
+        def fetch(page_number: int) -> PageResponse:
+            page = self.client.get_workflow_runs(
+                repo=repo,
+                start_epoch=start_epoch,
+                end_epoch=end_epoch,
+                page=page_number,
+                per_page=DEFAULT_PER_PAGE,
+                ledger=ledger,
+            )
+            page_counter[0] += 1
+            evidence_lines.append(
+                f"P\t{repo.key}\t{start_epoch}\t{end_epoch}\t"
+                f"{page_number}\t{page.total_count}\t"
+                f"{len(page.workflow_runs)}\t{page.payload_sha256}"
+            )
+            return page
+
+        first = fetch(1)
+        if first.total_count > GITHUB_FILTER_LIMIT:
+            unstable = True
+            pages = [first]
+        else:
+            unstable = False
+            pages = [first]
+            page_count = max(
+                1,
+                math.ceil(first.total_count / DEFAULT_PER_PAGE),
+            )
+            pages.extend(
+                fetch(page_number)
+                for page_number in range(2, page_count + 1)
+            )
+            unstable = any(
+                page.total_count != first.total_count for page in pages
+            )
+        members: dict[
+            tuple[int, int],
+            tuple[str, dict[str, Any]],
+        ] = {}
+        if not unstable:
+            for page in pages:
+                for run in page.workflow_runs:
+                    normalized, metadata_sha256, key = (
+                        self.db._normalize_run(
+                            repo.key,
+                            run,
+                            start_epoch=start_epoch,
+                            end_epoch=end_epoch,
+                        )
+                    )
+                    previous = members.setdefault(
+                        key,
+                        (metadata_sha256, normalized),
+                    )
+                    if previous[0] != metadata_sha256:
+                        unstable = True
+            if len(members) != first.total_count:
+                unstable = True
+        if not unstable:
+            return members
+        if end_epoch - start_epoch <= 1:
+            raise CompletionError(
+                f"source-drift reconciliation cannot close one-second "
+                f"window {repo.key} "
+                f"[{format_utc_instant(start_epoch)},"
+                f"{format_utc_instant(end_epoch)})"
+            )
+        midpoint = start_epoch + (end_epoch - start_epoch) // 2
+        left = self._enumerate_reconciliation_window(
+            repo,
+            start_epoch,
+            midpoint,
+            evidence_lines=evidence_lines,
+            request_counter=request_counter,
+            page_counter=page_counter,
+        )
+        right = self._enumerate_reconciliation_window(
+            repo,
+            midpoint,
+            end_epoch,
+            evidence_lines=evidence_lines,
+            request_counter=request_counter,
+            page_counter=page_counter,
+        )
+        overlap = set(left).intersection(right)
+        if overlap:
+            raise CompletionError(
+                f"source-drift reconciliation found {len(overlap)} "
+                f"cross-window run(s) in {repo.key}"
+            )
+        return left | right
+
+    def _reconciliation_pass(
+        self,
+        repo: Repo,
+        root: Mapping[str, int | str],
+        pass_number: int,
+    ) -> tuple[
+        dict[tuple[int, int], tuple[str, dict[str, Any]]],
+        dict[str, Any],
+    ]:
+        evidence_lines: list[str] = []
+        request_counter = [0]
+        page_counter = [0]
+        members = self._enumerate_reconciliation_window(
+            repo,
+            int(root["start_epoch"]),
+            int(root["end_epoch"]),
+            evidence_lines=evidence_lines,
+            request_counter=request_counter,
+            page_counter=page_counter,
+        )
+        projected = {
+            key: value[0] for key, value in members.items()
+        }
+        membership_sha256, metadata_sha256 = _run_projection_digests(
+            repo.key,
+            projected,
+        )
+        proof = {
+            "pass": pass_number,
+            "page_observation_count": page_counter[0],
+            "request_count": request_counter[0],
+            "membership_sha256": membership_sha256,
+            "metadata_sha256": metadata_sha256,
+            "page_ledger_sha256": _hash_lines(evidence_lines),
+        }
+        return members, proof
+
+    def _reconcile_source_drift_root(
+        self,
+        root: Mapping[str, int | str],
+        stored: Mapping[tuple[int, int], str],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        repo = next(
+            (
+                candidate
+                for candidate in self.scope.repos
+                if candidate.key == root["repo"]
+            ),
+            None,
+        )
+        if repo is None:
+            raise CompletionError(
+                f"source-drift root {root['repo']} is outside repository scope"
+            )
+        first, first_proof = self._reconciliation_pass(repo, root, 1)
+        second, second_proof = self._reconciliation_pass(repo, root, 2)
+        first_projection = {
+            key: value[0] for key, value in first.items()
+        }
+        current = {
+            key: value[0] for key, value in second.items()
+        }
+        if first_projection != current:
+            raise CompletionError(
+                f"source-drift reconciliation changed between exact passes "
+                f"for {repo.key}"
+            )
+        new_keys = set(current).difference(stored)
+        retained_keys = set(stored).difference(current)
+        stored_membership_sha, stored_metadata_sha = (
+            _run_projection_digests(repo.key, stored)
+        )
+        current_membership_sha, current_metadata_sha = (
+            _run_projection_digests(repo.key, current)
+        )
+        observed_union = dict(stored)
+        observed_union.update(
+            (key, current[key]) for key in new_keys
+        )
+        observed_union_membership_sha, _observed_union_metadata_sha = (
+            _run_projection_digests(repo.key, observed_union)
+        )
+        completed_at = _utc_now()
+        proof = {
+            "window_id": int(root["window_id"]),
+            "completed_at": completed_at,
+            "producer_script_sha256": self.script_sha256,
+            "repo": repo.key,
+            "interval": {
+                "start": format_utc_instant(int(root["start_epoch"])),
+                "end": format_utc_instant(int(root["end_epoch"])),
+                "semantics": "[start,end)",
+            },
+            "parent_total": int(root["parent_total"]),
+            "child_total": int(root["child_total"]),
+            "stored_count": len(stored),
+            "stored_membership_sha256": stored_membership_sha,
+            "stored_metadata_sha256": stored_metadata_sha,
+            "current_count": len(current),
+            "current_membership_sha256": current_membership_sha,
+            "current_metadata_sha256": current_metadata_sha,
+            "retained_upstream_deleted_count": len(retained_keys),
+            "new_current_count": len(new_keys),
+            "observed_union_count": len(observed_union),
+            "observed_union_membership_sha256": (
+                observed_union_membership_sha
+            ),
+            "metadata_changed_count": sum(
+                stored[key] != metadata_sha256
+                for key, metadata_sha256 in current.items()
+                if key in stored
+            ),
+            "current_members": [
+                [run_id, run_attempt, metadata_sha256]
+                for (run_id, run_attempt), metadata_sha256 in sorted(
+                    current.items()
+                )
+            ],
+            "passes": [first_proof, second_proof],
+        }
+        return proof, [
+            dict(second[key][1]) for key in sorted(new_keys)
+        ]
+
+    def reconcile_source_drift(
+        self,
+        *,
+        workers: int = 4,
+    ) -> dict[str, Any] | None:
+        if workers <= 0:
+            raise ValueError("source-drift reconciliation workers must be positive")
+        connection = self.db.connect(readonly=True)
+        try:
+            drift = _source_count_drift_summary(connection)
+            if drift["windows"] == 0:
+                return None
+            roots = _minimal_source_drift_roots(connection)
+            persisted_proofs = _load_source_drift_proofs(connection)
+            stored_by_window = {
+                int(root["window_id"]): _stored_reconciliation_members(
+                    connection,
+                    root,
+                )
+                for root in roots
+            }
+            meta = {
+                str(row["key"]): str(row["value"])
+                for row in connection.execute(
+                    "SELECT key,value FROM inventory_meta"
+                )
+            }
+        finally:
+            connection.close()
+
+        if persisted_proofs:
+            expected_ids = {
+                int(root["window_id"]) for root in roots
+            }
+            if set(persisted_proofs) != expected_ids:
+                raise CompletionError(
+                    "persisted source-drift proof roots differ from current "
+                    "inventory drift roots"
+                )
+            persisted_roots = [
+                persisted_proofs[int(root["window_id"])]
+                for root in roots
+            ]
+            payload = _source_drift_reconciliation_payload(
+                script_sha256=str(
+                    persisted_roots[0]["producer_script_sha256"]
+                ),
+                source_count_drift=drift,
+                roots=persisted_roots,
+            )
+            return self.db._validate_source_drift_reconciliation(
+                self.db._validate_and_digests(),
+                payload,
+            )
+
+        reconciled_by_window: dict[
+            int,
+            tuple[dict[str, Any], list[dict[str, Any]]],
+        ] = {}
+        errors: list[tuple[str, BaseException]] = []
+        with ThreadPoolExecutor(
+            max_workers=min(workers, 4, len(roots)),
+            thread_name_prefix="ci-source-drift",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._reconcile_source_drift_root,
+                    root,
+                    stored_by_window[int(root["window_id"])],
+                ): root
+                for root in roots
+            }
+            for future in as_completed(futures):
+                root = futures[future]
+                try:
+                    reconciled_by_window[int(root["window_id"])] = (
+                        future.result()
+                    )
+                except BaseException as exc:
+                    errors.append((str(root["repo"]), exc))
+        if errors:
+            details = "; ".join(
+                f"{repo}: {type(exc).__name__}: {self.client.redact(exc)}"
+                for repo, exc in errors[:10]
+            )
+            raise CompletionError(
+                "source-drift reconciliation failed for "
+                f"{len(errors)} root(s): {details}"
+            ) from errors[0][1]
+        reconciled_roots = [
+            reconciled_by_window[int(root["window_id"])][0]
+            for root in roots
+        ]
+        new_runs = [
+            record
+            for root in roots
+            for record in reconciled_by_window[int(root["window_id"])][1]
+        ]
+        self.db.store_source_drift_reconciliation(
+            reconciled_roots,
+            new_runs,
+        )
+        payload = _source_drift_reconciliation_payload(
+            script_sha256=meta["script_sha256"],
+            source_count_drift=drift,
+            roots=reconciled_roots,
+        )
+        return self.db._validate_source_drift_reconciliation(
+            self.db._validate_and_digests(),
+            payload,
+        )
+
     def write_completion_receipt(
         self,
         path: str | os.PathLike[str],
         *,
         allow_nonproduction: bool = False,
+        reconcile_source_drift: bool = False,
+        reconciliation_workers: int = 4,
     ) -> dict[str, Any]:
+        reconciliation = (
+            self.reconcile_source_drift(
+                workers=reconciliation_workers,
+            )
+            if reconcile_source_drift
+            else None
+        )
         receipt = self.db.completion_receipt(
-            allow_nonproduction=allow_nonproduction
+            allow_nonproduction=allow_nonproduction,
+            source_drift_reconciliation=reconciliation,
         )
         atomic_write_json(path, receipt)
         return receipt
@@ -5818,6 +7062,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "merge, or export"
         ),
     )
+    parser.add_argument(
+        "--reconcile-source-drift",
+        action="store_true",
+        help=(
+            "after exhaustive enumeration, re-enumerate only minimal "
+            "split-count drift roots twice, retain the frozen observed "
+            "membership, and append any stable live delta under a durable "
+            "reconciliation proof"
+        ),
+    )
     parser.add_argument("--max-repos", type=int)
     parser.add_argument("--max-attempts", type=int, default=12)
     parser.add_argument(
@@ -5875,6 +7129,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_nonproduction=(
                 args.smoke or args.diagnostic_nonproduction_receipt
             ),
+            reconcile_source_drift=args.reconcile_source_drift,
+            reconciliation_workers=min(args.workers, 4),
         )
     except InventoryError as exc:
         print(f"[ci-stream-inventory] ERROR: {exc}", file=sys.stderr)

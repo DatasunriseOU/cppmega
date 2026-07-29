@@ -60,6 +60,9 @@ from scripts.canonical_parquet_ledger import (
     CanonicalParquetLedgerError,
     iter_canonical_parquet_ledger,
 )
+from scripts.ci_stream_inventory import (
+    RECEIPT_SCHEMA as PRODUCTION_INVENTORY_RECEIPT_SCHEMA,
+)
 from scripts.ci_zlib_evidence import (
     MAX_CONTENT_FRAME_COMPRESSED_BYTES,
     MAX_CONTENT_FRAME_RAW_BYTES,
@@ -75,7 +78,6 @@ PRODUCTION_FETCH_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v4"
 CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 PRODUCTION_CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v4"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
-PRODUCTION_INVENTORY_RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v5"
 PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
 PRODUCTION_COMPLETION_MODE = "inventory-exhaustive"
 PRODUCTION_COVERAGE_SEMANTICS = (

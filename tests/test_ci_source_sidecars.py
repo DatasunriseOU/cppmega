@@ -33,6 +33,7 @@ from scripts.ci_source_sidecars import (
     PATH_ABSENT,
     PRODUCTION_CASE5_EXPORT_SCHEMA,
     PRODUCTION_FETCH_RECEIPT_SCHEMA,
+    PRODUCTION_INVENTORY_RECEIPT_SCHEMA,
     RECEIPT_SCHEMA,
     REPRESENTATIVE_LEDGER_SCHEMA,
     RESOLVED,
@@ -878,7 +879,7 @@ def _promote_case5_fixture_to_production(
         "completion_receipt": {
             "path": str(inventory_receipt_path),
             "sha256": "5" * 64,
-            "schema": "cppmega_ci_stream_inventory_receipt_v5",
+            "schema": PRODUCTION_INVENTORY_RECEIPT_SCHEMA,
         },
         "repo_count": 1,
         "expected_run_count": 1,
