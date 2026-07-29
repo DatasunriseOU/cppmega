@@ -1,11 +1,15 @@
 import json
+import struct
 import subprocess
 import tarfile
 
 import pytest
 
+import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 from scripts.nebius_h200_megatron_cpp_world_curriculum import (
     S3RestorePlan,
+    Stage,
+    _assert_prefix_contract,
     _default_stages,
     _make_s3_auth_tar,
     _make_curriculum_manifest,
@@ -28,6 +32,114 @@ def _capacity(stage, *, edges=23, chunks=17):
         "graph_max_edges": edges,
         "graph_max_chunks": chunks,
     }
+
+
+def _write_prefix_contract_fixture(
+    prefix,
+    *,
+    missing_token_sidecar=None,
+    missing_graph_sidecar=None,
+):
+    prefix.with_suffix(".bin").write_bytes(struct.pack("<H", 1))
+    prefix.with_suffix(".idx").write_bytes(
+        b"MMIDIDX\x00\x00"
+        + struct.pack("<QBQQ", 1, 8, 1, 2)
+        + struct.pack("<i", 1)
+        + struct.pack("<q", 0)
+        + struct.pack("<2q", 0, 1)
+    )
+
+    side_channel_paths = {}
+    for name in sorted(publisher.REQUIRED_TOKEN_SIDECARS):
+        if name == missing_token_sidecar:
+            continue
+        dtype = publisher.TOKEN_SIDECAR_DTYPES[name]
+        relative = f"{prefix.name}_{name}.bin"
+        (prefix.parent / relative).write_bytes(
+            b"\x01" * publisher.DTYPE_SIZES[dtype]
+        )
+        side_channel_paths[name] = {"path": relative, "dtype": dtype}
+
+    prefix.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "tokenizer_contract": "megacpp",
+                "vocab_size": 65536,
+                "token_count": 1,
+                "document_count": 1,
+                "dtype": "uint16",
+                "loss_mask_alignment": "source_token_predicts_next_v1",
+                "side_channel_paths": side_channel_paths,
+                "symbol_identity_schema_version": 3,
+                "graph_sidecar_schema": "cppmega_graph_routes_v2",
+                "graph_sidecar_paths": {
+                    name: {}
+                    for name in publisher.REQUIRED_GRAPH_SIDECARS
+                    if name != missing_graph_sidecar
+                },
+                "source_platform_sidecar": {
+                    "schema": "cppmega_source_platform_v1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return Stage(
+        index=1,
+        seq=1024,
+        batch=1,
+        micro_batch=1,
+        iters=1,
+        prefix=prefix,
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_token_sidecar",
+    ["token_source_doc_ids", "token_source_identity_ids"],
+)
+def test_curriculum_prefix_contract_rejects_missing_canonical_source_sidecars(
+    tmp_path,
+    missing_token_sidecar,
+):
+    stage = _write_prefix_contract_fixture(
+        tmp_path / "train",
+        missing_token_sidecar=missing_token_sidecar,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"missing token sidecars.*{missing_token_sidecar}",
+    ):
+        _assert_prefix_contract([stage])
+
+
+@pytest.mark.parametrize(
+    "missing_graph_sidecar",
+    [
+        "token_call_edges",
+        "token_domain_edges",
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+        "token_chunk_starts",
+    ],
+)
+def test_curriculum_prefix_contract_rejects_missing_canonical_graph_families(
+    tmp_path,
+    missing_graph_sidecar,
+):
+    stage = _write_prefix_contract_fixture(
+        tmp_path / "train",
+        missing_graph_sidecar=missing_graph_sidecar,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"graph sidecar key set.*{missing_graph_sidecar}",
+    ):
+        _assert_prefix_contract([stage])
 
 
 def test_default_curriculum_keeps_token_budget_with_receipt_backed_dsa_microbatch():
