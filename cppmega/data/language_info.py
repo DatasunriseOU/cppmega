@@ -141,21 +141,43 @@ OPENCL_STD_MAP: dict[str, str] = {
 
 SQL_DIALECT_HINTS: tuple[tuple[str, str], ...] = (
     ("sqlite3_", "sqlite"),
+    ("sqlite_master", "sqlite"),
+    ("without rowid", "sqlite"),
+    ("pragma ", "sqlite"),
     ("mysql_", "mysql"),
     ("mysql_real_query", "mysql"),
     ("mariadb", "mysql"),
+    ("auto_increment", "mysql"),
+    ("engine=innodb", "mysql"),
+    ("on duplicate key", "mysql"),
     ("postgresql", "postgresql"),
     ("postgres", "postgresql"),
     ("pgsql", "postgresql"),
     ("libpq", "postgresql"),
     ("pqexec", "postgresql"),
+    ("jsonb", "postgresql"),
+    ("bigserial", "postgresql"),
+    ("smallserial", "postgresql"),
+    ("language plpgsql", "postgresql"),
+    ("generate_series(", "postgresql"),
     ("sp_executesql", "tsql"),
     ("nvarchar", "tsql"),
+    ("identity(", "tsql"),
+    ("sys.objects", "tsql"),
+    ("try_convert(", "tsql"),
     ("sqlstate", "db2"),
     ("varchar_format", "db2"),
+    ("sysibm.", "db2"),
+    ("with ur", "db2"),
     ("dbms_", "plsql"),
     ("elsif", "plsql"),
+    ("varchar2", "plsql"),
+    ("create or replace package", "plsql"),
+    ("raise_application_error", "plsql"),
 )
+SQL_PATH_DIALECTS: dict[str, str] = {
+    ".psql": "postgresql",
+}
 
 SQL_KEYWORDS: tuple[str, ...] = (
     "select ",
@@ -496,13 +518,31 @@ def _detect_primary_from_extension(filepath: str | None):
     return language, standard, [f"path_ext:{ext}"]
 
 
-def _detect_sql_dialect(source_lower: str):
+def _detect_sql_dialect(
+    source_lower: str,
+    filepath: str | None = None,
+):
     signals = []
-    dialect = None
-    for needle, label in SQL_DIALECT_HINTS:
+    path_dialect = (
+        SQL_PATH_DIALECTS.get(Path(filepath).suffix.lower())
+        if filepath
+        else None
+    )
+    if path_dialect:
+        signals.append(f"sql_path_dialect:{path_dialect}")
+    scores: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    for index, (needle, label) in enumerate(SQL_DIALECT_HINTS):
         if needle in source_lower:
             signals.append(f"sql_hint:{needle}")
-            dialect = dialect or label
+            scores[label] = scores.get(label, 0) + 1
+            first_seen.setdefault(label, index)
+    dialect = path_dialect
+    if dialect is None and scores:
+        dialect = max(
+            scores,
+            key=lambda label: (scores[label], -first_seen[label]),
+        )
     keyword_hits = sum(1 for needle in SQL_KEYWORDS if needle in source_lower)
     if keyword_hits >= 2:
         signals.append(f"sql_keywords:{keyword_hits}")
@@ -782,7 +822,10 @@ def detect_language_info(
             signals.append("sql_constructs")
         detector_sources.append("source")
 
-    sql_dialect, sql_signals = _detect_sql_dialect(source_lower)
+    sql_dialect, sql_signals = _detect_sql_dialect(
+        source_lower,
+        filepath if primary_language == "sql" else None,
+    )
     signals.extend(sql_signals)
     embedded_languages = _detect_embedded_languages(source_lower, platform_info)
     if sql_dialect and primary_language != "sql" and "sql" not in embedded_languages:
