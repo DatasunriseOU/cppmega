@@ -3281,9 +3281,10 @@ def find_build_files(
 
     Returns a list of ``(abs_path, build_kind)`` tuples so the build-system tag
     (cmake/make/bazel/ninja/meson/...) is known at discovery time. Compilation
-    databases are structured inputs consumed separately by
-    ``load_compile_commands`` and are never returned as build/domain text. Build
-    files legitimately live under dirs that code discovery prunes (e.g.
+    databases are also consumed by ``load_compile_commands`` but remain useful
+    training evidence for the exact compiler invocation, so they are emitted on
+    their dedicated frozen domain as well. Build files legitimately live under
+    dirs that code discovery prunes (e.g.
     ``third_party/`` for vendored CMake), so only ``.git`` and the caller's extra
     excludes are pruned here.
     """
@@ -3294,8 +3295,6 @@ def find_build_files(
         for fname in filenames:
             build_kind = classify_build_file(fname)
             if build_kind is None:
-                continue
-            if build_kind == "compile_commands":
                 continue
             filepath = os.path.join(root, fname)
             try:
@@ -7580,6 +7579,7 @@ def _build_domain_sidecars(
         "gn": "BUILD.gn",
         "scons": "SConstruct",
         "xmake": "xmake.lua",
+        "dockerfile": "Dockerfile",
         "bash": "script.bash",
         "sh": "script.sh",
         "zsh": "script.zsh",
@@ -7598,6 +7598,11 @@ def _build_domain_sidecars(
     resolved_adapter = (
         resolve_domain_parser(resolved_path, text) if resolved_path is not None else None
     )
+    raw_shared_configure_kinds = {
+        "conan",
+        "vcpkg",
+        "msvc",
+    }
     if parser_path is not None:
         parsed = parse_domain_document(
             parser_path,
@@ -7609,6 +7614,26 @@ def _build_domain_sidecars(
             parsed.set_source_identity(
                 source_identity_for_path(resolved_path, text=text)
             )
+    elif kind in raw_shared_configure_kinds:
+        parsed = ParsedDomainDocument.new(
+            domain=DomainKind.CONFIGURE,
+            text=text,
+            confidence=ParseConfidence.RAW,
+            metadata={
+                "parser_adapter": f"{kind}-raw",
+                "build_dialect": build_kind,
+                "shared_domain": "configure",
+                "unsupported_syntax": f"{kind}_native_parser_unavailable",
+                "raw_reason": f"{kind}_native_parser_unavailable",
+            },
+        )
+        parsed.set_source_doc_id(source_doc_id)
+        parsed.set_source_identity(
+            source_identity_for_path(
+                resolved_path or parser_path or build_kind,
+                text=text,
+            )
+        )
     elif resolved_adapter is not None and resolved_adapter.name != "raw-output":
         assert resolved_path is not None
         parsed = parse_domain_document(
@@ -7624,7 +7649,7 @@ def _build_domain_sidecars(
             "xmake": DomainKind.XMAKE,
             "compile_commands": DomainKind.COMPILE_COMMANDS,
         }
-        domain = raw_domain_by_kind.get(kind, DomainKind.BUILD_DIAGNOSTIC)
+        domain = raw_domain_by_kind.get(kind, DomainKind.CONFIGURE)
         parsed = ParsedDomainDocument.new(
             domain=domain,
             text=text,
@@ -7632,6 +7657,9 @@ def _build_domain_sidecars(
             metadata={
                 "parser_adapter": "raw-build",
                 "build_kind": build_kind,
+                "shared_domain": (
+                    "configure" if domain == DomainKind.CONFIGURE else None
+                ),
                 "unsupported_syntax": f"unsupported_build_domain:{build_kind}",
                 "raw_reason": f"unsupported_build_domain:{build_kind}",
             },
@@ -7792,6 +7820,29 @@ def build_build_doc(
         if is_sql_doc
         else "build"
     )
+    detected_sql_language = (
+        detect_language_info(
+            text,
+            emitted_filepath,
+            detected_platform,
+            build_info=build_info,
+        )
+        if is_sql_doc
+        else None
+    )
+    sql_dialect = (
+        str(detected_sql_language["primary_dialect"])
+        if detected_sql_language
+        and detected_sql_language.get("primary_dialect")
+        else None
+    )
+    resolved_build_kind = (
+        f"sql:{sql_dialect}" if is_sql_doc and sql_dialect else build_kind
+    )
+    if sql_dialect:
+        cast(dict[str, object], domain_sidecars["domain_parse_info"])[
+            "sql_dialect"
+        ] = sql_dialect
     language_info = {
         "primary_language": build_kind,
         "primary_standard": (
@@ -7799,9 +7850,11 @@ def build_build_doc(
             if is_shell_doc or is_sql_doc
             else (build_info or {}).get("standard")
         ),
-        "primary_dialect": build_kind if is_shell_doc else None,
+        "primary_dialect": (
+            build_kind if is_shell_doc else sql_dialect if is_sql_doc else None
+        ),
         "embedded_languages": [],
-        "signals": [
+        "signals": sorted(set([
             f"shell_file:{build_kind}"
             if is_shell_doc
             else f"code_file:{build_kind}"
@@ -7809,8 +7862,12 @@ def build_build_doc(
             else f"sql_file:{build_kind}"
             if is_sql_doc
             else f"build_file:{build_kind}"
-        ],
-        "detector_sources": [
+        ] + (
+            list(detected_sql_language.get("signals", []))
+            if detected_sql_language
+            else []
+        ))),
+        "detector_sources": sorted(set([
             "shell_file"
             if is_shell_doc
             else "code_file"
@@ -7818,8 +7875,16 @@ def build_build_doc(
             else "sql_file"
             if is_sql_doc
             else "build_file"
-        ],
-        "confidence": "high",
+        ] + (
+            list(detected_sql_language.get("detector_sources", []))
+            if detected_sql_language
+            else []
+        ))),
+        "confidence": (
+            detected_sql_language.get("confidence", "high")
+            if detected_sql_language
+            else "high"
+        ),
     }
 
     result: dict[str, object] = {
@@ -7836,7 +7901,7 @@ def build_build_doc(
                 )[0]["source_identity_id"],
             )
         ),
-        'build_kind': build_kind,
+        'build_kind': resolved_build_kind,
         'filepath': emitted_filepath,
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
@@ -10296,6 +10361,12 @@ def process_project(
     }
     for discovered in typed_domain_files:
         filepath = os.path.abspath(discovered.path)
+        if filepath in domain_files_by_path and classify_build_file(
+            os.path.basename(filepath)
+        ) is not None:
+            # Exact build-file identity wins over a generic extension adapter
+            # (notably conanfile.py -> conan rather than plain Python).
+            continue
         # PowerShell deliberately shares the frozen SH domain ID, so its
         # adapter (not DomainKind.name) owns the dialect used downstream.
         discovered_kind = {

@@ -9,7 +9,10 @@ _EXPORT_MODULES = {
     "parse_configure": "cppmega.data.build_parsers.autotools",
     "parse_bazel": "cppmega.data.build_parsers.bazel",
     "parse_cmake": "cppmega.data.build_parsers.cmake",
+    "parse_compile_commands": "cppmega.data.build_parsers.compile_commands",
+    "parse_dockerfile": "cppmega.data.build_parsers.dockerfile",
     "parse_make": "cppmega.data.build_parsers.make",
+    "parse_meson": "cppmega.data.build_parsers.meson",
     "parse_ninja": "cppmega.data.build_parsers.ninja",
 }
 
@@ -19,7 +22,10 @@ __all__ = [
     "parse_configure",
     "parse_bazel",
     "parse_cmake",
+    "parse_compile_commands",
+    "parse_dockerfile",
     "parse_make",
+    "parse_meson",
     "parse_ninja",
 ]
 

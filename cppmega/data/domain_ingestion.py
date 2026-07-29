@@ -14,11 +14,13 @@ from cppmega.data.build_parsers import (
     parse_automake,
     parse_bazel,
     parse_cmake,
+    parse_compile_commands,
     parse_configure,
+    parse_dockerfile,
     parse_make,
+    parse_meson,
     parse_ninja,
 )
-from cppmega.data.build_parsers.meson import parse_meson
 from cppmega.data.build_parsers.shell import parse_shell as parse_extended_shell
 from cppmega.data.build_parsers.base import (
     ParsedDomainDocument,
@@ -167,6 +169,7 @@ _LARGE_DOMAIN_KINDS = frozenset(
         DomainKind.GN,
         DomainKind.SCONS,
         DomainKind.XMAKE,
+        DomainKind.COMPILE_COMMANDS,
         DomainKind.CONFIGURE,
         DomainKind.BASH,
         DomainKind.ZSH,
@@ -208,6 +211,7 @@ _EXPLICIT_DOMAIN_NAMES = frozenset(
         "SConstruct",
         "SConscript",
         "xmake.lua",
+        "compile_commands.json",
         "conanfile.txt",
         "conanfile.py",
         "vcpkg.json",
@@ -232,6 +236,9 @@ _EXPLICIT_DOMAIN_SUFFIXES = frozenset(
         ".bat",
         ".cmd",
         ".sql",
+        ".ddl",
+        ".dml",
+        ".psql",
         ".py",
         ".m4",
         ".gn",
@@ -249,6 +256,13 @@ _TEXT_SIGNATURE_SUFFIXES = frozenset(
 class _SqlLexState:
     mode: str = "normal"
     delimiter: bytes = b""
+
+
+@dataclass(frozen=True)
+class _JsonObjectLexState:
+    object_depth: int = 0
+    in_string: bool = False
+    escaped: bool = False
 
 
 _SQL_DOLLAR_QUOTE_RE = re.compile(rb"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
@@ -635,6 +649,58 @@ def _line_chunk_cut(
     return limit, "hard_limit"
 
 
+def _compile_commands_chunk_cut(
+    data: bytearray,
+    *,
+    max_chunk_bytes: int,
+    initial_state: _JsonObjectLexState,
+) -> tuple[int, str, _JsonObjectLexState]:
+    """Prefer a complete top-level compilation-database entry.
+
+    A compilation database is commonly emitted as one minified JSON array, so
+    line boundaries are not meaningful. Structural scanning only recognizes
+    braces outside JSON strings and carries lexical state across a hard split.
+    """
+
+    limit = _utf8_boundary_at_or_before(data, max_chunk_bytes)
+    object_depth = initial_state.object_depth
+    in_string = initial_state.in_string
+    escaped = initial_state.escaped
+    last_complete_object = 0
+
+    for index in range(limit):
+        byte = data[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # double quote
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte == 0x7B:  # {
+            object_depth += 1
+        elif byte == 0x7D:  # }
+            if object_depth > 0:
+                object_depth -= 1
+                if object_depth == 0:
+                    last_complete_object = index + 1
+
+    if last_complete_object:
+        return (
+            last_complete_object,
+            "compile_commands_entry",
+            _JsonObjectLexState(),
+        )
+    return (
+        limit,
+        "hard_limit",
+        _JsonObjectLexState(object_depth, in_string, escaped),
+    )
+
+
 def _decodable_prefix_at_or_before(
     data: bytearray,
     *,
@@ -725,7 +791,9 @@ def _encoded_chunk_cut(
     codec: str,
     sql: bool,
     sql_state: _SqlLexState,
-) -> tuple[int, str, _SqlLexState]:
+    compile_commands: bool,
+    json_state: _JsonObjectLexState,
+) -> tuple[int, str, _SqlLexState, _JsonObjectLexState]:
     source_limit = _decodable_prefix_at_or_before(
         data,
         limit=max_source_bytes,
@@ -739,12 +807,23 @@ def _encoded_chunk_cut(
             max_chunk_bytes=len(normalized),
             initial_state=sql_state,
         )
+        next_json_state = json_state
+    elif compile_commands:
+        normalized_cut, split_reason, next_json_state = (
+            _compile_commands_chunk_cut(
+                normalized,
+                max_chunk_bytes=len(normalized),
+                initial_state=json_state,
+            )
+        )
+        next_state = sql_state
     else:
         normalized_cut, split_reason = _line_chunk_cut(
             normalized,
             max_chunk_bytes=len(normalized),
         )
         next_state = sql_state
+        next_json_state = json_state
     selected_text = bytes(normalized[:normalized_cut]).decode(
         "utf-8",
         errors="strict",
@@ -755,7 +834,7 @@ def _encoded_chunk_cut(
             "domain chunk boundary could not be mapped to original encoding: "
             f"codec={codec} source_cut={source_cut} source_limit={source_limit}"
         )
-    return source_cut, split_reason, next_state
+    return source_cut, split_reason, next_state, next_json_state
 
 
 def _is_explicit_domain_path(path: Path, *, include_cpp: bool) -> bool:
@@ -860,6 +939,7 @@ def iter_domain_file_chunks(
             char_start = 0
             chunk_index = 0
             sql_state = _SqlLexState()
+            json_state = _JsonObjectLexState()
             payload_remaining = (
                 source_size - len(validated.bom) - validated.trailing_nul_bytes
             )
@@ -886,12 +966,16 @@ def iter_domain_file_chunks(
                         f"{path_obj}"
                     )
                 while len(buffer) > payload_limit:
-                    cut, split_reason, sql_state = _encoded_chunk_cut(
+                    cut, split_reason, sql_state, json_state = _encoded_chunk_cut(
                         buffer,
                         max_source_bytes=payload_limit,
                         codec=validated.codec,
                         sql=path_adapter.domain == DomainKind.SQL,
                         sql_state=sql_state,
+                        compile_commands=(
+                            path_adapter.domain == DomainKind.COMPILE_COMMANDS
+                        ),
+                        json_state=json_state,
                     )
                     raw = bytes(buffer[:cut])
                     del buffer[:cut]
@@ -1105,6 +1189,16 @@ _ADAPTERS = {
         DomainKind.XMAKE,
         _raw_typed_parser(DomainKind.XMAKE, "xmake-raw"),
     ),
+    "compile_commands": DomainParserAdapter(
+        "compile-commands-json",
+        DomainKind.COMPILE_COMMANDS,
+        parse_compile_commands,
+    ),
+    "dockerfile": DomainParserAdapter(
+        "dockerfile",
+        DomainKind.CONFIGURE,
+        parse_dockerfile,
+    ),
     "bash": DomainParserAdapter("bash", DomainKind.BASH, parse_bash),
     "sh": DomainParserAdapter("posix-sh", DomainKind.SH, parse_sh),
     "zsh": DomainParserAdapter("zsh", DomainKind.ZSH, parse_zsh),
@@ -1194,6 +1288,10 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["scons"]
     if name == "xmake.lua":
         return _ADAPTERS["xmake"]
+    if name == "compile_commands.json":
+        return _ADAPTERS["compile_commands"]
+    if name == "Dockerfile":
+        return _ADAPTERS["dockerfile"]
 
     shebang_kind = _script_kind_from_shebang(text)
     if shebang_kind is not None:
@@ -1225,7 +1323,7 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["cmd"]
     if suffix in {".gn", ".gni"}:
         return _ADAPTERS["gn"]
-    if suffix == ".sql":
+    if suffix in {".sql", ".ddl", ".dml", ".psql"}:
         return _ADAPTERS["sql"]
     if suffix == ".py":
         return _ADAPTERS["python"]

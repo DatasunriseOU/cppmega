@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import json
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,11 @@ def test_build_and_domain_discovery_covers_frozen_build_dialects(
         "SConstruct": 'Program("demo", ["main.cpp"])\n',
         "sub/SConscript": 'Library("demo", ["lib.cpp"])\n',
         "xmake.lua": 'target("demo")\n  set_kind("binary")\n',
+        "Dockerfile": "FROM alpine:3.22\nCOPY src /src\n",
+        "compile_commands.json": "[]\n",
+        "schema.ddl": "CREATE TABLE demo(id INTEGER);\n",
+        "migration.dml": "INSERT INTO demo VALUES (1);\n",
+        "postgres.psql": "CREATE TABLE events(payload JSONB);\n",
     }
     _write_files(tmp_path, fixtures)
 
@@ -36,7 +42,9 @@ def test_build_and_domain_discovery_covers_frozen_build_dialects(
     }
     assert build_files == {
         "BUILD.gn": "gn",
+        "Dockerfile": "dockerfile",
         "SConstruct": "scons",
+        "compile_commands.json": "compile_commands",
         "config/compiler.gni": "gn",
         "meson.build": "meson",
         "sub/SConscript": "scons",
@@ -49,9 +57,17 @@ def test_build_and_domain_discovery_covers_frozen_build_dialects(
     }
     assert discovered == {
         "BUILD.gn": (DomainKind.GN, "gn-raw"),
+        "Dockerfile": (DomainKind.CONFIGURE, "dockerfile"),
         "SConstruct": (DomainKind.SCONS, "scons-raw"),
+        "compile_commands.json": (
+            DomainKind.COMPILE_COMMANDS,
+            "compile-commands-json",
+        ),
         "config/compiler.gni": (DomainKind.GN, "gn-raw"),
         "meson.build": (DomainKind.MESON, "meson"),
+        "migration.dml": (DomainKind.SQL, "sql-lexical"),
+        "postgres.psql": (DomainKind.SQL, "sql-lexical"),
+        "schema.ddl": (DomainKind.SQL, "sql-lexical"),
         "sub/SConscript": (DomainKind.SCONS, "scons-raw"),
         "xmake.lua": (DomainKind.XMAKE, "xmake-raw"),
     }
@@ -64,6 +80,10 @@ def test_process_project_preserves_domain_and_powershell_dialect(
         "BUILD.gn": 'executable("demo") { sources = [ "main.cc" ] }\n',
         "SConstruct": 'Program("demo", ["main.cpp"])\n',
         "xmake.lua": 'target("demo")\n  set_kind("binary")\n',
+        "Dockerfile": "FROM alpine:3.22\nCOPY src /src\n",
+        "compile_commands.json": "[]\n",
+        "conanfile.py": "from conan import ConanFile\n",
+        "vcpkg.json": '{"name": "demo", "version": "1.0.0"}\n',
         "scripts/build.ps1": (
             '$Root = "./src"\n'
             "Get-ChildItem -Path $Root | Where-Object { $_.Name }\n"
@@ -75,7 +95,7 @@ def test_process_project_preserves_domain_and_powershell_dialect(
             ":: type secret.txt | upload.exe\n"
             "echo ^| literal\n"
         ),
-        "schema.sql": "CREATE TABLE demo(id INTEGER PRIMARY KEY);\n",
+        "schema.psql": "CREATE TABLE demo(payload JSONB);\n",
     }
     _write_files(tmp_path, fixtures)
 
@@ -97,6 +117,37 @@ def test_process_project_preserves_domain_and_powershell_dialect(
         assert doc["doc_type"] == "build"
         assert doc["domain_kind"] == int(domain)
         assert set(doc["domain_confidence_ids"]) == {int(ParseConfidence.RAW)}
+
+    dockerfile = by_path["Dockerfile"]
+    assert dockerfile["doc_type"] == "build"
+    assert dockerfile["build_kind"] == "dockerfile"
+    assert dockerfile["domain_kind"] == int(DomainKind.CONFIGURE)
+    assert dockerfile["domain_parse_info"]["parser_adapter"] == "dockerfile"
+    assert dockerfile["domain_parse_info"]["shared_domain"] == "configure"
+    assert dockerfile["domain_parse_info"]["parse_engine"] in {
+        "deterministic-lexical",
+        "tree-sitter+deterministic-lexical",
+    }
+    assert dockerfile["build_edges"]
+
+    compile_commands = by_path["compile_commands.json"]
+    assert compile_commands["doc_type"] == "build"
+    assert compile_commands["build_kind"] == "compile_commands"
+    assert compile_commands["domain_kind"] == int(DomainKind.COMPILE_COMMANDS)
+    assert compile_commands["domain_parse_info"]["parser_adapter"] == (
+        "compile-commands-json"
+    )
+
+    for filepath, build_kind in (
+        ("conanfile.py", "conan"),
+        ("vcpkg.json", "vcpkg"),
+    ):
+        manifest = by_path[filepath]
+        assert manifest["doc_type"] == "build"
+        assert manifest["build_kind"] == build_kind
+        assert manifest["domain_kind"] == int(DomainKind.CONFIGURE)
+        assert manifest["domain_parse_info"]["parser_adapter"] == f"{build_kind}-raw"
+        assert manifest["domain_parse_info"]["shared_domain"] == "configure"
 
     powershell = by_path["scripts/build.ps1"]
     assert powershell["doc_type"] == "shell"
@@ -130,14 +181,17 @@ def test_process_project_preserves_domain_and_powershell_dialect(
     }
     assert cmd["shell_edges"] == []
 
-    sql = by_path["schema.sql"]
+    sql = by_path["schema.psql"]
     assert sql["doc_type"] == "sql"
-    assert sql["build_kind"] == "sql"
+    assert sql["build_kind"] == "sql:postgresql"
     assert sql["domain_kind"] == int(DomainKind.SQL)
     assert int(DomainRoleKind.TARGET) in sql["domain_role_ids"]
     assert sql["language_info"]["primary_standard"] is None
-    assert sql["language_info"]["signals"] == ["sql_file:sql"]
-    assert sql["language_info"]["detector_sources"] == ["sql_file"]
+    assert sql["language_info"]["primary_dialect"] == "postgresql"
+    assert sql["domain_parse_info"]["sql_dialect"] == "postgresql"
+    assert "sql_file:sql" in sql["language_info"]["signals"]
+    assert "sql_path_dialect:postgresql" in sql["language_info"]["signals"]
+    assert "sql_file" in sql["language_info"]["detector_sources"]
 
     for filepath, text in fixtures.items():
         doc = by_path[filepath]
@@ -190,6 +244,229 @@ def test_meson_tree_sitter_edges_use_character_offsets_after_utf8_prefix() -> No
             "'src/main.cpp'",
             int(DomainEdgeKind.BUILD_TARGET_SOURCE),
         ) in edge_tokens
+
+
+def test_dockerfile_byte_edges_use_character_offsets_after_utf8_prefix() -> None:
+    from cppmega.data.build_parsers.base import ParsedDomainDocument
+    from cppmega.data.build_parsers.dockerfile import _attach_edges_to_doc
+    from cppmega.data.domain_schema import DomainEdgeKind
+
+    text = "# Привет, мир\nCOPY src/main.cpp /workspace/main.cpp\n"
+    source = text.encode("utf-8")
+    direct = ParsedDomainDocument.new(domain=DomainKind.CONFIGURE, text=text)
+    _attach_edges_to_doc(
+        direct,
+        [
+            (
+                source.index(b"src/main.cpp"),
+                source.index(b"/workspace/main.cpp"),
+                int(DomainEdgeKind.BUILD_ACTION_INPUT),
+            )
+        ],
+        source,
+    )
+    assert [
+        (direct.tokens[source_idx].text, direct.tokens[target_idx].text, kind)
+        for source_idx, target_idx, kind in direct.edges
+    ] == [
+        (
+            "src/main.cpp",
+            "/workspace/main.cpp",
+            int(DomainEdgeKind.BUILD_ACTION_INPUT),
+        )
+    ]
+
+
+def test_dockerfile_json_arguments_keep_build_edges_without_tree_sitter() -> None:
+    from cppmega.data.domain_ingestion import parse_domain_document
+    from cppmega.data.domain_schema import DomainEdgeKind
+
+    text = (
+        "FROM alpine:3.22 AS build\n"
+        'COPY --from=build ["src/a.cpp", "src/with space.cpp", "/workspace/"]\n'
+        'RUN ["cmake", "--build", "/workspace"]\n'
+    )
+    parsed = parse_domain_document("Dockerfile", text)
+    edge_tokens = {
+        (
+            parsed.tokens[source_index].text,
+            parsed.tokens[target_index].text,
+            kind,
+        )
+        for source_index, target_index, kind in parsed.edges
+    }
+
+    assert (
+        '"/workspace/"',
+        '"src/a.cpp"',
+        int(DomainEdgeKind.BUILD_ACTION_INPUT),
+    ) in edge_tokens
+    assert (
+        '"/workspace/"',
+        '"src/with space.cpp"',
+        int(DomainEdgeKind.BUILD_ACTION_INPUT),
+    ) in edge_tokens
+    assert (
+        "RUN",
+        '"cmake"',
+        int(DomainEdgeKind.BUILD_RULE_COMMAND),
+    ) in edge_tokens
+
+
+def test_compile_commands_parser_emits_action_roles_and_edges() -> None:
+    from cppmega.data.domain_ingestion import parse_domain_document
+    from cppmega.data.domain_schema import DomainEdgeKind
+
+    text = (
+        '[{"directory": "/repo/build", '
+        '"command": "clang++ -c src/main.cpp -o main.o", '
+        '"file": "src/main.cpp", "output": "main.o"}]\n'
+    )
+    parsed = parse_domain_document("compile_commands.json", text)
+
+    assert parsed.domain == DomainKind.COMPILE_COMMANDS
+    assert parsed.metadata["parser_adapter"] == "compile-commands-json"
+    assert parsed.metadata["json_entries"] == 1
+    role_tokens = {
+        role: {
+            token.text
+            for token, role_id in zip(
+                parsed.tokens,
+                parsed.role_ids,
+                strict=True,
+            )
+            if role_id == int(role)
+        }
+        for role in (
+            DomainRoleKind.COMMAND,
+            DomainRoleKind.SOURCE,
+            DomainRoleKind.OUTPUT,
+            DomainRoleKind.PATH,
+        )
+    }
+    assert role_tokens[DomainRoleKind.COMMAND] == {
+        '"clang++ -c src/main.cpp -o main.o"'
+    }
+    assert role_tokens[DomainRoleKind.SOURCE] == {'"src/main.cpp"'}
+    assert role_tokens[DomainRoleKind.OUTPUT] == {'"main.o"'}
+    assert role_tokens[DomainRoleKind.PATH] == {'"/repo/build"'}
+    assert {
+        kind for _source, _target, kind in parsed.edges
+    } == {
+        int(DomainEdgeKind.BUILD_ACTION_INPUT),
+        int(DomainEdgeKind.BUILD_ACTION_OUTPUT),
+    }
+
+
+def test_minified_compile_commands_chunks_on_complete_entries(
+    tmp_path: Path,
+) -> None:
+    entries = [
+        {
+            "directory": f"/repo/build/{index}",
+            "command": (
+                f'clang++ -DMESSAGE="{{unit_{index}}}" -c src/unit_{index}.cpp '
+                f"-o unit_{index}.o"
+            ),
+            "file": f"src/unit_{index}.cpp",
+            "output": f"unit_{index}.o",
+        }
+        for index in range(8)
+    ]
+    text = json.dumps(entries, separators=(",", ":"))
+    path = tmp_path / "compile_commands.json"
+    path.write_text(text, encoding="utf-8")
+    largest_entry_bytes = max(
+        len(json.dumps(entry, separators=(",", ":")).encode("utf-8"))
+        for entry in entries
+    )
+    chunk_bytes = largest_entry_bytes + 8
+    assert len(text.encode("utf-8")) > chunk_bytes
+
+    documents = ip.emit_build_documents(
+        [(str(path), "compile_commands")],
+        source_root=str(tmp_path),
+        project_id="fixture/minified-compile-commands",
+        default_build_info=None,
+        max_chunk_bytes=chunk_bytes,
+    )
+
+    assert len(documents) > 1
+    assert "".join(str(document["text"]) for document in documents) == text
+    assert sum(
+        int(document["domain_parse_info"]["json_entries"])
+        for document in documents
+    ) == len(entries)
+    assert all(
+        "raw_reason" not in document["domain_parse_info"]
+        for document in documents
+    )
+    assert sum(len(document["build_edges"]) for document in documents) == (
+        2 * len(entries)
+    )
+    assert all(
+        len(str(document["text"]).encode("utf-8")) <= chunk_bytes
+        for document in documents
+    )
+    assert {
+        str(document["source_span"]["split_reason"])
+        for document in documents[:-1]
+    } == {"compile_commands_entry"}
+    assert documents[-1]["source_span"]["split_reason"] == "eof"
+    for previous, current in zip(documents, documents[1:]):
+        assert previous["source_span"]["byte_end"] == current["source_span"]["byte_start"]
+        assert previous["source_span"]["char_end"] == current["source_span"]["char_start"]
+
+
+@pytest.mark.parametrize(
+    ("dialect", "text"),
+    [
+        (
+            "sqlite",
+            "PRAGMA foreign_keys = ON; CREATE TABLE item(id INTEGER) WITHOUT ROWID;\n",
+        ),
+        (
+            "mysql",
+            "CREATE TABLE item(id INT AUTO_INCREMENT) ENGINE=InnoDB;\n",
+        ),
+        (
+            "postgresql",
+            "CREATE TABLE item(payload JSONB); SELECT * FROM generate_series(1, 2);\n",
+        ),
+        (
+            "tsql",
+            "CREATE TABLE item(id INT IDENTITY(1,1)); SELECT * FROM sys.objects;\n",
+        ),
+        (
+            "db2",
+            (
+                "SELECT VARCHAR_FORMAT(CURRENT DATE, 'YYYY') "
+                "FROM SYSIBM.SYSDUMMY1 WITH UR;\n"
+            ),
+        ),
+        (
+            "plsql",
+            (
+                "CREATE OR REPLACE PACKAGE demo AS "
+                "value VARCHAR2(32); END demo;\n"
+            ),
+        ),
+    ],
+)
+def test_sql_dialect_survives_build_document_sidecars(
+    dialect: str,
+    text: str,
+) -> None:
+    document = ip.build_build_doc(
+        "schema.sql",
+        text,
+        "sql",
+        project_id=f"fixture/sql-{dialect}",
+    )
+
+    assert document["build_kind"] == f"sql:{dialect}"
+    assert document["language_info"]["primary_dialect"] == dialect
+    assert document["domain_parse_info"]["sql_dialect"] == dialect
 
 
 def test_emit_build_documents_chunks_build_shell_and_sql_losslessly(
@@ -313,6 +590,7 @@ def test_build_kind_survives_tokenized_and_packed_materialization(
     from scripts.nanochat_data.pack_enriched_rows import (
         pack_documents,
         read_tokenized_documents,
+        rows_to_table as packed_rows_to_table,
     )
     from scripts.nanochat_data.token_budget import load_tokenizer
 
@@ -321,6 +599,17 @@ def test_build_kind_survives_tokenized_and_packed_materialization(
         ("scripts/build.cmd", "@echo off\ndir ./src\n", "cmd"),
         ("schema.sql", "CREATE TABLE demo(id INTEGER);\n", "sql"),
         ("BUILD.gn", 'source_set("demo") { sources = [ "a.cc" ] }\n', "gn"),
+        ("Dockerfile", "FROM alpine:3.22\nCOPY src /src\n", "dockerfile"),
+        ("schema.psql", "CREATE TABLE events(payload JSONB);\n", "sql"),
+        (
+            "compile_commands.json",
+            (
+                '[{"directory": "/repo", '
+                '"command": "clang++ -c src/main.cpp -o main.o", '
+                '"file": "src/main.cpp", "output": "main.o"}]\n'
+            ),
+            "compile_commands",
+        ),
     ]
     documents = [
         ip.build_build_doc(
@@ -350,6 +639,9 @@ def test_build_kind_survives_tokenized_and_packed_materialization(
         "cmd",
         "sql",
         "gn",
+        "dockerfile",
+        "sql:postgresql",
+        "compile_commands",
     ]
 
     normalized = read_tokenized_documents(tokenized_path)
@@ -365,5 +657,29 @@ def test_build_kind_survives_tokenized_and_packed_materialization(
         "cmd",
         "sql",
         "gn",
+        "dockerfile",
+        "sql:postgresql",
+        "compile_commands",
     ]
     assert all(packed_rows[0]["source_build_kinds"])
+
+    packed_path = tmp_path / "packed.parquet"
+    pq.write_table(
+        packed_rows_to_table(packed_rows),
+        packed_path,
+        compression="zstd",
+    )
+    from scripts.verify_domain_routed_dataset import verify_file
+
+    report = verify_file("code", packed_path, "fixture")
+    assert report["errors"] == []
+    assert report["build_kind_counts"] == {
+        "powershell": 1,
+        "cmd": 1,
+        "sql": 1,
+        "gn": 1,
+        "dockerfile": 1,
+        "sql:postgresql": 1,
+        "compile_commands": 1,
+    }
+    assert report["edge_count"]["token_build_edges"] >= 3
