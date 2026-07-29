@@ -5,9 +5,17 @@ import json
 import sys
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega.data.nanochat_pipeline.packed_rows_schema import (
+    NUM_DOCS_COLUMN,
+    SOURCE_COMMIT_HASHES_COLUMN,
+    SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+    SOURCE_PR_NUMBERS_COLUMN,
+)
+from cppmega.data.source_conveyor_composition import SourceComposition
 from cppmega.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
@@ -27,7 +35,9 @@ def _verified_pr_inputs(
     records: list[dict],
     *,
     stale_records: list[dict] | None = None,
-) -> tuple[Path, Path, Path, str]:
+    target_lengths: tuple[int, ...] = (1024,),
+    primary_pr_numbers: set[int] | None = None,
+) -> tuple[Path, Path, Path, str, SourceComposition, Path]:
     import pr_store
     from scripts.pr_ingest.graphql_pr_stream import (
         GRAPHQL_MANIFEST_SCHEMA,
@@ -111,14 +121,70 @@ def _verified_pr_inputs(
         store_path=store,
         output_path=receipt,
     )
-    return store, repo_list, receipt, scan_id
+    commit_root = tmp_path / "commits"
+    allowlist: dict[tuple[str, int], dict[str, int]] = {
+        ("code", length): {"unused.parquet": 1}
+        for length in target_lengths
+    }
+    for length in target_lengths:
+        bucket_root = commit_root / str(length)
+        bucket_root.mkdir(parents=True)
+        parquet = bucket_root / "primary.parquet"
+        table = pa.Table.from_pylist(
+            [
+                {
+                    "repo": record["repo"],
+                    NUM_DOCS_COLUMN: 1,
+                    SOURCE_PR_NUMBERS_COLUMN: [int(record["pr_number"])],
+                    SOURCE_COMMIT_HASHES_COLUMN: [
+                        str(record["merge_commit_sha"])
+                    ],
+                    SOURCE_HAS_PR_DISCUSSIONS_COLUMN: [True],
+                }
+                for record in records
+                if (
+                    primary_pr_numbers is None
+                    or int(record["pr_number"]) in primary_pr_numbers
+                )
+            ],
+            schema=pa.schema(
+                [
+                    pa.field("repo", pa.string()),
+                    pa.field(NUM_DOCS_COLUMN, pa.int32()),
+                    pa.field(SOURCE_PR_NUMBERS_COLUMN, pa.list_(pa.int64())),
+                    pa.field(SOURCE_COMMIT_HASHES_COLUMN, pa.list_(pa.string())),
+                    pa.field(
+                        SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+                        pa.list_(pa.bool_()),
+                    ),
+                ]
+            ),
+        )
+        pq.write_table(table, parquet, compression="zstd")
+        allowlist[("commits", length)] = {parquet.name: table.num_rows}
+    composition_plan = tmp_path / "source_composition.json"
+    composition_plan.write_text("{}\n", encoding="utf-8")
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    composition = SourceComposition(
+        allowlist=allowlist,
+        receipt={
+            "schema": "cppmega_source_conveyor_composition_v1",
+            "status": "complete",
+            "plan_sha256": "a" * 64,
+        },
+        plan_path=composition_plan,
+        dedup_receipt_path=tmp_path / "dedup.json",
+        run_files=(),
+    )
+    return store, repo_list, receipt, scan_id, composition, commit_root
 
 
 def _record(pr_number: int, *, repo: str = "owner/repo") -> dict:
     return {
         "repo": repo,
         "pr_number": pr_number,
-        "merge_commit_sha": f"sha{pr_number}",
+        "merge_commit_sha": f"{pr_number:040x}",
         "pr_title": f"title {pr_number}",
         "pr_body": "body",
         "comments": [
@@ -136,10 +202,11 @@ def _record(pr_number: int, *, repo: str = "owner/repo") -> dict:
 def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
     import export_pr_parquet
 
-    store, repo_list, receipt, scan_id = _verified_pr_inputs(
+    store, repo_list, receipt, scan_id, composition, commit_root = _verified_pr_inputs(
         tmp_path,
-        [_record(1), _record(2)],
+        [_record(1), _record(2), _record(3)],
         stale_records=[_record(3, repo="stale/repo")],
+        primary_pr_numbers={1, 2},
     )
 
     out = tmp_path / "out"
@@ -148,6 +215,9 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
         store=str(store),
         pr_completion_receipt=str(receipt),
         repo_list=str(repo_list),
+        source_composition=str(composition.plan_path),
+        code_root=str(tmp_path / "code"),
+        commit_root=str(commit_root),
         output_root=str(out),
         target_lengths="1024",
         repo=None,
@@ -161,7 +231,10 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
         memory_limit_gb=4.0,
     )
 
-    result = export_pr_parquet.export_pr_parquet_batches(args)
+    result = export_pr_parquet.export_pr_parquet_batches(
+        args,
+        source_composition=composition,
+    )
 
     assert result["n_shards"] == 2
     assert result["next_offset"] == 2
@@ -191,12 +264,20 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
     assert receipt_blob["schema"] == export_pr_parquet.EXPORT_RECEIPT_SCHEMA
     assert receipt_blob["selected_pr_count"] == 2
     assert receipt_blob["rendered_docs"] == 2
+    assert receipt_blob["pr_completion"]["stored_pr_count"] == 3
 
 
 def test_pr_export_partial_runs_cannot_publish_global_receipt(tmp_path):
     import export_pr_parquet
 
-    store, repo_list, receipt, _scan_id = _verified_pr_inputs(
+    (
+        store,
+        repo_list,
+        receipt,
+        _scan_id,
+        composition,
+        commit_root,
+    ) = _verified_pr_inputs(
         tmp_path / "inputs",
         [_record(1), _record(2)],
     )
@@ -206,6 +287,9 @@ def test_pr_export_partial_runs_cannot_publish_global_receipt(tmp_path):
         store=str(store),
         pr_completion_receipt=str(receipt),
         repo_list=str(repo_list),
+        source_composition=str(composition.plan_path),
+        code_root=str(tmp_path / "inputs" / "code"),
+        commit_root=str(commit_root),
         output_root=str(subset_out),
         target_lengths="1024",
         repo=None,
@@ -218,7 +302,10 @@ def test_pr_export_partial_runs_cannot_publish_global_receipt(tmp_path):
         no_resume=False,
         memory_limit_gb=4.0,
     )
-    subset_result = export_pr_parquet.export_pr_parquet_batches(subset_args)
+    subset_result = export_pr_parquet.export_pr_parquet_batches(
+        subset_args,
+        source_composition=composition,
+    )
 
     assert "completion_receipt" not in subset_result
     assert not (subset_out / "export_receipt.json").exists()
@@ -237,7 +324,10 @@ def test_pr_export_partial_runs_cannot_publish_global_receipt(tmp_path):
             "max_shards": 1,
         }
     )
-    bounded_result = export_pr_parquet.export_pr_parquet_batches(bounded_args)
+    bounded_result = export_pr_parquet.export_pr_parquet_batches(
+        bounded_args,
+        source_composition=composition,
+    )
 
     assert "completion_receipt" not in bounded_result
     assert not (bounded_out / "export_receipt.json").exists()
@@ -267,7 +357,7 @@ def test_pr_export_losslessly_splits_discussion_larger_than_16k(tmp_path):
             {
                 "repo": "owner/repo",
                 "pr_number": 99,
-                "merge_commit_sha": "sha99",
+                "merge_commit_sha": f"{99:040x}",
                 "pr_title": "Large parser review",
                 "pr_body": body,
                 "comments": [],
@@ -285,13 +375,20 @@ def test_pr_export_losslessly_splits_discussion_larger_than_16k(tmp_path):
         ) > 16_384
     finally:
         conn.close()
-    store, repo_list, receipt, _scan_id = _verified_pr_inputs(
+    (
+        store,
+        repo_list,
+        receipt,
+        _scan_id,
+        composition,
+        commit_root,
+    ) = _verified_pr_inputs(
         tmp_path / "verified",
         [
             {
                 "repo": "owner/repo",
                 "pr_number": 99,
-                "merge_commit_sha": "sha99",
+                "merge_commit_sha": f"{99:040x}",
                 "pr_title": "Large parser review",
                 "pr_body": body,
                 "comments": [],
@@ -299,6 +396,7 @@ def test_pr_export_losslessly_splits_discussion_larger_than_16k(tmp_path):
                 "linked_issues": [],
             }
         ],
+        target_lengths=(1024, 2048, 4096, 8192, 16384),
     )
 
     out = tmp_path / "out"
@@ -306,6 +404,9 @@ def test_pr_export_losslessly_splits_discussion_larger_than_16k(tmp_path):
         store=str(store),
         pr_completion_receipt=str(receipt),
         repo_list=str(repo_list),
+        source_composition=str(composition.plan_path),
+        code_root=str(tmp_path / "verified" / "code"),
+        commit_root=str(commit_root),
         output_root=str(out),
         target_lengths="1024,2048,4096,8192,16384",
         repo=None,
@@ -319,7 +420,10 @@ def test_pr_export_losslessly_splits_discussion_larger_than_16k(tmp_path):
         memory_limit_gb=4.0,
     )
 
-    result = export_pr_parquet.export_pr_parquet(args)
+    result = export_pr_parquet.export_pr_parquet(
+        args,
+        source_composition=composition,
+    )
 
     stats = result["materialize_stats"]
     assert stats["docs_in"] == 1
@@ -345,6 +449,9 @@ def test_pr_export_refuses_unverified_store(tmp_path):
         store=str(store),
         pr_completion_receipt=str(tmp_path / "missing.json"),
         repo_list=str(tmp_path / "missing-repos.json"),
+        source_composition=str(tmp_path / "missing-source-composition.json"),
+        code_root=str(tmp_path / "missing-code"),
+        commit_root=str(tmp_path / "missing-commits"),
         output_root=str(tmp_path / "out"),
         target_lengths="1024",
         repo=None,
