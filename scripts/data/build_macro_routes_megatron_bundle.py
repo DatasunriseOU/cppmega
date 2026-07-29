@@ -2,10 +2,12 @@
 """Build an audited, immutable cppmega macro-routes Megatron bundle.
 
 The live parquet conveyor keeps adding/replacing shards.  This builder first
-reflinks or copies stable shards into a private run-local snapshot, audits that
-snapshot, then converts every requested sequence bucket with the full token and
-graph sidecar contract.  Bucket directories and the final bundle are published
-by rename only after validation succeeds.
+reflinks or copies stable shards into a private run-local snapshot, repairs and
+audits that snapshot, then converts every requested sequence bucket with the
+full token and graph sidecar contract.  ``--prepare-objective-snapshot`` exposes
+the receipt-bound pause required to materialize objective artifacts from those
+exact repaired bytes.  Bucket directories and the final bundle are published by
+rename only after validation succeeds.
 """
 
 from __future__ import annotations
@@ -67,6 +69,7 @@ from scripts.ci_stream_fetch import (  # noqa: E402
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
 BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v2"
+SNAPSHOT_PLAN_SCHEMA = "cppmega_macro_routes_snapshot_plan_v1"
 CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
@@ -2459,6 +2462,91 @@ def _create_build_plan(
     }
 
 
+def _create_snapshot_plan(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    output_dir: Path,
+    source_composition: dict[str, object],
+    builder_revision: dict[str, object],
+    ci_manifest: dict[str, object],
+    pr_manifest: dict[str, object],
+) -> dict[str, object]:
+    plan = {
+        "output_dir": str(output_dir),
+        "source_roots": {
+            "code": str(args.code_root.resolve()),
+            "commits": str(args.commit_root.resolve()),
+            "ci": str(args.ci_root.resolve()),
+            "pr": str(args.pr_root.resolve()),
+        },
+        "source_composition": source_composition,
+        "ci_manifest": ci_manifest,
+        "pr_manifest": pr_manifest,
+        "implementation": _producer_binding_from_local_revision(
+            builder_revision,
+            cppmega_commit=args.cppmega_commit,
+            cppmega_tree_sha256=args.cppmega_tree_sha256,
+            cppmega_mlx_commit=args.cppmega_mlx_commit,
+            cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
+        ),
+        "buckets": list(buckets),
+        "min_age_seconds": args.min_age_seconds,
+        "implementation_sha256": {
+            "builder": {
+                "path": str(Path(__file__).resolve()),
+                "sha256": _sha256(Path(__file__).resolve()),
+            },
+            "audit": {
+                "path": str(args.audit_script.resolve()),
+                "sha256": _sha256(args.audit_script.resolve()),
+            },
+            "boundary_repair": {
+                "path": str(args.repair_script.resolve()),
+                "sha256": _sha256(args.repair_script.resolve()),
+            },
+        },
+    }
+    return {
+        "schema": SNAPSHOT_PLAN_SCHEMA,
+        "snapshot_plan_sha256": _canonical_sha256(plan),
+        "plan": plan,
+    }
+
+
+def _ensure_partial_snapshot_plan(
+    partial_dir: Path, expected: dict[str, object]
+) -> None:
+    plan_path = partial_dir / "snapshot_plan.json"
+    if partial_dir.exists():
+        if partial_dir.is_symlink() or not partial_dir.is_dir():
+            raise RuntimeError(f"partial build path is not a directory: {partial_dir}")
+        if plan_path.is_symlink() or not plan_path.is_file():
+            raise RuntimeError(
+                f"stale partial build has no canonical snapshot plan: {partial_dir}"
+            )
+        try:
+            existing = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"stale partial build has an unreadable snapshot plan: {partial_dir}"
+            ) from error
+        if not isinstance(existing, dict) or existing != expected:
+            existing_sha = (
+                existing.get("snapshot_plan_sha256")
+                if isinstance(existing, dict)
+                else None
+            )
+            raise RuntimeError(
+                "stale partial snapshot plan mismatch: "
+                f"existing={existing_sha} "
+                f"expected={expected.get('snapshot_plan_sha256')}"
+            )
+        return
+    partial_dir.mkdir(parents=True)
+    _write_json_atomic(plan_path, expected)
+
+
 def _ensure_partial_build_plan(
     partial_dir: Path, expected: dict[str, object]
 ) -> None:
@@ -2466,9 +2554,24 @@ def _ensure_partial_build_plan(
     if partial_dir.exists():
         if partial_dir.is_symlink() or not partial_dir.is_dir():
             raise RuntimeError(f"partial build path is not a directory: {partial_dir}")
-        if plan_path.is_symlink() or not plan_path.is_file():
+        if plan_path.is_symlink():
             raise RuntimeError(
-                f"stale partial build has no canonical build plan: {partial_dir}"
+                f"stale partial build has invalid canonical build plan: {partial_dir}"
+            )
+        if not plan_path.exists():
+            snapshot_plan_path = partial_dir / "snapshot_plan.json"
+            if (
+                snapshot_plan_path.is_symlink()
+                or not snapshot_plan_path.is_file()
+            ):
+                raise RuntimeError(
+                    f"stale partial build has no canonical build plan: {partial_dir}"
+                )
+            _write_json_atomic(plan_path, expected)
+            return
+        if not plan_path.is_file():
+            raise RuntimeError(
+                f"stale partial build has invalid canonical build plan: {partial_dir}"
             )
         try:
             existing = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -2763,6 +2866,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "bucket. Repeat once for every --buckets entry."
         ),
     )
+    parser.add_argument(
+        "--prepare-objective-snapshot",
+        action="store_true",
+        help=(
+            "Create, boundary-repair, and audit the private source snapshot, "
+            "then stop so CASE1 objective artifacts can be materialized from "
+            "the receipt-bound snapshot before finalizing the bundle."
+        ),
+    )
     parser.add_argument("--buckets", default=",".join(map(str, DEFAULT_BUCKETS)))
     parser.add_argument("--min-age-seconds", type=float, default=120.0)
     parser.add_argument("--audit-workers", type=int, default=8)
@@ -2800,17 +2912,17 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
         )
 
 
-def _run_build(
+def _load_snapshot_inputs(
     *,
     args: argparse.Namespace,
     buckets: tuple[int, ...],
-    objective_artifacts: dict[int, Path],
-    output_dir: Path,
-) -> int:
-    partial_dir = output_dir.with_name(f".{output_dir.name}.partial")
-    if output_dir.exists():
-        raise SystemExit(f"final bundle already exists: {output_dir}")
-
+) -> tuple[
+    dict[str, object],
+    SourceComposition,
+    dict[tuple[str, int], dict[str, int]],
+    dict[str, object],
+    dict[str, object],
+]:
     builder_revision = _verify_local_cppmega_revision(
         expected_commit=args.cppmega_commit,
         expected_tree_sha256=args.cppmega_tree_sha256,
@@ -2844,17 +2956,79 @@ def _run_build(
     if overlap:
         raise RuntimeError(f"PR allowlist collides with existing kinds: {overlap}")
     allowlist.update(pr_allowlist)
-    build_plan = _create_build_plan(
+    return (
+        builder_revision,
+        source_composition,
+        allowlist,
+        ci_manifest,
+        pr_manifest,
+    )
+
+
+def _assert_snapshot_plan_inputs(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    output_dir: Path,
+    snapshot_plan: dict[str, object],
+) -> None:
+    (
+        builder_revision,
+        source_composition,
+        _allowlist,
+        ci_manifest,
+        pr_manifest,
+    ) = _load_snapshot_inputs(args=args, buckets=buckets)
+    actual = _create_snapshot_plan(
         args=args,
         buckets=buckets,
         output_dir=output_dir,
-        objective_artifacts=objective_artifacts,
         source_composition=source_composition.receipt,
         builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
     )
-    _ensure_partial_build_plan(partial_dir, build_plan)
+    if actual != snapshot_plan:
+        raise RuntimeError("snapshot inputs changed after snapshot plan creation")
+
+
+def _prepare_objective_snapshot(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    output_dir: Path,
+) -> tuple[
+    Path,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    SourceComposition,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    partial_dir = output_dir.with_name(f".{output_dir.name}.partial")
+    if output_dir.exists():
+        raise SystemExit(f"final bundle already exists: {output_dir}")
+    (
+        builder_revision,
+        source_composition,
+        allowlist,
+        ci_manifest,
+        pr_manifest,
+    ) = _load_snapshot_inputs(args=args, buckets=buckets)
+    snapshot_plan = _create_snapshot_plan(
+        args=args,
+        buckets=buckets,
+        output_dir=output_dir,
+        source_composition=source_composition.receipt,
+        builder_revision=builder_revision,
+        ci_manifest=ci_manifest,
+        pr_manifest=pr_manifest,
+    )
+    _ensure_partial_snapshot_plan(partial_dir, snapshot_plan)
 
     snapshot_root = partial_dir / "snapshot"
     source_manifest = _snapshot_sources(
@@ -2884,6 +3058,155 @@ def _run_build(
         repair_receipt=repair_receipt,
         hash_jobs=args.hash_jobs,
     )
+    audit_receipt = _run_snapshot_audit(
+        snapshot_root=snapshot_root,
+        audit_script=args.audit_script.resolve(),
+        audit_root=partial_dir / "audit",
+        buckets=buckets,
+        workers=args.audit_workers,
+        snapshot_manifest_sha256=_sha256(
+            snapshot_root / "repaired_manifest.json"
+        ),
+    )
+    _assert_snapshot_plan_inputs(
+        args=args,
+        buckets=buckets,
+        output_dir=output_dir,
+        snapshot_plan=snapshot_plan,
+    )
+    _ensure_partial_snapshot_plan(partial_dir, snapshot_plan)
+
+    repaired_files = repaired_snapshot_manifest.get("files")
+    if not isinstance(repaired_files, list):
+        raise RuntimeError("repaired snapshot manifest has no files list")
+    bucket_receipts: dict[str, dict[str, object]] = {}
+    for bucket in buckets:
+        records = [
+            record
+            for record in repaired_files
+            if isinstance(record, dict)
+            and int(record.get("bucket", -1)) == bucket
+        ]
+        bucket_receipts[str(bucket)] = {
+            "data_glob": str(snapshot_root / "*" / str(bucket) / "*.parquet"),
+            "file_count": len(records),
+            "rows": sum(int(record["rows"]) for record in records),
+            "artifact_set_sha256": _canonical_sha256(
+                [
+                    {
+                        "path": str(record["snapshot"]),
+                        "size": int(record["size"]),
+                        "sha256": str(record["snapshot_sha256"]),
+                        "rows": int(record["rows"]),
+                    }
+                    for record in records
+                ]
+            ),
+        }
+    preparation_receipt = {
+        "schema": "cppmega_objective_snapshot_preparation_v1",
+        "status": "ready",
+        "created_at": _utc_now(),
+        "snapshot_plan_sha256": snapshot_plan["snapshot_plan_sha256"],
+        "source_root": str(snapshot_root),
+        "source_manifest": {
+            "path": str(snapshot_root / "source_manifest.json"),
+            "sha256": _sha256(snapshot_root / "source_manifest.json"),
+        },
+        "repaired_manifest": {
+            "path": str(snapshot_root / "repaired_manifest.json"),
+            "sha256": _sha256(snapshot_root / "repaired_manifest.json"),
+        },
+        "audit_receipt": {
+            "path": str(partial_dir / "audit/sidecar_parquet_audit.json"),
+            "sha256": _sha256(
+                partial_dir / "audit/sidecar_parquet_audit.json"
+            ),
+        },
+        "buckets": bucket_receipts,
+    }
+    preparation_path = snapshot_root / "objective_snapshot_preparation.json"
+    if preparation_path.is_symlink() or (
+        preparation_path.exists() and not preparation_path.is_file()
+    ):
+        raise RuntimeError(
+            f"objective snapshot preparation receipt is not a regular file: "
+            f"{preparation_path}"
+        )
+    _write_json_atomic(preparation_path, preparation_receipt)
+    return (
+        partial_dir,
+        builder_revision,
+        source_manifest,
+        repaired_snapshot_manifest,
+        repair_receipt,
+        audit_receipt,
+        source_composition,
+        ci_manifest,
+        pr_manifest,
+        preparation_receipt,
+    )
+
+
+def _run_prepare_objective_snapshot(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    output_dir: Path,
+) -> int:
+    (
+        partial_dir,
+        _builder_revision,
+        _source_manifest,
+        _repaired_snapshot_manifest,
+        _repair_receipt,
+        _audit_receipt,
+        _source_composition,
+        _ci_manifest,
+        _pr_manifest,
+        preparation_receipt,
+    ) = _prepare_objective_snapshot(
+        args=args,
+        buckets=buckets,
+        output_dir=output_dir,
+    )
+    print(
+        json.dumps(
+            {
+                "partial_bundle": str(partial_dir),
+                **preparation_receipt,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _run_build(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    objective_artifacts: dict[int, Path],
+    output_dir: Path,
+) -> int:
+    (
+        partial_dir,
+        builder_revision,
+        source_manifest,
+        repaired_snapshot_manifest,
+        repair_receipt,
+        audit_receipt,
+        source_composition,
+        ci_manifest,
+        pr_manifest,
+        _preparation_receipt,
+    ) = _prepare_objective_snapshot(
+        args=args,
+        buckets=buckets,
+        output_dir=output_dir,
+    )
+    snapshot_root = partial_dir / "snapshot"
     objective_source_bindings = {
         bucket: _validate_objective_source_binding(
             objective_artifact_path=objective_artifacts[bucket],
@@ -2892,14 +3215,18 @@ def _run_build(
         )
         for bucket in buckets
     }
-    audit_receipt = _run_snapshot_audit(
-        snapshot_root=snapshot_root,
-        audit_script=args.audit_script.resolve(),
-        audit_root=partial_dir / "audit",
+    build_plan = _create_build_plan(
+        args=args,
         buckets=buckets,
-        workers=args.audit_workers,
-        snapshot_manifest_sha256=_sha256(snapshot_root / "repaired_manifest.json"),
+        output_dir=output_dir,
+        objective_artifacts=objective_artifacts,
+        source_composition=source_composition.receipt,
+        builder_revision=builder_revision,
+        ci_manifest=ci_manifest,
+        pr_manifest=pr_manifest,
     )
+    _ensure_partial_build_plan(partial_dir, build_plan)
+
     _assert_build_plan_inputs(
         args=args,
         objective_artifacts=objective_artifacts,
@@ -3134,6 +3461,18 @@ def main(argv: Iterable[str] | None = None) -> int:
     output_dir = args.output_dir.resolve()
     lock = _acquire_build_lock(output_dir)
     try:
+        if args.prepare_objective_snapshot:
+            if args.objective_artifact:
+                raise SystemExit(
+                    "--prepare-objective-snapshot does not accept "
+                    "--objective-artifact; materialize artifacts from the "
+                    "prepared snapshot, then run the final build separately"
+                )
+            return _run_prepare_objective_snapshot(
+                args=args,
+                buckets=buckets,
+                output_dir=output_dir,
+            )
         objective_artifacts = _parse_objective_artifacts(
             args.objective_artifact, buckets
         )

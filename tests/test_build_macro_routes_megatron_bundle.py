@@ -16,6 +16,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     build_arg_parser,
     _canonical_sha256,
     _ensure_partial_build_plan,
+    _ensure_partial_snapshot_plan,
     _load_ci_manifest_allowlist,
     _load_pr_export_allowlist,
     _parse_objective_artifacts,
@@ -1657,6 +1658,68 @@ def _test_build_plan(objective_digest: str) -> dict[str, object]:
         "build_plan_sha256": _canonical_sha256(plan),
         "plan": plan,
     }
+
+
+def _test_snapshot_plan(source_digest: str) -> dict[str, object]:
+    plan = {
+        "buckets": [1024],
+        "source_composition_sha256": source_digest,
+    }
+    return {
+        "schema": builder.SNAPSHOT_PLAN_SCHEMA,
+        "snapshot_plan_sha256": _canonical_sha256(plan),
+        "plan": plan,
+    }
+
+
+def test_parser_exposes_explicit_objective_snapshot_preparation() -> None:
+    args = build_arg_parser().parse_args(["--prepare-objective-snapshot"])
+
+    assert args.prepare_objective_snapshot is True
+    assert args.objective_artifact == []
+
+
+def test_prepared_snapshot_plan_is_exactly_resume_bound(tmp_path: Path) -> None:
+    partial = tmp_path / ".bundle.partial"
+    original = _test_snapshot_plan("a" * 64)
+    _ensure_partial_snapshot_plan(partial, original)
+    _ensure_partial_snapshot_plan(partial, original)
+
+    with pytest.raises(RuntimeError, match="stale partial snapshot plan mismatch"):
+        _ensure_partial_snapshot_plan(
+            partial,
+            _test_snapshot_plan("b" * 64),
+        )
+
+
+def test_prepared_snapshot_can_adopt_one_exact_objective_build_plan(
+    tmp_path: Path,
+) -> None:
+    partial = tmp_path / ".bundle.partial"
+    snapshot_plan = _test_snapshot_plan("a" * 64)
+    build_plan = _test_build_plan("b" * 64)
+    _ensure_partial_snapshot_plan(partial, snapshot_plan)
+
+    _ensure_partial_build_plan(partial, build_plan)
+    _ensure_partial_build_plan(partial, build_plan)
+
+    assert json.loads(
+        (partial / "snapshot_plan.json").read_text(encoding="utf-8")
+    ) == snapshot_plan
+    assert json.loads(
+        (partial / "build_plan.json").read_text(encoding="utf-8")
+    ) == build_plan
+
+
+def test_prepared_snapshot_rejects_symlinked_objective_build_plan(
+    tmp_path: Path,
+) -> None:
+    partial = tmp_path / ".bundle.partial"
+    _ensure_partial_snapshot_plan(partial, _test_snapshot_plan("a" * 64))
+    (partial / "build_plan.json").symlink_to(tmp_path / "missing.json")
+
+    with pytest.raises(RuntimeError, match="invalid canonical build plan"):
+        _ensure_partial_build_plan(partial, _test_build_plan("b" * 64))
 
 
 def test_stale_partial_cannot_reuse_different_objective_build_plan(
