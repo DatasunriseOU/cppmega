@@ -163,17 +163,19 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - 8fdff5aa carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
-            #   - vendored TVM submodule (DatasunriseOU/tvm@36105156) includes
+            #   - 16531673 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - vendored TVM submodule (DatasunriseOU/tvm@78f930ed) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
             #   - the same TVM pin restores nvbench/l2_cache_flush.h, which
             #     TileLang's CUDA runtime still compiles.
+            #   - the TVM pin adapts AdjustMatmulOrder's axes to this fork's
+            #     boxed-Integer permute_dims API.
             #   - upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12,
             #     incompatible with FA4 beta23's >=0.1.12 floor.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: 8fdff5aa10f4265a4cb0e114d4c62613f3982180
+            ref: 16531673a11723a4d8243f2b94eb96a157c74cfc
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda
