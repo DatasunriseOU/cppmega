@@ -357,6 +357,50 @@ _SHELL_EXECUTABLE_RE = re.compile(
     r"(?:\.exe)?(?:\s|$)"
 )
 
+_SQL_DIALECT_COMMAND_PATTERNS: tuple[
+    tuple[str, re.Pattern[str]], ...
+] = (
+    (
+        "clickhouse",
+        re.compile(r"(?i)(?<![\w.-])clickhouse-client(?:\.exe)?(?![\w.-])"),
+    ),
+    ("duckdb", re.compile(r"(?i)(?<![\w.-])duckdb(?:\.exe)?(?![\w.-])")),
+    (
+        "mariadb",
+        re.compile(r"(?i)(?<![\w.-])mariadb(?:\.exe)?(?![\w.-])"),
+    ),
+    ("mysql", re.compile(r"(?i)(?<![\w.-])mysql(?:\.exe)?(?![\w.-])")),
+    ("oracle", re.compile(r"(?i)(?<![\w.-])sqlplus(?:\.exe)?(?![\w.-])")),
+    (
+        "postgresql",
+        re.compile(r"(?i)(?<![\w.-])psql(?:\.exe)?(?![\w.-])"),
+    ),
+    (
+        "sqlite",
+        re.compile(r"(?i)(?<![\w.-])sqlite3(?:\.exe)?(?![\w.-])"),
+    ),
+    (
+        "sql-server",
+        re.compile(r"(?i)(?<![\w.-])sqlcmd(?:\.exe)?(?![\w.-])"),
+    ),
+)
+_SQL_CLIENT_COMMAND_PREFIX_RE = re.compile(
+    r"""
+    \s*
+    (?:
+        (?:command|exec|nohup)\s+
+        |
+        env(?:\s+-[^\s]+)*\s+
+        |
+        sudo(?:\s+(?:-[ug]\s+[^\s]+|-[^\s]+))*\s+
+        |
+        [A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+
+    )*
+    (?:[^\s;&|"'`]*[\\/])?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _PATH_RE = re.compile(
     r"(?P<path>"
     r"[A-Za-z]:[\\/][^\s\"'<>|]+"
@@ -2093,6 +2137,64 @@ def _extract_shells_and_commands(
             }
         )
     return shell_records, commands, section_shell
+
+
+def _extract_sql_dialects(
+    commands: Sequence[Mapping[str, Any]],
+    builder: _EntityBuilder,
+) -> list[dict[str, Any]]:
+    """Classify SQL only when a retained command executes a known client."""
+
+    occurrences: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for command in commands:
+        text = str(command["text"])
+        command_start = int(command["start_char"])
+        for dialect, pattern in _SQL_DIALECT_COMMAND_PATTERNS:
+            for match in pattern.finditer(text):
+                if _SQL_CLIENT_COMMAND_PREFIX_RE.fullmatch(
+                    text[: match.start()]
+                ) is None:
+                    continue
+                start = command_start + match.start()
+                end = command_start + match.end()
+                entity_ref = builder.add(
+                    kind="sql_dialect",
+                    role="KEYWORD",
+                    domain="SQL",
+                    start=start,
+                    end=end,
+                    confidence=0.98,
+                    method=f"sql_client_command_v1:{dialect}",
+                    line_index=int(command["line_index"]),
+                    section_ordinal=int(command["section_ordinal"]),
+                    step_ordinal=command.get("step_ordinal"),
+                )
+                builder.edge(
+                    command["entity_ref"],
+                    entity_ref,
+                    "EMBEDDED_DOMAIN",
+                    confidence=0.98,
+                    method=f"sql_client_command_v1:{dialect}",
+                )
+                occurrences[dialect].append(
+                    {
+                        "start_char": start,
+                        "end_char": end,
+                        "line_index": int(command["line_index"]),
+                        "entity_ref": entity_ref,
+                    }
+                )
+    return [
+        {
+            "name": dialect,
+            "occurrence_count": len(occurrences[dialect]),
+            "occurrences": occurrences[dialect],
+            "confidence": _confidence(
+                0.98, source=f"sql_client_command_v1:{dialect}"
+            ),
+        }
+        for dialect in sorted(occurrences)
+    ]
 
 
 def _extract_build_systems_and_toolchains(
@@ -4199,6 +4301,22 @@ def _compact_classifications(
             clip_fields=clip_fields,
         )
 
+    sql_dialects = [
+        _bound_occurrence_field(record, field="occurrences")
+        for record in classifications.get("sql_dialects") or []
+    ]
+    compact["sql_dialects"] = sql_dialects[:MAX_CLASSIFICATION_GROUPS]
+    accounting["sql_dialects"] = {
+        "group_count": len(sql_dialects),
+        "retained_group_count": min(
+            len(sql_dialects), MAX_CLASSIFICATION_GROUPS
+        ),
+        "omitted_group_count": max(
+            0, len(sql_dialects) - MAX_CLASSIFICATION_GROUPS
+        ),
+        "all_groups_sha256": _sequence_digest(sql_dialects),
+    }
+
     build_systems = [
         _bound_occurrence_field(record, field="occurrences")
         for record in classifications.get("build_systems") or []
@@ -4519,6 +4637,7 @@ def canonicalize_ci_log(
     shell_dialects, commands, _section_shell = _extract_shells_and_commands(
         canonical_text, lines, sections, builder
     )
+    sql_dialects = _extract_sql_dialects(commands, builder)
     build_systems, toolchains = _extract_build_systems_and_toolchains(
         lines, sections, builder
     )
@@ -4560,6 +4679,7 @@ def canonicalize_ci_log(
 
     classifications: dict[str, Any] = {
         "shell_dialects": shell_dialects,
+        "sql_dialects": sql_dialects,
         "commands": commands,
         "build_systems": build_systems,
         "toolchains": toolchains,

@@ -56,6 +56,10 @@ from scripts.ci_source_binding_projection import (
     projection_script_sha256,
     target_parser_script_sha256,
 )
+from scripts.canonical_parquet_ledger import (
+    CanonicalParquetLedgerError,
+    iter_canonical_parquet_ledger,
+)
 from scripts.ci_zlib_evidence import (
     MAX_CONTENT_FRAME_COMPRESSED_BYTES,
     MAX_CONTENT_FRAME_RAW_BYTES,
@@ -152,7 +156,12 @@ _REPRESENTATIVE_SELECTION = (
     "one-per-eligible-token-sequence; "
     "content-sha256-then-eligible-occurrence-key"
 )
-_SOURCE_BINDING_PROJECTION_ARTIFACT = "source_binding_projection.jsonl"
+_SOURCE_BINDING_PROJECTION_ARTIFACTS = frozenset(
+    {
+        "source_binding_projection.jsonl",
+        "source_binding_projection.parquet",
+    }
+)
 _SOURCE_BINDING_PROJECTION_ORDER = (
     "occurrence-key-then-action-index-then-source-input-index"
 )
@@ -2014,6 +2023,33 @@ def _iter_canonical_jsonl(
             raise ExtractionError(f"{where} is empty")
 
 
+def _iter_canonical_ledger(
+    path: Path,
+    *,
+    where: str,
+    logical_domain: str,
+    expected_record_schema: str,
+    allow_empty: bool = False,
+) -> Iterator[tuple[dict[str, Any], bytes]]:
+    if path.suffix != ".parquet":
+        yield from _iter_canonical_jsonl(
+            path,
+            where=where,
+            allow_empty=allow_empty,
+        )
+        return
+    try:
+        yield from iter_canonical_parquet_ledger(
+            path,
+            expected_domain=logical_domain,
+            expected_record_schema=expected_record_schema,
+            max_record_bytes=MAX_JSONL_RECORD_BYTES - 1,
+            allow_empty=allow_empty,
+        )
+    except CanonicalParquetLedgerError as exc:
+        raise ExtractionError(f"{where} Parquet is invalid: {exc}") from exc
+
+
 def _require_occurrence_key(value: object, *, where: str) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != set(_OCCURRENCE_FIELDS):
         raise ExtractionError(
@@ -2115,18 +2151,16 @@ def _prepare_representatives(
         "representative_provenance_sha256",
     }
     logical = _RecordHasher("cppmega-ci-case5-representative-ledger-v1")
-    physical = hashlib.sha256()
-    physical_size = 0
     previous_sequence: str | None = None
-    for index, (record, raw) in enumerate(
-        _iter_canonical_jsonl(
+    for index, (record, _raw) in enumerate(
+        _iter_canonical_ledger(
             ledger_path,
             where="CASE5 representative ledger",
+            logical_domain="cppmega-ci-case5-representative-ledger-v1",
+            expected_record_schema=REPRESENTATIVE_LEDGER_SCHEMA,
             allow_empty=expected_count == 0,
         )
     ):
-        physical.update(raw)
-        physical_size += len(raw)
         if set(record) != required_keys or record.get("schema") != (
             REPRESENTATIVE_LEDGER_SCHEMA
         ):
@@ -2197,8 +2231,8 @@ def _prepare_representatives(
     if (
         logical.count != expected_count
         or logical.hexdigest != expected_logical
-        or physical_size != expected_artifact_size
-        or physical.hexdigest() != expected_artifact
+        or ledger_path.stat().st_size != expected_artifact_size
+        or _sha256_file(ledger_path) != expected_artifact
     ):
         raise ExtractionError("CASE5 representative ledger receipt differs")
     return {
@@ -2384,8 +2418,8 @@ def _prepare_source_binding_projection(
             SourceBindingProjectionRouter.MIXED_MODE,
         }
         or section.get("ledger_artifact")
-        != _SOURCE_BINDING_PROJECTION_ARTIFACT
-        or ledger_path.name != _SOURCE_BINDING_PROJECTION_ARTIFACT
+        not in _SOURCE_BINDING_PROJECTION_ARTIFACTS
+        or ledger_path.name != section.get("ledger_artifact")
         or section.get("claim_boundary")
         != _SOURCE_BINDING_PROJECTION_CLAIM_BOUNDARY
     ):
@@ -2579,7 +2613,7 @@ def _prepare_source_binding_projection(
     artifact_size = artifact.get("byte_size")
     if (
         set(artifact) != {"path", "kind", "rows", "byte_size", "sha256"}
-        or artifact.get("path") != _SOURCE_BINDING_PROJECTION_ARTIFACT
+        or artifact.get("path") != ledger_path.name
         or artifact.get("rows") != expected_count
         or isinstance(artifact_size, bool)
         or not isinstance(artifact_size, int)
@@ -2640,8 +2674,6 @@ def _prepare_source_binding_projection(
         )
 
     logical = _RecordHasher(SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN)
-    physical = hashlib.sha256()
-    physical_size = 0
     previous_key: tuple[str, str, str, str, int, int, int] | None = None
     previous_record_occurrence: tuple[str, str, str, str, int] | None = None
     previous_record_action: tuple[str, str, str, str, int, int] | None = None
@@ -2656,10 +2688,12 @@ def _prepare_source_binding_projection(
     decoded_actions: list[Any] | None = None
     decoded_action_index: int | None = None
     decoded_action_projection: tuple[dict[str, object], ...] | None = None
-    for index, (record, raw) in enumerate(
-        _iter_canonical_jsonl(
+    for index, (record, _raw) in enumerate(
+        _iter_canonical_ledger(
             ledger_path,
             where="source-binding projection ledger",
+            logical_domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+            expected_record_schema=SOURCE_BINDING_PROJECTION_SCHEMA,
             allow_empty=expected_count == 0,
         )
     ):
@@ -2765,8 +2799,6 @@ def _prepare_source_binding_projection(
                 (*key, _canonical_json(record)),
             )
         logical.update(record)
-        physical.update(raw)
-        physical_size += len(raw)
         change_counts[str(record["change_kind"])] += 1
         selection_counts[str(record["mode"])] += 1
         old_binding_count += record["old_binding"] is not None
@@ -2780,8 +2812,8 @@ def _prepare_source_binding_projection(
     if (
         logical.count != expected_count
         or logical.hexdigest != expected_logical
-        or physical_size != artifact_size
-        or physical.hexdigest() != expected_artifact
+        or ledger_path.stat().st_size != artifact_size
+        or _sha256_file(ledger_path) != expected_artifact
         or dict(sorted(change_counts.items()))
         != dict(sorted(expected_change_counts.items()))
         or (
@@ -4890,6 +4922,19 @@ def extract_binding_inventory(
         )
 
     output = Path(output_path)
+    projection_section = export_receipt.get("source_binding_projection")
+    projection_artifact = (
+        projection_section.get("ledger_artifact")
+        if isinstance(projection_section, Mapping)
+        else None
+    )
+    if (
+        not isinstance(projection_artifact, str)
+        or projection_artifact not in _SOURCE_BINDING_PROJECTION_ARTIFACTS
+    ):
+        raise ExtractionError(
+            "CASE5 source-binding projection receipt artifact is missing or unsafe"
+        )
     with tempfile.TemporaryDirectory(prefix="ci-source-inventory-") as temporary:
         snapshot_db = Path(temporary) / "snapshot.sqlite3"
         connection, projection_scope = _verify_frozen_content_store(
@@ -4907,7 +4952,7 @@ def extract_binding_inventory(
                 connection,
                 ledger_path=(
                     Path(case5_export_receipt_path).parent
-                    / _SOURCE_BINDING_PROJECTION_ARTIFACT
+                    / projection_artifact
                 ),
                 export_receipt=export_receipt,
                 content_receipt=content_receipt,

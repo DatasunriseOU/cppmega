@@ -6,9 +6,12 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import scripts.data.build_macro_routes_megatron_bundle as builder
+from scripts.canonical_parquet_ledger import CanonicalParquetLedgerWriter
 from scripts.data.build_macro_routes_megatron_bundle import (
     BUNDLE_KNOWN_LIMITATIONS,
     _acquire_build_lock,
@@ -191,7 +194,12 @@ def _write_content_store_ci_export(
                 bucket_dir
                 / f"ci-case5-{split}-{bucket}-{shard:06d}.parquet"
             )
-            parquet.write_bytes(f"ci-{bucket}-{split}".encode("ascii"))
+            pq.write_table(
+                pa.table({"fixture_row": [bucket]}),
+                parquet,
+                compression="zstd",
+                compression_level=9,
+            )
             row_valid_tokens = bucket - shard - 1
             row_trained_tokens = row_valid_tokens - 1
             relative = parquet.relative_to(root).as_posix()
@@ -222,25 +230,64 @@ def _write_content_store_ci_export(
             valid_tokens += row_valid_tokens
             trained_tokens += row_trained_tokens
 
-    for kind, filename in (
-        ("representative_ledger", "representative_ledger.jsonl"),
-        ("fragment_ledger", "fragment_ledger.jsonl"),
-        ("dropped_graph_edges", "dropped_graph_edges.jsonl"),
-        ("representative_metadata", "representative_metadata.jsonl"),
-        ("excluded_opaque_artifacts", "excluded_opaque_artifacts.jsonl"),
-        ("source_binding_projection", "source_binding_projection.jsonl"),
+    for kind, filename, domain in (
+        (
+            "representative_ledger",
+            "representative_ledger.parquet",
+            "cppmega-ci-case5-representative-ledger-v1",
+        ),
+        ("fragment_ledger", "fragment_ledger.parquet", None),
+        ("dropped_graph_edges", "dropped_graph_edges.parquet", None),
+        ("representative_metadata", "representative_metadata.parquet", None),
+        (
+            "excluded_opaque_artifacts",
+            "excluded_opaque_artifacts.parquet",
+            "cppmega-ci-case5-excluded-opaque-artifact-ledger-v1",
+        ),
+        (
+            "source_binding_projection",
+            "source_binding_projection.parquet",
+            "cppmega-ci-source-binding-projection-ledger-v1",
+        ),
     ):
         ledger = root / filename
-        ledger.write_text("{}\n", encoding="utf-8")
+        ledger.unlink(missing_ok=True)
+        ledger_writer = CanonicalParquetLedgerWriter(
+            ledger,
+            domain=domain,
+        )
+        ledger_writer.append({})
+        ledger_writer.close()
         artifacts.append(
             {
                 "path": filename,
                 "kind": kind,
-                "rows": 1,
+                "rows": ledger_writer.count,
                 "byte_size": ledger.stat().st_size,
                 "sha256": hashlib.sha256(ledger.read_bytes()).hexdigest(),
             }
         )
+    occurrence_metadata = root / "occurrence_metadata.parquet"
+    occurrence_metadata.unlink(missing_ok=True)
+    occurrence_writer = CanonicalParquetLedgerWriter(
+        occurrence_metadata,
+        domain="cppmega-ci-case5-occurrence-metadata-ledger-v1",
+    )
+    occurrence_writer.append(
+        {"schema": "cppmega_ci_case5_occurrence_metadata_v1"}
+    )
+    occurrence_writer.close()
+    artifacts.append(
+        {
+            "path": occurrence_metadata.name,
+            "kind": "occurrence_metadata",
+            "rows": occurrence_writer.count,
+            "byte_size": occurrence_metadata.stat().st_size,
+            "sha256": hashlib.sha256(
+                occurrence_metadata.read_bytes()
+            ).hexdigest(),
+        }
+    )
 
     payload_tokens = 20_000_000_123
     exporter_path = (
@@ -286,6 +333,7 @@ def _write_content_store_ci_export(
             "overflow_rows": 0,
             "parquet_shard_max_rows": 512,
             "parquet_layout": "bucket-first-split-in-filename-v1",
+            "parquet_compression": {"codec": "zstd", "level": 9},
         },
         "eligibility": {
             "target_exact_unique_payload_tokens": 20_000_000_000,
@@ -306,6 +354,24 @@ def _write_content_store_ci_export(
             "count": len(buckets),
             "ledger_sha256": "4" * 64,
         },
+        "source_binding_projection": {
+            "coverage": {"occurrence_count": occurrence_writer.count},
+        },
+        "occurrence_metadata": {
+            "schema": "cppmega_ci_case5_occurrence_metadata_v1",
+            "scope": "one-record-per-frozen-cas-occurrence",
+            "count": occurrence_writer.count,
+            "input_occurrence_set_sha256": "a" * 64,
+            "artifact": occurrence_metadata.name,
+            "artifact_sha256": hashlib.sha256(
+                occurrence_metadata.read_bytes()
+            ).hexdigest(),
+            "physical_format": {
+                "container": "parquet",
+                "compression": "zstd",
+                "record_encoding": "canonical-json",
+            },
+        },
         "counts": {
             "representatives": len(buckets),
             "fragments": fragments,
@@ -325,6 +391,7 @@ def _write_content_store_ci_export(
             "zero_overflow": True,
             "payload_conserved": True,
             "payload_identity_and_order_verified": True,
+            "all_case5_parquet_zstd": True,
             "post_normalize_pack_sidecars_and_edges_verified": True,
             "case5_audit": audits,
         },
@@ -662,6 +729,73 @@ def test_content_store_export_allowlist_rejects_drift_and_orphans(
     manifest_path = _write_content_store_ci_export(ci_root)
     (ci_root / "1024" / "orphan.parquet").write_bytes(b"orphan")
     with pytest.raises(RuntimeError, match="inventory differs"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_content_store_export_requires_physical_zstd_training_parquet(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    parquet_path = (
+        ci_root
+        / "1024"
+        / "ci-case5-train-1024-000000.parquet"
+    )
+    table = pq.read_table(parquet_path)
+    pq.write_table(table, parquet_path, compression=None)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifact = next(
+        item
+        for item in manifest["artifacts"]
+        if item["path"] == "1024/ci-case5-train-1024-000000.parquet"
+    )
+    artifact["byte_size"] = parquet_path.stat().st_size
+    artifact["sha256"] = hashlib.sha256(parquet_path.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="CI training Parquet is not receipt-bound ZSTD",
+    ):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_content_store_export_requires_zstd_receipt_contract(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["case5_contract"]["parquet_compression"] = {
+        "codec": "snappy",
+        "level": None,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="unsupported CI export CASE5 bucket contract",
+    ):
         _load_ci_manifest_allowlist(
             manifest_path,
             ci_root,

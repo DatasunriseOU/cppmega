@@ -39,7 +39,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
-from typing import Any, BinaryIO, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -92,6 +92,10 @@ from cppmega.megatron.domain_route_contract import (  # noqa: E402
     VALID_DOMAIN_ROLE_IDS,
 )
 from scripts.audit_sidecar_parquet import _audit_file  # noqa: E402
+from scripts.canonical_parquet_ledger import (  # noqa: E402
+    CanonicalParquetLedgerWriter,
+    iter_canonical_parquet_ledger,
+)
 from scripts.ci_content_store import (  # noqa: E402
     RECEIPT_SCHEMA as STORE_RECEIPT_SCHEMA,
     STORE_SCHEMA,
@@ -162,8 +166,12 @@ EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
 PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
-REPRESENTATIVE_METADATA_SCHEMA = "cppmega_ci_case5_representative_metadata_v2"
-DERIVED_CLASSIFICATION_SCHEMA = "cppmega_ci_case5_derived_classifications_v1"
+REPRESENTATIVE_METADATA_SCHEMA = "cppmega_ci_case5_representative_metadata_v3"
+DERIVED_CLASSIFICATION_SCHEMA = "cppmega_ci_case5_derived_classifications_v2"
+OCCURRENCE_METADATA_SCHEMA = "cppmega_ci_case5_occurrence_metadata_v1"
+OCCURRENCE_METADATA_LEDGER_DOMAIN = (
+    "cppmega-ci-case5-occurrence-metadata-ledger-v1"
+)
 OPAQUE_ARTIFACT_LEDGER_SCHEMA = "cppmega_ci_case5_excluded_opaque_artifact_v1"
 OPAQUE_ARTIFACT_POLICY_SCHEMA = "cppmega_ci_opaque_artifact_policy_v1"
 OPAQUE_INVALID_RATIO_PPM_THRESHOLD = 100_000
@@ -172,6 +180,7 @@ TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v2"
 BUCKETS = (1024, 2048, 4096, 8192, 16384)
 PARQUET_SHARD_ROWS = 512
 PARQUET_SHARD_TOKEN_BUDGET = 16_384
+PARQUET_ZSTD_LEVEL = 9
 SPLIT_CONTRACT = {
     "schema": "cppmega_ci_token_sequence_split_v1",
     "hash": "token_sequence_sha256",
@@ -363,64 +372,13 @@ class FetchMemberEvidence:
     invalid_ratio_ppm: int
 
 
-class CanonicalLedgerWriter:
-    """Stream canonical JSONL while hashing the logical framed record sequence."""
-
-    def __init__(
-        self,
-        path: Path,
-        *,
-        domain: str | None = None,
-        max_record_bytes: int | None = None,
-    ):
-        self.path = path
-        self._handle: BinaryIO = path.open("wb")
-        self._logical_digest = hashlib.sha256()
-        if domain is not None:
-            self._logical_digest.update(domain.encode("ascii"))
-            self._logical_digest.update(b"\0")
-        self.count = 0
-        self._closed = False
-        self._max_record_bytes = max_record_bytes
-
-    def append(self, value: object) -> None:
-        if self._closed:
-            raise ExportError(f"ledger is already closed: {self.path}")
-        encoded = _canonical_json_bytes(value)
-        if (
-            self._max_record_bytes is not None
-            and len(encoded) + 1 > self._max_record_bytes
-        ):
-            raise ExportError(
-                f"{self.path.name} record exceeds "
-                f"{self._max_record_bytes} bytes"
-            )
-        self._handle.write(encoded)
-        self._handle.write(b"\n")
-        self._logical_digest.update(len(encoded).to_bytes(8, "big"))
-        self._logical_digest.update(encoded)
-        self.count += 1
-
-    @property
-    def logical_sha256(self) -> str:
-        if not self._closed:
-            raise ExportError(f"ledger is not closed: {self.path}")
-        return self._logical_digest.hexdigest()
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._handle.flush()
-        os.fsync(self._handle.fileno())
-        self._handle.close()
-        self._closed = True
-
-
-def _source_binding_projection_writer(path: Path) -> CanonicalLedgerWriter:
-    return CanonicalLedgerWriter(
+def _source_binding_projection_writer(
+    path: Path,
+) -> CanonicalParquetLedgerWriter:
+    return CanonicalParquetLedgerWriter(
         path,
         domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
-        max_record_bytes=MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+        max_record_bytes=MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES - 1,
     )
 
 
@@ -3999,11 +3957,18 @@ def _derived_classifications(
         where="parser_sidecar.classifications",
     )
 
-    def parser_named_values(group: str) -> list[str]:
+    def parser_named_values(
+        group: str,
+        *,
+        optional: bool = False,
+    ) -> list[str]:
         values: list[str] = []
+        raw_group = parser_classifications.get(group)
+        if raw_group is None and optional:
+            raw_group = []
         for index, raw_record in enumerate(
             _require_list(
-                parser_classifications.get(group),
+                raw_group,
                 where=f"parser_sidecar.classifications.{group}",
             )
         ):
@@ -4021,6 +3986,8 @@ def _derived_classifications(
         return values
 
     parser_languages = parser_named_values("languages")
+    parser_shell_dialects = parser_named_values("shell_dialects")
+    parser_sql_dialects = parser_named_values("sql_dialects", optional=True)
     parser_build_systems = parser_named_values("build_systems")
     parser_toolchains = parser_named_values("toolchains")
     source_paths: list[str] = []
@@ -4245,22 +4212,41 @@ def _derived_classifications(
 
     return {
         "schema": DERIVED_CLASSIFICATION_SCHEMA,
+        "scope_contract": {
+            "workflow_job_runner": "exact-occurrence-api-metadata",
+            "parser_classifications": "archive-member",
+            "training_sidecars": "chunk-local",
+            "derived_values": (
+                "typed union; evidence_source identifies member versus chunk scope"
+            ),
+        },
         "language": {
             **_typed_string_set(
                 languages,
                 evidence_source=(
-                    "training-entity-language-and-retained-source-extension-v1"
+                    "archive-member-parser-plus-chunk-training-entity-and-"
+                    "retained-source-extension-v1"
                 ),
             ),
             "source_extension_evidence": extension_language_evidence,
         },
+        "shell_dialect": _typed_string_set(
+            parser_shell_dialects,
+            evidence_source="archive-member-parser-shell-dialect-v1",
+        ),
+        "sql_dialect": _typed_string_set(
+            parser_sql_dialects,
+            evidence_source="archive-member-exact-sql-client-command-v1",
+        ),
         "source_extension": _typed_string_set(
             source_extensions,
             evidence_source="retained-build-input-binding-and-diagnostic-path-v1",
         ),
         "system": _typed_string_set(
             systems,
-            evidence_source="exact-github-actions-runner-os-label-v1",
+            evidence_source=(
+                "exact-job-label-plus-archive-member-parser-platform-v1"
+            ),
         ),
         "platform": {
             "value_type": "github_actions_runner_label_platform",
@@ -4275,6 +4261,19 @@ def _derived_classifications(
                 else None
             ),
             "evidence_source": "exact-github-actions-job-labels-v1",
+            "completeness": (
+                "complete"
+                if (
+                    (os_labels or projected_parser_platform.get("os"))
+                    and (
+                        architecture_labels
+                        or projected_parser_platform.get("architecture")
+                    )
+                )
+                else "partial"
+                if platform_resolved
+                else "unresolved"
+            ),
         },
         "runner": {
             "value_type": "github_actions_runner",
@@ -4312,7 +4311,9 @@ def _derived_classifications(
                 if detected_test_count
                 else None
             ),
-            "evidence_source": "retained-training-test-records-v1",
+            "evidence_source": (
+                "archive-member-parser-plus-chunk-training-test-records-v1"
+            ),
         },
         "tool": _typed_string_set(
             tools,
@@ -4621,25 +4622,27 @@ def _representative_metadata_record(
     }
 
 
-def _iter_canonical_jsonl(path: Path, *, schema: str) -> Iterable[dict[str, Any]]:
-    with path.open("rb") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            if len(raw_line) > 1024 * 1024:
-                raise ExportError(f"{path.name}:{line_number} exceeds 1 MiB")
-            encoded = raw_line.removesuffix(b"\n")
-            try:
-                value = json.loads(encoded)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ExportError(f"{path.name}:{line_number} is invalid JSON") from exc
-            if (
-                not isinstance(value, dict)
-                or value.get("schema") != schema
-                or _canonical_json_bytes(value) != encoded
-            ):
-                raise ExportError(
-                    f"{path.name}:{line_number} is not canonical {schema}"
-                )
-            yield value
+def _occurrence_metadata_record(
+    *,
+    content: ContentRecord,
+    occurrence: OccurrenceRecord,
+    member: FetchMemberEvidence,
+    source_binding_projector: SourceBindingProjector
+    | SourceBindingProjectionRouter,
+) -> dict[str, object]:
+    record = _representative_metadata_record(
+        content=content,
+        occurrence=occurrence,
+        parser_sidecar=member.sidecar,
+        source_binding_projector=source_binding_projector,
+    )
+    record["schema"] = OCCURRENCE_METADATA_SCHEMA
+    record["scope"] = "one-record-per-frozen-cas-occurrence"
+    record["case5_eligibility"] = {
+        "status": "excluded_opaque" if member.opaque else "eligible",
+        "reason": member.exclusion_reason,
+    }
+    return record
 
 
 def export_store(
@@ -4751,12 +4754,13 @@ def export_store(
         )
     )
     published = False
-    fragment_writer: CanonicalLedgerWriter | None = None
-    dropped_edge_writer: CanonicalLedgerWriter | None = None
-    representative_metadata_writer: CanonicalLedgerWriter | None = None
-    representative_ledger_writer: CanonicalLedgerWriter | None = None
-    excluded_opaque_writer: CanonicalLedgerWriter | None = None
-    source_binding_projection_writer: CanonicalLedgerWriter | None = None
+    fragment_writer: CanonicalParquetLedgerWriter | None = None
+    dropped_edge_writer: CanonicalParquetLedgerWriter | None = None
+    representative_metadata_writer: CanonicalParquetLedgerWriter | None = None
+    representative_ledger_writer: CanonicalParquetLedgerWriter | None = None
+    excluded_opaque_writer: CanonicalParquetLedgerWriter | None = None
+    source_binding_projection_writer: CanonicalParquetLedgerWriter | None = None
+    occurrence_metadata_writer: CanonicalParquetLedgerWriter | None = None
     eligibility_connection: sqlite3.Connection | None = None
     parquet_writers: dict[tuple[str, int], pq.ParquetWriter] = {}
     try:
@@ -4826,7 +4830,12 @@ def export_store(
                 ),
             )
             source_binding_projection_writer = _source_binding_projection_writer(
-                temp_path / "source_binding_projection.jsonl"
+                temp_path / "source_binding_projection.parquet"
+            )
+            occurrence_metadata_writer = CanonicalParquetLedgerWriter(
+                temp_path / "occurrence_metadata.parquet",
+                domain=OCCURRENCE_METADATA_LEDGER_DOMAIN,
+                max_record_bytes=1024 * 1024,
             )
             source_binding_projection_counts: Counter[str] = Counter()
             previous_source_binding_projection_key: (
@@ -4866,9 +4875,10 @@ def export_store(
                 );
                 """
             )
-            excluded_opaque_writer = CanonicalLedgerWriter(
-                temp_path / "excluded_opaque_artifacts.jsonl",
+            excluded_opaque_writer = CanonicalParquetLedgerWriter(
+                temp_path / "excluded_opaque_artifacts.parquet",
                 domain="cppmega-ci-case5-excluded-opaque-artifact-ledger-v1",
+                max_record_bytes=1024 * 1024,
             )
             prevalidated_occurrence_count = 0
             excluded_occurrence_payload_tokens = 0
@@ -4932,6 +4942,14 @@ def export_store(
                             f"selection_mode:{projection.selected_mode}"
                         ] += 1
                 content = store.get_content_record(occurrence.content_sha256)
+                occurrence_metadata_writer.append(
+                    _occurrence_metadata_record(
+                        content=content,
+                        occurrence=occurrence,
+                        member=member,
+                        source_binding_projector=source_binding_projector,
+                    )
+                )
                 try:
                     eligibility_connection.execute(
                         """
@@ -5004,14 +5022,17 @@ def export_store(
             frozen_fetch_state.verify_member_coverage(eligibility_connection)
             excluded_opaque_writer.close()
             source_binding_projection_writer.close()
+            occurrence_metadata_writer.close()
             if (
                 source_binding_projection_counts["occurrences"]
                 != expected_occurrence_count
                 or source_binding_projection_counts["source_inputs"]
                 != source_binding_projection_writer.count
+                or occurrence_metadata_writer.count
+                != expected_occurrence_count
             ):
                 raise ExportError(
-                    "source-binding projection coverage differs from the CAS"
+                    "occurrence sidecar coverage differs from the CAS"
                 )
             excluded_member_count = int(
                 eligibility_connection.execute(
@@ -5025,10 +5046,11 @@ def export_store(
                 ).fetchone()[0]
             )
 
-            ledger_path = temp_path / "representative_ledger.jsonl"
-            representative_ledger_writer = CanonicalLedgerWriter(
+            ledger_path = temp_path / "representative_ledger.parquet"
+            representative_ledger_writer = CanonicalParquetLedgerWriter(
                 ledger_path,
                 domain="cppmega-ci-case5-representative-ledger-v1",
+                max_record_bytes=1024 * 1024,
             )
             parser_sidecar_sequence = CanonicalSequenceHasher(
                 domain="cppmega-ci-parser-sidecar-occurrence-sequence-v1"
@@ -5202,12 +5224,17 @@ def export_store(
             eligibility_connection = None
             eligibility_path.unlink()
 
-            fragment_writer = CanonicalLedgerWriter(temp_path / "fragment_ledger.jsonl")
-            dropped_edge_writer = CanonicalLedgerWriter(
-                temp_path / "dropped_graph_edges.jsonl"
+            fragment_writer = CanonicalParquetLedgerWriter(
+                temp_path / "fragment_ledger.parquet",
+                max_record_bytes=1024 * 1024,
             )
-            representative_metadata_writer = CanonicalLedgerWriter(
-                temp_path / "representative_metadata.jsonl"
+            dropped_edge_writer = CanonicalParquetLedgerWriter(
+                temp_path / "dropped_graph_edges.parquet",
+                max_record_bytes=1024 * 1024,
+            )
+            representative_metadata_writer = CanonicalParquetLedgerWriter(
+                temp_path / "representative_metadata.parquet",
+                max_record_bytes=1024 * 1024,
             )
             row_buffers: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
             row_counts: Counter[tuple[str, int]] = Counter()
@@ -5243,7 +5270,12 @@ def export_store(
                     path = directory / (
                         f"ci-case5-{split_name}-{bucket_size}-{shard_index:06d}.parquet"
                     )
-                    parquet_writers[key] = pq.ParquetWriter(path, table.schema)
+                    parquet_writers[key] = pq.ParquetWriter(
+                        path,
+                        table.schema,
+                        compression="zstd",
+                        compression_level=PARQUET_ZSTD_LEVEL,
+                    )
                     shard_paths[key] = path
                 parquet_writers[key].write_table(
                     table,
@@ -5261,9 +5293,13 @@ def export_store(
             graph_by_family: Counter[str] = Counter()
             source_doc_index = 0
 
-            for ledger_record in _iter_canonical_jsonl(
+            for ledger_record, _encoded in iter_canonical_parquet_ledger(
                 ledger_path,
-                schema=REPRESENTATIVE_LEDGER_SCHEMA,
+                expected_domain=(
+                    "cppmega-ci-case5-representative-ledger-v1"
+                ),
+                expected_record_schema=REPRESENTATIVE_LEDGER_SCHEMA,
+                max_record_bytes=1024 * 1024,
             ):
                 representative_content = store.get_content_record(
                     _require_hex64(
@@ -5625,7 +5661,21 @@ def export_store(
                 if match is None:
                     raise ExportError(f"generated CASE5 path is not canonical: {path}")
                 split = match.group(1)
-                parquet_rows = int(pq.ParquetFile(path).metadata.num_rows)
+                parquet_metadata = pq.ParquetFile(path).metadata
+                parquet_rows = int(parquet_metadata.num_rows)
+                parquet_codecs = {
+                    str(
+                        parquet_metadata.row_group(row_group)
+                        .column(column)
+                        .compression
+                    )
+                    for row_group in range(parquet_metadata.num_row_groups)
+                    for column in range(parquet_metadata.num_columns)
+                }
+                if parquet_codecs != {"ZSTD"}:
+                    raise ExportError(
+                        f"generated CASE5 Parquet is not ZSTD-compressed: {path}"
+                    )
                 audit_result = _audit_file(
                     str(path), "ci", str(bucket), EXPECTED_VOCAB_SIZE
                 )
@@ -5688,6 +5738,11 @@ def export_store(
                     source_binding_projection_writer.path,
                     "source_binding_projection",
                     source_binding_projection_writer.count,
+                ),
+                (
+                    occurrence_metadata_writer.path,
+                    "occurrence_metadata",
+                    occurrence_metadata_writer.count,
                 ),
             ):
                 artifact_records.append(
@@ -5824,6 +5879,32 @@ def export_store(
                         "bytes, token IDs, token counts and CAS receipts are unchanged"
                     ),
                 },
+                "occurrence_metadata": {
+                    "schema": OCCURRENCE_METADATA_SCHEMA,
+                    "scope": "one-record-per-frozen-cas-occurrence",
+                    "count": occurrence_metadata_writer.count,
+                    "input_occurrence_set_sha256": store.receipt[
+                        "occurrence_set_sha256"
+                    ],
+                    "logical_domain": OCCURRENCE_METADATA_LEDGER_DOMAIN,
+                    "logical_sha256": occurrence_metadata_writer.logical_sha256,
+                    "artifact": occurrence_metadata_writer.path.relative_to(
+                        temp_path
+                    ).as_posix(),
+                    "artifact_sha256": _sha256_file(
+                        occurrence_metadata_writer.path
+                    ),
+                    "physical_format": {
+                        "container": "parquet",
+                        "compression": "zstd",
+                        "record_encoding": "canonical-json",
+                    },
+                    "claim_boundary": (
+                        "sanitized occurrence API metadata and chunk-local "
+                        "training sidecars; raw command and diagnostic message "
+                        "text are omitted"
+                    ),
+                },
                 "tokenizer": {
                     "exact_tokenizer_schema": tokenizer.contract["schema"],
                     "fingerprint": tokenizer.fingerprint,
@@ -5841,6 +5922,10 @@ def export_store(
                     "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
                     "buckets": list(BUCKETS),
                     "parquet_shard_max_rows": PARQUET_SHARD_ROWS,
+                    "parquet_compression": {
+                        "codec": "zstd",
+                        "level": PARQUET_ZSTD_LEVEL,
+                    },
                     "parquet_buffer_token_budget_per_split_bucket": (
                         PARQUET_SHARD_TOKEN_BUDGET
                     ),
@@ -6040,6 +6125,7 @@ def export_store(
                     "zero_overflow": True,
                     "payload_conserved": True,
                     "payload_identity_and_order_verified": True,
+                    "all_case5_parquet_zstd": True,
                     "post_normalize_pack_sidecars_and_edges_verified": True,
                 },
             }
@@ -6113,6 +6199,8 @@ def export_store(
             excluded_opaque_writer.close()
         if source_binding_projection_writer is not None:
             source_binding_projection_writer.close()
+        if occurrence_metadata_writer is not None:
+            occurrence_metadata_writer.close()
         if eligibility_connection is not None:
             eligibility_connection.close()
         for writer in parquet_writers.values():

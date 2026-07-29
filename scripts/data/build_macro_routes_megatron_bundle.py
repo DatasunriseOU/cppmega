@@ -29,6 +29,8 @@ import threading
 import time
 from typing import Iterable, TextIO
 
+import pyarrow.parquet as pq
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_ROOT = REPO_ROOT / "scripts"
@@ -523,6 +525,7 @@ def _load_content_store_ci_export_allowlist(
         "zero_overflow",
         "payload_conserved",
         "payload_identity_and_order_verified",
+        "all_case5_parquet_zstd",
         "post_normalize_pack_sidecars_and_edges_verified",
     )
     if not isinstance(validation, dict) or any(
@@ -541,6 +544,8 @@ def _load_content_store_ci_export_allowlist(
         or case5.get("parquet_shard_max_rows") != 512
         or case5.get("parquet_layout")
         != "bucket-first-split-in-filename-v1"
+        or case5.get("parquet_compression")
+        != {"codec": "zstd", "level": 9}
     ):
         raise RuntimeError(
             f"{manifest_path}: unsupported CI export CASE5 bucket contract"
@@ -647,10 +652,14 @@ def _load_content_store_ci_export_allowlist(
     counts = manifest.get("counts")
     representatives = manifest.get("representatives")
     graph = manifest.get("graph_accounting")
+    occurrence_metadata = manifest.get("occurrence_metadata")
+    source_binding_projection = manifest.get("source_binding_projection")
     if (
         not isinstance(counts, dict)
         or not isinstance(representatives, dict)
         or not isinstance(graph, dict)
+        or not isinstance(occurrence_metadata, dict)
+        or not isinstance(source_binding_projection, dict)
     ):
         raise RuntimeError(f"{manifest_path}: CI export accounting is incomplete")
 
@@ -678,6 +687,34 @@ def _load_content_store_ci_export_allowlist(
     representative_count = positive_int(
         representatives.get("count"), where="representative count"
     )
+    projection_coverage = source_binding_projection.get("coverage")
+    occurrence_count = positive_int(
+        (
+            projection_coverage.get("occurrence_count")
+            if isinstance(projection_coverage, dict)
+            else None
+        ),
+        where="source-binding projection occurrence count",
+    )
+    if (
+        occurrence_metadata.get("schema")
+        != "cppmega_ci_case5_occurrence_metadata_v1"
+        or occurrence_metadata.get("scope")
+        != "one-record-per-frozen-cas-occurrence"
+        or occurrence_metadata.get("count") != occurrence_count
+        or occurrence_metadata.get("input_occurrence_set_sha256")
+        != input_store["occurrence_set_sha256"]
+        or occurrence_metadata.get("artifact") != "occurrence_metadata.parquet"
+        or occurrence_metadata.get("physical_format")
+        != {
+            "container": "parquet",
+            "compression": "zstd",
+            "record_encoding": "canonical-json",
+        }
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI occurrence metadata coverage is incomplete"
+        )
     eligible_tokens = positive_int(
         eligible.get("exact_unique_payload_tokens"),
         where="eligible exact unique payload tokens",
@@ -746,12 +783,13 @@ def _load_content_store_ci_export_allowlist(
     expected_relative_parquets: set[Path] = set()
     provenance_artifacts: list[dict[str, object]] = []
     expected_ledger_names = {
-        "representative_ledger": "representative_ledger.jsonl",
-        "fragment_ledger": "fragment_ledger.jsonl",
-        "dropped_graph_edges": "dropped_graph_edges.jsonl",
-        "representative_metadata": "representative_metadata.jsonl",
-        "excluded_opaque_artifacts": "excluded_opaque_artifacts.jsonl",
-        "source_binding_projection": "source_binding_projection.jsonl",
+        "representative_ledger": "representative_ledger.parquet",
+        "fragment_ledger": "fragment_ledger.parquet",
+        "dropped_graph_edges": "dropped_graph_edges.parquet",
+        "representative_metadata": "representative_metadata.parquet",
+        "excluded_opaque_artifacts": "excluded_opaque_artifacts.parquet",
+        "source_binding_projection": "source_binding_projection.parquet",
+        "occurrence_metadata": "occurrence_metadata.parquet",
     }
     observed_ledger_kinds: set[str] = set()
     observed_rows = 0
@@ -811,6 +849,33 @@ def _load_content_store_ci_export_allowlist(
                     f"{manifest_path}: unsupported CI export artifact: {relative}"
                 )
             observed_ledger_kinds.add(kind)
+            if kind == "occurrence_metadata" and (
+                row_count != occurrence_count
+                or sha256 != occurrence_metadata.get("artifact_sha256")
+            ):
+                raise RuntimeError(
+                    f"{manifest_path}: CI occurrence metadata artifact differs"
+                )
+            if relative.suffix == ".parquet":
+                parquet_metadata = pq.ParquetFile(artifact_path).metadata
+                codecs = {
+                    str(
+                        parquet_metadata.row_group(row_group)
+                        .column(column)
+                        .compression
+                    )
+                    for row_group in range(parquet_metadata.num_row_groups)
+                    for column in range(parquet_metadata.num_columns)
+                }
+                if (
+                    parquet_metadata.num_rows != row_count
+                    or "UNCOMPRESSED" in codecs
+                    or any(codec != "ZSTD" for codec in codecs)
+                ):
+                    raise RuntimeError(
+                        f"{manifest_path}: CI sidecar Parquet is not "
+                        f"receipt-bound ZSTD: {relative}"
+                    )
             provenance_artifacts.append(
                 {
                     "path": relative.as_posix(),
@@ -842,6 +907,21 @@ def _load_content_store_ci_export_allowlist(
                 f"{manifest_path}: CI parquet split/bucket binding drifted: {relative}"
             )
         rows = positive_int(raw_artifact.get("rows"), where=f"{relative} rows")
+        parquet_metadata = pq.ParquetFile(artifact_path).metadata
+        codecs = {
+            str(
+                parquet_metadata.row_group(row_group)
+                .column(column)
+                .compression
+            )
+            for row_group in range(parquet_metadata.num_row_groups)
+            for column in range(parquet_metadata.num_columns)
+        }
+        if parquet_metadata.num_rows != rows or codecs != {"ZSTD"}:
+            raise RuntimeError(
+                f"{manifest_path}: CI training Parquet is not "
+                f"receipt-bound ZSTD: {relative}"
+            )
         if (
             relative in expected_relative_parquets
             or relative.name in allowed[("ci", bucket)]
@@ -885,7 +965,9 @@ def _load_content_store_ci_export_allowlist(
             f"{manifest_path}: CI export has no Parquet shards for buckets {missing}"
         )
     actual_relative_parquets = {
-        path for path in actual_relative_files if path.suffix == ".parquet"
+        path
+        for path in actual_relative_files
+        if path.suffix == ".parquet" and len(path.parts) == 2
     }
     if actual_relative_parquets != expected_relative_parquets:
         raise RuntimeError(
