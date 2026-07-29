@@ -44,7 +44,9 @@ from cppmega.data.pr_primary_membership import (  # noqa: E402
     build_primary_pr_membership,
     count_primary_pr_keys,
     iter_primary_pr_keys,
+    publish_primary_pr_membership_inputs,
     verify_primary_pr_membership_binding,
+    verify_primary_pr_membership_receipt,
 )
 from cppmega.data.source_conveyor_composition import (  # noqa: E402
     SourceComposition,
@@ -346,11 +348,13 @@ def _manifest_input(
     args: argparse.Namespace,
     binding: dict[str, object],
     primary_membership: dict[str, object],
+    primary_membership_receipt: dict[str, object],
     lengths: tuple[int, ...],
 ) -> dict[str, object]:
     return {
         "pr_completion": binding,
         "primary_membership": primary_membership,
+        "primary_membership_receipt": primary_membership_receipt,
         "exporter_script_sha256": _sha256_file(Path(__file__).resolve()),
         "pr_completion_receipt": str(
             Path(args.pr_completion_receipt).resolve()
@@ -435,6 +439,7 @@ def _publish_complete_receipt(
     manifest: dict,
     binding: dict[str, object],
     primary_membership: dict[str, object],
+    primary_membership_receipt: dict[str, object],
     scan_id: str,
     target_lengths: tuple[int, ...],
     selected_pr_count: int,
@@ -497,6 +502,7 @@ def _publish_complete_receipt(
         "scan_id": scan_id,
         "pr_completion": binding,
         "primary_membership": primary_membership,
+        "primary_membership_receipt": primary_membership_receipt,
         "exporter_script_sha256": _sha256_file(Path(__file__).resolve()),
         "target_lengths": list(target_lengths),
         "selected_pr_count": selected_pr_count,
@@ -509,6 +515,7 @@ def _publish_complete_receipt(
         "validation": {
             "exact_scan_membership": True,
             "exact_primary_commit_membership": True,
+            "portable_primary_membership_verified": True,
             "input_revalidated_after_export": True,
             "document_conservation": True,
             "all_requested_buckets_present": True,
@@ -535,6 +542,7 @@ def export_pr_parquet(
     revalidate_at_finish: bool = True,
     source_composition: SourceComposition | None = None,
     primary_membership: dict[str, object] | None = None,
+    primary_membership_receipt: dict[str, object] | None = None,
     connection: sqlite3.Connection | None = None,
 ) -> dict:
     store = Path(args.store)
@@ -575,6 +583,18 @@ def export_pr_parquet(
                 buckets=lengths,
                 scan_id=scan_id,
             )
+            (
+                primary_membership,
+                primary_membership_receipt,
+            ) = publish_primary_pr_membership_inputs(
+                conn,
+                output_root=output_root,
+                membership=primary_membership,
+            )
+        elif primary_membership_receipt is None:
+            raise ValueError(
+                "provided primary membership requires its receipt binding"
+            )
         shard_name = _shard_name(args.repo, scan_id, int(args.offset))
         with tempfile.TemporaryDirectory(prefix="pr_parquet_export_") as tmp:
             work = Path(tmp)
@@ -614,11 +634,13 @@ def export_pr_parquet(
         if owns_connection:
             conn.close()
     assert primary_membership is not None
+    assert primary_membership_receipt is not None
     result = {
         "source": "pr",
         "store": str(store),
         "pr_completion": binding,
         "primary_membership": primary_membership,
+        "primary_membership_receipt": primary_membership_receipt,
         "scan_id": scan_id,
         "output_root": str(output_root),
         "shard": shard_name,
@@ -633,6 +655,11 @@ def export_pr_parquet(
             source_composition=composition,
             commit_root=commit_root,
             buckets=lengths,
+        )
+        verify_primary_pr_membership_receipt(
+            primary_membership,
+            primary_membership_receipt,
+            output_root=output_root,
         )
     return result
 
@@ -672,6 +699,7 @@ def export_pr_parquet_batches(
     complete = False
     result: dict[str, object]
     primary_membership: dict[str, object] | None = None
+    primary_membership_receipt: dict[str, object] | None = None
     conn = connect(str(store), create=False, readonly=True)
     try:
         primary_membership = build_primary_pr_membership(
@@ -681,10 +709,19 @@ def export_pr_parquet_batches(
             buckets=lengths,
             scan_id=scan_id,
         )
+        (
+            primary_membership,
+            primary_membership_receipt,
+        ) = publish_primary_pr_membership_inputs(
+            conn,
+            output_root=Path(args.output_root),
+            membership=primary_membership,
+        )
         expected_input = _manifest_input(
             args,
             binding,
             primary_membership,
+            primary_membership_receipt,
             lengths,
         )
         manifest = _load_manifest(
@@ -745,6 +782,7 @@ def export_pr_parquet_batches(
                         revalidate_at_finish=False,
                         source_composition=composition,
                         primary_membership=primary_membership,
+                        primary_membership_receipt=primary_membership_receipt,
                         connection=conn,
                     )
                 except Exception as exc:
@@ -780,6 +818,7 @@ def export_pr_parquet_batches(
             "store": str(store),
             "pr_completion": binding,
             "primary_membership": primary_membership,
+            "primary_membership_receipt": primary_membership_receipt,
             "scan_id": scan_id,
             "output_root": str(Path(args.output_root)),
             "manifest": str(manifest_path),
@@ -796,13 +835,23 @@ def export_pr_parquet_batches(
     finally:
         conn.close()
         _revalidate_pr_completion(args, binding)
-        if primary_membership is not None:
+        if (
+            primary_membership is not None
+            and primary_membership_receipt is not None
+        ):
             verify_primary_pr_membership_binding(
                 primary_membership,
                 source_composition=composition,
                 commit_root=commit_root,
                 buckets=lengths,
             )
+            verify_primary_pr_membership_receipt(
+                primary_membership,
+                primary_membership_receipt,
+                output_root=Path(args.output_root),
+            )
+    assert primary_membership is not None
+    assert primary_membership_receipt is not None
     if complete:
         manifest["completed_pr_count"] = selected_pr_count
         if global_selection:
@@ -814,6 +863,7 @@ def export_pr_parquet_batches(
                 manifest=manifest,
                 binding=binding,
                 primary_membership=primary_membership,
+                primary_membership_receipt=primary_membership_receipt,
                 scan_id=scan_id,
                 target_lengths=lengths,
                 selected_pr_count=selected_pr_count,

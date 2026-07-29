@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -17,9 +18,11 @@ from cppmega.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_PR_NUMBERS_COLUMN,
 )
 from cppmega.data.pr_primary_membership import (
+    PRIMARY_PR_MEMBERSHIP_TABLE,
     PRIMARY_PR_MEMBERSHIP_POLICY,
     PRIMARY_PR_MEMBERSHIP_SCHEMA,
     primary_commit_artifact_binding,
+    publish_primary_pr_membership_inputs,
 )
 from cppmega.data.source_conveyor_composition import SourceComposition
 import scripts.data.build_macro_routes_megatron_bundle as builder
@@ -569,6 +572,10 @@ def _write_pr_export(
         dedup_receipt_path=root.parent / "dedup.json",
         run_files=(),
     )
+    membership_digest = hashlib.sha256()
+    membership_key = b"owner/repo\x001"
+    membership_digest.update(len(membership_key).to_bytes(8, "big"))
+    membership_digest.update(membership_key)
     membership = {
         "schema": PRIMARY_PR_MEMBERSHIP_SCHEMA,
         "policy": PRIMARY_PR_MEMBERSHIP_POLICY,
@@ -585,7 +592,7 @@ def _write_pr_export(
         "selected_pr_count": 1,
         "sha_only_matched_source_docs": 0,
         "unmatched_commit_sha_source_docs": 0,
-        "selected_membership_sha256": "8" * 64,
+        "selected_membership_sha256": membership_digest.hexdigest(),
         "validation": {
             "source_composition_complete": True,
             "exact_allowlisted_commit_artifacts": True,
@@ -594,6 +601,34 @@ def _write_pr_export(
             "direct_pr_sha_conflicts": 0,
         },
     }
+    membership_conn = sqlite3.connect(":memory:")
+    membership_conn.row_factory = sqlite3.Row
+    try:
+        membership_conn.execute(
+            f"""
+            CREATE TEMP TABLE {PRIMARY_PR_MEMBERSHIP_TABLE} (
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                PRIMARY KEY (repo, pr_number)
+            )
+            """
+        )
+        membership_conn.execute(
+            f"""
+            INSERT INTO {PRIMARY_PR_MEMBERSHIP_TABLE}(repo, pr_number)
+            VALUES (?, ?)
+            """,
+            ("owner/repo", 1),
+        )
+        membership, membership_receipt = (
+            publish_primary_pr_membership_inputs(
+                membership_conn,
+                output_root=root,
+                membership=membership,
+            )
+        )
+    finally:
+        membership_conn.close()
     artifacts: list[dict[str, object]] = []
     for bucket in buckets:
         bucket_root = root / str(bucket)
@@ -631,7 +666,7 @@ def _write_pr_export(
     done_manifest.write_text(
         json.dumps(
             {
-                "schema": "cppmega_pr_parquet_export_manifest_v2",
+                "schema": "cppmega_pr_parquet_export_manifest_v3",
                 "status": "complete",
             }
         )
@@ -646,6 +681,7 @@ def _write_pr_export(
         "scan_id": scan_id,
         "pr_completion": completion,
         "primary_membership": membership,
+        "primary_membership_receipt": membership_receipt,
         "exporter_script_sha256": hashlib.sha256(exporter.read_bytes()).hexdigest(),
         "target_lengths": list(buckets),
         "selected_pr_count": 1,
@@ -658,6 +694,7 @@ def _write_pr_export(
         "validation": {
             "exact_scan_membership": True,
             "exact_primary_commit_membership": True,
+            "portable_primary_membership_verified": True,
             "input_revalidated_after_export": True,
             "document_conservation": True,
             "all_requested_buckets_present": True,
@@ -749,6 +786,53 @@ def test_pr_export_allowlist_binds_exact_scan_and_every_artifact(
             receipt_path,
             pr_root,
             (1024, 2048, 4096, 8192, 16384),
+            source_composition=composition,
+            commit_root=commit_root,
+        )
+
+
+def test_pr_export_allowlist_rejects_portable_membership_receipt_drift(
+    tmp_path: Path,
+) -> None:
+    pr_root = tmp_path / "pr"
+    receipt_path, composition, commit_root = _write_pr_export(pr_root)
+    membership_receipt = pr_root / "primary_pr_membership_receipt.json"
+    membership_receipt.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="primary PR membership receipt binding drifted",
+    ):
+        _load_pr_export_allowlist(
+            receipt_path,
+            pr_root,
+            builder.DEFAULT_BUCKETS,
+            source_composition=composition,
+            commit_root=commit_root,
+        )
+
+
+def test_pr_export_allowlist_rejects_portable_membership_artifact_drift(
+    tmp_path: Path,
+) -> None:
+    pr_root = tmp_path / "pr"
+    receipt_path, composition, commit_root = _write_pr_export(pr_root)
+    artifact = pr_root / "primary_pr_membership.parquet"
+    parquet = pq.ParquetFile(artifact)
+    mutated = pa.Table.from_pylist(
+        [{"repo": "owner/repo", "pr_number": 2}],
+        schema=parquet.schema_arrow,
+    )
+    pq.write_table(mutated, artifact, compression="zstd")
+
+    with pytest.raises(
+        RuntimeError,
+        match="primary PR membership receipt binding drifted",
+    ):
+        _load_pr_export_allowlist(
+            receipt_path,
+            pr_root,
+            builder.DEFAULT_BUCKETS,
             source_composition=composition,
             commit_root=commit_root,
         )

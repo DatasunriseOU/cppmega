@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pyarrow as pa
@@ -219,3 +220,114 @@ def test_primary_membership_binding_rejects_commit_artifact_mutation(
             commit_root=commit_root,
             buckets=(1024,),
         )
+
+
+def test_primary_membership_publishes_portable_verified_zstd_artifact(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.pr_primary_membership import (
+        PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME,
+        PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME,
+        build_primary_pr_membership,
+        publish_primary_pr_membership_inputs,
+        verify_primary_pr_membership_artifact,
+        verify_primary_pr_membership_receipt,
+    )
+
+    store, scan_id = _store(tmp_path)
+    composition, commit_root = _composition(
+        tmp_path,
+        [
+            {
+                "repo": "owner/repo",
+                NUM_DOCS_COLUMN: 2,
+                SOURCE_PR_NUMBERS_COLUMN: [1, None],
+                SOURCE_COMMIT_HASHES_COLUMN: [_sha(1), _sha(2)],
+                SOURCE_HAS_PR_DISCUSSIONS_COLUMN: [True, False],
+            }
+        ],
+    )
+    output_root = tmp_path / "export"
+    conn = connect(str(store), create=False, readonly=True)
+    try:
+        membership = build_primary_pr_membership(
+            conn,
+            source_composition=composition,
+            commit_root=commit_root,
+            buckets=(1024,),
+            scan_id=scan_id,
+        )
+        published, binding = publish_primary_pr_membership_inputs(
+            conn,
+            output_root=output_root,
+            membership=membership,
+        )
+        repeated = publish_primary_pr_membership_inputs(
+            conn,
+            output_root=output_root,
+            membership=membership,
+        )
+    finally:
+        conn.close()
+
+    artifact_path = output_root / PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME
+    receipt_path = output_root / PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME
+    assert repeated == (published, binding)
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == published
+    assert binding == {
+        "path": PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME,
+        "byte_size": receipt_path.stat().st_size,
+        "sha256": published_receipt_sha256(receipt_path),
+    }
+    parquet = pq.ParquetFile(artifact_path)
+    assert {
+        str(
+            parquet.metadata.row_group(row_group)
+            .column(column)
+            .compression
+        )
+        for row_group in range(parquet.metadata.num_row_groups)
+        for column in range(parquet.metadata.num_columns)
+    } == {"ZSTD"}
+    assert parquet.read().to_pylist() == [
+        {"repo": "owner/repo", "pr_number": 1},
+        {"repo": "owner/repo", "pr_number": 2},
+    ]
+    assert verify_primary_pr_membership_artifact(
+        published,
+        output_root=output_root,
+    ) == published["artifact"]
+    assert verify_primary_pr_membership_receipt(
+        published,
+        binding,
+        output_root=output_root,
+    ) == binding
+
+    original_receipt = receipt_path.read_bytes()
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="receipt binding drifted"):
+        verify_primary_pr_membership_receipt(
+            published,
+            binding,
+            output_root=output_root,
+        )
+    receipt_path.write_bytes(original_receipt)
+    mutated = pa.Table.from_pylist(
+        [
+            {"repo": "owner/repo", "pr_number": 1},
+            {"repo": "owner/repo", "pr_number": 999},
+        ],
+        schema=parquet.schema_arrow,
+    )
+    pq.write_table(mutated, artifact_path, compression="zstd")
+    with pytest.raises(RuntimeError, match="logical digest drifted"):
+        verify_primary_pr_membership_artifact(
+            published,
+            output_root=output_root,
+        )
+
+
+def published_receipt_sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()

@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 from typing import Iterator
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cppmega.data.nanochat_pipeline.packed_rows_schema import (
@@ -30,6 +32,11 @@ PRIMARY_PR_MEMBERSHIP_POLICY = (
     "exact_allowlisted_primary_commit_source_documents_v1"
 )
 PRIMARY_PR_MEMBERSHIP_TABLE = "_cppmega_primary_pr_membership"
+PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA = (
+    "cppmega_primary_pr_membership_parquet_v1"
+)
+PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME = "primary_pr_membership.parquet"
+PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME = "primary_pr_membership_receipt.json"
 _SOURCE_REFS_TABLE = "_cppmega_primary_pr_source_refs"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -556,6 +563,345 @@ def _membership_sha256(conn: sqlite3.Connection) -> str:
     return digest.hexdigest()
 
 
+def _membership_arrow_schema(
+    *,
+    scan_id: str,
+    membership_sha256: str,
+) -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("repo", pa.string(), nullable=False),
+            pa.field("pr_number", pa.int64(), nullable=False),
+        ],
+        metadata={
+            b"cppmega.primary_pr_membership_schema": (
+                PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA.encode("ascii")
+            ),
+            b"cppmega.primary_pr_membership_policy": (
+                PRIMARY_PR_MEMBERSHIP_POLICY.encode("ascii")
+            ),
+            b"cppmega.primary_pr_membership_scan_id": scan_id.encode("ascii"),
+            b"cppmega.primary_pr_membership_sha256": (
+                membership_sha256.encode("ascii")
+            ),
+        },
+    )
+
+
+def _artifact_descriptor(
+    path: Path,
+    *,
+    expected_scan_id: str,
+    expected_rows: int,
+    expected_membership_sha256: str,
+) -> dict[str, object]:
+    parquet = pq.ParquetFile(path)
+    expected_schema = _membership_arrow_schema(
+        scan_id=expected_scan_id,
+        membership_sha256=expected_membership_sha256,
+    )
+    if parquet.schema_arrow != expected_schema:
+        raise RuntimeError(
+            f"{path}: primary PR membership parquet schema drifted"
+        )
+    if int(parquet.metadata.num_rows) != expected_rows:
+        raise RuntimeError(
+            f"{path}: primary PR membership rows drifted: "
+            f"parquet={parquet.metadata.num_rows} expected={expected_rows}"
+        )
+    for row_group in range(parquet.metadata.num_row_groups):
+        for column in range(parquet.metadata.num_columns):
+            compression = str(
+                parquet.metadata.row_group(row_group).column(column).compression
+            ).upper()
+            if compression != "ZSTD":
+                raise RuntimeError(
+                    f"{path}: primary PR membership parquet must be ZSTD, "
+                    f"got {compression}"
+                )
+
+    digest = hashlib.sha256()
+    observed_rows = 0
+    previous: tuple[str, int] | None = None
+    for batch in parquet.iter_batches(
+        columns=["repo", "pr_number"],
+        batch_size=8192,
+    ):
+        for row in batch.to_pylist():
+            repo = row.get("repo")
+            pr_number = row.get("pr_number")
+            if (
+                not isinstance(repo, str)
+                or not repo.strip()
+                or isinstance(pr_number, bool)
+                or not isinstance(pr_number, int)
+                or pr_number < 1
+            ):
+                raise RuntimeError(
+                    f"{path}: invalid primary PR membership key"
+                )
+            key = (repo, pr_number)
+            if previous is not None and key <= previous:
+                raise RuntimeError(
+                    f"{path}: primary PR membership keys are not strictly sorted"
+                )
+            previous = key
+            encoded = f"{repo}\0{pr_number}".encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            observed_rows += 1
+    observed_sha256 = digest.hexdigest()
+    if (
+        observed_rows != expected_rows
+        or observed_sha256 != expected_membership_sha256
+    ):
+        raise RuntimeError(
+            f"{path}: primary PR membership logical digest drifted"
+        )
+    return {
+        "schema": PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA,
+        "path": PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME,
+        "rows": observed_rows,
+        "byte_size": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "membership_sha256": observed_sha256,
+    }
+
+
+def verify_primary_pr_membership_artifact(
+    membership: object,
+    *,
+    output_root: Path,
+) -> dict[str, object]:
+    """Verify the portable ZSTD key artifact bound by a membership receipt."""
+
+    if (
+        not isinstance(membership, dict)
+        or membership.get("schema") != PRIMARY_PR_MEMBERSHIP_SCHEMA
+        or membership.get("policy") != PRIMARY_PR_MEMBERSHIP_POLICY
+    ):
+        raise RuntimeError("primary PR membership receipt is unsupported")
+    scan_id = _require_scan_id(membership.get("scan_id"))
+    selected = membership.get("selected_pr_count")
+    logical_sha256 = membership.get("selected_membership_sha256")
+    if (
+        isinstance(selected, bool)
+        or not isinstance(selected, int)
+        or selected < 1
+        or not isinstance(logical_sha256, str)
+        or _SHA256_RE.fullmatch(logical_sha256) is None
+    ):
+        raise RuntimeError("primary PR membership receipt counters are invalid")
+    root = output_root.expanduser()
+    if root.is_symlink():
+        raise RuntimeError(f"primary PR membership root is a symlink: {root}")
+    path = root.resolve() / PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(
+            f"primary PR membership artifact is missing or symlinked: {path}"
+        )
+    descriptor = _artifact_descriptor(
+        path,
+        expected_scan_id=scan_id,
+        expected_rows=selected,
+        expected_membership_sha256=logical_sha256,
+    )
+    if membership.get("artifact") != descriptor:
+        raise RuntimeError("primary PR membership artifact binding drifted")
+    return descriptor
+
+
+def verify_primary_pr_membership_receipt(
+    membership: object,
+    receipt_binding: object,
+    *,
+    output_root: Path,
+) -> dict[str, object]:
+    """Verify the immutable JSON receipt and its portable Parquet artifact."""
+
+    if (
+        not isinstance(receipt_binding, dict)
+        or set(receipt_binding) != {"path", "byte_size", "sha256"}
+        or receipt_binding.get("path") != PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME
+        or isinstance(receipt_binding.get("byte_size"), bool)
+        or not isinstance(receipt_binding.get("byte_size"), int)
+        or int(receipt_binding["byte_size"]) < 1
+        or not isinstance(receipt_binding.get("sha256"), str)
+        or _SHA256_RE.fullmatch(str(receipt_binding["sha256"])) is None
+    ):
+        raise RuntimeError("primary PR membership receipt binding is malformed")
+    root = output_root.expanduser()
+    if root.is_symlink():
+        raise RuntimeError(f"primary PR membership root is a symlink: {root}")
+    receipt_path = root.resolve() / PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise RuntimeError(
+            "primary PR membership receipt is missing or symlinked: "
+            f"{receipt_path}"
+        )
+    if (
+        receipt_path.stat().st_size != int(receipt_binding["byte_size"])
+        or _sha256_file(receipt_path) != receipt_binding["sha256"]
+    ):
+        raise RuntimeError("primary PR membership receipt binding drifted")
+    try:
+        portable_membership = json.loads(
+            receipt_path.read_text(encoding="utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid primary PR membership receipt: {receipt_path}"
+        ) from exc
+    if portable_membership != membership:
+        raise RuntimeError(
+            "primary PR membership JSON receipt differs from bound membership"
+        )
+    verify_primary_pr_membership_artifact(
+        membership,
+        output_root=root,
+    )
+    return dict(receipt_binding)
+
+
+def _write_membership_receipt(path: Path, membership: dict[str, object]) -> None:
+    payload = (
+        json.dumps(membership, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    staged = path.with_name(f".{path.name}.staging-{os.getpid()}")
+    if staged.exists() or staged.is_symlink():
+        raise FileExistsError(
+            f"stale primary PR membership receipt staging file: {staged}"
+        )
+    try:
+        with staged.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def publish_primary_pr_membership_inputs(
+    conn: sqlite3.Connection,
+    *,
+    output_root: Path,
+    membership: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Publish portable membership keys and their immutable JSON receipt."""
+
+    scan_id = _require_scan_id(membership.get("scan_id"))
+    selected = membership.get("selected_pr_count")
+    logical_sha256 = membership.get("selected_membership_sha256")
+    if (
+        membership.get("schema") != PRIMARY_PR_MEMBERSHIP_SCHEMA
+        or membership.get("policy") != PRIMARY_PR_MEMBERSHIP_POLICY
+        or isinstance(selected, bool)
+        or not isinstance(selected, int)
+        or selected < 1
+        or not isinstance(logical_sha256, str)
+        or _SHA256_RE.fullmatch(logical_sha256) is None
+    ):
+        raise ValueError("cannot publish malformed primary PR membership")
+    root = output_root.expanduser()
+    if root.is_symlink():
+        raise ValueError(f"primary PR output root must not be a symlink: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    resolved_root = root.resolve()
+    artifact_path = resolved_root / PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME
+    if artifact_path.is_symlink():
+        raise FileExistsError(
+            f"primary PR membership artifact is a symlink: {artifact_path}"
+        )
+    if not artifact_path.exists():
+        staged = artifact_path.with_name(
+            f".{artifact_path.name}.staging-{os.getpid()}"
+        )
+        if staged.exists() or staged.is_symlink():
+            raise FileExistsError(
+                f"stale primary PR membership staging artifact: {staged}"
+            )
+        schema = _membership_arrow_schema(
+            scan_id=scan_id,
+            membership_sha256=logical_sha256,
+        )
+        written = 0
+        try:
+            with pq.ParquetWriter(
+                staged,
+                schema,
+                compression="zstd",
+            ) as writer:
+                cursor = conn.execute(
+                    f"""
+                    SELECT repo, pr_number
+                    FROM {PRIMARY_PR_MEMBERSHIP_TABLE}
+                    ORDER BY repo, pr_number
+                    """
+                )
+                while rows := cursor.fetchmany(8192):
+                    writer.write_table(
+                        pa.Table.from_pylist(
+                            [
+                                {
+                                    "repo": str(row["repo"]),
+                                    "pr_number": int(row["pr_number"]),
+                                }
+                                for row in rows
+                            ],
+                            schema=schema,
+                        )
+                    )
+                    written += len(rows)
+            if written != selected:
+                raise RuntimeError(
+                    "primary PR membership artifact row conservation failed: "
+                    f"written={written} expected={selected}"
+                )
+            with staged.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(staged, artifact_path)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    descriptor = _artifact_descriptor(
+        artifact_path,
+        expected_scan_id=scan_id,
+        expected_rows=selected,
+        expected_membership_sha256=logical_sha256,
+    )
+    published = {**membership, "artifact": descriptor}
+    receipt_path = resolved_root / PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME
+    if receipt_path.is_symlink():
+        raise FileExistsError(
+            f"primary PR membership receipt is a symlink: {receipt_path}"
+        )
+    if receipt_path.exists():
+        try:
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"invalid primary PR membership receipt: {receipt_path}"
+            ) from exc
+        if existing != published:
+            raise RuntimeError(
+                f"existing primary PR membership receipt differs: {receipt_path}"
+            )
+    else:
+        _write_membership_receipt(receipt_path, published)
+    receipt_binding = {
+        "path": PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME,
+        "byte_size": receipt_path.stat().st_size,
+        "sha256": _sha256_file(receipt_path),
+    }
+    verify_primary_pr_membership_receipt(
+        published,
+        receipt_binding,
+        output_root=resolved_root,
+    )
+    return published, receipt_binding
+
+
 def build_primary_pr_membership(
     conn: sqlite3.Connection,
     *,
@@ -683,9 +1029,15 @@ __all__ = [
     "PRIMARY_PR_MEMBERSHIP_POLICY",
     "PRIMARY_PR_MEMBERSHIP_SCHEMA",
     "PRIMARY_PR_MEMBERSHIP_TABLE",
+    "PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME",
+    "PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA",
+    "PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME",
     "build_primary_pr_membership",
     "count_primary_pr_keys",
     "iter_primary_pr_keys",
     "primary_commit_artifact_binding",
+    "publish_primary_pr_membership_inputs",
     "verify_primary_pr_membership_binding",
+    "verify_primary_pr_membership_artifact",
+    "verify_primary_pr_membership_receipt",
 ]
