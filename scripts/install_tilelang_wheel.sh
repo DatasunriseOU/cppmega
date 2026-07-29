@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9+cuda.git5952468a into the active (or given) venv.
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@8fdff5aa into the active
+# (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
-# Fallback:     clone DatasunriseOU/tilelang at commit 5952468a, build from source.
+# Fallback:     clone DatasunriseOU/tilelang at the exact pinned commit.
 #
 # This fork commit carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix,
-# via vendored TVM DatasunriseOU/tvm@9b0a1667) and removes the
-# apache-tvm-ffi<0.1.10 cap (upstream PR #2071), so it imports cleanly under
-# tvm-ffi >=0.1.12 as required by FA4 beta23. Must match STACK.lock.
+# via vendored TVM DatasunriseOU/tvm@36105156), restores the nvbench CUDA
+# L2-cache-flush header, and removes the apache-tvm-ffi<0.1.10 cap (upstream
+# PR #2071), so it imports cleanly under tvm-ffi >=0.1.12 as required by FA4
+# beta23. Must match STACK.lock.
 #
 # Usage:
 #   scripts/install_tilelang_wheel.sh                # uses $VIRTUAL_ENV
@@ -20,8 +22,9 @@
 
 set -euo pipefail
 
-WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9+cuda.git5952468a-cp38-abi3-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-5952468a}"
+WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-8fdff5aa10f4265a4cb0e114d4c62613f3982180}"
+TVM_COMMIT="${TILELANG_TVM_COMMIT:-36105156803007279d6ff481621b083441503cde}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"
 
 # --- venv activation ---------------------------------------------------------
@@ -45,16 +48,25 @@ ARCH="$(uname -m)"
 # --- helper: verify import succeeds -----------------------------------------
 verify_import() {
   python - <<'PY'
-import tilelang, sys
+from importlib import metadata
+import tilelang
+
 print(f"[tilelang] imported OK: {tilelang.__version__} @ {tilelang.__file__}")
-if "5952468a" not in tilelang.__version__:
-    print(f"WARNING: version does not contain expected commit 5952468a", file=sys.stderr)
+observed = metadata.version("tilelang")
+if observed != "0.1.9":
+    raise SystemExit(f"unexpected TileLang version: {observed!r} != '0.1.9'")
 PY
 }
 
 # --- wheel path (x86_64 only) ------------------------------------------------
 if [[ "${FORCE_SOURCE}" != "1" && "${ARCH}" == "x86_64" ]]; then
-  TMP_WHEEL="/tmp/tilelang-${GIT_COMMIT}.whl"
+  TMP_WHEEL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cppmega-tilelang-wheel.XXXXXX")"
+  TMP_WHEEL="${TMP_WHEEL_DIR}/tilelang.whl"
+  cleanup_temp_wheel() {
+    rm -f "${TMP_WHEEL}"
+    rmdir "${TMP_WHEEL_DIR}" 2>/dev/null || true
+  }
+  trap cleanup_temp_wheel EXIT
   echo "[tilelang] fetching wheel: ${WHEEL_URL}"
   if [[ "${WHEEL_URL}" == sftp://* ]]; then
     if gsutil cp "${WHEEL_URL}" "${TMP_WHEEL}"; then
@@ -86,6 +98,9 @@ fi
 cd "${SRC_DIR}"
 git fetch origin
 git checkout "${GIT_COMMIT}"
+test "$(git rev-parse HEAD)" = "${GIT_COMMIT}"
 git submodule update --init --recursive
+test "$(git -C 3rdparty/tvm rev-parse HEAD)" = "${TVM_COMMIT}"
+test -f 3rdparty/tvm/3rdparty/nvbench/l2_cache_flush.h
 pip install -e . --no-build-isolation
 verify_import

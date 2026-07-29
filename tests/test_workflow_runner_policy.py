@@ -185,7 +185,7 @@ def test_wheel_build_keeps_gcc_and_gxx_in_one_alternatives_group() -> None:
     assert workflow.count('test "$(readlink -f /usr/bin/g++)"') == 2
 
 
-def test_wheel_build_uses_torch_matched_cudnn_without_replacing_system_cudnn() -> None:
+def test_wheel_build_uses_torch_matched_cuda_libraries_without_system_replacement() -> None:
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
     ).read_text(encoding="utf-8")
@@ -196,6 +196,46 @@ def test_wheel_build_uses_torch_matched_cudnn_without_replacing_system_cudnn() -
     assert '"nvidia-nccl-cu13": metadata.version("nvidia-nccl-cu13")' in workflow
     assert 'if torch.version.cuda != "13.2":' in workflow
     assert 'stream.write(f"CUDNN_PATH={cudnn_path}\\n")' in workflow
-    assert 'f"CPATH={cudnn_path / \'include\'}:"' in workflow
-    assert 'f"LIBRARY_PATH={cudnn_path / \'lib\'}:"' in workflow
+    assert 'nccl_path = resolve_package_root("nvidia.nccl")' in workflow
+    assert 'nccl_path / "include/nccl.h"' in workflow
+    assert 'glob("libnccl.so.2*")' in workflow
+    assert 'stream.write(f"NCCL_PATH={nccl_path}\\n")' in workflow
+    assert 'f"CPATH={nccl_path / \'include\'}:"' in workflow
+    assert 'f"{cudnn_path / \'include\'}:"' in workflow
+    assert 'f"LIBRARY_PATH={nccl_path / \'lib\'}:"' in workflow
+    assert 'f"{cudnn_path / \'lib\'}:"' in workflow
     assert "grep -q 'release 13\\.2'" in workflow
+
+
+def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
+    tilelang_commit = "8fdff5aa10f4265a4cb0e114d4c62613f3982180"
+    tvm_commit = "36105156803007279d6ff481621b083441503cde"
+    wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+    stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
+    rebuild = (REPO_ROOT / "scripts" / "rebuild_tilelang_wheel.sh").read_text(
+        encoding="utf-8"
+    )
+    install = (REPO_ROOT / "scripts" / "install_tilelang_wheel.sh").read_text(
+        encoding="utf-8"
+    )
+    modal_build = (
+        REPO_ROOT / "scripts" / "modal_build_tilelang_beta23.py"
+    ).read_text(encoding="utf-8")
+    modal_base = (REPO_ROOT / "scripts" / "modal_cppmega_base.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert f"ref: {tilelang_commit}" in workflow
+    assert f"ref: {tilelang_commit}" in stack
+    for text in (rebuild, install, modal_build):
+        assert tilelang_commit in text
+        assert tvm_commit in text
+    for text in (install, modal_build, modal_base):
+        assert wheel_name in text
+    assert "version: 0.1.9" in stack
+    assert "/tmp/cppmega_wheels" not in modal_base
+    assert '_REPO_ROOT / "wheels"' in modal_base

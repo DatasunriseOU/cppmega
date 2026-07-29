@@ -7,21 +7,24 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
-  - tilelang 0.1.9+cuda.git5952468a (local wheel, abi3; DatasunriseOU fork —
-    carries apache/tvm#18938 __slots__ fix + removes apache-tvm-ffi<0.1.10 cap)
+  - tilelang 0.1.9 from DatasunriseOU/tilelang@8fdff5aa (local abi3 wheel;
+    carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
+    the apache-tvm-ffi<0.1.10 cap)
   - qoptim_cuda 0.0.0 (local wheel)
   - fast_hadamard_transform 1.1.0 (local wheel)
   - apache-tvm-ffi 0.1.9 (pypi; fork also imports cleanly under >=0.1.12 for FA4 beta23)
   - megatron-core 0.18 from origin/dev HEAD (editable)
 
-Wheels are downloaded once from HETZ_1_IP:/data/gs-* to
-/tmp/cppmega_wheels/ and baked into the image via add_local_dir(copy=True).
-Total: ~700 MB, caches once in Modal's layer store, reused forever.
+Wheels are downloaded once into the repository-owned wheels/ directory (or
+CPPMEGA_WHEELS_DIR) and baked into the image via add_local_file(copy=True).
+The local compressed inputs therefore survive a host restart; Modal caches the
+resulting image layer separately.
 """
 # ruff: noqa: E402
 
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import Any
 
@@ -34,7 +37,9 @@ TORCH_INDEX = "https://download.pytorch.org/whl/cu132"
 MEGATRON_COMMIT = "980211ae"  # bench3's pin (2026-04-09), before output_cross_entropy_loss kwarg
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
-_WHEELS_DIR = "/tmp/cppmega_wheels"
+_WHEELS_DIR = pathlib.Path(
+    os.environ.get("CPPMEGA_WHEELS_DIR", _REPO_ROOT / "wheels")
+).expanduser().resolve()
 
 _WHEEL_FILES = [
     "transformer_engine_torch-2.13.0-cp313-cp313-linux_x86_64.whl",
@@ -44,7 +49,7 @@ _WHEEL_FILES = [
     "causal_conv1d-1.6.1-cp313-cp313-linux_x86_64.whl",
     "flash_attn-2.8.3-cp313-cp313-linux_x86_64.whl",
     "qoptim_cuda-0.0.0-cp313-cp313-linux_x86_64.whl",
-    "tilelang-0.1.9+cuda.git5952468a-cp38-abi3-linux_x86_64.whl",
+    "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl",
     "fast_hadamard_transform-1.1.0-cp313-cp313-linux_x86_64.whl",
 ]
 
@@ -95,12 +100,19 @@ def cppmega_base_image() -> modal.Image:
             "liger-kernel",
         )
     )
-    # Add wheels from local scp'd /tmp/cppmega_wheels/ as a single big layer.
-    wheels_path = pathlib.Path(_WHEELS_DIR)
+    # Add durable, compressed local wheel inputs as one image layer. Missing
+    # pins fail locally instead of producing a partially populated image.
+    wheels_path = _WHEELS_DIR
+    missing_wheels = [
+        name for name in _WHEEL_FILES if not (wheels_path / name).is_file()
+    ]
+    if missing_wheels:
+        raise FileNotFoundError(
+            f"missing pinned wheels below {wheels_path}: {missing_wheels}"
+        )
     for whl in _WHEEL_FILES:
         p = wheels_path / whl
-        if p.exists():
-            img = img.add_local_file(str(p), f"/wheels/{whl}", copy=True)
+        img = img.add_local_file(str(p), f"/wheels/{whl}", copy=True)
     img = img.run_commands(
         # Ensure libz3.so.4.15 symlink exists even if z3-solver ships a
         # slightly different minor version.

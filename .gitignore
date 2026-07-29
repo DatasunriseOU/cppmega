@@ -67,3 +67,6 @@ outputs/ci_diagnostics/*
 reports/chatgpt/*
 outputs/source_cache/*
 outputs/source_cache/code/test_make_lib/vector.c
+
+# Compressed CUDA wheel inputs are durable local build artifacts, not source.
+wheels/*.whl
