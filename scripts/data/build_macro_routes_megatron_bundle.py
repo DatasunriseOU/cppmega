@@ -3029,7 +3029,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "explicit cppmega_ci_fixed_buckets_manifest_v3 or immutable "
-            "cppmega_ci_content_store_case5_export_v2/v3 receipt binding the CI "
+            "cppmega_ci_content_store_case5_export_v2/v4 receipt binding the CI "
             "source inventory, lossless splits, shard hashes and reject counters"
         ),
     )
