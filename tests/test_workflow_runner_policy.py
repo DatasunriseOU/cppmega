@@ -207,6 +207,16 @@ def test_wheel_build_uses_torch_matched_cuda_libraries_without_system_replacemen
     assert "grep -q 'release 13\\.2'" in workflow
 
 
+def test_fa2_wheel_build_uses_upstream_arch_knob_and_exact_kernel_trim() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "FLASH_ATTN_CUDA_ARCHS=120" in workflow
+    assert "flash_fwd_split(_align)?_hdim" in workflow
+    assert '[[ "$after" -ne 8 || -n "$unexpected" ]]' in workflow
+
+
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     tilelang_commit = "8fdff5aa10f4265a4cb0e114d4c62613f3982180"
     tvm_commit = "36105156803007279d6ff481621b083441503cde"
