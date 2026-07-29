@@ -183,3 +183,18 @@ def test_wheel_build_keeps_gcc_and_gxx_in_one_alternatives_group() -> None:
     assert workflow.count("--set gcc /usr/bin/gcc-15") == 2
     assert "update-alternatives --install /usr/bin/g++ g++" not in workflow
     assert workflow.count('test "$(readlink -f /usr/bin/g++)"') == 2
+
+
+def test_wheel_build_uses_torch_matched_cudnn_without_replacing_system_cudnn() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+
+    assert '"cuda-toolkit-13-2=${CUDA_TOOLKIT_DEB_VERSION}"' in workflow
+    assert "cudnn9-cuda-13 libnccl-dev libnccl2" not in workflow
+    assert '"nvidia-cudnn-cu13": metadata.version("nvidia-cudnn-cu13")' in workflow
+    assert '"nvidia-nccl-cu13": metadata.version("nvidia-nccl-cu13")' in workflow
+    assert 'stream.write(f"CUDNN_PATH={cudnn_path}\\n")' in workflow
+    assert 'f"CPATH={cudnn_path / \'include\'}:"' in workflow
+    assert 'f"LIBRARY_PATH={cudnn_path / \'lib\'}:"' in workflow
+    assert "grep -q 'release 13\\.2'" in workflow
