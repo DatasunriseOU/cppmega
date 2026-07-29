@@ -628,6 +628,49 @@ def test_bazel_pytest_gtest_ctest_failure_diagnostics_and_sanitizer() -> None:
     _assert_conserved(result)
 
 
+def test_javascript_typescript_paths_are_auxiliary_language_evidence() -> None:
+    raw = _timestamped(
+        "##[group]Run npx vitest run tests/widget.test.ts",
+        "  shell: /usr/bin/bash -e {0}",
+        "[command]npx vitest run tests/widget.test.ts",
+        "transforming src/index.ts",
+        "emitted dist/app.js",
+        "loaded scripts/bootstrap.mjs",
+    )
+
+    result = canonicalize_ci_log(
+        raw,
+        {
+            "repository": "nodejs/node",
+            "workflow_name": "javascript-tests",
+            "run_id": 31,
+            "job_id": 81,
+            "job_name": "vitest",
+            "conclusion": "success",
+            "steps": [{"name": "npx vitest run tests/widget.test.ts"}],
+        },
+    )
+
+    languages = {
+        item["name"]
+        for item in result["sidecar"]["classifications"]["languages"]
+    }
+    assert {"JavaScript", "TypeScript"} <= languages
+    language_entities = [
+        entity
+        for chunk in result["chunks"]
+        for entity in chunk["training_sidecars"]["entities"]
+        if entity.get("attributes", {}).get("likely_language")
+        in {"JavaScript", "TypeScript"}
+    ]
+    assert {
+        entity["attributes"]["likely_language"]
+        for entity in language_entities
+    } == {"JavaScript", "TypeScript"}
+    assert all(entity["domain"] == "TOOL_OUTPUT" for entity in language_entities)
+    _assert_conserved(result)
+
+
 def test_windows_powershell_msvc_msbuild_matrix_metadata() -> None:
     raw = _timestamped(
         "##[group]Run msbuild.exe app.sln /m /t:Build",

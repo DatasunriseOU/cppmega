@@ -60,6 +60,14 @@ from cppmega.data.source_conveyor_composition import (  # noqa: E402
     SourceComposition,
     load_source_composition,
 )
+from cppmega.data.ci_training_scope import (  # noqa: E402
+    PRIMARY_ROUTE as CI_PRIMARY_ROUTE,
+    training_scope_policy,
+)
+from scripts.ci_source_binding_projection import (  # noqa: E402
+    projection_script_sha256,
+    target_parser_script_sha256,
+)
 from scripts.ci_source_sidecars import (  # noqa: E402
     ExtractionError as CISourceExtractionError,
     verify_production_acquisition_chain,
@@ -77,7 +85,7 @@ CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
 CI_CONTENT_STORE_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA = (
-    "cppmega_ci_content_store_case5_export_v3"
+    "cppmega_ci_content_store_case5_export_v4"
 )
 PRODUCTION_CI_COMPLETION_MODE = "inventory-exhaustive"
 PRODUCTION_CI_MERGE_RECEIPT_SCHEMA = (
@@ -618,6 +626,22 @@ def _load_content_store_ci_export_allowlist(
         raise RuntimeError(
             f"{manifest_path}: CI export immutable producer binding is incomplete"
         )
+    current_parser_sha256 = target_parser_script_sha256()
+    parser_generation = manifest.get("parser_generation_policy")
+    if (
+        not isinstance(parser_generation, dict)
+        or parser_generation.get("mode") != "current-singleton-required"
+        or parser_generation.get("expected_current_parser_script_sha256")
+        != current_parser_sha256
+        or parser_generation.get("observed_parser_lineage")
+        != [current_parser_sha256]
+        or parser_generation.get("current_singleton") is not True
+        or fetch_settings.get("parser_script_sha256")
+        != current_parser_sha256
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI export is not current-parser singleton data"
+        )
     production_provenance = (
         _require_content_store_export_completion_semantics(
             manifest_path=manifest_path,
@@ -648,6 +672,30 @@ def _load_content_store_ci_export_allowlist(
         raise RuntimeError(
             f"{manifest_path}: CI export eligibility/conservation is not green"
         )
+    eligibility_policy = eligibility.get("policy")
+    expected_training_scope = training_scope_policy()
+    expected_step_propagation = {
+        "schema": "cppmega_ci_exact_step_scope_propagation_v1",
+        "key": ["repo", "run_attempt", "job", "step"],
+        "primary_priority": True,
+        "opaque_members_never_inherit": True,
+        "cross_step_propagation": False,
+        "cross_job_propagation": False,
+        "cross_attempt_propagation": False,
+    }
+    if (
+        not isinstance(eligibility_policy, dict)
+        or eligibility_policy.get("schema")
+        != "cppmega_ci_primary_training_eligibility_policy_v1"
+        or eligibility_policy.get("primary_route") != CI_PRIMARY_ROUTE
+        or eligibility_policy.get("training_scope")
+        != expected_training_scope
+        or eligibility_policy.get("exact_step_propagation")
+        != expected_step_propagation
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI primary training-scope policy is missing or stale"
+        )
 
     counts = manifest.get("counts")
     representatives = manifest.get("representatives")
@@ -662,6 +710,18 @@ def _load_content_store_ci_export_allowlist(
         or not isinstance(source_binding_projection, dict)
     ):
         raise RuntimeError(f"{manifest_path}: CI export accounting is incomplete")
+    if (
+        source_binding_projection.get("mode") != "current_audit"
+        or source_binding_projection.get("projection_script_sha256")
+        != projection_script_sha256()
+        or source_binding_projection.get("input_parser_script_sha256")
+        != current_parser_sha256
+        or source_binding_projection.get("target_parser_script_sha256")
+        != current_parser_sha256
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI source-binding projection is not current-audit"
+        )
 
     def positive_int(value: object, *, where: str) -> int:
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -788,6 +848,7 @@ def _load_content_store_ci_export_allowlist(
         "dropped_graph_edges": "dropped_graph_edges.parquet",
         "representative_metadata": "representative_metadata.parquet",
         "excluded_opaque_artifacts": "excluded_opaque_artifacts.parquet",
+        "excluded_training_scope": "excluded_training_scope.parquet",
         "source_binding_projection": "source_binding_projection.parquet",
         "occurrence_metadata": "occurrence_metadata.parquet",
     }
@@ -855,6 +916,22 @@ def _load_content_store_ci_export_allowlist(
             ):
                 raise RuntimeError(
                     f"{manifest_path}: CI occurrence metadata artifact differs"
+                )
+            excluded_training_scope = eligibility.get(
+                "excluded_training_scope_occurrences"
+            )
+            if kind == "excluded_training_scope" and (
+                not isinstance(excluded_training_scope, dict)
+                or excluded_training_scope.get("ledger")
+                != "excluded_training_scope.parquet"
+                or excluded_training_scope.get("ledger_schema")
+                != "cppmega_ci_case5_excluded_training_scope_v1"
+                or excluded_training_scope.get("occurrences") != row_count
+                or excluded_training_scope.get("ledger_artifact_sha256")
+                != sha256
+            ):
+                raise RuntimeError(
+                    f"{manifest_path}: CI training-scope exclusion artifact differs"
                 )
             if relative.suffix == ".parquet":
                 parquet_metadata = pq.ParquetFile(artifact_path).metadata

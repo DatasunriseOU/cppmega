@@ -413,7 +413,9 @@ _PATH_RE = re.compile(
     r"BUILD(?:\.bazel)?|WORKSPACE(?:\.bazel)?|configure\.ac|"
     r"[A-Za-z0-9_.@+-]+\."
     r"(?:c|cc|cpp|cxx|h|hh|hpp|hxx|cu|cuh|ixx|cppm|mpp|"
-    r"cmake|mk|ninja|bzl|bazel|gn|gni|py|pyi|sh|bash|zsh|"
+    r"cmake|mk|ninja|bzl|bazel|gn|gni|py|pyi|"
+    r"js|jsx|mjs|cjs|ts|tsx|mts|cts|"
+    r"sh|bash|zsh|"
     r"ksh|ps1|bat|cmd|sql|o|obj|a|so|dylib|dll|exe|lib|pdb)"
     r")"
     r")"
@@ -433,6 +435,18 @@ _SOURCE_EXTENSIONS = {
     ".ixx": "module",
     ".cppm": "module",
     ".mpp": "module",
+}
+_AUX_SOURCE_EXTENSIONS = {
+    ".py": "Python",
+    ".pyi": "Python",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".mjs": "JavaScript",
+    ".cjs": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".mts": "TypeScript",
+    ".cts": "TypeScript",
 }
 _BUILD_EXTENSIONS = {
     ".cmake",
@@ -2308,6 +2322,8 @@ def _path_language(path: str) -> str:
     extension = basename[dot:] if dot >= 0 else ""
     if extension in _SOURCE_EXTENSIONS:
         return _SOURCE_EXTENSIONS[extension]
+    if extension in _AUX_SOURCE_EXTENSIONS:
+        return _AUX_SOURCE_EXTENSIONS[extension]
     if (
         extension in _BUILD_EXTENSIONS
         or basename
@@ -2324,8 +2340,6 @@ def _path_language(path: str) -> str:
         return "build"
     if extension in _SHELL_EXTENSIONS:
         return "shell"
-    if extension in {".py", ".pyi"}:
-        return "Python"
     if extension == ".sql":
         return "SQL"
     return "other"
@@ -2339,6 +2353,8 @@ def _path_category(path: str, line_prefix: str) -> tuple[str, str]:
     if extension in _OUTPUT_EXTENSIONS:
         return "output", "OUTPUT"
     if extension in _SOURCE_EXTENSIONS:
+        return "source", "SOURCE"
+    if extension in _AUX_SOURCE_EXTENSIONS:
         return "source", "SOURCE"
     if re.search(r"(?:^|\s)(?:-o|/out:|>)\s*$", line_prefix, re.IGNORECASE):
         return "output", "OUTPUT"
@@ -2402,6 +2418,8 @@ def _extract_paths(
                 "build": "CMAKE",
                 "shell": "BASH",
                 "Python": "PYTHON",
+                "JavaScript": "TOOL_OUTPUT",
+                "TypeScript": "TOOL_OUTPUT",
                 "SQL": "SQL",
                 "other": "TOOL_OUTPUT",
             }[language]

@@ -675,7 +675,7 @@ def _frozen_case5_fixture(
         "representatives": {
             "schema": REPRESENTATIVE_LEDGER_SCHEMA,
             "selection": (
-                "one-per-eligible-token-sequence; "
+                "one-per-primary-eligible-token-sequence; "
                 "content-sha256-then-eligible-occurrence-key"
             ),
             "count": 1,

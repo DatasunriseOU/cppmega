@@ -73,7 +73,7 @@ CONTENT_STORE_PACK_SCHEMA = "cppmega_ci_content_pack_v1"
 FETCH_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v3"
 PRODUCTION_FETCH_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v4"
 CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
-PRODUCTION_CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
+PRODUCTION_CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v4"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
 PRODUCTION_INVENTORY_RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v5"
 PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
@@ -153,7 +153,7 @@ _OCCURRENCE_FIELDS = (
     "chunk_ordinal",
 )
 _REPRESENTATIVE_SELECTION = (
-    "one-per-eligible-token-sequence; "
+    "one-per-primary-eligible-token-sequence; "
     "content-sha256-then-eligible-occurrence-key"
 )
 _SOURCE_BINDING_PROJECTION_ARTIFACTS = frozenset(

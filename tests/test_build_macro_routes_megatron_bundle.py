@@ -245,6 +245,11 @@ def _write_content_store_ci_export(
             "cppmega-ci-case5-excluded-opaque-artifact-ledger-v1",
         ),
         (
+            "excluded_training_scope",
+            "excluded_training_scope.parquet",
+            "cppmega-ci-case5-excluded-training-scope-ledger-v1",
+        ),
+        (
             "source_binding_projection",
             "source_binding_projection.parquet",
             "cppmega-ci-source-binding-projection-ledger-v1",
@@ -290,6 +295,12 @@ def _write_content_store_ci_export(
     )
 
     payload_tokens = 20_000_000_123
+    current_parser_sha256 = builder.target_parser_script_sha256()
+    excluded_scope_artifact = next(
+        artifact
+        for artifact in artifacts
+        if artifact["kind"] == "excluded_training_scope"
+    )
     exporter_path = (
         builder.REPO_ROOT / "scripts/export_ci_content_store_case5.py"
     )
@@ -324,9 +335,17 @@ def _write_content_store_ci_export(
             "sidecar_set_sha256": "3" * 64,
             "settings": {
                 "fetcher_script_sha256": "e" * 64,
-                "parser_script_sha256": "f" * 64,
+                "parser_script_sha256": current_parser_sha256,
                 "content_store_script_sha256": "0" * 64,
             },
+        },
+        "parser_generation_policy": {
+            "mode": "current-singleton-required",
+            "expected_current_parser_script_sha256": (
+                current_parser_sha256
+            ),
+            "observed_parser_lineage": [current_parser_sha256],
+            "current_singleton": True,
         },
         "case5_contract": {
             "buckets": list(buckets),
@@ -336,6 +355,24 @@ def _write_content_store_ci_export(
             "parquet_compression": {"codec": "zstd", "level": 9},
         },
         "eligibility": {
+            "policy": {
+                "schema": (
+                    "cppmega_ci_primary_training_eligibility_policy_v1"
+                ),
+                "primary_route": "primary_cpp_sql_build_test",
+                "training_scope": builder.training_scope_policy(),
+                "exact_step_propagation": {
+                    "schema": (
+                        "cppmega_ci_exact_step_scope_propagation_v1"
+                    ),
+                    "key": ["repo", "run_attempt", "job", "step"],
+                    "primary_priority": True,
+                    "opaque_members_never_inherit": True,
+                    "cross_step_propagation": False,
+                    "cross_job_propagation": False,
+                    "cross_attempt_propagation": False,
+                },
+            },
             "target_exact_unique_payload_tokens": 20_000_000_000,
             "target_source": "explicit_export_requirement",
             "cas_acquisition_target_exact_unique_payload_tokens": 20_200_000_000,
@@ -349,12 +386,31 @@ def _write_content_store_ci_export(
                 "exact_unique_payload_tokens": True,
                 "unique_token_sequences": True,
             },
+            "excluded_training_scope_occurrences": {
+                "members": 1,
+                "occurrences": int(excluded_scope_artifact["rows"]),
+                "summed_exact_tokens_with_occurrence_multiplicity": 1,
+                "ledger_schema": (
+                    "cppmega_ci_case5_excluded_training_scope_v1"
+                ),
+                "ledger": str(excluded_scope_artifact["path"]),
+                "ledger_sha256": "7" * 64,
+                "ledger_artifact_sha256": str(
+                    excluded_scope_artifact["sha256"]
+                ),
+            },
         },
         "representatives": {
             "count": len(buckets),
             "ledger_sha256": "4" * 64,
         },
         "source_binding_projection": {
+            "mode": "current_audit",
+            "projection_script_sha256": (
+                builder.projection_script_sha256()
+            ),
+            "input_parser_script_sha256": current_parser_sha256,
+            "target_parser_script_sha256": current_parser_sha256,
             "coverage": {"occurrence_count": occurrence_writer.count},
         },
         "occurrence_metadata": {
