@@ -4653,6 +4653,7 @@ def export_store(
     tokenizer_json: str | os.PathLike[str],
     output: str | os.PathLike[str],
     source_binding_projection_from_parser_sha256: str | None = None,
+    require_current_parser_only: bool = False,
     required_eligible_exact_unique_payload_tokens: int | None = None,
     completion_mode: str = COMPLETION_MODE_THRESHOLD,
     inventory: str | os.PathLike[str] | None = None,
@@ -4823,8 +4824,19 @@ def export_store(
             if expected_content_count < 1 or expected_occurrence_count < 1:
                 raise ExportError("content store has no exportable occurrences")
 
+            parser_lineage = frozen_fetch_state.parser_lineage()
+            current_parser_sha256 = target_parser_script_sha256()
+            if (
+                require_current_parser_only
+                and parser_lineage != (current_parser_sha256,)
+            ):
+                raise ExportError(
+                    "current-parser-only export requires exactly one parser "
+                    f"generation {current_parser_sha256}; observed lineage "
+                    f"{list(parser_lineage)}"
+                )
             source_binding_projector = SourceBindingProjectionRouter(
-                frozen_fetch_state.parser_lineage(),
+                parser_lineage,
                 authorized_legacy_sha256=(
                     source_binding_projection_from_parser_sha256
                 ),
@@ -5793,6 +5805,19 @@ def export_store(
                     "unchanged_after_export": True,
                 },
                 "input_fetch_state": frozen_fetch_state.receipt_binding(),
+                "parser_generation_policy": {
+                    "mode": (
+                        "current-singleton-required"
+                        if require_current_parser_only
+                        else "audited-lineage"
+                    ),
+                    "expected_current_parser_script_sha256": (
+                        current_parser_sha256
+                    ),
+                    "observed_parser_lineage": list(parser_lineage),
+                    "current_singleton": parser_lineage
+                    == (current_parser_sha256,),
+                },
                 "source_binding_projection": {
                     "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
                     "mode": source_binding_projector.mode,
@@ -6237,6 +6262,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--require-current-parser-only",
+        action="store_true",
+        help=(
+            "refuse stores with any parser upgrade lineage; require every "
+            "occurrence to come from the exact parser implementation used by "
+            "this exporter"
+        ),
+    )
+    parser.add_argument(
         "--required-eligible-exact-unique-payload-tokens",
         type=int,
         help=(
@@ -6259,6 +6293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_binding_projection_from_parser_sha256=(
                 args.source_binding_projection_from_parser_sha256
             ),
+            require_current_parser_only=args.require_current_parser_only,
             required_eligible_exact_unique_payload_tokens=(
                 args.required_eligible_exact_unique_payload_tokens
             ),
