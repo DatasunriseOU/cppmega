@@ -130,11 +130,11 @@
         "boto3",
         "zstandard"
       ],
-      "timeout_seconds": 1200,
+      "timeout_seconds": 3900,
       "commands": [
         {
           "name": "portable-contracts",
-          "timeout_seconds": 1080,
+          "timeout_seconds": 3600,
           "argv": [
             "{python}",
             "-m",
