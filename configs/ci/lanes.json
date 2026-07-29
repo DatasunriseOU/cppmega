@@ -85,7 +85,7 @@
             "--completions",
             "evals/domain_routed_gold_completions.jsonl",
             "--out",
-            "/tmp/cppmega-domain-routed-codegen.json"
+            "outputs/ci_diagnostics/domain-routed-codegen.json"
           ]
         },
         {
@@ -180,7 +180,7 @@
             "--completions",
             "evals/domain_routed_gold_completions.jsonl",
             "--out",
-            "/tmp/cppmega-domain-routed-codegen.json"
+            "outputs/ci_diagnostics/domain-routed-codegen.json"
           ]
         },
         {

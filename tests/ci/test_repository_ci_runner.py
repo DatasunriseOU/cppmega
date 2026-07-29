@@ -20,6 +20,12 @@ LANES_CONFIG = REPO_ROOT / "configs" / "ci" / "lanes.json"
 CPPMEGA_MLX_LANES_CONFIG = REPO_ROOT / "configs" / "ci" / "cppmega_mlx_lanes.json"
 
 
+def test_default_receipt_base_is_durable_and_repository_owned() -> None:
+    assert ci.DEFAULT_RECEIPT_BASE == (
+        REPO_ROOT / "outputs" / "ci_diagnostics" / "repository-ci"
+    )
+
+
 def _all_keys(value: Any) -> set[str]:
     if isinstance(value, dict):
         keys = {str(key).lower() for key in value}
