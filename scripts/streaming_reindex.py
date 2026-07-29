@@ -1153,6 +1153,8 @@ def stage_materialize(
             project_id, source=f"stage_materialize({repo})"
         )
         cmd += ["--default-repo", project_id]
+    if fixed_shape_max_tokens is not None:
+        cmd += ["--fixed-shape-max-tokens", str(fixed_shape_max_tokens)]
     # A failed/retried materialization must never validate a newly replaced
     # parquet against a receipt left by an earlier attempt.
     stats_path.unlink(missing_ok=True)
@@ -1234,6 +1236,15 @@ def read_materialize_stats(
         "schema": stats["schema"],
         "overflow_policy": stats["overflow_policy"],
     }
+    receipt_fixed_shape_max_tokens = stats.get("fixed_shape_max_tokens")
+    if receipt_fixed_shape_max_tokens is not None:
+        receipt_fixed_shape_max_tokens = int(receipt_fixed_shape_max_tokens)
+        if receipt_fixed_shape_max_tokens <= 0:
+            raise ValueError(
+                "fixed_shape_max_tokens must be positive, got "
+                f"{receipt_fixed_shape_max_tokens}"
+            )
+        normalized["fixed_shape_max_tokens"] = receipt_fixed_shape_max_tokens
     for counter_name in integer_fields:
         value = int(stats[counter_name])
         if value < 0:
@@ -1294,6 +1305,16 @@ def read_materialize_stats(
         raise ValueError(
             "materialized token row exceeds the largest fixed bucket: "
             f"{normalized['max_materialized_tokens']} > {fixed_shape_max_tokens}"
+        )
+    if (
+        receipt_fixed_shape_max_tokens is not None
+        and int(normalized["max_materialized_tokens"])
+        > receipt_fixed_shape_max_tokens
+    ):
+        raise ValueError(
+            "materialized token row exceeds its receipted fixed-shape limit: "
+            f"{normalized['max_materialized_tokens']} "
+            f"> {receipt_fixed_shape_max_tokens}"
         )
     return normalized
 

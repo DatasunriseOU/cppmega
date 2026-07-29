@@ -207,6 +207,7 @@ def _slice_doc_char_range(
             "type_edges",
             "actual_token_count",
             "embedded_domain_spans",
+            _SPLIT_AUDIT_FIELD,
             *_CHAR_LEVEL_METADATA_FIELDS,
         }
     }
@@ -440,6 +441,40 @@ def _annotate_cross_piece_edge_audit(
     }
 
 
+def _validated_split_audit_counts(doc: dict[str, Any]) -> dict[str, int]:
+    raw_audit = doc.get(_SPLIT_AUDIT_FIELD)
+    if raw_audit is None:
+        return {}
+    if not isinstance(raw_audit, dict):
+        raise ValueError(f"{_SPLIT_AUDIT_FIELD} must be an object")
+    raw_counts = raw_audit.get("cross_piece_edges", {})
+    if not isinstance(raw_counts, dict):
+        raise ValueError(
+            f"{_SPLIT_AUDIT_FIELD}.cross_piece_edges must be an object"
+        )
+    expected_fields = {
+        *DOMAIN_EDGE_FIELD_FAMILIES,
+        "call_edges",
+        "type_edges",
+    }
+    unknown_fields = set(raw_counts) - expected_fields
+    if unknown_fields:
+        raise ValueError(
+            f"{_SPLIT_AUDIT_FIELD}.cross_piece_edges has unknown fields: "
+            f"{sorted(unknown_fields)}"
+        )
+    counts: dict[str, int] = {}
+    for field, raw_count in raw_counts.items():
+        count = int(raw_count)
+        if count < 0:
+            raise ValueError(
+                f"{_SPLIT_AUDIT_FIELD}.cross_piece_edges.{field} "
+                f"must be non-negative, got {count}"
+            )
+        counts[field] = count
+    return counts
+
+
 def chunk_enriched_document(
     doc: dict[str, Any],
     max_tokens: int,
@@ -468,6 +503,21 @@ def chunk_enriched_document(
     # Output order is deliberately source order; callers may not use dependency
     # sorting to omit or reorder characters.
     del boundary_sort_key
-    pieces = _split_doc_without_boundaries(doc, max_tokens, tokenizer)
-    _annotate_cross_piece_edge_audit(doc, pieces)
+    inherited_counts = _validated_split_audit_counts(doc)
+    split_source = dict(doc)
+    split_source.pop(_SPLIT_AUDIT_FIELD, None)
+    pieces = _split_doc_without_boundaries(split_source, max_tokens, tokenizer)
+    _annotate_cross_piece_edge_audit(split_source, pieces)
+    new_counts = _validated_split_audit_counts(pieces[0])
+    merged_counts = {
+        field: inherited_counts.get(field, 0) + new_counts.get(field, 0)
+        for field in {
+            *DOMAIN_EDGE_FIELD_FAMILIES,
+            "call_edges",
+            "type_edges",
+        }
+    }
+    pieces[0][_SPLIT_AUDIT_FIELD] = {
+        "cross_piece_edges": merged_counts,
+    }
     return pieces

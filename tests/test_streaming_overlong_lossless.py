@@ -9,6 +9,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega.data.domain_schema import DomainKind
+from cppmega.data.nanochat_pipeline.tokenized_enriched import (
+    materialized_marker_token_overhead,
+    materialize_tokenized_enriched_batch,
+)
 from cppmega.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
 from cppmega.data.source_identity import source_identity
 from scripts import streaming_reindex as sr
@@ -233,6 +238,131 @@ def test_overlong_split_is_text_lossless_and_slices_all_char_sidecars() -> None:
         "call_edges": 0,
         "type_edges": 0,
     }
+
+
+def test_recursive_split_audit_conserves_inherited_and_new_cross_piece_edges() -> None:
+    text = "x" * 20
+    doc = {
+        "text": text,
+        "structure_ids": [1] * len(text),
+        "chunk_boundaries": [],
+        "domain_edges": [
+            {"from_char": 1, "to_char": 8, "kind": 1},
+            {"from_char": 1, "to_char": 15, "kind": 1},
+        ],
+    }
+
+    first_pass = chunk_enriched_document(doc, 12, _CharacterTokenizer())
+    assert first_pass[0]["_lossless_split_audit"]["cross_piece_edges"][
+        "domain_edges"
+    ] == 1
+
+    nested = chunk_enriched_document(
+        first_pass[0],
+        5,
+        _CharacterTokenizer(),
+    )
+
+    assert nested[0]["_lossless_split_audit"]["cross_piece_edges"][
+        "domain_edges"
+    ] == 2
+    assert all("_lossless_split_audit" not in piece for piece in nested[1:])
+
+
+def test_materialized_marker_overhead_matches_actual_bos_and_delimiters() -> None:
+    tokenizer = materializer.load_tokenizer(str(sr.TOKENIZER_PATH))
+    text = "int main() { SELECT value; echo done; }\n"
+    select_start = text.index("SELECT")
+    echo_start = text.index("echo")
+    doc = {
+        "text": text,
+        "repo": "owner/repo",
+        "filepath": "src/main.cc",
+        "domain_kind": int(DomainKind.CPP),
+        "embedded_domain_spans": [
+            {
+                "start": select_start,
+                "end": select_start + len("SELECT value"),
+                "domain_kind": int(DomainKind.SQL),
+            },
+            {
+                "start": echo_start,
+                "end": echo_start + len("echo done"),
+                "domain_kind": int(DomainKind.BASH),
+            },
+        ],
+    }
+
+    tokenized = materialize_tokenized_enriched_batch(
+        [doc],
+        tokenizer,
+        num_threads=1,
+    )[0]
+    raw_tokens = len(tokenizer.encode(text))
+
+    assert materialized_marker_token_overhead({"text": text}) == 1
+    assert materialized_marker_token_overhead(
+        {"text": text, "domain_kind": int(DomainKind.CPP)}
+    ) == 3
+    assert materialized_marker_token_overhead(doc) == 7
+    assert len(tokenized["token_ids"]) - raw_tokens == 7
+
+
+def test_fixed_shape_refinement_resplits_dynamic_embedded_marker_overhead() -> None:
+    text = "x" * 125
+    doc = {
+        "text": text,
+        "source_text": text,
+        "structure_ids": list(range(len(text))),
+        "chunk_boundaries": [],
+        "domain_kind": int(DomainKind.CPP),
+        "embedded_domain_spans": [
+            {
+                "start": 0,
+                "end": 60,
+                "domain_kind": int(DomainKind.SQL),
+            },
+            {
+                "start": 60,
+                "end": len(text),
+                "domain_kind": int(DomainKind.BASH),
+            },
+        ],
+    }
+
+    pieces = materializer._refine_for_fixed_shape(
+        doc,
+        _CharacterTokenizer(),
+        128,
+    )
+
+    assert len(pieces) == 2
+    assert "".join(piece["text"] for piece in pieces) == text
+    assert "".join(piece["source_text"] for piece in pieces) == text
+    assert [
+        value for piece in pieces for value in piece["structure_ids"]
+    ] == doc["structure_ids"]
+    assert all(
+        piece["actual_token_count"]
+        + materialized_marker_token_overhead(piece)
+        <= 128
+        for piece in pieces
+    )
+
+    original_domains = [0] * len(text)
+    for span in doc["embedded_domain_spans"]:
+        original_domains[int(span["start"]):int(span["end"])] = [
+            int(span["domain_kind"])
+        ] * (int(span["end"]) - int(span["start"]))
+    refined_domains = [0] * len(text)
+    cursor = 0
+    for piece in pieces:
+        for span in piece["embedded_domain_spans"]:
+            start = cursor + int(span["start"])
+            end = cursor + int(span["end"])
+            refined_domains[start:end] = [int(span["domain_kind"])] * (end - start)
+        cursor += len(piece["text"])
+    assert refined_domains == original_domains
 
 
 def test_overlong_split_rejects_misaligned_commit_sidecar() -> None:
@@ -474,6 +604,7 @@ def test_real_materialized_split_keeps_token_sidecars_aligned(
         max_tokens=125,
         overflow_policy="split",
         materialize_tokenized_enriched=True,
+        fixed_shape_max_tokens=128,
         stats_file=receipt,
     )
     assert sr.read_materialize_stats(
@@ -539,6 +670,19 @@ def test_streaming_stage_materializes_and_routes_overlong_input(
                 "filepath": "src/stage.cc",
                 "doc_type": "code",
                 "build_kind": "cmake",
+                "domain_kind": int(DomainKind.CPP),
+                "embedded_domain_spans": [
+                    {
+                        "start": 0,
+                        "end": len(text) // 2,
+                        "domain_kind": int(DomainKind.SQL),
+                    },
+                    {
+                        "start": len(text) // 2,
+                        "end": len(text),
+                        "domain_kind": int(DomainKind.BASH),
+                    },
+                ],
                 "structure_ids": [3] * len(text),
                 "chunk_boundaries": [],
                 "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
