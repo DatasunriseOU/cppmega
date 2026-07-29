@@ -2801,6 +2801,18 @@ def _stage_source_composition(
                 for file_key, binding_key in input_file_keys.items()
             },
         }
+        pr_completion = run.get("pr_completion")
+        if pr_completion is not None:
+            if not isinstance(pr_completion, dict):
+                raise RuntimeError(
+                    f"source composition run {run_id} has malformed PR provenance"
+                )
+            expected_hashes.update(
+                {
+                    "pr_completion": str(pr_completion["receipt_sha256"]),
+                    "pr_repo_list": str(pr_completion["repo_list_sha256"]),
+                }
+            )
         artifacts: dict[str, dict[str, object]] = {}
         for name, source in sorted(files.items()):
             expected_sha256 = expected_hashes.get(name)
