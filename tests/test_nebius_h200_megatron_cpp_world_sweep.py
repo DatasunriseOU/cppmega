@@ -715,10 +715,13 @@ def test_remote_script_does_not_shadow_upstream_model_provider():
 def test_overlay_packages_complete_cppmega_and_contract_closure(tmp_path):
     output = tmp_path / "overlay.tgz"
 
-    make_overlay_tar(output)
+    revision = make_overlay_tar(output)
 
     with tarfile.open(output, "r:gz") as archive:
         names = set(archive.getnames())
+        revision_member = archive.extractfile("cppmega_overlay_revision.json")
+        assert revision_member is not None
+        archived_revision = json.loads(revision_member.read())
     assert "cppmega/__init__.py" in names
     assert "cppmega/recipes/nam56r_launch.py" in names
     assert "cppmega/recipes/nam56r_megatron.py" in names
@@ -728,10 +731,13 @@ def test_overlay_packages_complete_cppmega_and_contract_closure(tmp_path):
     assert "cppmega/receipt_binding.py" in names
     assert "scripts/h200_megatron_preflight.py" in names
     assert "scripts/data/publish_megatron_bundle_to_nebius_s3.py" in names
+    assert "scripts/data/restore_megatron_bundle_from_nebius_s3.py" in names
+    assert "cppmega_overlay_revision.json" in names
     assert "data/domain_schema_v1.json" in names
     assert "data/tokenizer_v2/tokenizer_contract_v1.json" in names
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
     assert OVERLAY_PATHS[0] == "cppmega"
+    assert archived_revision == revision
 
     extracted = tmp_path / "extracted"
     extracted.mkdir()

@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,13 @@ import subprocess
 import sys
 import tarfile
 from typing import Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -45,6 +53,10 @@ from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+_S3_REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_MAX_DESCRIPTOR_BYTES = 256 * 1024**2
 _REUSABLE_ARCHIVE_RECEIPT_STATUSES = frozenset(
     {
         "recovered_verified",
@@ -52,6 +64,189 @@ _REUSABLE_ARCHIVE_RECEIPT_STATUSES = frozenset(
         "downloaded_verified",
     }
 )
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _s3_request_target(uri: str, *, endpoint: str) -> tuple[str, str]:
+    remote = urlsplit(uri)
+    if (
+        remote.scheme != "s3"
+        or not _S3_BUCKET_RE.fullmatch(remote.netloc)
+        or not remote.path.startswith("/")
+        or remote.path == "/"
+        or remote.query
+        or remote.fragment
+    ):
+        raise ValueError(f"invalid S3 object URI: {uri!r}")
+    base = urlsplit(endpoint)
+    if (
+        base.scheme != "https"
+        or not base.hostname
+        or base.username is not None
+        or base.password is not None
+        or base.query
+        or base.fragment
+    ):
+        raise ValueError("S3 endpoint must be an HTTPS origin without credentials")
+    bucket = quote(remote.netloc, safe="-._~")
+    key = quote(remote.path[1:], safe="/-._~")
+    canonical_uri = f"{base.path.rstrip('/')}/{bucket}/{key}"
+    if not canonical_uri.startswith("/"):
+        canonical_uri = "/" + canonical_uri
+    return f"{base.scheme}://{base.netloc}{canonical_uri}", canonical_uri
+
+
+def _hmac_sha256(key: bytes, value: str) -> bytes:
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _sigv4_headers(
+    url: str,
+    *,
+    canonical_uri: str,
+    region: str,
+    env: dict[str, str],
+    timestamp: datetime | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    if not _S3_REGION_RE.fullmatch(region):
+        raise ValueError(f"invalid S3 signing region: {region!r}")
+    access_key = env.get("AWS_ACCESS_KEY_ID", "")
+    secret_key = env.get("AWS_SECRET_ACCESS_KEY", "")
+    if not access_key or not secret_key:
+        raise ValueError("S3 SigV4 requires a complete AWS credential pair")
+    if any(character in access_key + secret_key for character in "\r\n\x00"):
+        raise ValueError("S3 credentials contain an unsafe control character")
+
+    now = timestamp or datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("S3 SigV4 timestamp must be timezone-aware")
+    now = now.astimezone(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    host = urlsplit(url).netloc
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": _EMPTY_SHA256,
+        "x-amz-date": amz_date,
+    }
+    session_token = env.get("AWS_SESSION_TOKEN")
+    if session_token:
+        if any(character in session_token for character in "\r\n\x00"):
+            raise ValueError("S3 session token contains an unsafe control character")
+        headers["x-amz-security-token"] = session_token
+    for name, value in (extra_headers or {}).items():
+        lowered = name.strip().lower()
+        if (
+            not lowered
+            or lowered in headers
+            or any(character in lowered + value for character in "\r\n\x00")
+        ):
+            raise ValueError(f"invalid extra SigV4 header: {name!r}")
+        headers[lowered] = value
+
+    normalized = {
+        name: " ".join(value.strip().split()) for name, value in headers.items()
+    }
+    signed_headers = ";".join(sorted(normalized))
+    canonical_headers = "".join(
+        f"{name}:{normalized[name]}\n" for name in sorted(normalized)
+    )
+    canonical_request = "\n".join(
+        (
+            "GET",
+            canonical_uri,
+            "",
+            canonical_headers,
+            signed_headers,
+            _EMPTY_SHA256,
+        )
+    )
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        (
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        )
+    )
+    date_key = _hmac_sha256(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    region_key = _hmac_sha256(date_key, region)
+    service_key = _hmac_sha256(region_key, "s3")
+    signing_key = _hmac_sha256(service_key, "aws4_request")
+    signature = hmac.new(
+        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    result = {
+        name: value
+        for name, value in normalized.items()
+        if name != "host"
+    }
+    result["Authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope},"
+        f"SignedHeaders={signed_headers},Signature={signature}"
+    )
+    return result
+
+
+def _open_signed_s3_get(
+    uri: str,
+    *,
+    endpoint: str,
+    region: str,
+    env: dict[str, str],
+):
+    url, canonical_uri = _s3_request_target(uri, endpoint=endpoint)
+    headers = _sigv4_headers(
+        url,
+        canonical_uri=canonical_uri,
+        region=region,
+        env=env,
+    )
+    request = Request(url, headers=headers, method="GET")
+    try:
+        return build_opener(_NoRedirectHandler()).open(request, timeout=120)
+    except HTTPError as error:
+        raise RuntimeError(
+            f"S3 GET failed for {uri}: HTTP {error.code} {error.reason}"
+        ) from error
+    except URLError as error:
+        raise RuntimeError(f"S3 GET failed for {uri}: {error.reason}") from error
+
+
+def _python_s3_read(
+    uri: str, *, endpoint: str, region: str, env: dict[str, str]
+) -> bytes:
+    with _open_signed_s3_get(
+        uri, endpoint=endpoint, region=region, env=env
+    ) as response:
+        declared = response.headers.get("Content-Length")
+        if declared is not None and int(declared) > _MAX_DESCRIPTOR_BYTES:
+            raise RuntimeError(f"S3 descriptor is too large: {uri}")
+        payload = response.read(_MAX_DESCRIPTOR_BYTES + 1)
+    if len(payload) > _MAX_DESCRIPTOR_BYTES:
+        raise RuntimeError(f"S3 descriptor is too large: {uri}")
+    return payload
+
+
+def _python_s3_download(
+    uri: str,
+    destination: Path,
+    *,
+    endpoint: str,
+    region: str,
+    env: dict[str, str],
+) -> None:
+    with _open_signed_s3_get(
+        uri, endpoint=endpoint, region=region, env=env
+    ) as response, destination.open("xb") as output:
+        while chunk := response.read(8 * 1024 * 1024):
+            output.write(chunk)
 
 
 def _aws_read(uri: str, *, endpoint: str, env: dict[str, str]) -> bytes:
@@ -86,6 +281,45 @@ def _aws_download(
         env=env,
         check=True,
     )
+
+
+def _s3_read(
+    uri: str,
+    *,
+    endpoint: str,
+    region: str,
+    env: dict[str, str],
+    client: str,
+) -> bytes:
+    if client == "python":
+        return _python_s3_read(uri, endpoint=endpoint, region=region, env=env)
+    if client == "aws":
+        return _aws_read(uri, endpoint=endpoint, env=env)
+    raise ValueError(f"unsupported S3 client: {client!r}")
+
+
+def _s3_download(
+    uri: str,
+    destination: Path,
+    *,
+    endpoint: str,
+    region: str,
+    env: dict[str, str],
+    client: str,
+) -> None:
+    if client == "python":
+        _python_s3_download(
+            uri,
+            destination,
+            endpoint=endpoint,
+            region=region,
+            env=env,
+        )
+        return
+    if client == "aws":
+        _aws_download(uri, destination, endpoint=endpoint, env=env)
+        return
+    raise ValueError(f"unsupported S3 client: {client!r}")
 
 
 def _archive_receipt_path(archive: Path) -> Path:
@@ -194,6 +428,8 @@ def _acquire_archive(
     expected_size: int,
     expected_sha256: str,
     receipt_binding: dict[str, object] | None = None,
+    s3_client: str = "aws",
+    s3_region: str = "eu-north1",
 ) -> dict[str, object]:
     download = archive.with_name(archive.name + ".download")
     receipt_path = _archive_receipt_path(archive)
@@ -270,7 +506,14 @@ def _acquire_archive(
         else:
             download.unlink()
     if not download.exists():
-        _aws_download(uri, download, endpoint=endpoint, env=env)
+        _s3_download(
+            uri,
+            download,
+            endpoint=endpoint,
+            region=s3_region,
+            env=env,
+            client=s3_client,
+        )
     if download.stat().st_size != expected_size:
         download.unlink(missing_ok=True)
         raise ValueError("downloaded archive size does not match transport descriptor")
@@ -547,6 +790,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--endpoint-url", default=DEFAULT_ENDPOINT)
+    parser.add_argument(
+        "--s3-client",
+        choices=("python", "aws"),
+        default="python",
+        help="Use the dependency-free SigV4 reader, or an installed AWS CLI.",
+    )
+    parser.add_argument(
+        "--s3-region",
+        default="eu-north1",
+    )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--free-space-headroom-gb", type=int, default=10)
@@ -581,6 +834,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise ValueError(
             "hash jobs must be positive and free-space headroom nonnegative"
         )
+    if not _S3_REGION_RE.fullmatch(args.s3_region):
+        raise ValueError(f"invalid S3 signing region: {args.s3_region!r}")
+    _s3_request_target(
+        f"s3://{args.bucket}/{args.prefix.strip('/')}/probe",
+        endpoint=args.endpoint_url,
+    )
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")
@@ -593,7 +852,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
     else:
         latest_uri = f"s3://{args.bucket}/{prefix}/latest_transport.json"
-        latest_bytes = _aws_read(latest_uri, endpoint=args.endpoint_url, env=env)
+        latest_bytes = _s3_read(
+            latest_uri,
+            endpoint=args.endpoint_url,
+            region=args.s3_region,
+            env=env,
+            client=args.s3_client,
+        )
         latest = json.loads(latest_bytes)
         if latest.get("schema") != "cppmega_megatron_latest_transport_v1":
             raise ValueError(f"unsupported latest schema: {latest.get('schema')!r}")
@@ -601,8 +866,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         transport_uri = str(latest["transport"])
         expected_transport_sha256 = str(latest["transport_sha256"])
 
-    transport_bytes = _aws_read(
-        transport_uri, endpoint=args.endpoint_url, env=env
+    transport_bytes = _s3_read(
+        transport_uri,
+        endpoint=args.endpoint_url,
+        region=args.s3_region,
+        env=env,
+        client=args.s3_client,
     )
     if (
         expected_transport_sha256
@@ -613,8 +882,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     _validate_transport(transport, expected_bundle_id=bundle_id)
 
     logical_manifest_info = transport["logical_manifest"]
-    logical_manifest_bytes = _aws_read(
-        str(logical_manifest_info["uri"]), endpoint=args.endpoint_url, env=env
+    logical_manifest_bytes = _s3_read(
+        str(logical_manifest_info["uri"]),
+        endpoint=args.endpoint_url,
+        region=args.s3_region,
+        env=env,
+        client=args.s3_client,
     )
     if len(logical_manifest_bytes) != int(logical_manifest_info["size"]):
         raise ValueError("remote logical manifest size does not match transport")
@@ -646,6 +919,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         "bucket": args.bucket,
         "prefix": prefix,
         "endpoint_url": args.endpoint_url,
+        "s3_client": args.s3_client,
+        "s3_region": args.s3_region,
         "output_root": str(output_root),
         "bundle_id": bundle_id,
         "hash_jobs": args.hash_jobs,
@@ -722,6 +997,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         expected_size=int(archive_info["size"]),
         expected_sha256=str(archive_info["sha256"]),
         receipt_binding=receipt_binding,
+        s3_client=args.s3_client,
+        s3_region=args.s3_region,
     )
 
     try:

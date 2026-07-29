@@ -42,6 +42,26 @@ if tuple(int(kind) for kind in GraphChunkKind) != tuple(
 
 
 REQUIRED_BATCH_FIELDS = ("tokens", "labels", "loss_mask")
+REQUIRED_FULL_TOKEN_SIDECAR_FIELDS = (
+    "domain_ids",
+    "role_ids",
+    "entity_ids",
+    "scope_ids",
+    "source_doc_ids",
+    "source_identity_ids",
+    "confidence_ids",
+    "structure_ids",
+    "dep_levels",
+    "ast_depth_ids",
+    "sibling_index_ids",
+    "node_type_ids",
+    "symbol_ids",
+    "call_targets",
+    "type_refs",
+    "def_use",
+    "change_mask_pre",
+    "change_mask_post",
+)
 REQUIRED_GRAPH_BATCH_FIELDS = (
     "source_doc_ids",
     "graph_call_edges",
@@ -83,13 +103,52 @@ def _tensor_summary(value: object) -> dict[str, object]:
     if shape is None or not hasattr(value, "numel"):
         raise RuntimeError(f"preflight batch value is not a tensor: {type(value)!r}")
     detached = value.detach()
+    try:
+        nonzero = int(torch.count_nonzero(detached).item())
+    except RuntimeError:
+        # PyTorch CPU kernels do not implement count_nonzero for every integer
+        # dtype (notably uint64), while production sidecars legitimately use it.
+        nonzero = int(
+            torch.count_nonzero(detached.to(dtype=torch.float64)).item()
+        )
+    try:
+        total = float(detached.sum(dtype=torch.float64).item())
+    except (RuntimeError, TypeError):
+        total = float(detached.to(dtype=torch.float64).sum().item())
     return {
         "shape": [int(size) for size in shape],
         "dtype": str(getattr(value, "dtype", "unknown")),
         "device": str(getattr(value, "device", "unknown")),
         "numel": int(value.numel()),
-        "nonzero": int(detached.count_nonzero().item()),
-        "sum": float(detached.to(dtype=torch.float64).sum().item()),
+        "nonzero": nonzero,
+        "sum": total,
+    }
+
+
+def _gradient_summary(value: object) -> dict[str, object]:
+    import torch
+
+    if not isinstance(value, torch.Tensor):
+        raise RuntimeError(f"embedding gradient is not a tensor: {type(value)!r}")
+    detached = value.detach()
+    if detached.is_sparse:
+        detached = detached.coalesce().values()
+    finite = torch.isfinite(detached)
+    finite_values = detached[finite].to(dtype=torch.float64)
+    return {
+        "shape": [int(size) for size in value.shape],
+        "dtype": str(value.dtype),
+        "device": str(value.device),
+        "numel": int(detached.numel()),
+        "nonzero": int(torch.count_nonzero(detached).item()),
+        "finite_count": int(finite.sum().item()),
+        "nan_count": int(torch.isnan(detached).sum().item()),
+        "infinity_count": int(torch.isinf(detached).sum().item()),
+        "l2_norm": (
+            float(torch.linalg.vector_norm(finite_values).item())
+            if finite_values.numel()
+            else 0.0
+        ),
     }
 
 
@@ -419,6 +478,17 @@ def _binding_from_environment() -> dict[str, object] | None:
     return validate_binding_shape(value, where="H200 environment")
 
 
+def _receipt_rank(environment: Mapping[str, str]) -> int:
+    raw = environment.get("RANK", "0")
+    try:
+        rank = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"invalid distributed rank for H200 receipt: {raw!r}") from error
+    if rank < 0:
+        raise RuntimeError(f"invalid negative distributed rank for H200 receipt: {rank}")
+    return rank
+
+
 def observe_production_batch(
     *,
     batch: Mapping[str, object],
@@ -430,6 +500,13 @@ def observe_production_batch(
     """Record the first real Megatron batch after sidecar materialization."""
 
     environment = os.environ if environment is None else environment
+    rank = _receipt_rank(environment)
+    if rank != 0:
+        return {
+            "schema": "cppmega_h200_production_batch_v1",
+            "status": "non_writer_rank",
+            "rank": rank,
+        }
     if receipt_binding is None:
         receipt_binding = _binding_from_environment()
     output = Path(receipt_path)
@@ -463,6 +540,18 @@ def observe_production_batch(
         raise RuntimeError(
             "production objective contract requires objective_ids in the batch"
         )
+    require_full_sidecars = (
+        environment.get("CPPMEGA_H200_FULL_SIDECAR_RECEIPT", "0") == "1"
+    )
+    if require_full_sidecars:
+        missing_token_sidecars = sorted(
+            set(REQUIRED_FULL_TOKEN_SIDECAR_FIELDS) - set(structure_batch)
+        )
+        if missing_token_sidecars:
+            raise RuntimeError(
+                "missing full production token sidecars: "
+                f"{missing_token_sidecars}"
+            )
 
     batch_summary = {
         name: _tensor_summary(batch[name]) for name in REQUIRED_BATCH_FIELDS
@@ -474,6 +563,41 @@ def observe_production_batch(
         name: _tensor_summary(structure_batch[name])
         for name in structure_names
     }
+    token_sidecars = (
+        {
+            name: _tensor_summary(structure_batch[name])
+            for name in REQUIRED_FULL_TOKEN_SIDECAR_FIELDS
+        }
+        if require_full_sidecars
+        else None
+    )
+    if token_sidecars is not None:
+        token_shape = batch_summary["tokens"]["shape"]
+        token_numel = batch_summary["tokens"]["numel"]
+        invalid_shapes = sorted(
+            name
+            for name, summary in token_sidecars.items()
+            if summary["shape"] != token_shape or summary["numel"] != token_numel
+        )
+        if invalid_shapes:
+            raise RuntimeError(
+                "full production token sidecar shapes differ from tokens: "
+                f"{invalid_shapes}"
+            )
+        if (
+            sum(
+                int(token_sidecars[name]["nonzero"])
+                for name in ("domain_ids", "role_ids", "confidence_ids")
+            )
+            <= 0
+        ):
+            raise RuntimeError(
+                "full production batch has no active domain/role/confidence signal"
+            )
+        if int(token_sidecars["source_identity_ids"]["nonzero"]) <= 0:
+            raise RuntimeError(
+                "full production batch has no source-identity provenance"
+            )
     if batch_summary["tokens"]["numel"] <= 0:
         raise RuntimeError("production tokens batch is empty")
     if batch_summary["loss_mask"]["nonzero"] <= 0:
@@ -519,11 +643,299 @@ def observe_production_batch(
     }
     if objective_mix is not None:
         receipt["objective_mix"] = objective_mix
+    if token_sidecars is not None:
+        receipt["token_sidecars"] = token_sidecars
     if receipt_binding is not None:
         receipt["binding"] = validate_binding_shape(
             receipt_binding, where="H200 batch receipt"
         )
     _write_json_atomic(output, receipt)
+    return receipt
+
+
+def validate_production_batch_receipt(
+    receipt: object,
+    *,
+    require_full_sidecars: bool,
+    require_objective_mix: bool = True,
+) -> dict[str, object]:
+    if not isinstance(receipt, dict):
+        raise RuntimeError("production batch receipt must be an object")
+    active_graph = receipt.get("active_graph")
+    source_provenance = receipt.get("source_provenance")
+    objective_mix = receipt.get("objective_mix")
+    if (
+        receipt.get("schema") != "cppmega_h200_production_batch_v1"
+        or receipt.get("status") != "verified"
+        or not isinstance(active_graph, dict)
+        or int(active_graph.get("route_edge_count", 0)) <= 0
+        or not isinstance(source_provenance, dict)
+        or int(source_provenance.get("minimum_source_doc_id", 0)) <= 0
+        or (
+            require_objective_mix
+            and (
+                not isinstance(objective_mix, dict)
+                or not objective_mix.get("observed_objective_ids")
+            )
+        )
+    ):
+        raise RuntimeError(
+            "production batch receipt is not verified or lacks graph, provenance, "
+            "or objective evidence"
+        )
+    if require_full_sidecars:
+        sidecars = receipt.get("token_sidecars")
+        if not isinstance(sidecars, dict) or set(sidecars) != set(
+            REQUIRED_FULL_TOKEN_SIDECAR_FIELDS
+        ):
+            raise RuntimeError("production batch receipt lacks full token sidecars")
+        token_summary = (
+            receipt.get("batch", {}).get("tokens")
+            if isinstance(receipt.get("batch"), dict)
+            else None
+        )
+        if not isinstance(token_summary, dict):
+            raise RuntimeError("production batch receipt lacks token shape evidence")
+        for name, summary in sidecars.items():
+            if (
+                not isinstance(summary, dict)
+                or summary.get("shape") != token_summary.get("shape")
+                or summary.get("numel") != token_summary.get("numel")
+            ):
+                raise RuntimeError(
+                    f"production batch token sidecar {name!r} has invalid shape"
+                )
+        if (
+            sum(
+                int(sidecars[name].get("nonzero", 0))
+                for name in ("domain_ids", "role_ids", "confidence_ids")
+            )
+            <= 0
+            or int(sidecars["source_identity_ids"].get("nonzero", 0)) <= 0
+        ):
+            raise RuntimeError(
+                "production batch receipt lacks active domain or source identity"
+            )
+    return receipt
+
+
+def _expected_embedding_components(
+    environment: Mapping[str, str],
+) -> set[str]:
+    expected = set()
+    if environment.get("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "0") == "1":
+        expected.add("domain")
+    if environment.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1":
+        expected.add("structure")
+    return expected
+
+
+def _embedding_receipt_status(
+    components: Mapping[str, object],
+    *,
+    expected_components: set[str],
+) -> str:
+    if set(components) != expected_components:
+        return "forward_observed"
+    for value in components.values():
+        if not isinstance(value, Mapping):
+            return "forward_observed"
+        gradient = value.get("table_gradient")
+        if (
+            not isinstance(gradient, Mapping)
+            or int(gradient.get("nonzero", 0)) <= 0
+            or int(gradient.get("finite_count", -1))
+            != int(gradient.get("numel", -2))
+            or float(gradient.get("l2_norm", 0.0)) <= 0.0
+        ):
+            return "forward_observed"
+    return "verified"
+
+
+def observe_embedding_component(
+    *,
+    component: str,
+    module: object,
+    inputs: Mapping[str, object],
+    output: object,
+    receipt_path: str | Path,
+    receipt_binding: Mapping[str, object] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Record forward ingress and first live table gradient for one embedding."""
+
+    import torch
+
+    environment = os.environ if environment is None else environment
+    if component not in {"domain", "structure"}:
+        raise RuntimeError(f"unsupported embedding receipt component: {component!r}")
+    expected_components = _expected_embedding_components(environment)
+    if component not in expected_components:
+        raise RuntimeError(
+            f"embedding component {component!r} is not enabled by the environment"
+        )
+    rank = _receipt_rank(environment)
+    if rank != 0:
+        return {
+            "schema": "cppmega_h200_embedding_consumption_v1",
+            "status": "non_writer_rank",
+            "rank": rank,
+            "components": {},
+        }
+    if receipt_binding is None:
+        receipt_binding = _binding_from_environment()
+    output_path = Path(receipt_path)
+    payload: dict[str, object]
+    if output_path.exists():
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        if payload.get("schema") != "cppmega_h200_embedding_consumption_v1":
+            raise RuntimeError(f"invalid existing H200 embedding receipt: {output_path}")
+        if receipt_binding is not None:
+            validate_receipt_binding(
+                payload.get("binding"),
+                expected=receipt_binding,
+                where="H200 embedding receipt",
+            )
+        if payload.get("status") == "verified":
+            return validate_embedding_consumption_receipt(
+                payload,
+                expected_components=expected_components,
+            )
+    else:
+        payload = {
+            "schema": "cppmega_h200_embedding_consumption_v1",
+            "status": "forward_observed",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "rank": rank,
+            "components": {},
+        }
+        if receipt_binding is not None:
+            payload["binding"] = validate_binding_shape(
+                receipt_binding, where="H200 embedding receipt"
+            )
+    if not isinstance(output, torch.Tensor):
+        raise RuntimeError(f"{component} embedding output is not a tensor")
+    if not inputs or any(not isinstance(value, torch.Tensor) for value in inputs.values()):
+        raise RuntimeError(f"{component} embedding inputs are missing or non-tensors")
+    output_summary = _tensor_summary(output)
+    if output_summary["numel"] <= 0 or not bool(torch.isfinite(output).all().item()):
+        raise RuntimeError(f"{component} embedding output is empty or non-finite")
+    input_summaries = {name: _tensor_summary(value) for name, value in inputs.items()}
+    token_shape = next(iter(input_summaries.values()))["shape"]
+    if any(summary["shape"] != token_shape for summary in input_summaries.values()):
+        raise RuntimeError(f"{component} embedding input shapes disagree")
+
+    table = getattr(getattr(module, "stacked_emb", None), "weight", None)
+    projection = getattr(getattr(module, "up_proj", None), "weight", None)
+    if not isinstance(table, torch.Tensor) or not isinstance(projection, torch.Tensor):
+        raise RuntimeError(
+            f"{component} embedding lacks registered table/projection parameters"
+        )
+    components = payload.get("components")
+    if not isinstance(components, dict):
+        raise RuntimeError("H200 embedding receipt components must be an object")
+    existing_component = components.get(component)
+    gradient = (
+        existing_component.get("table_gradient")
+        if isinstance(existing_component, dict)
+        else None
+    )
+    components[component] = {
+        "module": f"{type(module).__module__}.{type(module).__qualname__}",
+        "inputs": input_summaries,
+        "output": output_summary,
+        "parameters": {
+            "table": _tensor_summary(table),
+            "projection": _tensor_summary(projection),
+        },
+        **({"table_gradient": gradient} if gradient is not None else {}),
+    }
+    payload["status"] = _embedding_receipt_status(
+        components, expected_components=expected_components
+    )
+    _write_json_atomic(output_path, payload)
+
+    hook_flag = f"_cppmega_h200_{component}_gradient_hook_registered"
+    if table.requires_grad and not getattr(module, hook_flag, False):
+        setattr(module, hook_flag, True)
+        gradient_written = False
+
+        def _observe_gradient(grad):
+            nonlocal gradient_written
+            if gradient_written:
+                return grad
+            summary = _gradient_summary(grad)
+            if (
+                summary["nonzero"] <= 0
+                or summary["finite_count"] != summary["numel"]
+                or summary["l2_norm"] <= 0.0
+            ):
+                raise RuntimeError(
+                    f"{component} embedding table gradient is zero or non-finite"
+                )
+            current = json.loads(output_path.read_text(encoding="utf-8"))
+            current_components = current.get("components")
+            if not isinstance(current_components, dict) or not isinstance(
+                current_components.get(component), dict
+            ):
+                raise RuntimeError(
+                    f"{component} embedding receipt disappeared before backward"
+                )
+            current_components[component]["table_gradient"] = summary
+            current["status"] = _embedding_receipt_status(
+                current_components, expected_components=expected_components
+            )
+            _write_json_atomic(output_path, current)
+            gradient_written = True
+            return grad
+
+        handle = table.register_hook(_observe_gradient)
+        handles = getattr(module, "_cppmega_h200_gradient_hook_handles", None)
+        if handles is None:
+            handles = []
+            setattr(module, "_cppmega_h200_gradient_hook_handles", handles)
+        handles.append(handle)
+    return payload
+
+
+def validate_embedding_consumption_receipt(
+    receipt: object,
+    *,
+    expected_components: set[str] | None = None,
+) -> dict[str, object]:
+    if not isinstance(receipt, dict):
+        raise RuntimeError("embedding consumption receipt must be an object")
+    components = receipt.get("components")
+    expected = {"domain", "structure"} if expected_components is None else expected_components
+    if (
+        receipt.get("schema") != "cppmega_h200_embedding_consumption_v1"
+        or receipt.get("status") != "verified"
+        or not isinstance(components, dict)
+        or set(components) != expected
+    ):
+        raise RuntimeError("embedding consumption receipt is incomplete")
+    required_inputs = {
+        "domain": {"domain_ids", "role_ids", "confidence_ids"},
+        "structure": {"structure_ids", "dep_levels"},
+    }
+    for component in expected:
+        value = components.get(component)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{component} embedding receipt is malformed")
+        inputs = value.get("inputs")
+        gradient = value.get("table_gradient")
+        if (
+            not isinstance(inputs, dict)
+            or not required_inputs[component].issubset(inputs)
+            or not isinstance(gradient, dict)
+            or int(gradient.get("nonzero", 0)) <= 0
+            or int(gradient.get("finite_count", -1))
+            != int(gradient.get("numel", -2))
+            or float(gradient.get("l2_norm", 0.0)) <= 0.0
+        ):
+            raise RuntimeError(
+                f"{component} embedding receipt lacks live gradient evidence"
+            )
     return receipt
 
 

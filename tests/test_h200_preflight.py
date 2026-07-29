@@ -12,10 +12,15 @@ from cppmega.receipt_binding import build_implementation_binding  # noqa: E402
 from cppmega.megatron.h200_preflight import (  # noqa: E402
     GRAPH_CHUNK_KIND_COUNT,
     GraphChunkKind,
+    observe_embedding_component,
     observe_dsa_selector,
     observe_graph_prior,
     observe_production_batch,
+    validate_embedding_consumption_receipt,
+    validate_production_batch_receipt,
 )
+from cppmega.features.domain.embedding import CppMegaDomainEmbedding  # noqa: E402
+from cppmega.features.structure.embedding import CppMegaStructureEmbedding  # noqa: E402
 from cppmega.megatron.checkpoint_restore_preflight import state_fingerprint  # noqa: E402
 from cppmega.megatron.graph_objective_loss import (  # noqa: E402
     validate_runtime_graph_contract,
@@ -66,6 +71,38 @@ def _structure_batch():
         batch[f"graph_{family}_edge_counts"] = torch.tensor([0], dtype=torch.int64)
     batch["graph_domain_edges"] = torch.tensor([[[1, 2, 5]]], dtype=torch.int64)
     batch["graph_domain_edge_counts"] = torch.tensor([1], dtype=torch.int64)
+    return batch
+
+
+def _full_structure_batch():
+    batch = _structure_batch()
+    values = {
+        "domain_ids": [1, 1, 2, 2],
+        "role_ids": [3, 3, 4, 4],
+        "entity_ids": [7, 7, 8, 8],
+        "scope_ids": [9, 9, 10, 10],
+        "source_identity_ids": [101, 101, 202, 202],
+        "confidence_ids": [2, 2, 3, 3],
+        "dep_levels": [0, 1, 1, 0],
+        "ast_depth_ids": [0, 1, 2, 1],
+        "sibling_index_ids": [0, 0, 1, 1],
+        "node_type_ids": [11, 12, 13, 14],
+        "symbol_ids": [0, 1001, 1001, 0],
+        "call_targets": [0, 0, 1001, 0],
+        "type_refs": [0, 2001, 0, 0],
+        "def_use": [0, 1, 2, 0],
+        "change_mask_pre": [0, 1, 0, 0],
+        "change_mask_post": [0, 0, 1, 0],
+    }
+    uint64_names = {
+        "source_identity_ids",
+        "symbol_ids",
+        "call_targets",
+        "type_refs",
+    }
+    for name, row in values.items():
+        dtype = torch.uint64 if name in uint64_names else torch.int64
+        batch[name] = torch.tensor([row], dtype=dtype)
     return batch
 
 
@@ -127,6 +164,161 @@ def test_observe_production_batch_records_nonzero_structure_and_graph(tmp_path):
         "observed_objective_ids": [2, 4, 5],
     }
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+
+
+def test_observe_production_batch_proves_full_token_sidecar_ingress(tmp_path):
+    receipt = observe_production_batch(
+        batch=_production_batch(),
+        structure_batch=_full_structure_batch(),
+        receipt_path=tmp_path / "batch.json",
+        environment={
+            "CPPMEGA_H200_FULL_SIDECAR_RECEIPT": "1",
+            "CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED": "1",
+        },
+    )
+
+    validate_production_batch_receipt(
+        receipt,
+        require_full_sidecars=True,
+        require_objective_mix=True,
+    )
+    assert receipt["token_sidecars"]["source_identity_ids"]["dtype"] == (
+        "torch.uint64"
+    )
+    assert receipt["token_sidecars"]["change_mask_post"]["shape"] == [1, 4]
+
+
+def test_embedding_receipt_requires_live_domain_and_structure_gradients(tmp_path):
+    receipt_path = tmp_path / "embedding.json"
+    environment = {
+        "CPPMEGA_DOMAIN_EMBEDDING_ENABLED": "1",
+        "CPPMEGA_STRUCTURE_ENABLED": "1",
+    }
+    domain = CppMegaDomainEmbedding(hidden_size=8, bottleneck_dim=4)
+    structure = CppMegaStructureEmbedding(hidden_size=8, bottleneck_dim=4)
+    domain_inputs = {
+        "domain_ids": torch.tensor([[1, 2]]),
+        "role_ids": torch.tensor([[3, 4]]),
+        "confidence_ids": torch.tensor([[1, 2]]),
+    }
+    structure_inputs = {
+        "structure_ids": torch.tensor([[1, 2]]),
+        "dep_levels": torch.tensor([[0, 1]]),
+    }
+    domain_output = domain(**domain_inputs)
+    structure_output = structure(**structure_inputs)
+
+    observe_embedding_component(
+        component="domain",
+        module=domain,
+        inputs=domain_inputs,
+        output=domain_output,
+        receipt_path=receipt_path,
+        environment=environment,
+    )
+    observe_embedding_component(
+        component="structure",
+        module=structure,
+        inputs=structure_inputs,
+        output=structure_output,
+        receipt_path=receipt_path,
+        environment=environment,
+    )
+    assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == (
+        "forward_observed"
+    )
+
+    (domain_output.sum() + structure_output.sum()).backward()
+
+    receipt = validate_embedding_consumption_receipt(
+        json.loads(receipt_path.read_text(encoding="utf-8"))
+    )
+    assert receipt["components"]["domain"]["output"]["nonzero"] == 0
+    assert receipt["components"]["domain"]["table_gradient"]["nonzero"] > 0
+    assert receipt["components"]["structure"]["table_gradient"]["nonzero"] > 0
+
+
+def test_h200_receipts_are_written_only_by_global_rank_zero(tmp_path):
+    batch_receipt = tmp_path / "batch.json"
+    embedding_receipt = tmp_path / "embedding.json"
+    environment = {
+        "RANK": "3",
+        "CPPMEGA_DOMAIN_EMBEDDING_ENABLED": "1",
+        "CPPMEGA_STRUCTURE_ENABLED": "1",
+    }
+
+    batch = observe_production_batch(
+        batch={},
+        structure_batch={},
+        receipt_path=batch_receipt,
+        environment=environment,
+    )
+    embedding = observe_embedding_component(
+        component="domain",
+        module=object(),
+        inputs={},
+        output=object(),
+        receipt_path=embedding_receipt,
+        environment=environment,
+    )
+
+    assert batch == {
+        "schema": "cppmega_h200_production_batch_v1",
+        "status": "non_writer_rank",
+        "rank": 3,
+    }
+    assert embedding["status"] == "non_writer_rank"
+    assert not batch_receipt.exists()
+    assert not embedding_receipt.exists()
+
+
+def test_verified_embedding_receipt_uses_constant_cost_fast_path(tmp_path):
+    receipt_path = tmp_path / "embedding.json"
+    environment = {
+        "CPPMEGA_DOMAIN_EMBEDDING_ENABLED": "1",
+        "CPPMEGA_STRUCTURE_ENABLED": "1",
+    }
+    domain = CppMegaDomainEmbedding(hidden_size=8, bottleneck_dim=4)
+    structure = CppMegaStructureEmbedding(hidden_size=8, bottleneck_dim=4)
+    domain_inputs = {
+        "domain_ids": torch.tensor([[1, 2]]),
+        "role_ids": torch.tensor([[3, 4]]),
+        "confidence_ids": torch.tensor([[1, 2]]),
+    }
+    structure_inputs = {
+        "structure_ids": torch.tensor([[1, 2]]),
+        "dep_levels": torch.tensor([[0, 1]]),
+    }
+    domain_output = domain(**domain_inputs)
+    structure_output = structure(**structure_inputs)
+    observe_embedding_component(
+        component="domain",
+        module=domain,
+        inputs=domain_inputs,
+        output=domain_output,
+        receipt_path=receipt_path,
+        environment=environment,
+    )
+    observe_embedding_component(
+        component="structure",
+        module=structure,
+        inputs=structure_inputs,
+        output=structure_output,
+        receipt_path=receipt_path,
+        environment=environment,
+    )
+    (domain_output.sum() + structure_output.sum()).backward()
+
+    receipt = observe_embedding_component(
+        component="domain",
+        module=object(),
+        inputs={},
+        output=object(),
+        receipt_path=receipt_path,
+        environment=environment,
+    )
+
+    assert receipt["status"] == "verified"
 
 
 def test_observe_production_batch_requires_objective_ids_for_contract_mode(tmp_path):
@@ -332,6 +524,7 @@ def test_h200_graph_preflight_contract_rejects_tensor_only_without_gpu(tmp_path)
 
     assert environment["CPPMEGA_GRAPH_ROUTES_ENABLED"] == "1"
     assert environment["CPPMEGA_STRUCTURE_ENABLED"] == "1"
+    assert environment["CPPMEGA_DOMAIN_EMBEDDING_ENABLED"] == "1"
     assert environment["CPPMEGA_DSA_GRAPH_AUX_ENABLED"] == "1"
     assert environment["CPPMEGA_DSA_PATCH_ENABLED"] == "1"
     assert "CPPMEGA_GRAPH_ROUTES_ABLATION" not in environment

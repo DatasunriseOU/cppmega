@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import re
 import shlex
 import subprocess
 import sys
@@ -27,7 +29,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,8 @@ def _load_sweep_module():
 
 
 sweep = _load_sweep_module()
+from scripts.data import publish_megatron_bundle_to_nebius_s3 as s3_publish  # noqa: E402
+from scripts.streaming_conveyor import capture_code_revision  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,206 @@ class Stage:
             f"/data/cppmega_curriculum_checkpoints/"
             f"stage_{self.index:02d}_seq_{self.seq}_gbs_{self.batch}_mbs_{self.micro_batch}"
         )
+
+
+@dataclass(frozen=True)
+class S3RestorePlan:
+    bundle_id: str
+    artifact_set_sha256: str
+    bucket: str
+    prefix: str
+    endpoint_url: str
+    megatron_commit: str
+    run_id: str
+    s3_region: str = "eu-north1"
+    hash_jobs: int = 4
+    free_space_headroom_gb: int = 40
+    output_root: str = "/data/cppmega_s3_restore"
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", self.bundle_id):
+            raise ValueError(f"unsafe bundle ID for S3 restore: {self.bundle_id!r}")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.artifact_set_sha256):
+            raise ValueError("S3 restore artifact-set SHA-256 is invalid")
+        if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", self.megatron_commit):
+            raise ValueError("S3 restore Megatron commit must be an exact Git SHA")
+        if not self.bucket or not self.prefix or not self.endpoint_url:
+            raise ValueError("S3 restore bucket, prefix, and endpoint must be nonempty")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.s3_region):
+            raise ValueError(f"invalid S3 signing region: {self.s3_region!r}")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", self.run_id):
+            raise ValueError(f"unsafe S3 restore run ID: {self.run_id!r}")
+        if self.hash_jobs <= 0 or self.free_space_headroom_gb < 0:
+            raise ValueError(
+                "S3 restore hash jobs must be positive and free-space headroom "
+                "must be nonnegative"
+            )
+
+    @property
+    def remote_bundle_root(self) -> str:
+        return f"{self.output_root.rstrip('/')}/{self.bundle_id}"
+
+
+def _validate_training_source_revision(
+    bundle_manifest: Mapping[str, object],
+    revision: Mapping[str, object],
+) -> dict[str, object]:
+    implementation = bundle_manifest.get("implementation")
+    components = (
+        implementation.get("components")
+        if isinstance(implementation, Mapping)
+        else None
+    )
+    producer = (
+        components.get("cppmega")
+        if isinstance(components, Mapping)
+        else None
+    )
+    if not isinstance(producer, Mapping):
+        raise ValueError("bundle lacks a cppmega producer implementation binding")
+    if (
+        revision.get("producer_role") != "canonical_source_conveyor"
+        or revision.get("repository_identity") != "cppmega"
+        or revision.get("dirty") is not False
+    ):
+        raise RuntimeError(
+            "H200 overlay requires a clean canonical cppmega source revision"
+        )
+    if revision.get("git_commit") != producer.get("commit"):
+        raise RuntimeError(
+            "H200 overlay cppmega commit differs from the bundle producer"
+        )
+    if revision.get("source_tree_sha256") != producer.get("tree_sha256"):
+        raise RuntimeError(
+            "H200 overlay cppmega source tree differs from the bundle producer"
+        )
+    return dict(revision)
+
+
+def _read_env_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            values[key] = value.strip().strip('"').strip("'")
+    return values
+
+
+def _resolve_s3_credentials(
+    source: Mapping[str, str],
+) -> dict[str, str]:
+    resolved = s3_publish._resolve_s3_env(source)
+    names = (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+    )
+    credentials = {name: resolved[name] for name in names if resolved.get(name)}
+    for name, value in credentials.items():
+        if "\n" in value or "\r" in value or "\x00" in value:
+            raise ValueError(f"S3 credential {name} contains an unsafe control character")
+    return credentials
+
+
+def _make_s3_auth_tar(path: Path, credentials: Mapping[str, str]) -> None:
+    required = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
+    missing = sorted(required - set(credentials))
+    if missing:
+        raise ValueError(f"S3 credential archive lacks {missing}")
+    with tempfile.TemporaryDirectory(prefix="cppmega-s3-auth-") as raw:
+        root = Path(raw)
+        auth = root / "cppmega_s3_auth"
+        auth.mkdir(mode=0o700)
+        env_file = auth / ".env"
+        env_file.write_text(
+            "".join(f"{name}={credentials[name]}\n" for name in sorted(credentials)),
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+        with tarfile.open(path, "w:gz") as archive:
+            archive.add(auth, arcname="cppmega_s3_auth")
+
+
+def _remote_s3_restore_block(plan: S3RestorePlan, docker_image: str) -> str:
+    restore_command = shlex.join(
+        [
+            "python",
+            "/opt/cppmega/scripts/data/restore_megatron_bundle_from_nebius_s3.py",
+            "--output-root",
+            plan.output_root,
+            "--bundle-id",
+            plan.bundle_id,
+            "--run-id",
+            f"{plan.run_id}-restore",
+            "--megatron-commit",
+            plan.megatron_commit,
+            "--bucket",
+            plan.bucket,
+            "--prefix",
+            plan.prefix,
+            "--endpoint-url",
+            plan.endpoint_url,
+            "--s3-client",
+            "python",
+            "--s3-region",
+            plan.s3_region,
+            "--env-file",
+            "/data/cppmega_s3_auth/.env",
+            "--hash-jobs",
+            str(plan.hash_jobs),
+            "--free-space-headroom-gb",
+            str(plan.free_space_headroom_gb),
+        ]
+    )
+    container_command = "\n".join(
+        (
+            "set -euo pipefail",
+            "cp -a /overlay/. /opt/cppmega/",
+            'export PYTHONPATH="/opt/cppmega:/opt/megatron-lm:${PYTHONPATH:-}"',
+            "command -v zstd",
+            'ACTUAL_MEGATRON_COMMIT="$(git -C /opt/megatron-lm rev-parse HEAD)"',
+            (
+                f'test "$ACTUAL_MEGATRON_COMMIT" = '
+                f"{shlex.quote(plan.megatron_commit)}"
+            ),
+            restore_command,
+        )
+    )
+    receipt = f"{plan.remote_bundle_root}/restore_receipt.json"
+    block = f"""\
+sudo docker run --rm --ipc=host \\
+  -v /data:/data \\
+  -v /data/cppmega_overlay:/overlay:ro \\
+  {shlex.quote(docker_image)} \\
+  bash -lc {shlex.quote(container_command)}
+rm -f /data/cppmega_s3_auth/.env
+rmdir /data/cppmega_s3_auth 2>/dev/null || true
+python - {shlex.quote(receipt)} {shlex.quote(plan.bundle_id)} {shlex.quote(plan.artifact_set_sha256)} <<'PYRESTORE'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+receipt = json.loads(path.read_text(encoding="utf-8"))
+if receipt.get("status") not in ("restored_verified", "already_verified"):
+    raise RuntimeError(f"S3 restore receipt is not verified: {{receipt.get('status')}}")
+if receipt.get("bundle_id") != sys.argv[2]:
+    raise RuntimeError("S3 restore receipt bundle mismatch")
+if receipt.get("artifact_set_sha256") != sys.argv[3]:
+    raise RuntimeError("S3 restore receipt artifact-set mismatch")
+PYRESTORE
+cp {shlex.quote(receipt)} /data/cppmega_h200_results/s3_restore_receipt.json
+echo "CPPMEGA_S3_RESTORE_STATUS=PASS bundle={plan.bundle_id} artifact_set_sha256={plan.artifact_set_sha256}" | tee -a /data/cppmega_h200_results/summary.log
+"""
+    return textwrap.indent(block, "        ")
 
 
 def _parse_stage(raw: str, index: int) -> Stage:
@@ -270,18 +474,30 @@ def _remote_script(
     fp8_recipe: str,
     remote_prefixes: dict[int, str],
     graph_capacities: dict[int, dict[str, object]],
+    megatron_commit: str,
     bundle_root: str = "/data/cppmega_bundle",
     tokenizer_model: str = "/data/cppmega_bundle/tokenizer",
     enable_dsa_patch: bool = True,
     run_id: str = "nebius-h200-curriculum",
     initial_checkpoint_root: str = "",
     initial_cum_iters: int = 0,
+    s3_restore: S3RestorePlan | None = None,
 ) -> str:
     sweep.validate_docker_image_digest(docker_image)
+    if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", megatron_commit):
+        raise ValueError("curriculum Megatron commit must be an exact Git SHA")
     if not enable_dsa_patch:
         raise ValueError(
             "production curriculum requires the fused DSA patch and graph auxiliary loss"
         )
+    if s3_restore is not None:
+        if s3_restore.megatron_commit != megatron_commit:
+            raise ValueError("S3 restore and curriculum Megatron commits disagree")
+        if s3_restore.remote_bundle_root != bundle_root:
+            raise ValueError("S3 restore destination and curriculum bundle root disagree")
+        restore_block = _remote_s3_restore_block(s3_restore, docker_image)
+    else:
+        restore_block = ""
     dsa_native_args, dsa_spec = sweep.production_dsa_launch_contract()
     dsa_args = " ".join(shlex.quote(value) for value in dsa_native_args)
     dsa_spec_args = " ".join(shlex.quote(value) for value in dsa_spec)
@@ -312,6 +528,13 @@ def _remote_script(
         #!/usr/bin/env bash
         set -euo pipefail
 
+        cleanup_cppmega_remote_secrets() {{
+          rm -f /data/cppmega_s3_auth/.env
+          rmdir /data/cppmega_s3_auth 2>/dev/null || true
+          rm -f /data/cppmega_auth/ghcr_token
+        }}
+        trap cleanup_cppmega_remote_secrets EXIT
+
         sudo mkdir -p /data/cppmega_h200_results /data/cppmega_overlay
         sudo chown -R "$USER":"$USER" /data
 
@@ -339,6 +562,7 @@ def _remote_script(
         fi
         sudo docker pull {shlex.quote(docker_image)}
 
+{restore_block}\
         cat >/data/cppmega_h200_results/container_run.sh <<'INNER'
         set -euo pipefail
         cp -a /overlay/. /opt/cppmega/
@@ -358,6 +582,8 @@ def _remote_script(
         export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
         export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
         export CPPMEGA_H200_DSA_GRAPH_RECEIPTS=1
+        export CPPMEGA_H200_FULL_SIDECAR_RECEIPT=1
+        export CPPMEGA_MEGATRON_COMMIT={shlex.quote(megatron_commit)}
         export CPPMEGA_BUNDLE_ROOT={shlex.quote(bundle_root)}
         export CPPMEGA_TOKENIZER_MODEL={shlex.quote(tokenizer_model)}
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results /data/cppmega_curriculum_checkpoints
@@ -366,6 +592,8 @@ def _remote_script(
         import importlib
         import json
         import os
+        import subprocess
+        from pathlib import Path
         import torch
         from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
         from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
@@ -405,8 +633,32 @@ def _remote_script(
             "capability": torch.cuda.get_device_capability(0),
             "total_memory_gib": torch.cuda.get_device_properties(0).total_memory / 1024**3,
         }}
+        report["megatron_commit"] = subprocess.check_output(
+            ["git", "-C", "/opt/megatron-lm", "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        overlay_revision = json.loads(
+            Path("/opt/cppmega/cppmega_overlay_revision.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        bundle_manifest = json.loads(
+            (Path(os.environ["CPPMEGA_BUNDLE_ROOT"]) / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        producer = bundle_manifest["implementation"]["components"]["cppmega"]
+        report["cppmega_overlay_revision"] = {{
+            "git_commit": overlay_revision.get("git_commit"),
+            "source_tree_sha256": overlay_revision.get("source_tree_sha256"),
+            "dirty": overlay_revision.get("dirty"),
+        }}
         print("CPPMEGA_STACK_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
         assert report["megatron.core.utils.get_batch_on_this_tp_rank"], report
+        assert report["megatron_commit"] == os.environ["CPPMEGA_MEGATRON_COMMIT"], report
+        assert overlay_revision.get("dirty") is False, overlay_revision
+        assert overlay_revision.get("git_commit") == producer["commit"], (overlay_revision, producer)
+        assert overlay_revision.get("source_tree_sha256") == producer["tree_sha256"], (overlay_revision, producer)
         PY
 
         STAGES=(
@@ -426,6 +678,7 @@ def _remote_script(
           --data-prefix "$PREFLIGHT_DATA_PREFIX" \
           --tokenizer-model "$CPPMEGA_TOKENIZER_MODEL" \
           --run-id {shlex.quote(run_id)} \
+          --megatron-commit "$CPPMEGA_MEGATRON_COMMIT" \
           --sequence-length "$PREFLIGHT_SEQ" \
           --micro-batch-size 1 \
           --fp8-recipe {shlex.quote(fp8_recipe)} \
@@ -444,8 +697,12 @@ def _remote_script(
           LOG="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_seq_${{SEQ}}_gbs_${{BS}}_mbs_${{MBS}}.log"
           NVSMI="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_seq_${{SEQ}}_gbs_${{BS}}_mbs_${{MBS}}.nvsmi.csv"
           GRAPH_PRIOR_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_graph_prior.json"
-          rm -f "$GRAPH_PRIOR_RECEIPT"
+          BATCH_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_batch.json"
+          EMBEDDING_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_embedding.json"
+          rm -f "$GRAPH_PRIOR_RECEIPT" "$BATCH_RECEIPT" "$EMBEDDING_RECEIPT"
           export CPPMEGA_H200_GRAPH_PRIOR_RECEIPT="$GRAPH_PRIOR_RECEIPT"
+          export CPPMEGA_H200_BATCH_RECEIPT="$BATCH_RECEIPT"
+          export CPPMEGA_H200_EMBEDDING_RECEIPT="$EMBEDDING_RECEIPT"
           export DATA_PREFIX
           export CPPMEGA_GRAPH_MAX_EDGES="$GRAPH_MAX_EDGES"
           export CPPMEGA_GRAPH_MAX_CHUNKS="$GRAPH_MAX_CHUNKS"
@@ -657,6 +914,32 @@ def _remote_script(
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} status=FAIL exit=${{status}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit "$status"
           fi
+          if ! python - "$BATCH_RECEIPT" "$EMBEDDING_RECEIPT" <<'PYSIDECARS'
+        import json
+        import sys
+        from pathlib import Path
+        from cppmega.megatron.h200_preflight import (
+            validate_embedding_consumption_receipt,
+            validate_production_batch_receipt,
+        )
+
+        batch_path = Path(sys.argv[1])
+        embedding_path = Path(sys.argv[2])
+        if not batch_path.is_file() or not embedding_path.is_file():
+            raise RuntimeError("training did not write sidecar consumption receipts")
+        validate_production_batch_receipt(
+            json.loads(batch_path.read_text(encoding="utf-8")),
+            require_full_sidecars=True,
+            require_objective_mix=True,
+        )
+        validate_embedding_consumption_receipt(
+            json.loads(embedding_path.read_text(encoding="utf-8"))
+        )
+        PYSIDECARS
+          then
+            echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=sidecar_consumption_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+            exit 6
+          fi
           LOSS_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_loss_gate.json"
           if ! python - "$LOG" "$TARGET_ITERS" "$LOSS_RECEIPT" <<'PYLOSS'
         import sys
@@ -703,7 +986,7 @@ def _remote_script(
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=checkpoint_iteration expected=${{TARGET_ITERS}} actual=${{LATEST_ITER}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit 3
           fi
-          echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} status=OK checkpoint_root=${{CHECKPOINT_ROOT}} loss_receipt=${{LOSS_RECEIPT}} transition=${{TRANSITION}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+          echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} status=OK checkpoint_root=${{CHECKPOINT_ROOT}} batch_receipt=${{BATCH_RECEIPT}} embedding_receipt=${{EMBEDDING_RECEIPT}} loss_receipt=${{LOSS_RECEIPT}} transition=${{TRANSITION}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
           PREV_CHECKPOINT_ROOT="$CHECKPOINT_ROOT"
           PREV_CUM_ITERS="$CUM_ITERS"
         done
@@ -783,6 +1066,36 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--docker-image", default=sweep.DEFAULT_DOCKER_IMAGE)
     parser.add_argument("--bundle-root", type=Path, required=True)
+    parser.add_argument(
+        "--megatron-commit",
+        default=os.environ.get("CPPMEGA_MEGATRON_COMMIT"),
+        help=(
+            "Exact Megatron-LM Git SHA in the pinned image; defaults to "
+            "CPPMEGA_MEGATRON_COMMIT."
+        ),
+    )
+    parser.add_argument(
+        "--bundle-transport",
+        choices=("s3", "local"),
+        default="s3",
+        help=(
+            "Restore the committed full bundle transport from Nebius S3 "
+            "(production default), or upload only the local training prefixes."
+        ),
+    )
+    parser.add_argument("--s3-bucket", default=s3_publish.DEFAULT_BUCKET)
+    parser.add_argument("--s3-prefix", default=s3_publish.DEFAULT_PREFIX)
+    parser.add_argument("--s3-endpoint-url", default=s3_publish.DEFAULT_ENDPOINT)
+    parser.add_argument(
+        "--s3-region",
+        default="eu-north1",
+    )
+    parser.add_argument(
+        "--s3-env-file",
+        type=Path,
+        default=Path(os.environ.get("CPPMEGA_S3_ENV_FILE", ".env")),
+    )
+    parser.add_argument("--s3-free-space-headroom-gb", type=int, default=40)
     parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--ghcr-user", default=None)
     parser.add_argument("--ghcr-token-file", type=Path, default=None)
@@ -832,6 +1145,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             "production curriculum cannot run with --no-enable-dsa-patch"
         )
 
+    if not isinstance(args.megatron_commit, str) or not re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
+    ):
+        raise ValueError(
+            "curriculum requires --megatron-commit or CPPMEGA_MEGATRON_COMMIT "
+            "with an exact lowercase Git SHA"
+        )
     sweep.validate_ssh_host_key_contract(args, required=not args.dry_run)
     sweep.validate_docker_image_digest(args.docker_image)
     for name, value in (
@@ -841,12 +1161,18 @@ def main(argv: Iterable[str] | None = None) -> int:
         ("--image-id", args.image_id),
     ):
         sweep.validate_nebius_resource_id(value, name=name)
-    if args.hash_jobs <= 0:
-        raise ValueError("--hash-jobs must be positive")
+    if args.hash_jobs <= 0 or args.s3_free_space_headroom_gb < 0:
+        raise ValueError(
+            "hash jobs must be positive and S3 free-space headroom nonnegative"
+        )
     bundle_root = args.bundle_root.expanduser().resolve()
     bundle_manifest, _bundle_artifacts = sweep._validate_bundle(
         bundle_root,
         args.hash_jobs,
+    )
+    training_source_revision = _validate_training_source_revision(
+        bundle_manifest,
+        capture_code_revision(ROOT),
     )
     tokenizer_relative = str(bundle_manifest["tokenizer"]["path"])
     bundle_tokenizer = (bundle_root / tokenizer_relative).resolve()
@@ -892,6 +1218,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         "bundle_id": str(bundle_manifest["bundle_id"]),
         "artifact_set_sha256": str(bundle_manifest["artifact_set_sha256"]),
     }
+    s3_restore: S3RestorePlan | None = None
+    remote_bundle_root = "/data/cppmega_bundle"
+    if args.bundle_transport == "s3":
+        s3_restore = S3RestorePlan(
+            bundle_id=bundle_identity["bundle_id"],
+            artifact_set_sha256=bundle_identity["artifact_set_sha256"],
+            bucket=args.s3_bucket,
+            prefix=args.s3_prefix.strip("/"),
+            endpoint_url=args.s3_endpoint_url,
+            megatron_commit=args.megatron_commit,
+            run_id=args.instance_name,
+            s3_region=args.s3_region,
+            hash_jobs=args.hash_jobs,
+            free_space_headroom_gb=args.s3_free_space_headroom_gb,
+        )
+        remote_bundle_root = s3_restore.remote_bundle_root
+    remote_tokenizer = f"{remote_bundle_root}/{tokenizer_relative}"
 
     args.ssh_key = args.ssh_key.expanduser().resolve()
     ssh_pubkey_path = args.ssh_pubkey or Path(str(args.ssh_key) + ".pub")
@@ -925,13 +1268,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                 fp8_recipe=args.fp8_recipe,
                 remote_prefixes=remote_prefixes,
                 graph_capacities=graph_capacities,
-                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                megatron_commit=args.megatron_commit,
+                bundle_root=remote_bundle_root,
+                tokenizer_model=remote_tokenizer,
                 enable_dsa_patch=args.enable_dsa_patch,
                 run_id=args.instance_name,
                 initial_checkpoint_root="/data/cppmega_curriculum_checkpoints/initial"
                 if args.initial_checkpoint_root is not None
                 else "",
                 initial_cum_iters=previous_cum_iters,
+                s3_restore=s3_restore,
             )[:4000]
         )
         return 0
@@ -948,20 +1294,41 @@ def main(argv: Iterable[str] | None = None) -> int:
         overlay_tar = tmp / "cppmega_overlay.tgz"
         bundle_tar = tmp / "cppmega_bundle.tgz"
         auth_tar = tmp / "cppmega_ghcr_auth.tgz"
+        s3_auth_tar = tmp / "cppmega_s3_auth.tgz"
         curriculum_tar = tmp / "cppmega_curriculum.tgz"
         checkpoint_tar = tmp / "cppmega_initial_checkpoint.tgz"
 
-        sweep.make_overlay_tar(overlay_tar)
-        archived_prefixes, archived_tokenizer = sweep.make_bundle_tar(
-            bundle_root,
-            [stage.prefix for stage in stages],
-            bundle_tar,
-            hash_jobs=args.hash_jobs,
+        archived_source_revision = sweep.make_overlay_tar(overlay_tar)
+        _validate_training_source_revision(
+            bundle_manifest,
+            archived_source_revision,
         )
-        if archived_prefixes != [remote_prefixes[stage.index] for stage in stages]:
-            raise RuntimeError("bundle archive prefix layout drifted after validation")
-        if archived_tokenizer != tokenizer_relative:
-            raise RuntimeError("bundle archive tokenizer layout drifted after validation")
+        if archived_source_revision != training_source_revision:
+            raise RuntimeError(
+                "cppmega source revision changed after curriculum validation"
+            )
+        if s3_restore is None:
+            archived_prefixes, archived_tokenizer = sweep.make_bundle_tar(
+                bundle_root,
+                [stage.prefix for stage in stages],
+                bundle_tar,
+                hash_jobs=args.hash_jobs,
+            )
+            if archived_prefixes != [
+                remote_prefixes[stage.index] for stage in stages
+            ]:
+                raise RuntimeError("bundle archive prefix layout drifted after validation")
+            if archived_tokenizer != tokenizer_relative:
+                raise RuntimeError("bundle archive tokenizer layout drifted after validation")
+        else:
+            s3_source = {
+                **_read_env_values(args.s3_env_file.expanduser()),
+                **os.environ,
+            }
+            _make_s3_auth_tar(
+                s3_auth_tar,
+                _resolve_s3_credentials(s3_source),
+            )
         _make_curriculum_tar(
             stages,
             curriculum_tar,
@@ -992,7 +1359,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             ip = sweep.wait_for_ip(instance_id)
             sweep.wait_for_ssh(args, ip)
             sweep.stream_tar_to_remote(args, ip, overlay_tar, "/data/cppmega_overlay")
-            sweep.stream_tar_to_remote(args, ip, bundle_tar, "/data")
+            if s3_restore is None:
+                sweep.stream_tar_to_remote(args, ip, bundle_tar, "/data")
+            else:
+                sweep.stream_tar_to_remote(args, ip, s3_auth_tar, "/data")
             sweep.stream_tar_to_remote(args, ip, curriculum_tar, "/data")
             if args.initial_checkpoint_root is not None:
                 sweep.stream_tar_to_remote(args, ip, checkpoint_tar, "/data")
@@ -1005,11 +1375,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                 fp8_recipe=args.fp8_recipe,
                 remote_prefixes=remote_prefixes,
                 graph_capacities=graph_capacities,
-                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                megatron_commit=args.megatron_commit,
+                bundle_root=remote_bundle_root,
+                tokenizer_model=remote_tokenizer,
                 enable_dsa_patch=args.enable_dsa_patch,
                 run_id=args.instance_name,
                 initial_checkpoint_root=initial_remote_checkpoint_root,
                 initial_cum_iters=previous_cum_iters,
+                s3_restore=s3_restore,
             )
             sweep.ssh(
                 args,

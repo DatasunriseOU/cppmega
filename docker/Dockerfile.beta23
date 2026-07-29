@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-15 g++-15 \
         python3.13 python3.13-dev python3.13-venv \
         git build-essential cmake ninja-build pkg-config libnuma-dev \
+        zstd \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.13 90 \

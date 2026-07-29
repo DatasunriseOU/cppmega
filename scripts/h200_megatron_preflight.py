@@ -49,6 +49,10 @@ from cppmega.megatron.graph_objective_loss import (  # noqa: E402
 from cppmega.megatron.graph_recipe import (  # noqa: E402
     stage1_graph_recipe_binding,
 )
+from cppmega.megatron.h200_preflight import (  # noqa: E402
+    validate_embedding_consumption_receipt,
+    validate_production_batch_receipt,
+)
 
 PENDING_CHECKPOINT_SHA256 = "0" * 64
 _GRAPH_CHUNK_SIDECARS = (
@@ -337,6 +341,7 @@ def _profile_environment(
     environment.update(
         {
             "CPPMEGA_STRUCTURE_ENABLED": "1",
+            "CPPMEGA_DOMAIN_EMBEDDING_ENABLED": "1",
             "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
             "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "0",
             "CPPMEGA_GRAPH_MAX_EDGES": str(graph_max_edges),
@@ -1140,6 +1145,7 @@ def _run_phase(
     environment: dict[str, str],
     log_path: Path,
     batch_receipt: Path,
+    embedding_receipt: Path,
     graph_prior_receipt: Path,
     checkpoint_state_receipt: Path,
     backend_dispatch_receipt: Path,
@@ -1149,13 +1155,20 @@ def _run_phase(
     checkpoint_root: Path,
     receipt_binding: dict[str, object],
 ) -> dict[str, object]:
-    required_receipts = [batch_receipt, graph_prior_receipt, checkpoint_state_receipt]
+    required_receipts = [
+        batch_receipt,
+        embedding_receipt,
+        graph_prior_receipt,
+        checkpoint_state_receipt,
+    ]
     if backend_claims:
         required_receipts.append(backend_dispatch_receipt)
     for path in required_receipts:
         path.unlink(missing_ok=True)
     phase_environment = dict(environment)
     phase_environment["CPPMEGA_H200_BATCH_RECEIPT"] = str(batch_receipt)
+    phase_environment["CPPMEGA_H200_EMBEDDING_RECEIPT"] = str(embedding_receipt)
+    phase_environment["CPPMEGA_H200_FULL_SIDECAR_RECEIPT"] = "1"
     phase_environment["CPPMEGA_H200_GRAPH_PRIOR_RECEIPT"] = str(
         graph_prior_receipt
     )
@@ -1213,22 +1226,18 @@ def _run_phase(
     if not batch_receipt.is_file():
         raise RuntimeError(f"H200 preflight {name} did not record a production batch")
     batch = json.loads(batch_receipt.read_text(encoding="utf-8"))
-    active_graph = batch.get("active_graph")
-    source_provenance = batch.get("source_provenance")
-    objective_mix = batch.get("objective_mix")
-    if (
-        batch.get("status") != "verified"
-        or not isinstance(active_graph, dict)
-        or int(active_graph.get("route_edge_count", 0)) <= 0
-        or not isinstance(source_provenance, dict)
-        or int(source_provenance.get("minimum_source_doc_id", 0)) <= 0
-        or not isinstance(objective_mix, dict)
-        or not objective_mix.get("observed_objective_ids")
-    ):
+    validate_production_batch_receipt(
+        batch,
+        require_full_sidecars=True,
+        require_objective_mix=True,
+    )
+    if not embedding_receipt.is_file():
         raise RuntimeError(
-            f"H200 preflight {name} production batch is not verified or lacks "
-            "objective mix accounting"
+            f"H200 preflight {name} did not record embedding consumption"
         )
+    embedding = validate_embedding_consumption_receipt(
+        json.loads(embedding_receipt.read_text(encoding="utf-8"))
+    )
     if not graph_prior_receipt.is_file():
         raise RuntimeError(
             f"H200 preflight {name} did not record graph-prior consumption"
@@ -1271,6 +1280,11 @@ def _run_phase(
             expected_pending=receipt_binding,
             final=final_binding,
         )
+        embedding = _finalize_bound_receipt(
+            embedding_receipt,
+            expected_pending=receipt_binding,
+            final=final_binding,
+        )
         graph_prior = _finalize_bound_receipt(
             graph_prior_receipt,
             expected_pending=receipt_binding,
@@ -1290,6 +1304,7 @@ def _run_phase(
     else:
         bound_receipts = [
             (batch_receipt, batch),
+            (embedding_receipt, embedding),
             (graph_prior_receipt, graph_prior),
             (checkpoint_state_receipt, checkpoint_state),
         ]
@@ -1312,6 +1327,8 @@ def _run_phase(
         "command_shell": shlex.join(command),
         "log": str(log_path),
         "batch_receipt": str(batch_receipt),
+        "embedding_receipt": str(embedding_receipt),
+        "embedding_consumption": embedding,
         "graph_prior_receipt": str(graph_prior_receipt),
         "checkpoint_state_receipt": str(checkpoint_state_receipt),
         "backend_dispatch_receipt": (
@@ -1590,6 +1607,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 environment=environment,
                 log_path=output.parent / "h200_preflight_save.log",
                 batch_receipt=output.parent / "h200_preflight_save_batch.json",
+                embedding_receipt=output.parent
+                / "h200_preflight_save_embedding.json",
                 graph_prior_receipt=output.parent
                 / "h200_preflight_save_graph_prior.json",
                 checkpoint_state_receipt=save_state_receipt,
@@ -1634,6 +1653,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 environment=environment,
                 log_path=output.parent / "h200_preflight_restore.log",
                 batch_receipt=output.parent / "h200_preflight_restore_batch.json",
+                embedding_receipt=output.parent
+                / "h200_preflight_restore_embedding.json",
                 graph_prior_receipt=output.parent
                 / "h200_preflight_restore_graph_prior.json",
                 checkpoint_state_receipt=restore_state_receipt,

@@ -190,6 +190,23 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
                 target_dtype=embeddings.dtype,
             )
             if domain_embeddings is not None:
+                receipt_path = os.environ.get("CPPMEGA_H200_EMBEDDING_RECEIPT")
+                if receipt_path:
+                    from cppmega.megatron.h200_preflight import (
+                        observe_embedding_component,
+                    )
+
+                    observe_embedding_component(
+                        component="domain",
+                        module=self.cppmega_domain,
+                        inputs={
+                            name: value
+                            for name, value in normalized_domain.items()
+                            if value is not None
+                        },
+                        output=domain_embeddings,
+                        receipt_path=receipt_path,
+                    )
                 # RULE #1: a wrong-shape domain embedding must not be silently
                 # dropped -- that would train with the domain signal disabled.
                 if domain_embeddings.shape != embeddings.shape:
@@ -210,6 +227,34 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
                 node_type_ids=normalized_structure["node_type_ids"],
                 target_dtype=embeddings.dtype,
             )
+            receipt_path = os.environ.get("CPPMEGA_H200_EMBEDDING_RECEIPT")
+            if receipt_path:
+                from cppmega.megatron.h200_preflight import (
+                    observe_embedding_component,
+                )
+
+                input_name_by_component = {
+                    "structure": "structure_ids",
+                    "dep_level": "dep_levels",
+                    "ast_depth": "ast_depth_ids",
+                    "sibling_index": "sibling_index_ids",
+                    "ast_node_type": "node_type_ids",
+                }
+                active_input_names = {
+                    input_name_by_component[name]
+                    for name in self.cppmega_structure.active_component_names
+                }
+                observe_embedding_component(
+                    component="structure",
+                    module=self.cppmega_structure,
+                    inputs={
+                        name: value
+                        for name, value in normalized_structure.items()
+                        if name in active_input_names and value is not None
+                    },
+                    output=structure_embeddings,
+                    receipt_path=receipt_path,
+                )
             if isinstance(structure_embeddings, torch.Tensor) and structure_embeddings.ndim == embeddings.ndim:
                 embeddings = embeddings + structure_embeddings
 

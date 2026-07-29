@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import hashlib
+from datetime import datetime, timezone
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,8 @@ from scripts.data.restore_megatron_bundle_from_nebius_s3 import (
     _extract_tar_zst,
     _prefix_manifest_sha256s,
     _require_free_space,
+    _s3_request_target,
+    _sigv4_headers,
     _validate_run_id,
     _validate_tar_zst_members,
     _validate_transport,
@@ -296,6 +299,71 @@ def test_restore_cli_requires_explicit_run_identity() -> None:
     assert {"output_root", "run_id"} <= required
 
 
+def test_restore_defaults_to_dependency_free_s3_client() -> None:
+    parser = build_arg_parser()
+
+    args = parser.parse_args(["--output-root", "/data/restore", "--run-id", "run-1"])
+
+    assert args.s3_client == "python"
+    assert args.s3_region == "eu-north1"
+
+
+def test_s3_request_target_uses_nebius_path_style_without_normalizing_key() -> None:
+    url, canonical_uri = _s3_request_target(
+        "s3://bucket-1/a//space here/%literal",
+        endpoint="https://storage.eu-north1.nebius.cloud",
+    )
+
+    assert canonical_uri == "/bucket-1/a//space%20here/%25literal"
+    assert url == (
+        "https://storage.eu-north1.nebius.cloud"
+        "/bucket-1/a//space%20here/%25literal"
+    )
+
+
+def test_sigv4_matches_official_aws_get_object_vector() -> None:
+    headers = _sigv4_headers(
+        "https://examplebucket.s3.amazonaws.com/test.txt",
+        canonical_uri="/test.txt",
+        region="us-east-1",
+        env={
+            "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+            "AWS_SECRET_ACCESS_KEY": (
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            ),
+        },
+        timestamp=datetime(2013, 5, 24, tzinfo=timezone.utc),
+        extra_headers={"range": "bytes=0-9"},
+    )
+
+    assert headers["x-amz-content-sha256"] == (
+        "e3b0c44298fc1c149afbf4c8996fb924"
+        "27ae41e4649b934ca495991b7852b855"
+    )
+    assert headers["Authorization"] == (
+        "AWS4-HMAC-SHA256 "
+        "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,"
+        "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
+        "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+    )
+
+
+@pytest.mark.parametrize(
+    ("uri", "endpoint"),
+    [
+        ("https://bucket/key", "https://storage.example"),
+        ("s3://bucket/key?query=1", "https://storage.example"),
+        ("s3://bucket/key", "http://storage.example"),
+        ("s3://bucket/key", "https://user:secret@storage.example"),
+    ],
+)
+def test_s3_request_target_rejects_unsafe_transport(
+    uri: str, endpoint: str
+) -> None:
+    with pytest.raises(ValueError):
+        _s3_request_target(uri, endpoint=endpoint)
+
+
 def test_restore_binding_derives_all_prefix_manifest_hashes() -> None:
     manifest = {
         "artifacts": [
@@ -433,6 +501,8 @@ def test_restore_rejects_legacy_manifest_before_archive_download(
                 "preflight",
                 "--megatron-commit",
                 "1" * 40,
+                "--s3-client",
+                "aws",
             ]
         )
 
