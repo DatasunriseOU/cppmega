@@ -13,6 +13,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -63,6 +64,7 @@ OVERLAY_PATHS = (
     "cppmega",
     "scripts/h200_megatron_preflight.py",
     "scripts/data/publish_megatron_bundle_to_nebius_s3.py",
+    "scripts/data/restore_megatron_bundle_from_nebius_s3.py",
     "data/domain_schema_v1.json",
     "data/tokenizer_v2/tokenizer_contract_v1.json",
 )
@@ -235,16 +237,37 @@ def run_json(cmd: list[str], *, timeout: int | None = None) -> object:
     return json.loads(proc.stdout)
 
 
-def make_overlay_tar(path: Path) -> None:
+def make_overlay_tar(path: Path) -> dict[str, object]:
+    from scripts.streaming_conveyor import capture_code_revision
+
     def keep_source(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
         parts = Path(info.name).parts
         if "__pycache__" in parts or info.name.endswith((".pyc", ".pyo")):
             return None
         return info
 
+    revision_before = capture_code_revision(ROOT)
     with tarfile.open(path, "w:gz") as tf:
         for rel in OVERLAY_PATHS:
             tf.add(ROOT / rel, arcname=rel, filter=keep_source)
+        revision_bytes = (
+            json.dumps(
+                revision_before,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        revision_info = tarfile.TarInfo("cppmega_overlay_revision.json")
+        revision_info.mode = 0o444
+        revision_info.size = len(revision_bytes)
+        tf.addfile(revision_info, io.BytesIO(revision_bytes))
+    revision_after = capture_code_revision(ROOT)
+    if revision_after != revision_before:
+        path.unlink(missing_ok=True)
+        raise RuntimeError("cppmega source revision changed while building H200 overlay")
+    return revision_after
 
 
 def _assert_prefix_contract(prefix: Path) -> dict:
@@ -791,6 +814,19 @@ def stream_tar_to_remote(args: argparse.Namespace, ip: str, tar_path: Path, targ
         subprocess.run(ssh_cmd, stdin=f, check=True)
 
 
+def production_dsa_launch_contract() -> tuple[list[str], tuple[str, str]]:
+    """Return the native CLI and spec required for the production DSA lane."""
+
+    profile = get_run_profile("h200_cpp_world_mini")
+    profile.model.dense = False
+    profile.spec_module = "cppmega.megatron.nam56r_full_spec"
+    profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
+    native_args = shlex.split(profile.native_args_fragment())
+    if "--experimental-attention-variant" not in native_args:
+        raise ValueError("H200 graph auxiliary launcher requires native DSA args")
+    return native_args, (profile.spec_module, profile.spec_function)
+
+
 def remote_run_script(
     batch_sizes: list[int],
     train_iters: int,
@@ -818,17 +854,10 @@ def remote_run_script(
         raise ValueError(
             "production graph auxiliary contract requires the fused DSA patch"
         )
-    dsa_profile = get_run_profile("h200_cpp_world_mini")
-    dsa_profile.model.dense = False
-    dsa_profile.spec_module = "cppmega.megatron.nam56r_full_spec"
-    dsa_profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
-    dsa_native_args = shlex.split(dsa_profile.native_args_fragment())
-    if "--experimental-attention-variant" not in dsa_native_args:
-        raise ValueError("H200 graph auxiliary launcher requires native DSA args")
+    dsa_native_args, dsa_spec = production_dsa_launch_contract()
     dsa_args = " ".join(shlex.quote(value) for value in dsa_native_args)
     dsa_spec_args = " ".join(
-        shlex.quote(value)
-        for value in (dsa_profile.spec_module, dsa_profile.spec_function)
+        shlex.quote(value) for value in dsa_spec
     )
     batches = " ".join(str(v) for v in batch_sizes)
     if seq_data_prefixes is None:

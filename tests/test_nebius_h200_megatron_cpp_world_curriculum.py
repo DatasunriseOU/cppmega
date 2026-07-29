@@ -1,15 +1,23 @@
 import json
 import subprocess
+import tarfile
 
 import pytest
 
 from scripts.nebius_h200_megatron_cpp_world_curriculum import (
+    S3RestorePlan,
     _default_stages,
+    _make_s3_auth_tar,
     _make_curriculum_manifest,
     _parse_stage,
     _remote_script,
+    _resolve_s3_credentials,
+    _validate_training_source_revision,
 )
 from scripts.nebius_h200_megatron_cpp_world_sweep import DEFAULT_DOCKER_IMAGE
+
+
+_MEGATRON_COMMIT = "b" * 40
 
 
 def _capacity(stage, *, edges=23, chunks=17):
@@ -22,23 +30,23 @@ def _capacity(stage, *, edges=23, chunks=17):
     }
 
 
-def test_default_curriculum_uses_h200_observed_long_context_batches():
+def test_default_curriculum_keeps_token_budget_with_receipt_backed_dsa_microbatch():
     stages = _default_stages()
 
     by_seq = {stage.seq: stage for stage in stages}
 
     assert by_seq[1024].batch == 192
-    assert by_seq[1024].micro_batch == 192
+    assert by_seq[1024].micro_batch == 1
     assert by_seq[2048].batch == 96
-    assert by_seq[2048].micro_batch == 96
+    assert by_seq[2048].micro_batch == 1
     assert by_seq[4096].batch == 40
-    assert by_seq[4096].micro_batch == 40
+    assert by_seq[4096].micro_batch == 1
     assert by_seq[4096].iters == 2311
     assert by_seq[8192].batch == 16
-    assert by_seq[8192].micro_batch == 4
+    assert by_seq[8192].micro_batch == 1
     assert by_seq[8192].iters == 2756
     assert by_seq[16384].batch == 8
-    assert by_seq[16384].micro_batch == 2
+    assert by_seq[16384].micro_batch == 1
     assert by_seq[16384].iters == 2391
 
 
@@ -82,7 +90,7 @@ def test_curriculum_manifest_records_global_and_micro_batch(tmp_path):
     payload = json.loads(out.read_text())
     assert payload["schema"] == "cppmega_h200_curriculum_v2"
     assert payload["stages"][0]["global_batch"] == 16
-    assert payload["stages"][0]["micro_batch"] == 4
+    assert payload["stages"][0]["micro_batch"] == 1
     assert payload["stages"][0]["graph_capacity"]["graph_max_edges"] == 23
     assert payload["stages"][0]["remote_prefix"] == "data/seq_8192/train"
     assert payload["checkpoint_transition"] == {
@@ -95,6 +103,39 @@ def test_curriculum_manifest_records_global_and_micro_batch(tmp_path):
     }
 
 
+def test_curriculum_overlay_must_match_clean_bundle_producer_revision():
+    manifest = {
+        "implementation": {
+            "components": {
+                "cppmega": {
+                    "commit": "a" * 40,
+                    "tree_sha256": "b" * 64,
+                }
+            }
+        }
+    }
+    revision = {
+        "producer_role": "canonical_source_conveyor",
+        "repository_identity": "cppmega",
+        "dirty": False,
+        "git_commit": "a" * 40,
+        "source_tree_sha256": "b" * 64,
+    }
+
+    assert _validate_training_source_revision(manifest, revision) == revision
+
+    with pytest.raises(RuntimeError, match="clean canonical"):
+        _validate_training_source_revision(
+            manifest,
+            {**revision, "dirty": True},
+        )
+    with pytest.raises(RuntimeError, match="commit differs"):
+        _validate_training_source_revision(
+            manifest,
+            {**revision, "git_commit": "c" * 40},
+        )
+
+
 def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     stage = _default_stages()[3]
     script = _remote_script(
@@ -103,12 +144,13 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
         fp8_recipe="tensorwise",
         remote_prefixes={stage.index: "data/seq_8192/train"},
         graph_capacities={stage.index: _capacity(stage)},
+        megatron_commit=_MEGATRON_COMMIT,
         initial_checkpoint_root="/data/cppmega_curriculum_checkpoints/initial",
     )
     script_path = tmp_path / "curriculum.sh"
     script_path.write_text(script, encoding="utf-8")
 
-    assert "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS" in script
+    assert "export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=0" in script
     assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in script
     assert "--enable-dsa-patch" in script
     assert "if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1'" in script
@@ -116,6 +158,14 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     assert "export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001" in script
     assert "GRAPH_PRIOR_RECEIPT=\"/data/cppmega_h200_results/stage_${STAGE_IDX}_graph_prior.json\"" in script
     assert "reason=dsa_selector_gate" in script
+    assert "--experimental-attention-variant dsa" in script
+    assert "--dsa-indexer-loss-coeff 0.001" in script
+    assert (
+        "--spec cppmega.megatron.nam56r_full_spec "
+        "build_cppmega_nam56r_full_stack_spec"
+    ) in script
+    assert "unset CPPMEGA_DENSE_GQA" in script
+    assert "--group-query-attention" not in script
     assert "apply_graph_route_attention_bias_patch()" in script
     assert "--micro-batch-size ${MBS}" in script
     assert "--global-batch-size ${BS}" in script
@@ -124,6 +174,12 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     assert "--no-check-for-nan-in-loss-and-grad" not in script
     assert "write_graph_capacity_receipt" in script
     assert "write_training_loss_receipt" in script
+    assert "validate_production_batch_receipt" in script
+    assert "validate_embedding_consumption_receipt" in script
+    assert "reason=sidecar_consumption_gate" in script
+    assert "CPPMEGA_H200_FULL_SIDECAR_RECEIPT=1" in script
+    assert "cppmega_overlay_revision.json" in script
+    assert "source_tree_sha256" in script
     assert "model_weights_warm_start optimizer=reset rng=reset scheduler=reset exact_resume=false" in script
     assert "--finetune --no-load-optim --no-load-rng --override-opt-param-scheduler" in script
     assert "checkpoint_iteration expected=${TARGET_ITERS}" in script
@@ -138,6 +194,7 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
         fp8_recipe="tensorwise",
         remote_prefixes={stage.index: "data/seq_8192/train"},
         graph_capacities={stage.index: _capacity(stage)},
+        megatron_commit=_MEGATRON_COMMIT,
         enable_dsa_patch=True,
     )
     assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in dsa_script
@@ -153,5 +210,100 @@ def test_curriculum_rejects_dense_only_mode():
             fp8_recipe="tensorwise",
             remote_prefixes={stage.index: "data/seq_1024/train"},
             graph_capacities={stage.index: _capacity(stage)},
+            megatron_commit=_MEGATRON_COMMIT,
             enable_dsa_patch=False,
+        )
+
+
+def test_s3_restore_is_verified_before_curriculum_training(tmp_path):
+    stage = _default_stages()[0]
+    plan = S3RestorePlan(
+        bundle_id="bundle-verified",
+        artifact_set_sha256="a" * 64,
+        bucket="bucket",
+        prefix="cppmega/full",
+        endpoint_url="https://storage.example.invalid",
+        megatron_commit=_MEGATRON_COMMIT,
+        run_id="curriculum-001",
+    )
+    script = _remote_script(
+        [stage],
+        docker_image=DEFAULT_DOCKER_IMAGE,
+        fp8_recipe="tensorwise",
+        remote_prefixes={stage.index: "data/seq_1024/train"},
+        graph_capacities={stage.index: _capacity(stage)},
+        megatron_commit=_MEGATRON_COMMIT,
+        bundle_root=plan.remote_bundle_root,
+        tokenizer_model=f"{plan.remote_bundle_root}/tokenizer",
+        s3_restore=plan,
+    )
+    script_path = tmp_path / "s3-curriculum.sh"
+    script_path.write_text(script, encoding="utf-8")
+
+    restore = "restore_megatron_bundle_from_nebius_s3.py"
+    preflight = "python /opt/cppmega/scripts/h200_megatron_preflight.py"
+    assert restore in script
+    assert "--require-empty-output-root" not in script
+    assert "--bundle-id bundle-verified" in script
+    assert f"--megatron-commit {_MEGATRON_COMMIT}" in script
+    assert "--s3-client python" in script
+    assert "--s3-region eu-north1" in script
+    assert "command -v aws" not in script
+    assert "command -v zstd" in script
+    assert "CPPMEGA_S3_RESTORE_STATUS=PASS" in script
+    assert "s3_restore_receipt.json" in script
+    assert script.index(restore) < script.index(preflight)
+    assert script.index("trap cleanup_cppmega_remote_secrets EXIT") < script.index(
+        "sudo docker pull"
+    )
+    assert "AWS_SECRET_ACCESS_KEY" not in script
+    subprocess.run(["bash", "-n", str(script_path)], check=True)
+
+
+def test_s3_auth_archive_contains_only_normalized_s3_credentials(tmp_path):
+    credentials = _resolve_s3_credentials(
+        {
+            "NEBIUS_S3_ACCESS_KEY_ID": "access-test",
+            "NEBIUS_S3_SECRET_ACCESS_KEY": "secret-test",
+            "UNRELATED_SECRET": "must-not-be-archived",
+        }
+    )
+    archive_path = tmp_path / "s3-auth.tgz"
+
+    _make_s3_auth_tar(archive_path, credentials)
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        member = archive.extractfile("cppmega_s3_auth/.env")
+        assert member is not None
+        payload = member.read().decode("utf-8")
+    assert payload == (
+        "AWS_ACCESS_KEY_ID=access-test\n"
+        "AWS_SECRET_ACCESS_KEY=secret-test\n"
+    )
+    assert "NEBIUS_S3_" not in payload
+    assert "UNRELATED_SECRET" not in payload
+
+
+def test_s3_restore_must_match_curriculum_bundle_and_megatron_identity():
+    stage = _default_stages()[0]
+    plan = S3RestorePlan(
+        bundle_id="bundle-verified",
+        artifact_set_sha256="a" * 64,
+        bucket="bucket",
+        prefix="cppmega/full",
+        endpoint_url="https://storage.example.invalid",
+        megatron_commit=_MEGATRON_COMMIT,
+        run_id="curriculum-001",
+    )
+
+    with pytest.raises(ValueError, match="bundle root disagree"):
+        _remote_script(
+            [stage],
+            docker_image=DEFAULT_DOCKER_IMAGE,
+            fp8_recipe="tensorwise",
+            remote_prefixes={stage.index: "data/seq_1024/train"},
+            graph_capacities={stage.index: _capacity(stage)},
+            megatron_commit=_MEGATRON_COMMIT,
+            bundle_root="/data/not-the-restored-bundle",
+            s3_restore=plan,
         )

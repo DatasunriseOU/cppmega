@@ -172,3 +172,14 @@ def test_ci_streaming_contracts_are_portable_and_run_on_both_platforms() -> None
         )
         assert CI_STREAMING_CONTRACT_TESTS <= set(pytest_argv)
         assert "tests/test_build_macro_routes_megatron_bundle.py" in pytest_argv
+
+
+def test_wheel_build_keeps_gcc_and_gxx_in_one_alternatives_group() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+
+    assert workflow.count("--slave /usr/bin/g++ g++ /usr/bin/g++-15") == 2
+    assert workflow.count("--set gcc /usr/bin/gcc-15") == 2
+    assert "update-alternatives --install /usr/bin/g++ g++" not in workflow
+    assert workflow.count('test "$(readlink -f /usr/bin/g++)"') == 2

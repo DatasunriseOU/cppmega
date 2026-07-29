@@ -26,6 +26,13 @@ def test_cuda_stack_uses_stable_torch_213_release() -> None:
     assert "pip install --pre" not in workflow
 
 
+def test_h200_images_include_dependency_free_bundle_restore_runtime() -> None:
+    for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
+        dockerfile = _read(path)
+        assert "        zstd \\" in dockerfile, path
+        assert "awscli" not in dockerfile, path
+
+
 def test_executable_gpu_envs_do_not_pin_torch_nightlies() -> None:
     paths = (
         "scripts/modal_cppmega_base.py",

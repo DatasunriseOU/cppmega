@@ -220,8 +220,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/gcc15
-          cd /tmp/gcc15
+          toolchain_dir="$RUNNER_TEMP/gcc15"
+          rm -rf "$toolchain_dir"
+          mkdir -p "$toolchain_dir"
+          cd "$toolchain_dir"
           # Download from our own release (GitHub's CDN, very stable). One blob,
           # no PPA, no add-apt-repository, no Launchpad anywhere in the path.
           if ! gh release download "$TOOLCHAIN_TAG" \
@@ -233,8 +235,11 @@ jobs:
             sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
             sudo apt-get -o Acquire::Retries=5 update
             sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
-            sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
-            sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90
+            sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 150 \
+              --slave /usr/bin/g++ g++ /usr/bin/g++-15
+            sudo update-alternatives --set gcc /usr/bin/gcc-15
+            test "$(readlink -f /usr/bin/gcc)" = "$(readlink -f /usr/bin/gcc-15)"
+            test "$(readlink -f /usr/bin/g++)" = "$(readlink -f /usr/bin/g++-15)"
             gcc --version
             g++ --version
             exit 0
@@ -253,8 +258,11 @@ jobs:
           # (libgmp10, libisl23, libmpc3, libmpfr6, libzstd1, zlib1g, binutils)
           # are already in noble main and noble's versions are new enough.
           sudo dpkg -i *.deb
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
-          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 150 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-15
+          sudo update-alternatives --set gcc /usr/bin/gcc-15
+          test "$(readlink -f /usr/bin/gcc)" = "$(readlink -f /usr/bin/gcc-15)"
+          test "$(readlink -f /usr/bin/g++)" = "$(readlink -f /usr/bin/g++-15)"
           gcc --version
           g++ --version
 
