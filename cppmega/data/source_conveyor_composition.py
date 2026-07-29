@@ -18,6 +18,19 @@ _FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 _FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
 _TARGETED_LAUNCH_SCHEMA = "cppmega.canonical_source_targeted_retry_launch_v1"
 _TARGETED_EXIT_SCHEMA = "cppmega.canonical_source_targeted_retry_exit_v1"
+_PR_COMPLETION_SCHEMA = "cppmega_pr_completion_v2"
+_PR_COMPLETION_BINDING_FIELDS = {
+    "schema",
+    "status",
+    "receipt_sha256",
+    "pr_store_sha256",
+    "repo_list_sha256",
+    "expected_repos_sha256",
+    "scan_id",
+    "expected_repo_count",
+    "stored_pr_count",
+    "unverified_store_pr_count",
+}
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -314,6 +327,202 @@ def _validate_input_artifact(
     if _sha256(path) != expected_sha256:
         raise ValueError(f"{run_id} {name} artifact binding drifted")
     return binding, path
+
+
+def _validate_pr_provenance(
+    *,
+    launch: Mapping[str, object],
+    manifest: Mapping[str, object],
+    command: Sequence[object],
+    run_id: str,
+) -> tuple[dict[str, object], dict[str, Path]]:
+    """Verify the immutable PR corpus used by one commit conveyor run."""
+
+    pr_inputs = _require_mapping(
+        launch.get("pr_inputs"), where=f"{run_id} PR inputs"
+    )
+    repo_binding = _require_mapping(
+        pr_inputs.get("repo_list"), where=f"{run_id} PR repo list"
+    )
+    completion_artifact = _require_mapping(
+        pr_inputs.get("completion"), where=f"{run_id} PR completion artifact"
+    )
+    store_binding = _require_mapping(
+        pr_inputs.get("store"), where=f"{run_id} PR store"
+    )
+    completion_binding = _require_mapping(
+        pr_inputs.get("completion_binding"),
+        where=f"{run_id} PR completion binding",
+    )
+    _require_exact_fields(
+        completion_binding,
+        _PR_COMPLETION_BINDING_FIELDS,
+        where=f"{run_id} PR completion binding",
+    )
+
+    repo_path = _resolve_bound_path(
+        repo_binding.get("path"), where=f"{run_id} PR repo list"
+    )
+    completion_path = _resolve_bound_path(
+        completion_artifact.get("path"), where=f"{run_id} PR completion"
+    )
+    store_path = _resolve_bound_path(
+        store_binding.get("path"), where=f"{run_id} PR store"
+    )
+    if (
+        Path(_single_option(command, "--pr-repo-list")).expanduser().resolve()
+        != repo_path
+        or Path(_single_option(command, "--pr-completion-receipt"))
+        .expanduser()
+        .resolve()
+        != completion_path
+        or Path(_single_option(command, "--pr-store")).expanduser().resolve()
+        != store_path
+    ):
+        raise ValueError(f"{run_id} PR command paths drifted")
+
+    repo_sha256 = _require_sha256(
+        repo_binding.get("sha256"), where=f"{run_id} PR repo list.sha256"
+    )
+    completion_sha256 = _require_sha256(
+        completion_artifact.get("sha256"),
+        where=f"{run_id} PR completion.sha256",
+    )
+    store_sha256 = _require_sha256(
+        store_binding.get("sha256"), where=f"{run_id} PR store.sha256"
+    )
+    if _sha256(repo_path) != repo_sha256:
+        raise ValueError(f"{run_id} PR repo list artifact binding drifted")
+    completion_raw, completion = _load_json_object(
+        completion_path,
+        where=f"{run_id} PR completion",
+        max_bytes=_MAX_RECEIPT_BYTES,
+    )
+    if hashlib.sha256(completion_raw).hexdigest() != completion_sha256:
+        raise ValueError(f"{run_id} PR completion artifact binding drifted")
+
+    store_stat = store_path.stat()
+    store_identity = (
+        store_stat.st_dev,
+        store_stat.st_ino,
+        store_stat.st_size,
+        store_stat.st_mtime_ns,
+        store_stat.st_ctime_ns,
+    )
+    for field, actual in (
+        ("device", store_stat.st_dev),
+        ("inode", store_stat.st_ino),
+        ("size_bytes", store_stat.st_size),
+    ):
+        if _require_positive_int(
+            store_binding.get(field), where=f"{run_id} PR store.{field}"
+        ) != actual:
+            raise ValueError(f"{run_id} PR store identity drifted")
+    if store_binding.get("quick_check") != "ok":
+        raise ValueError(f"{run_id} PR store lacks a green quick_check")
+    wal_path = Path(f"{store_path}-wal")
+    if wal_path.exists() and wal_path.stat().st_size:
+        raise ValueError(f"{run_id} PR store has an uncheckpointed WAL")
+    if _sha256(store_path) != store_sha256:
+        raise ValueError(f"{run_id} PR store artifact binding drifted")
+    store_stat_after = store_path.stat()
+    if store_identity != (
+        store_stat_after.st_dev,
+        store_stat_after.st_ino,
+        store_stat_after.st_size,
+        store_stat_after.st_mtime_ns,
+        store_stat_after.st_ctime_ns,
+    ):
+        raise ValueError(f"{run_id} PR store changed while hashing")
+    if wal_path.exists() and wal_path.stat().st_size:
+        raise ValueError(f"{run_id} PR store WAL appeared while hashing")
+
+    if (
+        completion.get("schema") != _PR_COMPLETION_SCHEMA
+        or completion.get("status") != "verified"
+    ):
+        raise ValueError(f"{run_id} PR completion is not verified")
+    receipt_repo = _require_mapping(
+        completion.get("repo_list"), where=f"{run_id} PR receipt repo list"
+    )
+    receipt_store = _require_mapping(
+        completion.get("pr_store"), where=f"{run_id} PR receipt store"
+    )
+    if (
+        _resolve_bound_path(
+            receipt_repo.get("path"), where=f"{run_id} PR receipt repo list"
+        )
+        != repo_path
+        or _require_sha256(
+            receipt_repo.get("sha256"),
+            where=f"{run_id} PR receipt repo list.sha256",
+        )
+        != repo_sha256
+        or _resolve_bound_path(
+            receipt_store.get("path"), where=f"{run_id} PR receipt store"
+        )
+        != store_path
+        or _require_sha256(
+            receipt_store.get("sha256"),
+            where=f"{run_id} PR receipt store.sha256",
+        )
+        != store_sha256
+        or _require_positive_int(
+            receipt_store.get("size"), where=f"{run_id} PR receipt store.size"
+        )
+        != store_stat.st_size
+    ):
+        raise ValueError(f"{run_id} PR completion input bindings drifted")
+
+    manifest_binding = _require_mapping(
+        manifest.get("pr_completion"), where=f"{run_id} manifest PR completion"
+    )
+    if manifest.get("pr_completion_reverified_at_finish") is not True:
+        raise ValueError(f"{run_id} PR completion was not reverified at finish")
+    if manifest_binding != completion_binding:
+        raise ValueError(f"{run_id} manifest PR completion binding drifted")
+    if (
+        completion_binding.get("schema") != _PR_COMPLETION_SCHEMA
+        or completion_binding.get("status") != "verified"
+        or completion_binding.get("receipt_sha256") != completion_sha256
+        or completion_binding.get("pr_store_sha256") != store_sha256
+        or completion_binding.get("repo_list_sha256") != repo_sha256
+    ):
+        raise ValueError(f"{run_id} normalized PR completion binding drifted")
+    for field, minimum in (
+        ("expected_repo_count", 1),
+        ("stored_pr_count", 0),
+        ("unverified_store_pr_count", 0),
+    ):
+        value = completion_binding.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{run_id} PR completion {field} is invalid")
+    if completion_binding["stored_pr_count"] != _require_nonnegative_int(
+        store_binding.get("pr_rows"), where=f"{run_id} PR store.pr_rows"
+    ):
+        raise ValueError(f"{run_id} PR store row count drifted")
+    for field in ("expected_repos_sha256", "scan_id"):
+        _require_sha256(
+            completion_binding.get(field),
+            where=f"{run_id} PR completion {field}",
+        )
+    for field in (
+        "expected_repos_sha256",
+        "scan_id",
+        "expected_repo_count",
+        "stored_pr_count",
+        "unverified_store_pr_count",
+    ):
+        if completion_binding[field] != completion.get(field):
+            raise ValueError(f"{run_id} PR completion {field} drifted")
+
+    return (
+        dict(completion_binding),
+        {
+            "pr_completion": completion_path,
+            "pr_repo_list": repo_path,
+        },
+    )
 
 
 def _archive_identity(
@@ -719,6 +928,24 @@ def _load_run(
 
     done = _require_mapping(manifest.get("done"), where=f"{run_id} done")
     failed = _require_mapping(manifest.get("failed"), where=f"{run_id} failed")
+    pr_provenance: dict[str, object] | None = None
+    pr_files: dict[str, Path] = {}
+    if streams in {"commits", "both"}:
+        pr_provenance, pr_files = _validate_pr_provenance(
+            launch=launch,
+            manifest=manifest,
+            command=command,
+            run_id=run_id,
+        )
+    elif launch.get("pr_inputs") is not None or any(
+        option in command
+        for option in (
+            "--pr-repo-list",
+            "--pr-store",
+            "--pr-completion-receipt",
+        )
+    ):
+        raise ValueError(f"{run_id} code-only run contains PR inputs")
     selected: set[str] = set()
     if launch_schema == _TARGETED_LAUNCH_SCHEMA:
         raw_selected = launch.get("selected_repositories")
@@ -789,6 +1016,8 @@ def _load_run(
             for (kind, bucket), files in sorted(allowed.items())
         },
     }
+    if pr_provenance is not None:
+        portable["pr_completion"] = pr_provenance
     files = {
         "launch": launch_path,
         "exit": exit_path,
@@ -801,6 +1030,7 @@ def _load_run(
         ][1],
         "tokenizer": input_artifacts["tokenizer"][1],
     }
+    files.update(pr_files)
     return (
         portable,
         allowed,

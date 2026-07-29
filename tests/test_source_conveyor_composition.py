@@ -62,6 +62,74 @@ def _lengths(rows: int = 1) -> dict[str, object]:
     return {"1024": {"rows": rows}}
 
 
+def _write_pr_inputs(root: Path) -> dict[str, object]:
+    repo_list = root / "pr_repo_list.json"
+    store = root / "prs.sqlite"
+    completion = root / "pr_completion.json"
+    _write_json(repo_list, {"repo_names": ["owner/alpha", "owner/beta"]})
+    store.write_bytes(b"immutable PR store fixture")
+    repo_list_sha256 = _sha256(repo_list)
+    store_sha256 = _sha256(store)
+    expected_repos_sha256 = _canonical_sha256(["owner/alpha", "owner/beta"])
+    scan_id = "6" * 64
+    _write_json(
+        completion,
+        {
+            "schema": "cppmega_pr_completion_v2",
+            "status": "verified",
+            "repo_list": {
+                "path": str(repo_list),
+                "sha256": repo_list_sha256,
+            },
+            "pr_store": {
+                "path": str(store),
+                "sha256": store_sha256,
+                "size": store.stat().st_size,
+            },
+            "expected_repos_sha256": expected_repos_sha256,
+            "scan_id": scan_id,
+            "expected_repo_count": 2,
+            "stored_pr_count": 2,
+            "declared_pr_count": 2,
+            "unverified_store_pr_count": 0,
+        },
+    )
+    completion_sha256 = _sha256(completion)
+    store_stat = store.stat()
+    completion_binding = {
+        "schema": "cppmega_pr_completion_v2",
+        "status": "verified",
+        "receipt_sha256": completion_sha256,
+        "pr_store_sha256": store_sha256,
+        "repo_list_sha256": repo_list_sha256,
+        "expected_repos_sha256": expected_repos_sha256,
+        "scan_id": scan_id,
+        "expected_repo_count": 2,
+        "stored_pr_count": 2,
+        "unverified_store_pr_count": 0,
+    }
+    return {
+        "repo_list": {
+            "path": str(repo_list),
+            "sha256": repo_list_sha256,
+        },
+        "completion": {
+            "path": str(completion),
+            "sha256": completion_sha256,
+        },
+        "completion_binding": completion_binding,
+        "store": {
+            "path": str(store),
+            "sha256": store_sha256,
+            "device": store_stat.st_dev,
+            "inode": store_stat.st_ino,
+            "size_bytes": store_stat.st_size,
+            "quick_check": "ok",
+            "pr_rows": 2,
+        },
+    }
+
+
 def _write_run(
     root: Path,
     *,
@@ -79,6 +147,7 @@ def _write_run(
     quarantine: Path,
     tokenizer: Path,
     targeted: tuple[str, ...] = (),
+    pr_inputs: dict[str, object] | None = None,
 ) -> dict[str, str]:
     run_root = root / run_id
     manifest_path = run_root / "conveyor" / "_done.json"
@@ -89,6 +158,11 @@ def _write_run(
         "done": done,
         "failed": failed,
     }
+    if streams in {"commits", "both"} and pr_inputs is not None:
+        manifest["pr_completion"] = copy.deepcopy(
+            pr_inputs["completion_binding"]
+        )
+        manifest["pr_completion_reverified_at_finish"] = True
     _write_json(manifest_path, manifest)
 
     command = [
@@ -123,6 +197,17 @@ def _write_run(
                 str(commit_root),
             ]
         )
+        if pr_inputs is not None:
+            command.extend(
+                [
+                    "--pr-repo-list",
+                    str(pr_inputs["repo_list"]["path"]),
+                    "--pr-store",
+                    str(pr_inputs["store"]["path"]),
+                    "--pr-completion-receipt",
+                    str(pr_inputs["completion"]["path"]),
+                ]
+            )
     for repository in targeted:
         command.extend(["--only-repo", repository])
     if targeted:
@@ -182,6 +267,8 @@ def _write_run(
         launch["expected_selected_repository_count"] = len(targeted)
     else:
         launch["expected_repository_count"] = len(_REPOSITORIES)
+    if pr_inputs is not None:
+        launch["pr_inputs"] = copy.deepcopy(pr_inputs)
     _write_json(launch_path, launch)
 
     exit_code = 0 if not failed else 1
@@ -325,6 +412,7 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         },
     )
     dedup_receipt = _write_dedup_receipt(tmp_path, dedup_db)
+    pr_inputs = _write_pr_inputs(tmp_path)
     failed_record = {"stage": "index_project", "detail": "USR failure"}
     runs = [
         _write_run(
@@ -380,6 +468,7 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             repo_list=repo_list,
             quarantine=quarantine,
             tokenizer=tokenizer,
+            pr_inputs=pr_inputs,
         ),
     ]
     plan = {
@@ -427,6 +516,13 @@ def test_source_composition_resolves_revision_bound_code_repair(
         "beta_r0.parquet",
     }
     assert len(composition.receipt["source_producers"]) == 3
+    commit_run = next(
+        run
+        for run in composition.receipt["runs"]
+        if run["run_id"] == "full-commits"
+    )
+    assert commit_run["pr_completion"]["status"] == "verified"
+    assert commit_run["pr_completion"]["stored_pr_count"] == 2
 
 
 def test_bundle_stages_every_source_composition_proof(tmp_path: Path) -> None:
@@ -466,6 +562,8 @@ def test_bundle_stages_every_source_composition_proof(tmp_path: Path) -> None:
         "repo_list",
         "source_quarantine_manifest",
         "tokenizer",
+        "pr_completion",
+        "pr_repo_list",
     }
     for descriptor in (
         staged["receipt"],
@@ -658,6 +756,74 @@ def test_source_composition_rejects_full_launch_count_drift(
     _write_json(exit_path, exit_receipt)
 
     with pytest.raises(ValueError, match="full launch repository count drifted"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_source_composition_rejects_nonverified_pr_completion(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    launch_path = Path(plan["runs"][2]["launch_receipt"])
+    exit_path = Path(plan["runs"][2]["exit_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    completion_path = Path(launch["pr_inputs"]["completion"]["path"])
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["status"] = "complete"
+    _write_json(completion_path, completion)
+    launch["pr_inputs"]["completion"]["sha256"] = _sha256(completion_path)
+    _write_json(launch_path, launch)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(ValueError, match="PR completion is not verified"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_source_composition_rejects_pr_store_mutation(tmp_path: Path) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    launch_path = Path(plan["runs"][2]["launch_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    store_path = Path(launch["pr_inputs"]["store"]["path"])
+    with store_path.open("ab") as stream:
+        stream.write(b"mutated")
+
+    with pytest.raises(ValueError, match="PR store identity drifted"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_source_composition_requires_pr_reverification_at_finish(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    manifest_path = Path(plan["runs"][2]["manifest"])
+    exit_path = Path(plan["runs"][2]["exit_receipt"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["pr_completion_reverified_at_finish"] = False
+    _write_json(manifest_path, manifest)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["done_manifest"]["sha256"] = _sha256(manifest_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(ValueError, match="not reverified at finish"):
         load_source_composition(
             plan_path,
             buckets=_BUCKETS,
