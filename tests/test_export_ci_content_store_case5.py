@@ -900,10 +900,19 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
         fetch_state=fetch_state,
         tokenizer_json=TOKENIZER_JSON,
         output=output,
+        require_current_parser_only=True,
     )
 
     assert receipt["schema"] == EXPORT_SCHEMA
     assert receipt["status"] == "complete"
+    assert receipt["parser_generation_policy"] == {
+        "mode": "current-singleton-required",
+        "expected_current_parser_script_sha256": (
+            target_parser_script_sha256()
+        ),
+        "observed_parser_lineage": [target_parser_script_sha256()],
+        "current_singleton": True,
+    }
     assert receipt["representatives"]["count"] == 1
     assert receipt["counts"]["payload_tokens"] == len(token_rows[0])
     assert receipt["case5_contract"]["overflow_rows"] == 0
@@ -1814,6 +1823,21 @@ def test_parser_binding_rollback_preserves_generation_evidence(
     projection = receipt["source_binding_projection"]
     assert projection["mode"] == "mixed_lineage_projection"
     assert projection["parser_lineage"] == [rolled_back_from, current]
+
+    refused = tmp_path / "rollback-current-only-refused"
+    with pytest.raises(
+        ExportError,
+        match="current-parser-only export requires exactly one parser generation",
+    ):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=refused,
+            require_current_parser_only=True,
+        )
+    assert not refused.exists()
 
 
 def test_parser_binding_history_disconnected_from_current_fails_closed(
