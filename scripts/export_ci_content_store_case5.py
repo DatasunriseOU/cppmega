@@ -55,6 +55,15 @@ from cppmega.data.domain_schema import (  # noqa: E402
     delimiter_token_ids,
     domain_edge_family,
 )
+from cppmega.data.ci_training_scope import (  # noqa: E402
+    AUX_JS_TS_ROUTE,
+    AUX_PYTHON_ROUTE,
+    CITrainingScopeError,
+    PRIMARY_ROUTE,
+    TRAINING_SCOPE_DECISION_SCHEMA,
+    classify_ci_training_sidecars,
+    training_scope_policy,
+)
 from cppmega.data.nanochat_pipeline.tokenized_enriched import (  # noqa: E402
     _char_position_to_token_index,
     _chars_to_tokens_structure_ids,
@@ -163,7 +172,7 @@ from scripts.nanochat_data.pack_enriched_rows import (  # noqa: E402
 
 
 EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
-PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
+PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v4"
 PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
 REPRESENTATIVE_METADATA_SCHEMA = "cppmega_ci_case5_representative_metadata_v3"
@@ -174,6 +183,12 @@ OCCURRENCE_METADATA_LEDGER_DOMAIN = (
 )
 OPAQUE_ARTIFACT_LEDGER_SCHEMA = "cppmega_ci_case5_excluded_opaque_artifact_v1"
 OPAQUE_ARTIFACT_POLICY_SCHEMA = "cppmega_ci_opaque_artifact_policy_v1"
+TRAINING_SCOPE_EXCLUSION_LEDGER_SCHEMA = (
+    "cppmega_ci_case5_excluded_training_scope_v1"
+)
+TRAINING_SCOPE_EXCLUSION_LEDGER_DOMAIN = (
+    "cppmega-ci-case5-excluded-training-scope-ledger-v1"
+)
 OPAQUE_INVALID_RATIO_PPM_THRESHOLD = 100_000
 OCCURRENCE_SCHEMA = "cppmega_ci_chunk_occurrence_v3"
 TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v2"
@@ -4627,6 +4642,7 @@ def _occurrence_metadata_record(
     content: ContentRecord,
     occurrence: OccurrenceRecord,
     member: FetchMemberEvidence,
+    scope_decision: Mapping[str, object],
     source_binding_projector: SourceBindingProjector
     | SourceBindingProjectionRouter,
 ) -> dict[str, object]:
@@ -4638,9 +4654,33 @@ def _occurrence_metadata_record(
     )
     record["schema"] = OCCURRENCE_METADATA_SCHEMA
     record["scope"] = "one-record-per-frozen-cas-occurrence"
+    effective_routes = _require_list(
+        scope_decision.get("effective_routes"),
+        where="training scope effective_routes",
+    )
+    if member.opaque:
+        status = "excluded_opaque"
+        reason = member.exclusion_reason
+    elif PRIMARY_ROUTE in effective_routes:
+        status = "eligible_primary"
+        reason = None
+    elif AUX_PYTHON_ROUTE in effective_routes and AUX_JS_TS_ROUTE in effective_routes:
+        status = "aux_python_js_ts"
+        reason = "exact_step_auxiliary_only"
+    elif AUX_PYTHON_ROUTE in effective_routes:
+        status = "aux_python"
+        reason = "exact_step_auxiliary_only"
+    elif AUX_JS_TS_ROUTE in effective_routes:
+        status = "aux_js_ts"
+        reason = "exact_step_auxiliary_only"
+    else:
+        status = "excluded_irrelevant"
+        reason = "no_primary_or_auxiliary_scope_evidence"
     record["case5_eligibility"] = {
-        "status": "excluded_opaque" if member.opaque else "eligible",
-        "reason": member.exclusion_reason,
+        "status": status,
+        "reason": reason,
+        "primary_eligible": status == "eligible_primary",
+        "training_scope": dict(scope_decision),
     }
     return record
 
@@ -4698,6 +4738,10 @@ def export_store(
         raise ExportError(
             f"unsupported completion mode: {completion_mode!r}"
         )
+    if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
+        # A production receipt must prove current-parser singleton input even
+        # when a caller omitted the redundant CLI hardening flag.
+        require_current_parser_only = True
     production_provenance: dict[str, object] | None = None
     production_paths: tuple[Path, Path, Path, Path] | None = None
     if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
@@ -4760,6 +4804,7 @@ def export_store(
     representative_metadata_writer: CanonicalParquetLedgerWriter | None = None
     representative_ledger_writer: CanonicalParquetLedgerWriter | None = None
     excluded_opaque_writer: CanonicalParquetLedgerWriter | None = None
+    excluded_training_scope_writer: CanonicalParquetLedgerWriter | None = None
     source_binding_projection_writer: CanonicalParquetLedgerWriter | None = None
     occurrence_metadata_writer: CanonicalParquetLedgerWriter | None = None
     eligibility_connection: sqlite3.Connection | None = None
@@ -4885,6 +4930,48 @@ def export_store(
                     repo,run_attempt,job,step,chunk_ordinal
                   )
                 );
+                CREATE TABLE occurrence_scope (
+                  repo TEXT NOT NULL,
+                  run_attempt TEXT NOT NULL,
+                  job TEXT NOT NULL,
+                  step TEXT NOT NULL,
+                  chunk_ordinal INTEGER NOT NULL,
+                  run_id INTEGER NOT NULL,
+                  attempt INTEGER NOT NULL,
+                  archive_member TEXT NOT NULL,
+                  opaque INTEGER NOT NULL CHECK (opaque IN (0,1)),
+                  local_primary INTEGER NOT NULL
+                    CHECK (local_primary IN (0,1)),
+                  local_aux_python INTEGER NOT NULL
+                    CHECK (local_aux_python IN (0,1)),
+                  local_aux_js_ts INTEGER NOT NULL
+                    CHECK (local_aux_js_ts IN (0,1)),
+                  effective_primary INTEGER NOT NULL DEFAULT 0
+                    CHECK (effective_primary IN (0,1)),
+                  effective_aux_python INTEGER NOT NULL DEFAULT 0
+                    CHECK (effective_aux_python IN (0,1)),
+                  effective_aux_js_ts INTEGER NOT NULL DEFAULT 0
+                    CHECK (effective_aux_js_ts IN (0,1)),
+                  decision_json TEXT NOT NULL,
+                  PRIMARY KEY (
+                    repo,run_attempt,job,step,chunk_ordinal
+                  )
+                );
+                CREATE INDEX occurrence_scope_exact_step
+                  ON occurrence_scope(repo,run_attempt,job,step);
+                CREATE TABLE exact_step_scope (
+                  repo TEXT NOT NULL,
+                  run_attempt TEXT NOT NULL,
+                  job TEXT NOT NULL,
+                  step TEXT NOT NULL,
+                  primary_route INTEGER NOT NULL
+                    CHECK (primary_route IN (0,1)),
+                  aux_python_route INTEGER NOT NULL
+                    CHECK (aux_python_route IN (0,1)),
+                  aux_js_ts_route INTEGER NOT NULL
+                    CHECK (aux_js_ts_route IN (0,1)),
+                  PRIMARY KEY (repo,run_attempt,job,step)
+                ) WITHOUT ROWID;
                 """
             )
             excluded_opaque_writer = CanonicalParquetLedgerWriter(
@@ -4892,8 +4979,14 @@ def export_store(
                 domain="cppmega-ci-case5-excluded-opaque-artifact-ledger-v1",
                 max_record_bytes=1024 * 1024,
             )
+            excluded_training_scope_writer = CanonicalParquetLedgerWriter(
+                temp_path / "excluded_training_scope.parquet",
+                domain=TRAINING_SCOPE_EXCLUSION_LEDGER_DOMAIN,
+                max_record_bytes=1024 * 1024,
+            )
+            scope_policy = training_scope_policy()
             prevalidated_occurrence_count = 0
-            excluded_occurrence_payload_tokens = 0
+            excluded_opaque_occurrence_payload_tokens = 0
             eligibility_connection.execute("BEGIN")
             for occurrence in store.iter_occurrences():
                 member = frozen_fetch_state.validate_occurrence(occurrence)
@@ -4908,6 +5001,8 @@ def export_store(
                     raw_training.get("build_actions"),
                     where="source-binding projection build_actions",
                 )
+                local_scope = classify_ci_training_sidecars(raw_training)
+                local_scope_record = local_scope.as_dict()
                 source_binding_projection_counts["occurrences"] += 1
                 for action_index, raw_action in enumerate(raw_actions):
                     action = _require_mapping(
@@ -4954,14 +5049,6 @@ def export_store(
                             f"selection_mode:{projection.selected_mode}"
                         ] += 1
                 content = store.get_content_record(occurrence.content_sha256)
-                occurrence_metadata_writer.append(
-                    _occurrence_metadata_record(
-                        content=content,
-                        occurrence=occurrence,
-                        member=member,
-                        source_binding_projector=source_binding_projector,
-                    )
-                )
                 try:
                     eligibility_connection.execute(
                         """
@@ -4979,6 +5066,33 @@ def export_store(
                             content.token_count,
                         ),
                     )
+                    eligibility_connection.execute(
+                        """
+                        INSERT INTO occurrence_scope(
+                          repo,run_attempt,job,step,chunk_ordinal,
+                          run_id,attempt,archive_member,opaque,
+                          local_primary,local_aux_python,local_aux_js_ts,
+                          decision_json
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            *occurrence.key,
+                            member.key[1],
+                            member.key[2],
+                            member.key[3],
+                            int(member.opaque),
+                            int(local_scope.primary),
+                            int(local_scope.aux_python),
+                            int(local_scope.aux_js_ts),
+                            json.dumps(
+                                local_scope_record,
+                                allow_nan=False,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
                 except sqlite3.IntegrityError as exc:
                     raise ExportError(
                         "CAS contains duplicate fetch-member chunk coverage"
@@ -4988,21 +5102,7 @@ def export_store(
                     continue
                 if member.exclusion_reason is None:
                     raise ExportError("opaque member has no exclusion reason")
-                eligibility_connection.execute(
-                    """
-                    INSERT INTO excluded_occurrences(
-                      repo,run_attempt,job,step,chunk_ordinal,
-                      run_id,attempt,archive_member
-                    ) VALUES (?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        *occurrence.key,
-                        member.key[1],
-                        member.key[2],
-                        member.key[3],
-                    ),
-                )
-                excluded_occurrence_payload_tokens += content.token_count
+                excluded_opaque_occurrence_payload_tokens += content.token_count
                 excluded_opaque_writer.append(
                     {
                         "schema": OPAQUE_ARTIFACT_LEDGER_SCHEMA,
@@ -5032,7 +5132,227 @@ def export_store(
                     "fetch-state prevalidation occurrence count differs from CAS"
                 )
             frozen_fetch_state.verify_member_coverage(eligibility_connection)
+
+            # A parser signal may occur only in the command chunk while later
+            # chunks carry its compile/test output.  Propagation is restricted
+            # to the exact receipt-bound job section/step key.  It never crosses
+            # a job, step, attempt, repository, or opaque member.
+            eligibility_connection.executescript(
+                """
+                BEGIN;
+                INSERT INTO exact_step_scope(
+                  repo,run_attempt,job,step,
+                  primary_route,aux_python_route,aux_js_ts_route
+                )
+                SELECT
+                  repo,run_attempt,job,step,
+                  MAX(local_primary),
+                  MAX(local_aux_python),
+                  MAX(local_aux_js_ts)
+                FROM occurrence_scope
+                WHERE opaque = 0
+                GROUP BY repo,run_attempt,job,step;
+                UPDATE occurrence_scope AS target
+                SET effective_primary = CASE
+                  WHEN target.opaque = 0 THEN COALESCE((
+                      SELECT route.primary_route
+                      FROM exact_step_scope AS route
+                      WHERE route.repo = target.repo
+                        AND route.run_attempt = target.run_attempt
+                        AND route.job = target.job
+                        AND route.step = target.step
+                    ), 0) ELSE 0 END,
+                    effective_aux_python = CASE
+                  WHEN target.opaque = 0 AND COALESCE((
+                    SELECT route.primary_route
+                    FROM exact_step_scope AS route
+                    WHERE route.repo = target.repo
+                      AND route.run_attempt = target.run_attempt
+                      AND route.job = target.job
+                      AND route.step = target.step
+                  ), 0) = 0 THEN COALESCE((
+                    SELECT route.aux_python_route
+                    FROM exact_step_scope AS route
+                    WHERE route.repo = target.repo
+                      AND route.run_attempt = target.run_attempt
+                      AND route.job = target.job
+                      AND route.step = target.step
+                  ), 0) ELSE 0 END,
+                    effective_aux_js_ts = CASE
+                  WHEN target.opaque = 0 AND COALESCE((
+                    SELECT route.primary_route
+                    FROM exact_step_scope AS route
+                    WHERE route.repo = target.repo
+                      AND route.run_attempt = target.run_attempt
+                      AND route.job = target.job
+                      AND route.step = target.step
+                  ), 0) = 0 THEN COALESCE((
+                    SELECT route.aux_js_ts_route
+                    FROM exact_step_scope AS route
+                    WHERE route.repo = target.repo
+                      AND route.run_attempt = target.run_attempt
+                      AND route.job = target.job
+                      AND route.step = target.step
+                  ), 0) ELSE 0 END;
+                INSERT INTO excluded_occurrences(
+                  repo,run_attempt,job,step,chunk_ordinal,
+                  run_id,attempt,archive_member
+                )
+                SELECT
+                  repo,run_attempt,job,step,chunk_ordinal,
+                  run_id,attempt,archive_member
+                FROM occurrence_scope
+                WHERE effective_primary = 0;
+                COMMIT;
+                """
+            )
+
+            training_scope_occurrence_counts: Counter[str] = Counter()
+            training_scope_token_counts: Counter[str] = Counter()
+            excluded_training_scope_occurrence_payload_tokens = 0
+            scope_rows = iter(
+                eligibility_connection.execute(
+                    """
+                    SELECT *
+                    FROM occurrence_scope
+                    ORDER BY repo,run_attempt,job,step,chunk_ordinal
+                    """
+                )
+            )
+            for occurrence in store.iter_occurrences():
+                member = frozen_fetch_state.validate_occurrence(occurrence)
+                content = store.get_content_record(occurrence.content_sha256)
+                try:
+                    scope_row = next(scope_rows)
+                except StopIteration as exc:
+                    raise ExportError(
+                        "training scope decision disappeared after propagation"
+                    ) from exc
+                scope_key = (
+                    str(scope_row["repo"]),
+                    str(scope_row["run_attempt"]),
+                    str(scope_row["job"]),
+                    str(scope_row["step"]),
+                    int(scope_row["chunk_ordinal"]),
+                )
+                if scope_key != occurrence.key:
+                    raise ExportError(
+                        "training scope decisions are not in occurrence order"
+                    )
+                local_decision = json.loads(str(scope_row["decision_json"]))
+                if (
+                    not isinstance(local_decision, dict)
+                    or local_decision.get("schema")
+                    != TRAINING_SCOPE_DECISION_SCHEMA
+                ):
+                    raise ExportError("stored training scope decision is malformed")
+                effective_primary = bool(scope_row["effective_primary"])
+                effective_aux_python = bool(
+                    scope_row["effective_aux_python"]
+                )
+                effective_aux_js_ts = bool(scope_row["effective_aux_js_ts"])
+                effective_routes: list[str] = []
+                if effective_primary:
+                    effective_routes.append(PRIMARY_ROUTE)
+                else:
+                    if effective_aux_python:
+                        effective_routes.append(AUX_PYTHON_ROUTE)
+                    if effective_aux_js_ts:
+                        effective_routes.append(AUX_JS_TS_ROUTE)
+                reasons = list(
+                    _require_list(
+                        local_decision.get("reasons"),
+                        where="local training scope reasons",
+                    )
+                )
+                if (
+                    effective_primary
+                    and not bool(local_decision.get("local_primary"))
+                ):
+                    reasons.append("propagated:exact_step_primary_evidence")
+                if (
+                    effective_aux_python
+                    and not bool(local_decision.get("local_aux_python"))
+                ):
+                    reasons.append("propagated:exact_step_aux_python_evidence")
+                if (
+                    effective_aux_js_ts
+                    and not bool(local_decision.get("local_aux_js_ts"))
+                ):
+                    reasons.append("propagated:exact_step_aux_js_ts_evidence")
+                scope_decision: dict[str, object] = {
+                    **local_decision,
+                    "policy_schema": scope_policy["schema"],
+                    "policy_sha256": scope_policy["sha256"],
+                    "effective_primary": effective_primary,
+                    "effective_aux_python": effective_aux_python,
+                    "effective_aux_js_ts": effective_aux_js_ts,
+                    "effective_routes": effective_routes,
+                    "reasons": sorted(set(str(value) for value in reasons)),
+                    "propagation": {
+                        "schema": "cppmega_ci_exact_step_scope_propagation_v1",
+                        "key": [
+                            occurrence.key_dict["repo"],
+                            occurrence.key_dict["run_attempt"],
+                            occurrence.key_dict["job"],
+                            occurrence.key_dict["step"],
+                        ],
+                        "opaque_members_never_inherit": True,
+                    },
+                }
+                occurrence_metadata_writer.append(
+                    _occurrence_metadata_record(
+                        content=content,
+                        occurrence=occurrence,
+                        member=member,
+                        scope_decision=scope_decision,
+                        source_binding_projector=source_binding_projector,
+                    )
+                )
+                if member.opaque:
+                    route_status = "excluded_opaque"
+                elif effective_primary:
+                    route_status = PRIMARY_ROUTE
+                elif effective_aux_python and effective_aux_js_ts:
+                    route_status = "aux_python_js_ts"
+                elif effective_aux_python:
+                    route_status = AUX_PYTHON_ROUTE
+                elif effective_aux_js_ts:
+                    route_status = AUX_JS_TS_ROUTE
+                else:
+                    route_status = "excluded_irrelevant"
+                training_scope_occurrence_counts[route_status] += 1
+                training_scope_token_counts[route_status] += content.token_count
+                if not effective_primary and not member.opaque:
+                    excluded_training_scope_occurrence_payload_tokens += (
+                        content.token_count
+                    )
+                    excluded_training_scope_writer.append(
+                        {
+                            "schema": TRAINING_SCOPE_EXCLUSION_LEDGER_SCHEMA,
+                            "occurrence_key": occurrence.key_dict,
+                            "content_sha256": content.sha256,
+                            "provenance_sha256": (
+                                occurrence.provenance_sha256
+                            ),
+                            "token_sequence_sha256": (
+                                content.token_sequence_sha256
+                            ),
+                            "exact_token_count": content.token_count,
+                            "effective_routes": effective_routes,
+                            "scope_decision": scope_decision,
+                        }
+                    )
+            try:
+                next(scope_rows)
+            except StopIteration:
+                pass
+            else:
+                raise ExportError(
+                    "training scope has decisions without CAS occurrences"
+                )
             excluded_opaque_writer.close()
+            excluded_training_scope_writer.close()
             source_binding_projection_writer.close()
             occurrence_metadata_writer.close()
             if (
@@ -5052,6 +5372,35 @@ def export_store(
                     SELECT COUNT(*) FROM (
                       SELECT repo,run_id,attempt,archive_member
                       FROM excluded_occurrences
+                      GROUP BY repo,run_id,attempt,archive_member
+                    )
+                    """
+                ).fetchone()[0]
+            )
+            excluded_occurrence_count = int(
+                eligibility_connection.execute(
+                    "SELECT COUNT(*) FROM excluded_occurrences"
+                ).fetchone()[0]
+            )
+            excluded_opaque_member_count = int(
+                eligibility_connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                      SELECT repo,run_id,attempt,archive_member
+                      FROM occurrence_scope
+                      WHERE opaque=1
+                      GROUP BY repo,run_id,attempt,archive_member
+                    )
+                    """
+                ).fetchone()[0]
+            )
+            excluded_training_scope_member_count = int(
+                eligibility_connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                      SELECT repo,run_id,attempt,archive_member
+                      FROM occurrence_scope
+                      WHERE opaque=0 AND effective_primary=0
                       GROUP BY repo,run_id,attempt,archive_member
                     )
                     """
@@ -5229,7 +5578,7 @@ def export_store(
             representative_count = representative_ledger_writer.count
             if representative_count < 1:
                 raise ExportError(
-                    "opaque-artifact policy excluded every token sequence"
+                    "primary training-scope policy excluded every token sequence"
                 )
             ledger_digest = representative_ledger_writer.logical_sha256
             eligibility_connection.close()
@@ -5747,6 +6096,11 @@ def export_store(
                     excluded_opaque_writer.count,
                 ),
                 (
+                    excluded_training_scope_writer.path,
+                    "excluded_training_scope",
+                    excluded_training_scope_writer.count,
+                ),
+                (
                     source_binding_projection_writer.path,
                     "source_binding_projection",
                     source_binding_projection_writer.count,
@@ -6006,18 +6360,43 @@ def export_store(
                 },
                 "eligibility": {
                     "policy": {
-                        "schema": OPAQUE_ARTIFACT_POLICY_SCHEMA,
-                        "rule": (
-                            "archive-member-casefold-suffix-.zip AND "
-                            "decode-status-invalid_replaced AND "
-                            "invalid-sequence-ratio-ge-threshold"
+                        "schema": (
+                            "cppmega_ci_primary_training_eligibility_policy_v1"
                         ),
-                        "invalid_ratio_numerator": ("invalid_sequence_count * 1000000"),
-                        "invalid_ratio_denominator": "raw_byte_count",
-                        "invalid_ratio_ppm_threshold": (
-                            OPAQUE_INVALID_RATIO_PPM_THRESHOLD
-                        ),
-                        "raw_magic_retained": False,
+                        "primary_route": PRIMARY_ROUTE,
+                        "training_scope": scope_policy,
+                        "exact_step_propagation": {
+                            "schema": (
+                                "cppmega_ci_exact_step_scope_propagation_v1"
+                            ),
+                            "key": [
+                                "repo",
+                                "run_attempt",
+                                "job",
+                                "step",
+                            ],
+                            "primary_priority": True,
+                            "opaque_members_never_inherit": True,
+                            "cross_step_propagation": False,
+                            "cross_job_propagation": False,
+                            "cross_attempt_propagation": False,
+                        },
+                        "opaque_artifact": {
+                            "schema": OPAQUE_ARTIFACT_POLICY_SCHEMA,
+                            "rule": (
+                                "archive-member-casefold-suffix-.zip AND "
+                                "decode-status-invalid_replaced AND "
+                                "invalid-sequence-ratio-ge-threshold"
+                            ),
+                            "invalid_ratio_numerator": (
+                                "invalid_sequence_count * 1000000"
+                            ),
+                            "invalid_ratio_denominator": "raw_byte_count",
+                            "invalid_ratio_ppm_threshold": (
+                                OPAQUE_INVALID_RATIO_PPM_THRESHOLD
+                            ),
+                            "raw_magic_retained": False,
+                        },
                     },
                     "target_exact_unique_payload_tokens": eligible_target_tokens,
                     "target_source": eligible_target_source,
@@ -6042,9 +6421,26 @@ def export_store(
                     },
                     "excluded_occurrences": {
                         "members": excluded_member_count,
+                        "occurrences": excluded_occurrence_count,
+                        "summed_exact_tokens_with_occurrence_multiplicity": (
+                            excluded_opaque_occurrence_payload_tokens
+                            + excluded_training_scope_occurrence_payload_tokens
+                        ),
+                    },
+                    "routing_accounting": {
+                        "scope": "all-frozen-cas-occurrences",
+                        "occurrence_counts": dict(
+                            sorted(training_scope_occurrence_counts.items())
+                        ),
+                        "summed_exact_tokens_with_occurrence_multiplicity": (
+                            dict(sorted(training_scope_token_counts.items()))
+                        ),
+                    },
+                    "excluded_opaque_occurrences": {
+                        "members": excluded_opaque_member_count,
                         "occurrences": excluded_opaque_writer.count,
                         "summed_exact_tokens_with_occurrence_multiplicity": (
-                            excluded_occurrence_payload_tokens
+                            excluded_opaque_occurrence_payload_tokens
                         ),
                         "ledger_schema": OPAQUE_ARTIFACT_LEDGER_SCHEMA,
                         "ledger": excluded_opaque_writer.path.relative_to(
@@ -6053,6 +6449,27 @@ def export_store(
                         "ledger_sha256": excluded_opaque_writer.logical_sha256,
                         "ledger_artifact_sha256": _sha256_file(
                             excluded_opaque_writer.path
+                        ),
+                    },
+                    "excluded_training_scope_occurrences": {
+                        "members": excluded_training_scope_member_count,
+                        "occurrences": excluded_training_scope_writer.count,
+                        "summed_exact_tokens_with_occurrence_multiplicity": (
+                            excluded_training_scope_occurrence_payload_tokens
+                        ),
+                        "ledger_schema": (
+                            TRAINING_SCOPE_EXCLUSION_LEDGER_SCHEMA
+                        ),
+                        "ledger": (
+                            excluded_training_scope_writer.path.relative_to(
+                                temp_path
+                            ).as_posix()
+                        ),
+                        "ledger_sha256": (
+                            excluded_training_scope_writer.logical_sha256
+                        ),
+                        "ledger_artifact_sha256": _sha256_file(
+                            excluded_training_scope_writer.path
                         ),
                     },
                     "conservation": {
@@ -6069,7 +6486,7 @@ def export_store(
                 "representatives": {
                     "schema": REPRESENTATIVE_LEDGER_SCHEMA,
                     "selection": (
-                        "one-per-eligible-token-sequence; "
+                        "one-per-primary-eligible-token-sequence; "
                         "content-sha256-then-eligible-occurrence-key"
                     ),
                     "count": representative_count,
@@ -6211,6 +6628,8 @@ def export_store(
             return receipt
     except SourceBindingProjectionError as exc:
         raise ExportError(f"source-binding projection refused: {exc}") from exc
+    except CITrainingScopeError as exc:
+        raise ExportError(f"CI training scope refused: {exc}") from exc
     finally:
         if fragment_writer is not None:
             fragment_writer.close()
@@ -6222,6 +6641,8 @@ def export_store(
             representative_ledger_writer.close()
         if excluded_opaque_writer is not None:
             excluded_opaque_writer.close()
+        if excluded_training_scope_writer is not None:
+            excluded_training_scope_writer.close()
         if source_binding_projection_writer is not None:
             source_binding_projection_writer.close()
         if occurrence_metadata_writer is not None:

@@ -181,7 +181,16 @@ def _provenance(
             "confidence": 0.0,
         }
     ]
-    entities = entities or []
+    if entities is None:
+        entities = [
+            _entity(
+                "fixture-primary-scope",
+                0,
+                char_count,
+                domain=DomainKind.CPP,
+                role=int(DomainRoleKind.PATH),
+            )
+        ]
     edges = edges or []
     cross_chunk_edges = cross_chunk_edges or []
     crossing_edge_records = [
@@ -1002,7 +1011,7 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
         }
     }
     assert normalized["schema"] == EXPORT_SCHEMA
-    assert len(normalized["provenance_artifacts"]) == 7
+    assert len(normalized["provenance_artifacts"]) == 8
 
 
 def test_nested_zip_binary_garbage_is_conserved_but_not_trained(
@@ -1047,7 +1056,9 @@ def test_nested_zip_binary_garbage_is_conserved_but_not_trained(
         "unique_token_sequences": True,
     }
     assert receipt["representatives"]["count"] == 1
-    excluded_path = output / eligibility["excluded_occurrences"]["ledger"]
+    excluded_path = (
+        output / eligibility["excluded_opaque_occurrences"]["ledger"]
+    )
     excluded = _read_parquet_ledger(
         excluded_path,
         domain="cppmega-ci-case5-excluded-opaque-artifact-ledger-v1",
@@ -1078,7 +1089,7 @@ def test_nested_zip_binary_garbage_is_conserved_but_not_trained(
     assert {
         record["case5_eligibility"]["status"]
         for record in occurrence_records
-    } == {"eligible", "excluded_opaque"}
+    } == {"eligible_primary", "excluded_opaque"}
 
 
 def test_opaque_tokens_cannot_satisfy_the_eligible_target(
@@ -1119,6 +1130,188 @@ def test_opaque_tokens_cannot_satisfy_the_eligible_target(
             output=output,
         )
     assert not output.exists()
+
+
+def test_primary_scope_excludes_unrelated_and_routes_python_auxiliary(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    primary_text = "clang++ -c src/main.cpp -o build/main.o"
+    python_text = "tests/test_api.py::test_health PASSED"
+    irrelevant_text = "Downloading unrelated package metadata"
+    primary = _provenance(primary_text, archive_member="build.txt")
+    python = _provenance(
+        python_text,
+        archive_member="python-tests.txt",
+        entities=[
+            _entity(
+                "python-path",
+                0,
+                len(python_text),
+                domain=DomainKind.PYTHON,
+                role=int(DomainRoleKind.PATH),
+            )
+        ],
+    )
+    irrelevant = _provenance(
+        irrelevant_text,
+        archive_member="setup.txt",
+        entities=[],
+    )
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [
+            (primary_text, primary),
+            (python_text, python),
+            (irrelevant_text, irrelevant),
+        ],
+    )
+
+    output = tmp_path / "scope-routed"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+    )
+
+    eligibility = receipt["eligibility"]
+    assert eligibility["eligible"]["unique_token_sequences"] == 1
+    assert eligibility["excluded_training_scope_occurrences"][
+        "occurrences"
+    ] == 2
+    excluded = _read_parquet_ledger(
+        output
+        / eligibility["excluded_training_scope_occurrences"]["ledger"],
+        domain="cppmega-ci-case5-excluded-training-scope-ledger-v1",
+        schema="cppmega_ci_case5_excluded_training_scope_v1",
+    )
+    assert {
+        tuple(record["effective_routes"])
+        for record in excluded
+    } == {(), ("aux_python",)}
+    assert eligibility["routing_accounting"]["occurrence_counts"] == {
+        "aux_python": 1,
+        "excluded_irrelevant": 1,
+        "primary_cpp_sql_build_test": 1,
+    }
+
+
+def test_primary_scope_propagates_only_inside_the_exact_step(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    command_text = "cmake --build build --target all"
+    output_text = "[42/100] Building native target"
+    command = _provenance(
+        command_text,
+        ordinal=0,
+        archive_member="native-build.txt",
+    )
+    output_chunk = _provenance(
+        output_text,
+        ordinal=1,
+        archive_member="native-build.txt",
+        entities=[],
+    )
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(command_text, command), (output_text, output_chunk)],
+    )
+
+    output = tmp_path / "step-propagated"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+    )
+
+    assert receipt["eligibility"]["eligible"]["unique_token_sequences"] == 2
+    occurrences = [
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            output / receipt["occurrence_metadata"]["artifact"],
+            expected_domain=receipt["occurrence_metadata"]["logical_domain"],
+            expected_record_schema=receipt["occurrence_metadata"]["schema"],
+        )
+    ]
+    propagated = next(
+        record
+        for record in occurrences
+        if record["content_sha256"]
+        == hashlib.sha256(output_text.encode()).hexdigest()
+    )
+    scope = propagated["case5_eligibility"]["training_scope"]
+    assert scope["local_primary"] is False
+    assert scope["effective_primary"] is True
+    assert "propagated:exact_step_primary_evidence" in scope["reasons"]
+
+
+def test_primary_scope_does_not_cross_step_boundary(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    command_text = "cmake --build build --target all"
+    unrelated_text = "Downloading unrelated package metadata"
+    command = _provenance(
+        command_text,
+        ordinal=0,
+        archive_member="same-job.txt",
+    )
+    unrelated = _provenance(
+        unrelated_text,
+        ordinal=1,
+        archive_member="same-job.txt",
+        entities=[],
+    )
+    unrelated["chunk"]["section_id"] = "section:1"
+    unrelated["chunk"]["section_ordinal"] = 1
+    unrelated["chunk"]["step_ordinal"] = 1
+    unrelated["section"]["section_id"] = "section:1"
+    unrelated["section"]["ordinal"] = 1
+    unrelated["section"]["step_ordinal"] = 1
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(command_text, command), (unrelated_text, unrelated)],
+    )
+
+    output = tmp_path / "step-isolated"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+    )
+
+    eligibility = receipt["eligibility"]
+    assert eligibility["eligible"]["unique_token_sequences"] == 1
+    assert eligibility["excluded_training_scope_occurrences"][
+        "occurrences"
+    ] == 1
+    occurrences = [
+        record
+        for record, _encoded in iter_canonical_parquet_ledger(
+            output / receipt["occurrence_metadata"]["artifact"],
+            expected_domain=receipt["occurrence_metadata"]["logical_domain"],
+            expected_record_schema=receipt["occurrence_metadata"]["schema"],
+        )
+    ]
+    excluded = next(
+        record
+        for record in occurrences
+        if record["content_sha256"]
+        == hashlib.sha256(unrelated_text.encode()).hexdigest()
+    )
+    scope = excluded["case5_eligibility"]["training_scope"]
+    assert scope["effective_routes"] == []
+    assert scope["effective_primary"] is False
 
 
 def test_explicit_eligible_target_uses_receipt_bound_cas_reserve(
@@ -1449,10 +1642,14 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
     assert occurrence_metadata["scope"] == (
         "one-record-per-frozen-cas-occurrence"
     )
-    assert occurrence_metadata["case5_eligibility"] == {
-        "status": "eligible",
-        "reason": None,
-    }
+    assert occurrence_metadata["case5_eligibility"]["status"] == (
+        "eligible_primary"
+    )
+    assert occurrence_metadata["case5_eligibility"]["reason"] is None
+    assert occurrence_metadata["case5_eligibility"]["primary_eligible"] is True
+    assert occurrence_metadata["case5_eligibility"]["training_scope"][
+        "effective_routes"
+    ] == ["primary_cpp_sql_build_test"]
     parquet_metadata = pq.ParquetFile(occurrence_path).metadata
     assert {
         str(
@@ -2642,6 +2839,13 @@ def test_over_16k_mixed_domain_fragments_are_balanced_and_conserved(
             final_alpha + len("alpha"),
             domain=DomainKind.TEST_OUTPUT,
             role=int(DomainRoleKind.TARGET),
+        ),
+        _entity(
+            "entity:000002",
+            final_alpha,
+            final_alpha + len("alpha"),
+            domain=DomainKind.CPP,
+            role=int(DomainRoleKind.PATH),
         ),
     ]
     provenance = _provenance(
