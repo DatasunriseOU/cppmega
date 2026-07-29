@@ -372,6 +372,11 @@ jobs:
                   f"torch CUDA dependency contract drifted: "
                   f"observed={observed!r} expected={expected!r}"
               )
+          if torch.version.cuda != "13.2":
+              raise SystemExit(
+                  f"torch CUDA build drifted: observed={torch.version.cuda!r} "
+                  "expected='13.2'"
+              )
           spec = find_spec("nvidia.cudnn")
           locations = list(spec.submodule_search_locations or ()) if spec else []
           if len(locations) != 1:

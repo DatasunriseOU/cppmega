@@ -194,6 +194,7 @@ def test_wheel_build_uses_torch_matched_cudnn_without_replacing_system_cudnn() -
     assert "cudnn9-cuda-13 libnccl-dev libnccl2" not in workflow
     assert '"nvidia-cudnn-cu13": metadata.version("nvidia-cudnn-cu13")' in workflow
     assert '"nvidia-nccl-cu13": metadata.version("nvidia-nccl-cu13")' in workflow
+    assert 'if torch.version.cuda != "13.2":' in workflow
     assert 'stream.write(f"CUDNN_PATH={cudnn_path}\\n")' in workflow
     assert 'f"CPATH={cudnn_path / \'include\'}:"' in workflow
     assert 'f"LIBRARY_PATH={cudnn_path / \'lib\'}:"' in workflow
