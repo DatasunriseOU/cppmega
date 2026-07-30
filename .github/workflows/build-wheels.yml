@@ -163,8 +163,9 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - f4e9d04 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
-            #     and links TVM's CUDA driver calls to TileLang's lazy stub
+            #   - b2545eaa carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #     and links TVM's CUDA driver calls, including cuFuncGetAttribute,
+            #     to TileLang's lazy stub
             #   - vendored TVM submodule (DatasunriseOU/tvm@78f930ed) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
@@ -176,7 +177,7 @@ jobs:
             #     incompatible with FA4 beta23's >=0.1.12 floor.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: f4e9d04bc9a07ac40308eb89112250971f479667
+            ref: b2545eaa3f11610a31e5b8371aab97c369e95f27
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda

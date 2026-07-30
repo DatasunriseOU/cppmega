@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@f4e9d04 into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@b2545eaa into the active
 # (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
@@ -9,7 +9,8 @@
 # via vendored TVM DatasunriseOU/tvm@78f930ed), restores the nvbench CUDA
 # L2-cache-flush header, and removes the apache-tvm-ffi<0.1.10 cap (upstream
 # PR #2071), so it imports cleanly under tvm-ffi >=0.1.12 as required by FA4
-# beta23. Must match STACK.lock.
+# beta23. Its lazy driver stub also exports cuFuncGetAttribute required by the
+# CUDA 13.2 TVM runtime. Must match STACK.lock.
 #
 # Usage:
 #   scripts/install_tilelang_wheel.sh                # uses $VIRTUAL_ENV
@@ -23,7 +24,7 @@
 set -euo pipefail
 
 WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-f4e9d04bc9a07ac40308eb89112250971f479667}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-b2545eaa3f11610a31e5b8371aab97c369e95f27}"
 TVM_COMMIT="${TILELANG_TVM_COMMIT:-78f930edc805920428388518e12d111019383d2f}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"
 

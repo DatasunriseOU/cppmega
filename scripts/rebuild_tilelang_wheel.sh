@@ -9,12 +9,13 @@
 #   (_ObjectSlotsMeta), but TileLang's vendored TVM (882a774) lacks the fix
 #   from apache/tvm#18938 (TVMDerivedObject.__slots__ = ("__dict__","__weakref__")).
 #   Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12, so it is
-#   NOT usable. The DatasunriseOU/tilelang fork at f4e9d04 is the clean path:
+#   NOT usable. The DatasunriseOU/tilelang fork at b2545eaa is the clean path:
 #     - carries upstream tile-ai/tilelang#2071 (removes the <0.1.10 cap)
 #     - vendored TVM submodule = DatasunriseOU/tvm@78f930ed, which includes
 #       apache/tvm#18938 (the __slots__ fix) and restores the nvbench CUDA
 #       L2-cache-flush header that TVM still compiles
 #     - adapts AdjustMatmulOrder to the fork's boxed-Integer permute_dims API
+#     - completes the lazy CUDA driver stub for CUDA 13.2 TVM
 #   This script clones that fork commit, ensures the TVM submodule is checked
 #   out at the fixed commit, builds the wheel, and drops it in wheels/.
 #
@@ -28,7 +29,7 @@
 #
 # Env overrides:
 #   TILELANG_REPO    fork repo URL   (default: DatasunriseOU/tilelang)
-#   TILELANG_REF     fork commit     (default: f4e9d04...)
+#   TILELANG_REF     fork commit     (default: b2545eaa...)
 #   TILELANG_TVM_REF vendored TVM commit (default: 78f930ed...)
 #   TILELANG_SRC_DIR clone dir        (default: $HOME/tilelang-build)
 #   WHEELS_DIR       output dir       (default: <repo>/wheels)
@@ -36,7 +37,7 @@
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-f4e9d04bc9a07ac40308eb89112250971f479667}"
+TILELANG_REF="${TILELANG_REF:-b2545eaa3f11610a31e5b8371aab97c369e95f27}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.
