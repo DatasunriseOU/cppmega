@@ -351,8 +351,15 @@ def _trailing_nul_bytes(
     return width if stream.read(width) == b"\0" * width else 0
 
 
-def _filename_declared_codec(path: Path) -> tuple[str, str] | None:
-    return _FILENAME_DECLARED_CODECS.get(path.name.casefold())
+def _path_declared_codec(path: Path) -> tuple[str, str] | None:
+    declared = _FILENAME_DECLARED_CODECS.get(path.name.casefold())
+    if declared is not None:
+        return declared
+    if path.suffix.casefold() == ".bat" and any(
+        part.casefold() == "jpn" for part in path.parts
+    ):
+        return "shift_jis", "shift-jis"
+    return None
 
 
 def _decode_euc_tw(payload: bytes, *, path: Path) -> str:
@@ -501,7 +508,7 @@ def _validate_domain_stream(
             trailing_nul_bytes=trailing_nul_bytes,
         )
     except UnicodeDecodeError as utf8_exc:
-        declared_codec = _filename_declared_codec(path)
+        declared_codec = _path_declared_codec(path)
         if declared_codec is not None:
             codec, source_encoding = declared_codec
             if codec == _ICONV_EUC_TW_CODEC:
@@ -879,7 +886,7 @@ def decode_domain_prefix(
                 final=False,
             )
         except UnicodeDecodeError as utf8_exc:
-            declared_codec = _filename_declared_codec(path_obj)
+            declared_codec = _path_declared_codec(path_obj)
             if declared_codec is not None:
                 codec, source_encoding = declared_codec
                 if codec == _ICONV_EUC_TW_CODEC:

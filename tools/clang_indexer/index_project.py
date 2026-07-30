@@ -2398,19 +2398,20 @@ def _sanitize_compile_args_for_clang(args: list[str] | None) -> list[str]:
 def _decode_source_bytes(raw: bytes, filename: str) -> tuple[str, str]:
     """Decode source with a byte-exact fallback for mixed legacy text."""
 
-    if b"\0" in raw:
-        raise ValueError(f"source contains NUL byte: {filename}")
     try:
-        return raw.decode("utf-8", errors="strict"), "utf-8"
+        text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
     except UnicodeDecodeError:
         try:
-            return raw.decode("cp1252", errors="strict"), "cp1252"
+            text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
         except UnicodeDecodeError:
             # Historical source trees can mix Shift-JIS comments with raw
             # single-byte font tables in one translation unit. No semantic
             # codec covers that mixture; ISO-8859-1 preserves every byte and
             # keeps libclang byte offsets exact.
-            return raw.decode("latin-1", errors="strict"), "latin-1"
+            text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
+    if "\0" in text and "\0" in _mask_non_code(text):
+        raise ValueError(f"source contains NUL byte: {filename}")
+    return text, encoding
 
 
 def _read_source_file(filename: str) -> tuple[str, bytes, str]:
