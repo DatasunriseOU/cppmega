@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""Route packed source rows into primary native and auxiliary Python shards."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
+from dataclasses import replace
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any, Iterable
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from cppmega.data import symbol_identity as symbol_identity_schema
+from cppmega.data.nanochat_pipeline import packed_rows_schema as packed
+from cppmega.data.nanochat_pipeline import tokenized_enriched_schema as enriched
+from scripts.nanochat_data import pack_enriched_rows as packer
+from scripts.nanochat_data.atomic_publish import atomic_output_file
+
+SCHEMA = "cppmega_packed_source_route_v1"
+PYTHON_BUILD_KIND = "python"
+ROUTES = ("primary", "aux_python")
+_ALLOWED_LEGACY_MISSING_COLUMNS = frozenset({packed.SOURCE_COMMIT_HASHES_COLUMN})
+_ALIGNED_TO_CHRONOLOGY = {
+    packed.SOURCE_REPO_STABLE_IDS_COLUMN: enriched.REPO_STABLE_ID_COLUMN,
+    packed.SOURCE_FILEPATH_STABLE_IDS_COLUMN: enriched.FILEPATH_STABLE_ID_COLUMN,
+    packed.SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN: (
+        enriched.FILE_LOCAL_COMMIT_INDEX_COLUMN
+    ),
+    packed.SOURCE_COMMIT_HASHES_COLUMN: enriched.COMMIT_HASH_COLUMN,
+    packed.SOURCE_PR_NUMBERS_COLUMN: enriched.PR_NUMBER_COLUMN,
+    packed.SOURCE_HAS_PR_DISCUSSIONS_COLUMN: enriched.HAS_PR_DISCUSSION_COLUMN,
+    packed.SOURCE_PR_DISCUSSION_CHARS_COLUMN: (enriched.PR_DISCUSSION_CHARS_COLUMN),
+    packed.SOURCE_PR_DISCUSSION_LINES_COLUMN: (enriched.PR_DISCUSSION_LINES_COLUMN),
+    packed.SOURCE_DOC_TYPES_COLUMN: enriched.DOC_TYPE_COLUMN,
+    packed.SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: (enriched.HEADER_FRAGMENT_KIND_COLUMN),
+    packed.SOURCE_BUILD_KINDS_COLUMN: enriched.BUILD_KIND_COLUMN,
+}
+_DOC_ALIGNED_COLUMNS = (
+    packed.SOURCE_DOC_IDS_COLUMN,
+    packer.SOURCE_DOC_TOKEN_LENGTHS_COLUMN,
+    packed.SOURCE_PLATFORM_IDS_COLUMN,
+    *_ALIGNED_TO_CHRONOLOGY,
+    *packed.PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN,
+)
+_CHUNK_EDGE_COLUMNS = (
+    enriched.TOKEN_CALL_EDGES_COLUMN,
+    enriched.TOKEN_TYPE_EDGES_COLUMN,
+)
+_TOKEN_EDGE_COLUMNS = (
+    enriched.TOKEN_DOMAIN_EDGES_COLUMN,
+    enriched.TOKEN_BUILD_EDGES_COLUMN,
+    enriched.TOKEN_SHELL_EDGES_COLUMN,
+    enriched.TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+    enriched.TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _implementation() -> dict[str, str]:
+    return {
+        "router_sha256": _sha256_file(Path(__file__).resolve()),
+        "packer_sha256": _sha256_file(Path(packer.__file__).resolve()),
+        "packed_schema_sha256": _sha256_file(Path(packed.__file__).resolve()),
+        "enriched_schema_sha256": _sha256_file(Path(enriched.__file__).resolve()),
+        "symbol_identity_schema_sha256": _sha256_file(
+            Path(symbol_identity_schema.__file__).resolve()
+        ),
+    }
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    with atomic_output_file(path) as staged:
+        staged.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _aligned_values(
+    row: dict[str, Any],
+    column: str,
+    *,
+    num_docs: int,
+) -> list[Any]:
+    values = row.get(column)
+    if not isinstance(values, list) or len(values) != num_docs:
+        raise ValueError(
+            f"{column} must contain one value per source document: "
+            f"expected {num_docs}, got {values!r}"
+        )
+    return values
+
+
+def _upgrade_legacy_row(row: dict[str, Any]) -> dict[str, Any]:
+    upgraded = dict(row)
+    num_docs = int(upgraded.get(packed.NUM_DOCS_COLUMN, -1))
+    if num_docs <= 0:
+        raise ValueError(f"invalid num_docs={num_docs}")
+    if packed.SOURCE_COMMIT_HASHES_COLUMN not in upgraded:
+        upgraded[packed.SOURCE_COMMIT_HASHES_COLUMN] = [
+            upgraded.get(enriched.COMMIT_HASH_COLUMN)
+        ] * num_docs
+    for column in _DOC_ALIGNED_COLUMNS:
+        _aligned_values(upgraded, column, num_docs=num_docs)
+    lengths = [int(value) for value in upgraded[packer.SOURCE_DOC_TOKEN_LENGTHS_COLUMN]]
+    valid = int(upgraded.get(packed.VALID_TOKEN_COUNT_COLUMN, -1))
+    if any(length <= 0 for length in lengths) or sum(lengths) != valid:
+        raise ValueError(
+            f"source_doc_token_lengths={lengths!r} do not sum to "
+            f"valid_token_count={valid}"
+        )
+    capacity = len(upgraded.get(packed.INPUT_IDS_COLUMN) or [])
+    if not 0 < valid <= capacity:
+        raise ValueError(f"invalid valid_token_count={valid} for capacity={capacity}")
+    for column in (
+        packed.INPUT_IDS_COLUMN,
+        packed.TARGET_IDS_COLUMN,
+        packed.LOSS_MASK_COLUMN,
+        packed.DOC_IDS_COLUMN,
+        *packed.PACKED_ROWS_TOKEN_METADATA_COLUMNS,
+    ):
+        values = upgraded.get(column)
+        if not isinstance(values, list) or len(values) != capacity:
+            raise ValueError(
+                f"{column} must have packed capacity {capacity}, got "
+                f"{len(values) if isinstance(values, list) else values!r}"
+            )
+    trained = int(upgraded.get(packer.TRAINED_TOKEN_COUNT_COLUMN, -1))
+    if trained != sum(int(value) > 0 for value in upgraded[packed.LOSS_MASK_COLUMN]):
+        raise ValueError(
+            f"trained_token_count={trained} does not match positive loss_mask sum"
+        )
+    return upgraded
+
+
+def _validate_input_schema(schema: pa.Schema, *, where: Path) -> None:
+    expected = packer.PACKED_ROW_OUTPUT_SCHEMA
+    actual_names = set(schema.names)
+    expected_names = set(expected.names)
+    missing = expected_names - actual_names
+    extra = actual_names - expected_names
+    if not missing <= _ALLOWED_LEGACY_MISSING_COLUMNS or extra:
+        raise ValueError(
+            f"{where}: incompatible packed schema; missing={sorted(missing)} "
+            f"extra={sorted(extra)}"
+        )
+    for name in actual_names:
+        if schema.field(name).type != expected.field(name).type:
+            raise ValueError(
+                f"{where}: {name} type {schema.field(name).type} != "
+                f"{expected.field(name).type}"
+            )
+    metadata = schema.metadata or {}
+    for key, value in (expected.metadata or {}).items():
+        if metadata.get(key) != value:
+            raise ValueError(
+                f"{where}: schema metadata {key!r}={metadata.get(key)!r} "
+                f"!= required {value!r}"
+            )
+
+
+def _chunk_metadata_for_doc(
+    row: dict[str, Any],
+    *,
+    token_start: int,
+    token_end: int,
+) -> tuple[
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+    dict[int, int],
+]:
+    starts = [int(value) for value in row[enriched.TOKEN_CHUNK_STARTS_COLUMN]]
+    ends = [int(value) for value in row[enriched.TOKEN_CHUNK_ENDS_COLUMN]]
+    kinds = [int(value) for value in row[enriched.TOKEN_CHUNK_KINDS_COLUMN]]
+    levels = [int(value) for value in row[enriched.TOKEN_CHUNK_DEP_LEVELS_COLUMN]]
+    if len({len(starts), len(ends), len(kinds), len(levels)}) != 1:
+        raise ValueError("packed chunk metadata columns are not aligned")
+
+    selected: list[int] = []
+    for chunk_index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        overlaps = start < token_end and end > token_start
+        contained = token_start <= start < end <= token_end
+        if overlaps and not contained:
+            raise ValueError(
+                f"chunk {chunk_index} span ({start}, {end}) crosses a "
+                "source-document boundary"
+            )
+        if contained:
+            selected.append(chunk_index)
+    remap = {old: new for new, old in enumerate(selected)}
+    return (
+        [starts[index] - token_start for index in selected],
+        [ends[index] - token_start for index in selected],
+        [kinds[index] for index in selected],
+        [levels[index] for index in selected],
+        remap,
+    )
+
+
+def _chunk_edges_for_doc(
+    row: dict[str, Any],
+    *,
+    column: str,
+    remap: dict[int, int],
+) -> list[dict[str, int]]:
+    result: list[dict[str, int]] = []
+    for edge in row[column]:
+        source = int(edge["from"])
+        target = int(edge["to"])
+        source_here = source in remap
+        target_here = target in remap
+        if source_here != target_here:
+            raise ValueError(
+                f"{column} edge ({source}, {target}) crosses a "
+                "source-document boundary"
+            )
+        if source_here:
+            result.append({"from": remap[source], "to": remap[target]})
+    return result
+
+
+def _token_edges_for_doc(
+    row: dict[str, Any],
+    *,
+    column: str,
+    token_start: int,
+    token_end: int,
+) -> list[dict[str, int]]:
+    result: list[dict[str, int]] = []
+    for edge in row[column]:
+        source = int(edge["from"])
+        target = int(edge["to"])
+        source_here = token_start <= source < token_end
+        target_here = token_start <= target < token_end
+        if source_here != target_here:
+            raise ValueError(
+                f"{column} edge ({source}, {target}) crosses a "
+                "source-document boundary"
+            )
+        if source_here:
+            result.append(
+                {
+                    "from": source - token_start,
+                    "to": target - token_start,
+                    "kind": int(edge["kind"]),
+                }
+            )
+    return result
+
+
+def _changed_chunks_for_doc(
+    row: dict[str, Any],
+    *,
+    token_start: int,
+    token_end: int,
+    remap: dict[int, int],
+) -> tuple[list[int], list[tuple[int, int]]]:
+    chunk_ids = [int(value) for value in row[enriched.CHANGED_CHUNK_IDS_COLUMN]]
+    spans = row[enriched.CHANGED_CHUNK_SPANS_COLUMN]
+    if len(chunk_ids) != len(spans):
+        raise ValueError("changed chunk IDs and spans are not aligned")
+    selected_ids: list[int] = []
+    selected_spans: list[tuple[int, int]] = []
+    for chunk_id, span in zip(chunk_ids, spans, strict=True):
+        start = int(span["start"])
+        end = int(span["end"])
+        if chunk_id in remap:
+            if not token_start <= start < end <= token_end:
+                raise ValueError(
+                    f"changed chunk {chunk_id} span ({start}, {end}) crosses "
+                    "a source-document boundary"
+                )
+            selected_ids.append(remap[chunk_id])
+            selected_spans.append((start - token_start, end - token_start))
+        elif start < token_end and end > token_start:
+            raise ValueError(
+                f"changed span ({start}, {end}) overlaps a document without "
+                f"its chunk {chunk_id}"
+            )
+    return selected_ids, selected_spans
+
+
+def _extract_document(
+    row: dict[str, Any],
+    *,
+    doc_index: int,
+    token_start: int,
+    token_end: int,
+) -> packer.NormalizedDoc:
+    num_docs = int(row[packed.NUM_DOCS_COLUMN])
+    token_meta = {
+        column: [int(value) for value in row[column][token_start:token_end]]
+        for column in packed.PACKED_ROWS_TOKEN_METADATA_COLUMNS
+    }
+    (
+        chunk_starts,
+        chunk_ends,
+        chunk_kinds,
+        chunk_dep_levels,
+        chunk_remap,
+    ) = _chunk_metadata_for_doc(
+        row,
+        token_start=token_start,
+        token_end=token_end,
+    )
+    changed_ids, changed_spans = _changed_chunks_for_doc(
+        row,
+        token_start=token_start,
+        token_end=token_end,
+        remap=chunk_remap,
+    )
+
+    chronology = {
+        column: row.get(column) for column in packer.PACKED_ROW_PROVENANCE_COLUMNS
+    }
+    for source_column, chronology_column in _ALIGNED_TO_CHRONOLOGY.items():
+        chronology[chronology_column] = _aligned_values(
+            row, source_column, num_docs=num_docs
+        )[doc_index]
+
+    referenced_source_ids = {
+        int(value)
+        for value in token_meta[enriched.TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+        if int(value) > 0
+    }
+    source_registry = {
+        int(entry["source_identity_id"]): dict(entry)
+        for entry in row[enriched.SOURCE_IDENTITY_REGISTRY_COLUMN]
+    }
+    missing_source_ids = referenced_source_ids - set(source_registry)
+    if not referenced_source_ids or missing_source_ids:
+        raise ValueError(
+            "source identity registry does not cover routed document: "
+            f"referenced={sorted(referenced_source_ids)} "
+            f"missing={sorted(missing_source_ids)}"
+        )
+
+    referenced_symbol_ids = {
+        int(value)
+        for column in (
+            enriched.TOKEN_SYMBOL_IDS_COLUMN,
+            enriched.TOKEN_CALL_TARGETS_COLUMN,
+            enriched.TOKEN_TYPE_REFS_COLUMN,
+        )
+        for value in token_meta[column]
+        if int(value) > 0
+    }
+    symbol_registry = {
+        int(entry["symbol_id"]): dict(entry)
+        for entry in row[symbol_identity_schema.SYMBOL_IDENTITIES_COLUMN]
+    }
+    missing_symbol_ids = referenced_symbol_ids - set(symbol_registry)
+    if missing_symbol_ids:
+        raise ValueError(
+            f"symbol registry is missing routed IDs {sorted(missing_symbol_ids)}"
+        )
+
+    source_doc_index = int(
+        _aligned_values(row, packed.SOURCE_DOC_IDS_COLUMN, num_docs=num_docs)[doc_index]
+    )
+    stable_doc_values = token_meta[enriched.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    stable_doc_id = next(
+        (int(value) for value in stable_doc_values if int(value) > 0),
+        source_doc_index + 1,
+    )
+    objective_token_ids = {
+        token_column: [
+            int(value)
+            for value in _aligned_values(row, source_column, num_docs=num_docs)[
+                doc_index
+            ]
+        ]
+        for source_column, token_column in (
+            packed.PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.items()
+        )
+    }
+    chunk_edges = {
+        column: _chunk_edges_for_doc(row, column=column, remap=chunk_remap)
+        for column in _CHUNK_EDGE_COLUMNS
+    }
+    token_edges = {
+        column: _token_edges_for_doc(
+            row,
+            column=column,
+            token_start=token_start,
+            token_end=token_end,
+        )
+        for column in _TOKEN_EDGE_COLUMNS
+    }
+    return packer.NormalizedDoc(
+        source_doc_index=source_doc_index,
+        stable_doc_id=stable_doc_id,
+        stable_source_id=next(
+            int(value)
+            for value in token_meta[enriched.TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+            if int(value) > 0
+        ),
+        source_identity_registry=tuple(
+            source_registry[identity]
+            for identity in source_registry
+            if identity in referenced_source_ids
+        ),
+        token_ids=[
+            int(value) for value in row[packed.INPUT_IDS_COLUMN][token_start:token_end]
+        ],
+        token_meta=token_meta,
+        chunk_starts=chunk_starts,
+        chunk_ends=chunk_ends,
+        chunk_kinds=chunk_kinds,
+        chunk_dep_levels=chunk_dep_levels,
+        call_edges=chunk_edges[enriched.TOKEN_CALL_EDGES_COLUMN],
+        type_edges=chunk_edges[enriched.TOKEN_TYPE_EDGES_COLUMN],
+        platform_ids=[
+            int(value)
+            for value in _aligned_values(
+                row, packed.SOURCE_PLATFORM_IDS_COLUMN, num_docs=num_docs
+            )[doc_index]
+        ],
+        changed_chunk_ids=changed_ids,
+        changed_chunk_spans=changed_spans,
+        chronology=chronology,
+        symbol_identities=[
+            symbol_registry[identity]
+            for identity in symbol_registry
+            if identity in referenced_symbol_ids
+        ],
+        objective_token_ids=objective_token_ids,
+        domain_edges=token_edges[enriched.TOKEN_DOMAIN_EDGES_COLUMN],
+        build_edges=token_edges[enriched.TOKEN_BUILD_EDGES_COLUMN],
+        shell_edges=token_edges[enriched.TOKEN_SHELL_EDGES_COLUMN],
+        diagnostic_edges=token_edges[enriched.TOKEN_DIAGNOSTIC_EDGES_COLUMN],
+        cross_domain_edges=token_edges[enriched.TOKEN_CROSS_DOMAIN_EDGES_COLUMN],
+    )
+
+
+def _chain_documents(docs: list[packer.NormalizedDoc]) -> list[packer.NormalizedDoc]:
+    chained: list[packer.NormalizedDoc] = []
+    previous: int | None = None
+    for doc in docs:
+        chained.append(
+            replace(doc, doc_dep_edges=(() if previous is None else (previous,)))
+        )
+        previous = doc.source_doc_index
+    return chained
+
+
+def _assert_routed_content(
+    source: dict[str, Any],
+    routed: dict[str, Any],
+    *,
+    doc_indices: list[int],
+) -> None:
+    lengths = [int(value) for value in source[packer.SOURCE_DOC_TOKEN_LENGTHS_COLUMN]]
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    expected_tokens = [
+        int(token)
+        for doc_index in doc_indices
+        for token in source[packed.INPUT_IDS_COLUMN][
+            offsets[doc_index] : offsets[doc_index + 1]
+        ]
+    ]
+    valid = int(routed[packed.VALID_TOKEN_COUNT_COLUMN])
+    if routed[packed.INPUT_IDS_COLUMN][:valid] != expected_tokens:
+        raise ValueError("routed token payload is not lossless")
+    for column in _DOC_ALIGNED_COLUMNS:
+        expected = [source[column][index] for index in doc_indices]
+        if routed[column] != expected:
+            raise ValueError(f"routed {column} is not lossless")
+    for column in packed.PACKED_ROWS_TOKEN_METADATA_COLUMNS:
+        expected = [
+            int(value)
+            for doc_index in doc_indices
+            for value in source[column][offsets[doc_index] : offsets[doc_index + 1]]
+        ]
+        if routed[column][:valid] != expected:
+            raise ValueError(f"routed {column} is not lossless")
+
+
+def route_packed_row(
+    raw_row: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+    """Return primary, auxiliary-Python, and mixed-row flag for one packed row."""
+
+    row = _upgrade_legacy_row(raw_row)
+    kinds = [
+        value
+        for value in _aligned_values(
+            row,
+            packed.SOURCE_BUILD_KINDS_COLUMN,
+            num_docs=int(row[packed.NUM_DOCS_COLUMN]),
+        )
+    ]
+    python_docs = [value == PYTHON_BUILD_KIND for value in kinds]
+    if all(python_docs):
+        return None, row, False
+    if not any(python_docs):
+        return row, None, False
+
+    lengths = [int(value) for value in row[packer.SOURCE_DOC_TOKEN_LENGTHS_COLUMN]]
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    docs = [
+        _extract_document(
+            row,
+            doc_index=index,
+            token_start=offsets[index],
+            token_end=offsets[index + 1],
+        )
+        for index in range(len(lengths))
+    ]
+    primary_indices = [
+        index for index, is_python in enumerate(python_docs) if not is_python
+    ]
+    aux_indices = [index for index, is_python in enumerate(python_docs) if is_python]
+    capacity = len(row[packed.INPUT_IDS_COLUMN])
+    pad_token_id = int(row[packed.TARGET_IDS_COLUMN][-1])
+    primary = packer._materialize_packed_row(
+        _chain_documents([docs[index] for index in primary_indices]),
+        target_length=capacity,
+        pad_token_id=pad_token_id,
+        pack_id=int(row[packed.PACK_ID_COLUMN]),
+    )
+    auxiliary = packer._materialize_packed_row(
+        _chain_documents([docs[index] for index in aux_indices]),
+        target_length=capacity,
+        pad_token_id=pad_token_id,
+        pack_id=int(row[packed.PACK_ID_COLUMN]),
+    )
+    _assert_routed_content(row, primary, doc_indices=primary_indices)
+    _assert_routed_content(row, auxiliary, doc_indices=aux_indices)
+    return primary, auxiliary, True
+
+
+def _empty_counts() -> dict[str, int]:
+    return {
+        "rows": 0,
+        "valid_tokens": 0,
+        "trained_tokens": 0,
+        "documents": 0,
+        "capacity_tokens": 0,
+    }
+
+
+def _add_row(counts: dict[str, int], row: dict[str, Any]) -> None:
+    counts["rows"] += 1
+    counts["valid_tokens"] += int(row[packed.VALID_TOKEN_COUNT_COLUMN])
+    counts["trained_tokens"] += int(row[packer.TRAINED_TOKEN_COUNT_COLUMN])
+    counts["documents"] += int(row[packed.NUM_DOCS_COLUMN])
+    counts["capacity_tokens"] += len(row[packed.INPUT_IDS_COLUMN])
+
+
+def _assert_conservation(
+    source: dict[str, int],
+    primary: dict[str, int],
+    auxiliary: dict[str, int],
+    *,
+    where: Path,
+) -> None:
+    for key in ("valid_tokens", "trained_tokens", "documents"):
+        if source[key] != primary[key] + auxiliary[key]:
+            raise ValueError(
+                f"{where}: {key} is not conserved: source={source[key]} "
+                f"primary={primary[key]} aux_python={auxiliary[key]}"
+            )
+
+
+def _validate_output(path: Path, *, expected_rows: int) -> None:
+    parquet = pq.ParquetFile(path)
+    if not parquet.schema_arrow.equals(packer.PACKED_ROW_OUTPUT_SCHEMA) or dict(
+        parquet.schema_arrow.metadata or {}
+    ) != dict(packer.PACKED_ROW_OUTPUT_SCHEMA.metadata or {}):
+        raise ValueError(f"{path}: output schema is not canonical")
+    if parquet.metadata.num_rows != expected_rows:
+        raise ValueError(
+            f"{path}: expected {expected_rows} rows, got "
+            f"{parquet.metadata.num_rows}"
+        )
+    codecs = {
+        parquet.metadata.row_group(group).column(column).compression
+        for group in range(parquet.metadata.num_row_groups)
+        for column in range(parquet.metadata.row_group(group).num_columns)
+    }
+    if codecs and codecs != {"ZSTD"}:
+        raise ValueError(f"{path}: output codecs must be ZSTD, got {sorted(codecs)}")
+
+
+def _artifact(
+    path: Path, counts: dict[str, int], *, output_root: Path
+) -> dict[str, Any]:
+    _validate_output(path, expected_rows=counts["rows"])
+    return {
+        "path": str(path.relative_to(output_root)),
+        "sha256": _sha256_file(path),
+        "size": path.stat().st_size,
+        **counts,
+    }
+
+
+def _verify_completed_file(
+    marker: Path,
+    *,
+    input_path: Path,
+    output_root: Path,
+) -> dict[str, Any]:
+    receipt = json.loads(marker.read_text(encoding="utf-8"))
+    if receipt.get("schema") != SCHEMA or receipt.get("status") != "complete":
+        raise ValueError(f"{marker}: invalid route marker")
+    if receipt.get("implementation") != _implementation():
+        raise ValueError(f"{marker}: implementation changed after routing")
+    if receipt["input"]["sha256"] != _sha256_file(input_path):
+        raise ValueError(f"{marker}: input changed after routing")
+    for route in ROUTES:
+        artifact = receipt["routes"][route]
+        path = output_root / artifact["path"]
+        if _sha256_file(path) != artifact["sha256"]:
+            raise ValueError(f"{marker}: routed artifact changed: {path}")
+        _validate_output(path, expected_rows=int(artifact["rows"]))
+    return receipt
+
+
+def route_file(
+    input_path_str: str,
+    *,
+    input_root_str: str,
+    output_root_str: str,
+    compression_level: int,
+    resume: bool,
+) -> dict[str, Any]:
+    input_path = Path(input_path_str)
+    input_root = Path(input_root_str)
+    output_root = Path(output_root_str)
+    relative = input_path.relative_to(input_root)
+    primary_path = output_root / "primary" / relative
+    auxiliary_path = output_root / "aux_python" / relative
+    marker = output_root / "state" / relative.with_suffix(".route.json")
+    if marker.exists():
+        if not resume:
+            raise FileExistsError(marker)
+        return _verify_completed_file(
+            marker, input_path=input_path, output_root=output_root
+        )
+
+    parquet = pq.ParquetFile(input_path)
+    _validate_input_schema(parquet.schema_arrow, where=input_path)
+    bucket = int(relative.parent.name)
+    batch_size = max(1, 131_072 // bucket)
+    counts = {
+        "source": _empty_counts(),
+        "primary": _empty_counts(),
+        "aux_python": _empty_counts(),
+    }
+    mixed_rows = 0
+    with ExitStack() as stack:
+        primary_stage = stack.enter_context(atomic_output_file(primary_path))
+        auxiliary_stage = stack.enter_context(atomic_output_file(auxiliary_path))
+        writers = {
+            "primary": pq.ParquetWriter(
+                primary_stage,
+                packer.PACKED_ROW_OUTPUT_SCHEMA,
+                compression="zstd",
+                compression_level=compression_level,
+                use_dictionary=True,
+            ),
+            "aux_python": pq.ParquetWriter(
+                auxiliary_stage,
+                packer.PACKED_ROW_OUTPUT_SCHEMA,
+                compression="zstd",
+                compression_level=compression_level,
+                use_dictionary=True,
+            ),
+        }
+        try:
+            for batch in parquet.iter_batches(batch_size=batch_size):
+                routed_rows: dict[str, list[dict[str, Any]]] = {
+                    "primary": [],
+                    "aux_python": [],
+                }
+                for raw_row in batch.to_pylist():
+                    _add_row(counts["source"], raw_row)
+                    primary, auxiliary, mixed = route_packed_row(raw_row)
+                    mixed_rows += int(mixed)
+                    if primary is not None:
+                        _add_row(counts["primary"], primary)
+                        routed_rows["primary"].append(primary)
+                    if auxiliary is not None:
+                        _add_row(counts["aux_python"], auxiliary)
+                        routed_rows["aux_python"].append(auxiliary)
+                for route, rows in routed_rows.items():
+                    if rows:
+                        writers[route].write_table(
+                            pa.Table.from_pylist(
+                                rows, schema=packer.PACKED_ROW_OUTPUT_SCHEMA
+                            ),
+                            row_group_size=batch_size,
+                        )
+        finally:
+            for writer in writers.values():
+                writer.close()
+
+    _assert_conservation(
+        counts["source"],
+        counts["primary"],
+        counts["aux_python"],
+        where=input_path,
+    )
+    receipt = {
+        "schema": SCHEMA,
+        "status": "complete",
+        "created_at": _utc_now(),
+        "input": {
+            "path": str(relative),
+            "sha256": _sha256_file(input_path),
+            "size": input_path.stat().st_size,
+            **counts["source"],
+        },
+        "routes": {
+            "primary": _artifact(
+                primary_path, counts["primary"], output_root=output_root
+            ),
+            "aux_python": _artifact(
+                auxiliary_path, counts["aux_python"], output_root=output_root
+            ),
+        },
+        "mixed_rows_split": mixed_rows,
+        "implementation": _implementation(),
+        "unresolved_count": 0,
+    }
+    _write_json_atomic(marker, receipt)
+    return receipt
+
+
+def _discover(input_root: Path, buckets: tuple[int, ...]) -> list[Path]:
+    files: list[Path] = []
+    for bucket in buckets:
+        bucket_root = input_root / str(bucket)
+        if not bucket_root.is_dir():
+            raise FileNotFoundError(bucket_root)
+        files.extend(sorted(bucket_root.glob("*.parquet")))
+    if not files:
+        raise RuntimeError(f"no packed parquet files found under {input_root}")
+    return sorted(files, key=lambda path: path.relative_to(input_root).as_posix())
+
+
+def _parse_buckets(value: str) -> tuple[int, ...]:
+    buckets = tuple(int(part) for part in value.split(",") if part.strip())
+    if not buckets or any(bucket <= 0 for bucket in buckets):
+        raise argparse.ArgumentTypeError(
+            "buckets must be a non-empty comma-separated list"
+        )
+    if buckets != tuple(sorted(set(buckets))):
+        raise argparse.ArgumentTypeError(
+            "buckets must be unique and strictly increasing"
+        )
+    return buckets
+
+
+def _complete_input_receipt(
+    path: Path,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("status") != "complete" or value.get("unresolved_count") != 0:
+        raise ValueError(
+            f"{path}: input receipt must have status=complete and unresolved_count=0"
+        )
+    inventory = value.get("source_inventory")
+    if not isinstance(inventory, list) or not inventory:
+        raise ValueError(f"{path}: complete receipt has no source_inventory")
+    inventory_sha256 = value.get("source_inventory_sha256")
+    if inventory_sha256 != _canonical_sha256(inventory):
+        raise ValueError(f"{path}: source_inventory_sha256 does not match inventory")
+
+    normalized: list[dict[str, Any]] = []
+    for record in inventory:
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("path"), str)
+            or not record["path"]
+            or Path(record["path"]).is_absolute()
+            or ".." in Path(record["path"]).parts
+            or not isinstance(record.get("sha256"), str)
+            or len(record["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef" for character in record["sha256"]
+            )
+            or not isinstance(record.get("size"), int)
+            or isinstance(record["size"], bool)
+            or record["size"] <= 0
+        ):
+            raise ValueError(f"{path}: malformed source inventory record {record!r}")
+        normalized.append(
+            {
+                "path": record["path"],
+                "sha256": record["sha256"],
+                "size": record["size"],
+            }
+        )
+    if normalized != sorted(normalized, key=lambda record: record["path"]):
+        raise ValueError(f"{path}: source_inventory must be sorted by path")
+    if len({record["path"] for record in normalized}) != len(normalized):
+        raise ValueError(f"{path}: source_inventory contains duplicate paths")
+    return _sha256_file(path), inventory_sha256, normalized
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-root", type=Path, required=True)
+    parser.add_argument("--input-receipt", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--buckets",
+        type=_parse_buckets,
+        default=(1024, 2048, 4096, 8192, 16384),
+    )
+    parser.add_argument(
+        "--workers", type=int, default=max(1, min(4, os.cpu_count() or 1))
+    )
+    parser.add_argument("--compression-level", type=int, default=6)
+    parser.add_argument("--resume", action="store_true")
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    input_root = args.input_root.resolve()
+    input_receipt = args.input_receipt.resolve()
+    output_root = args.output_root.resolve()
+    (
+        receipt_sha256,
+        receipt_inventory_sha256,
+        expected_inventory,
+    ) = _complete_input_receipt(input_receipt)
+    files = _discover(input_root, args.buckets)
+    relative_files = [str(path.relative_to(input_root)) for path in files]
+    if relative_files != [record["path"] for record in expected_inventory]:
+        raise RuntimeError("input parquet paths differ from completion receipt")
+    if output_root.exists() and any(output_root.iterdir()) and not args.resume:
+        raise FileExistsError(
+            f"{output_root} is not empty; pass --resume for this exact route"
+        )
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    receipts: list[dict[str, Any]] = []
+    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [
+            pool.submit(
+                route_file,
+                str(path),
+                input_root_str=str(input_root),
+                output_root_str=str(output_root),
+                compression_level=args.compression_level,
+                resume=args.resume,
+            )
+            for path in files
+        ]
+        for future in as_completed(futures):
+            receipts.append(future.result())
+    receipts.sort(key=lambda value: value["input"]["path"])
+
+    if relative_files != [
+        str(path.relative_to(input_root))
+        for path in _discover(input_root, args.buckets)
+    ]:
+        raise RuntimeError("input parquet inventory changed while routing")
+    if _sha256_file(input_receipt) != receipt_sha256:
+        raise RuntimeError("input completion receipt changed while routing")
+    observed_inventory = [
+        {
+            "path": receipt["input"]["path"],
+            "sha256": receipt["input"]["sha256"],
+            "size": receipt["input"]["size"],
+        }
+        for receipt in receipts
+    ]
+    if observed_inventory != expected_inventory:
+        raise RuntimeError("input parquet bytes differ from completion receipt")
+
+    totals = {
+        "source": {
+            key: sum(int(receipt["input"][key]) for receipt in receipts)
+            for key in _empty_counts()
+        },
+        **{
+            route: {
+                key: sum(int(receipt["routes"][route][key]) for receipt in receipts)
+                for key in _empty_counts()
+            }
+            for route in ROUTES
+        },
+    }
+    _assert_conservation(
+        totals["source"],
+        totals["primary"],
+        totals["aux_python"],
+        where=input_root,
+    )
+    global_receipt = {
+        "schema": SCHEMA,
+        "status": "complete",
+        "created_at": _utc_now(),
+        "input_root": str(input_root),
+        "input_receipt": {
+            "path": str(input_receipt),
+            "sha256": receipt_sha256,
+            "source_inventory_sha256": receipt_inventory_sha256,
+        },
+        "output_root": str(output_root),
+        "routing": {
+            "primary": "source_build_kinds != 'python'",
+            "aux_python": "source_build_kinds == 'python'",
+            "mixed_rows": sum(int(receipt["mixed_rows_split"]) for receipt in receipts),
+            "legacy_schema_upgrade": {
+                "added_column": packed.SOURCE_COMMIT_HASHES_COLUMN,
+                "value": "shared commit_hash or null per source document",
+            },
+        },
+        "totals": totals,
+        "input_inventory_sha256": _canonical_sha256(observed_inventory),
+        "output_inventory_sha256": _canonical_sha256(
+            [
+                {
+                    "route": route,
+                    "path": receipt["routes"][route]["path"],
+                    "sha256": receipt["routes"][route]["sha256"],
+                }
+                for receipt in receipts
+                for route in ROUTES
+            ]
+        ),
+        "output_schema_sha256": hashlib.sha256(
+            packer.PACKED_ROW_OUTPUT_SCHEMA.serialize().to_pybytes()
+        ).hexdigest(),
+        "implementation": _implementation(),
+        "files": receipts,
+        "unresolved_count": 0,
+    }
+    _write_json_atomic(output_root / "route.receipt.json", global_receipt)
+    print(
+        json.dumps(
+            {
+                "status": "complete",
+                "totals": totals,
+                "mixed_rows": global_receipt["routing"]["mixed_rows"],
+                "receipt": str(output_root / "route.receipt.json"),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
