@@ -40,6 +40,7 @@ Usage:
 import argparse
 import datetime as _dt
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -59,6 +60,14 @@ if __package__ in (None, ""):
 from scripts.pr_ingest import pr_store  # noqa: E402
 
 GQL_URL = "https://api.github.com/graphql"
+TRANSIENT_RETRY_MAX_BACKOFF_S = 30.0
+_TRANSIENT_TRANSPORT_ERRORS = (
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    TimeoutError,
+    ConnectionError,
+    urllib.error.URLError,
+)
 
 PR_QUERY = """
 query($owner:String!, $name:String!, $number:Int!,
@@ -187,10 +196,52 @@ def _request_graphql_page(
     context: str,
     max_retries: int,
     post_fn: Callable[[str, dict], tuple[int, dict, dict]],
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict:
     attempts = 0
+    transient_attempts = 0
     while True:
-        status, headers, payload = post_fn(pool.current(), variables)
+        try:
+            status, headers, payload = post_fn(pool.current(), variables)
+        except urllib.error.HTTPError:
+            raise
+        except _TRANSIENT_TRANSPORT_ERRORS as exc:
+            transient_reason = type(exc).__name__
+            headers = {}
+        else:
+            transient_reason = (
+                f"HTTP {status}" if 500 <= status <= 599 else None
+            )
+        if transient_reason is not None:
+            transient_attempts += 1
+            if transient_attempts > max_retries:
+                raise SystemExit(
+                    f"[graphql] transient retry budget exhausted for {context} "
+                    f"after {transient_attempts} failed attempts "
+                    f"({transient_reason})"
+                )
+            retry_after = headers.get("Retry-After")
+            wait = min(
+                TRANSIENT_RETRY_MAX_BACKOFF_S,
+                float(2 ** min(5, transient_attempts - 1)),
+            )
+            if retry_after is not None:
+                try:
+                    wait = min(
+                        TRANSIENT_RETRY_MAX_BACKOFF_S,
+                        max(1.0, float(retry_after)),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            sys.stderr.write(
+                f"[graphql] transient {transient_reason} for {context}; "
+                f"retrying same token/query in {wait:.1f}s "
+                f"({transient_attempts}/{max_retries})\n"
+            )
+            sys.stderr.flush()
+            sleep_fn(wait)
+            continue
+
         if status == 401:
             raise SystemExit(
                 f"[graphql] 401 Unauthorized for token #{pool.idx} "
