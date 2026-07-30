@@ -3,7 +3,7 @@
 Builds the tilelang wheel (cp38-abi3, CUDA) on a Modal H100, then installs
 flash-attn-4==4.0.0b23 + apache-tvm-ffi>=0.1.12 and verifies both import cleanly.
 
-The fork at 16531673 carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
+The fork at f4e9d04 carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
 restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@78f930ed,
 and removes the apache-tvm-ffi<0.1.10 cap.
 
@@ -22,7 +22,7 @@ import pathlib
 import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
-TILELANG_COMMIT = "16531673a11723a4d8243f2b94eb96a157c74cfc"
+TILELANG_COMMIT = "f4e9d04bc9a07ac40308eb89112250971f479667"
 TILELANG_TVM_COMMIT = "78f930edc805920428388518e12d111019383d2f"
 EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 

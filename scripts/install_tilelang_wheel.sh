@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@16531673 into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@f4e9d04 into the active
 # (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-16531673a11723a4d8243f2b94eb96a157c74cfc}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-f4e9d04bc9a07ac40308eb89112250971f479667}"
 TVM_COMMIT="${TILELANG_TVM_COMMIT:-78f930edc805920428388518e12d111019383d2f}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"
 

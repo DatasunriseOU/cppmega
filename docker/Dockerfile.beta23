@@ -4,7 +4,7 @@
 # Identical to docker/Dockerfile except:
 #   - flash-attn-4 upgraded from 4.0.0b19 to 4.0.0b23
 #   - apache-tvm-ffi upgraded from 0.1.9 to 0.1.13
-#   - TileLang from DatasunriseOU/tilelang@16531673 (supports tvm-ffi >=0.1.12)
+#   - TileLang from DatasunriseOU/tilelang@f4e9d04 (supports tvm-ffi >=0.1.12)
 #     wheel: tilelang-0.1.9-cp38-abi3-linux_x86_64.whl:
 #     the fork carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix, via
 #     vendored TVM DatasunriseOU/tvm@78f930ed), restores the nvbench CUDA
