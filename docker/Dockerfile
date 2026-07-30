@@ -94,6 +94,8 @@ ENV CUDA_HOME=/usr/local/cuda \
 # Note: flash_attn ships FA2 kernels, flash_attn_3 is the separate FA3 Hopper
 # package, and flash-attn-4 owns flash_attn.cute for CuTe DSL kernels.
 RUN python -c "\
+from importlib import metadata; \
+assert metadata.version('apache-tvm-ffi') == '0.1.13.post1'; \
 import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \
 import transformer_engine.pytorch; \

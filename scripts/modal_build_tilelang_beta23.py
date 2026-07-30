@@ -1,10 +1,10 @@
 """Build pinned TileLang on Modal and verify the FA4 beta23 compatibility lane.
 
-Builds the tilelang wheel (cp38-abi3, CUDA) on a Modal H100, then installs
-flash-attn-4==4.0.0b23 + apache-tvm-ffi>=0.1.12 and verifies both import cleanly.
+Builds ABI-matched tvm-ffi and TileLang wheels on a Modal H100, then installs
+flash-attn-4==4.0.0b23 and verifies the complete stack imports cleanly.
 
-The fork at b2545eaa carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
-restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@78f930ed,
+The fork at fff5cfcc carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
+restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@ada9cffb,
 removes the apache-tvm-ffi<0.1.10 cap, and completes the CUDA driver stub.
 
 The clone and build directory are disposable container scratch. The compressed
@@ -22,9 +22,13 @@ import pathlib
 import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
-TILELANG_COMMIT = "b2545eaa3f11610a31e5b8371aab97c369e95f27"
-TILELANG_TVM_COMMIT = "78f930edc805920428388518e12d111019383d2f"
+TILELANG_COMMIT = "fff5cfcc60fed16d163f13cca991256b6ebe1573"
+TILELANG_TVM_COMMIT = "ada9cffbb381695651e265039f77c326c146d6b7"
+TILELANG_TVM_FFI_COMMIT = "4e74cb45fbcf6117b69a9864bbe5548f1a7e17a2"
 EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+EXPECTED_TVM_FFI_WHEEL = (
+    "apache_tvm_ffi-0.1.13.post1-cp313-cp313-linux_x86_64.whl"
+)
 
 PYTHON_VERSION = "3.13"
 CUDA_BASE = "nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04"
@@ -43,7 +47,7 @@ def _build_image() -> modal.Image:
         )
         .pip_install(
             "pip>=24.0", "setuptools", "wheel",
-            "scikit-build-core>=0.10", "cython", "z3-solver",
+            "scikit-build-core>=0.10", "setuptools-scm", "cython", "z3-solver",
             "numpy", "packaging", "pybind11",
         )
         .env({
@@ -94,6 +98,11 @@ def build_tilelang_wheel():
     assert TILELANG_TVM_COMMIT in out, (
         f"Expected TVM submodule at {TILELANG_TVM_COMMIT}, got: {out}"
     )
+    out = run(
+        "cd /tmp/tilelang && "
+        "git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD"
+    )
+    assert out.strip() == TILELANG_TVM_FFI_COMMIT, out
     run("test -f /tmp/tilelang/3rdparty/tvm/3rdparty/nvbench/l2_cache_flush.h")
 
     # --- 2. Install torch (needed for build) ---
@@ -102,8 +111,14 @@ def build_tilelang_wheel():
         "'torch==2.13.0+cu132' --quiet"
     )
 
-    # --- 3. Build the wheel ---
+    # --- 3. Build the ABI-matched wheels ---
     run("mkdir -p /tmp/tilelang-wheel-out")
+    run(
+        "cd /tmp/tilelang && "
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post1 "
+        "pip wheel 3rdparty/tvm/3rdparty/tvm-ffi --no-build-isolation --no-deps "
+        "-w /tmp/tilelang-wheel-out 2>&1 | tail -20"
+    )
     run(
         "cd /tmp/tilelang && pip wheel . --no-build-isolation "
         "-w /tmp/tilelang-wheel-out 2>&1 | tail -20"
@@ -117,23 +132,27 @@ def build_tilelang_wheel():
     wheel_name = pathlib.Path(wheel_path).name
     print(f"Wheel: {wheel_name}")
     shutil.copy2(wheel_path, f"/wheels/{EXPECTED_WHEEL}")
+    ffi_wheel_path = f"/tmp/tilelang-wheel-out/{EXPECTED_TVM_FFI_WHEEL}"
+    assert pathlib.Path(ffi_wheel_path).is_file(), ffi_wheel_path
+    shutil.copy2(ffi_wheel_path, f"/wheels/{EXPECTED_TVM_FFI_WHEEL}")
 
-    # --- 5. Install the built wheel + FA4 beta23 + tvm-ffi ---
-    run(f"pip install --no-deps {wheel_path}")
+    # --- 5. Install FA4 beta23, then the exact linked FFI + TileLang wheels ---
     run(
         "pip install --pre --quiet "
         "--extra-index-url https://pypi.nvidia.com "
-        "'flash-attn-4[cu13]==4.0.0b23' "
-        "'apache-tvm-ffi>=0.1.12,<0.2'"
+        "'flash-attn-4[cu13]==4.0.0b23'"
     )
+    run(f"pip install --force-reinstall --no-deps {ffi_wheel_path} {wheel_path}")
 
     # --- 6. Verify imports ---
     verify_code = """
+from importlib import metadata
 import tilelang
 import flash_attn
 from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
 import tvm.ffi
 assert tilelang.__version__ == "0.1.9", tilelang.__version__
+assert metadata.version("apache-tvm-ffi") == "0.1.13.post1"
 print(f"tilelang version: {tilelang.__version__}")
 print(f"flash_attn version: {flash_attn.__version__}")
 print(f"tvm.ffi version: {tvm.ffi.__version__}")

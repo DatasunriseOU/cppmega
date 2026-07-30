@@ -267,12 +267,19 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "b2545eaa3f11610a31e5b8371aab97c369e95f27"
-    tvm_commit = "78f930edc805920428388518e12d111019383d2f"
+    tilelang_commit = "fff5cfcc60fed16d163f13cca991256b6ebe1573"
+    tvm_commit = "ada9cffbb381695651e265039f77c326c146d6b7"
+    tvm_ffi_commit = "4e74cb45fbcf6117b69a9864bbe5548f1a7e17a2"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+    ffi_wheel_name = (
+        "apache_tvm_ffi-0.1.13.post1-cp313-cp313-linux_x86_64.whl"
+    )
 
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+    image_workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-image.yml"
     ).read_text(encoding="utf-8")
     stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
     rebuild = (REPO_ROOT / "scripts" / "rebuild_tilelang_wheel.sh").read_text(
@@ -293,11 +300,17 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     for text in (rebuild, install, modal_build):
         assert tilelang_commit in text
         assert tvm_commit in text
+        assert tvm_ffi_commit in text
     for text in (install, modal_build, modal_base):
         assert wheel_name in text
+        assert ffi_wheel_name in text
     assert "Smoke TileLang wheel linkage and import" in workflow
-    assert 'python -m pip install --no-deps "apache-tvm-ffi==0.1.13"' in workflow
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post1" in workflow
+    assert "wheels/apache_tvm_ffi-*.whl" in workflow
+    assert "'apache_tvm_ffi-*.whl'" in workflow
+    assert "'apache_tvm_ffi-*.whl'" in image_workflow
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
+    assert "version: 0.1.13.post1" in stack
     assert "/tmp/cppmega_wheels" not in modal_base
     assert '_REPO_ROOT / "wheels"' in modal_base

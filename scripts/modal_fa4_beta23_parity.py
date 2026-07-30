@@ -57,13 +57,29 @@ def _image() -> modal.Image:
         "WANDB_MODE": "disabled",
         "CPPMEGA_FA4_SCORE_MOD": "1",
     })
-    # When using the default b19 image, upgrade to beta23 + tvm-ffi at runtime.
-    # The dedicated beta23 GHCR image already ships these pins.
+    # The default image needs both matching local wheels; upgrading only
+    # tvm-ffi recreates the TileLang C++ ABI mismatch.
     if not USE_BETA23:
-        img = img.run_commands(
-            "pip install --pre 'apache-tvm-ffi>=0.1.12,<0.2' "
-            "'flash-attn-4[cu13]==4.0.0b23' "
-            "--extra-index-url https://pypi.nvidia.com 2>&1 | tail -5"
+        wheel_dir = _REPO_ROOT / "wheels"
+        ffi_wheel = wheel_dir / (
+            "apache_tvm_ffi-0.1.13.post1-cp313-cp313-linux_x86_64.whl"
+        )
+        tilelang_wheel = wheel_dir / "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+        missing = [
+            wheel for wheel in (ffi_wheel, tilelang_wheel) if not wheel.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(f"missing beta23 compatibility wheels: {missing}")
+        img = (
+            img.add_local_file(str(ffi_wheel), "/tmp/tvm_ffi.whl", copy=True)
+            .add_local_file(str(tilelang_wheel), "/tmp/tilelang.whl", copy=True)
+            .run_commands(
+                "pip install --pre 'apache-tvm-ffi>=0.1.12,<0.2' "
+                "'flash-attn-4[cu13]==4.0.0b23' "
+                "--extra-index-url https://pypi.nvidia.com && "
+                "pip install --force-reinstall --no-deps "
+                "/tmp/tvm_ffi.whl /tmp/tilelang.whl"
+            )
         )
     img = (
         img.add_local_dir(str(_REPO_ROOT / "cppmega"), remote_path="/opt/cppmega/cppmega", copy=True)

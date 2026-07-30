@@ -83,6 +83,7 @@ jobs:
             'mamba_ssm-*.whl'
             'causal_conv1d-*.whl'
             'fast_hadamard_transform-*.whl'
+            'apache_tvm_ffi-*.whl'
             'tilelang-*.whl'
             'qoptim_cuda-*.whl'
           )
