@@ -296,6 +296,24 @@ def test_filename_declared_legacy_sql_round_trips_in_bounded_chunks(
     assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
 
 
+def test_japanese_localized_batch_file_round_trips_shift_jis(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    text = "@echo off\r\nrem 日本語ヘルプ\r\n"
+    encoded = text.encode("shift_jis")
+    path = tmp_path / "Loc" / "VCMunge" / "Jpn" / "Res" / "MakeHelp.Bat"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path))
+
+    assert "".join(chunk.text for chunk in chunks) == text
+    assert {chunk.source_encoding for chunk in chunks} == {"shift-jis"}
+    assert b"".join(chunk.text.encode("shift_jis") for chunk in chunks) == encoded
+
+
 def test_filename_declared_euc_tw_sql_uses_strict_native_round_trip(
     tmp_path: Path,
 ) -> None:

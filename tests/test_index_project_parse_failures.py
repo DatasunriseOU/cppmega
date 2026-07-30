@@ -1063,6 +1063,21 @@ def test_source_with_nul_byte_is_rejected() -> None:
         index_project._decode_source_bytes(b"int value = 0;\0\n", "binary.cpp")
 
 
+def test_textual_nul_inside_comment_or_literal_round_trips() -> None:
+    index_project = _load_indexer()
+    source = (
+        b'char normal[] = "value\\0";\n'
+        b'char embedded[] = "value\x00";\n'
+        b'char raw[] = R"tag(value\x00)tag";\n'
+        b"/* glyph \x81 '\x00' */\n"
+    )
+
+    text, encoding = index_project._decode_source_bytes(source, "fixture.cpp")
+
+    assert encoding == "latin-1"
+    assert text.encode(encoding) == source
+
+
 def test_mixed_legacy_source_uses_byte_exact_latin1_fallback() -> None:
     from tools.clang_indexer import index_project
 
