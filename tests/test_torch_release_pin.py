@@ -29,12 +29,12 @@ def test_cuda_stack_uses_stable_torch_213_release() -> None:
 def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
     stack = _read("STACK.lock")
 
-    assert 'package: "apache-tvm-ffi==0.1.13.post2"' in stack
+    assert 'package: "apache-tvm-ffi==0.1.13.post3"' in stack
     assert 'package: "flash-attn-4[cu13]==4.0.0b23"' in stack
     for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
         dockerfile = _read(path)
         assert "apache-tvm-ffi==0.1.13" in dockerfile, path
-        assert "metadata.version('apache-tvm-ffi') == '0.1.13.post2'" in dockerfile
+        assert "metadata.version('apache-tvm-ffi') == '0.1.13.post3'" in dockerfile
         assert '"flash-attn-4[cu13]==4.0.0b23"' in dockerfile, path
         assert '"flash-attn-4[cu13]==4.0.0b19"' not in dockerfile, path
 

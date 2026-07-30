@@ -7,12 +7,12 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
-  - tilelang 0.1.9 from DatasunriseOU/tilelang@1014a028 (local abi3 wheel;
+  - tilelang 0.1.9 from DatasunriseOU/tilelang@a39056b5 (local abi3 wheel;
     carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
     the apache-tvm-ffi<0.1.10 cap)
   - qoptim_cuda 0.0.0 (local wheel)
   - fast_hadamard_transform 1.1.0 (local wheel)
-  - apache-tvm-ffi 0.1.13.post2 (local wheel matching TileLang's linked TVM ABI)
+  - apache-tvm-ffi 0.1.13.post3 (local wheel matching TileLang's linked TVM ABI)
   - megatron-core 0.18 from origin/dev HEAD (editable)
 
 Wheels are downloaded once into the repository-owned wheels/ directory (or
@@ -49,7 +49,7 @@ _WHEEL_FILES = [
     "causal_conv1d-1.6.1-cp313-cp313-linux_x86_64.whl",
     "flash_attn-2.8.3-cp313-cp313-linux_x86_64.whl",
     "qoptim_cuda-0.0.0-cp313-cp313-linux_x86_64.whl",
-    "apache_tvm_ffi-0.1.13.post2-cp313-cp313-linux_x86_64.whl",
+    "apache_tvm_ffi-0.1.13.post3-cp313-cp313-linux_x86_64.whl",
     "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl",
     "fast_hadamard_transform-1.1.0-cp313-cp313-linux_x86_64.whl",
 ]
@@ -81,7 +81,7 @@ def cppmega_base_image() -> modal.Image:
         # TE + wheel-pkg declared deps (must be present BEFORE installing
         # our --no-deps wheels, because mamba_ssm/TE import time needs them).
         .pip_install(
-            # Bootstrap FA4's dependency; the matching local post2 wheel
+            # Bootstrap FA4's dependency; the matching local post3 wheel
             # replaces it in the compressed wheel layer below.
             "apache-tvm-ffi==0.1.13",
             "transformer-engine-cu13==2.13.0",
@@ -129,7 +129,7 @@ def cppmega_base_image() -> modal.Image:
         "pip install --no-deps /wheels/*.whl && "
         "python -c 'import transformer_engine.pytorch as te; print(\"TE Linear ok:\", te.Linear)' && "
         "python -c 'from importlib import metadata; "
-        "assert metadata.version(\"apache-tvm-ffi\") == \"0.1.13.post2\"; "
+        "assert metadata.version(\"apache-tvm-ffi\") == \"0.1.13.post3\"; "
         "import mamba_ssm, flash_attn, tilelang; "
         "print(\"mamba_ssm\", mamba_ssm.__version__, "
         "\"flash_attn\", flash_attn.__version__, "

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@1014a028 into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@a39056b5 into the active
 # (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
 # Fallback:     clone DatasunriseOU/tilelang at the exact pinned commit.
 #
 # This fork commit carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix,
-# via vendored TVM DatasunriseOU/tvm@19a512a7), restores the nvbench CUDA
+# via vendored TVM DatasunriseOU/tvm@05020f4a), restores the nvbench CUDA
 # L2-cache-flush header, and removes the apache-tvm-ffi<0.1.10 cap (upstream
 # PR #2071), so it imports cleanly under tvm-ffi >=0.1.12 as required by FA4
 # beta23. Its lazy driver stub also exports cuFuncGetAttribute required by the
-# CUDA 13.2 TVM runtime, and its matching tvm-ffi wheel is v0.1.13.post2.
+# CUDA 13.2 TVM runtime, and its matching tvm-ffi wheel is v0.1.13.post3.
 # Must match STACK.lock.
 #
 # Usage:
@@ -26,10 +26,10 @@
 set -euo pipefail
 
 WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
-TVM_FFI_WHEEL_URL="${TVM_FFI_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/apache_tvm_ffi-0.1.13.post2-cp313-cp313-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-1014a028963afc498d422f07f4ecbe09bbfbb43c}"
-TVM_COMMIT="${TILELANG_TVM_COMMIT:-19a512a70eaf4674da9efa8f1f74b9eff5033150}"
-TVM_FFI_COMMIT="${TILELANG_TVM_FFI_COMMIT:-44996556b6937a9ced7972f2d2a5b7e86b7dcb1e}"
+TVM_FFI_WHEEL_URL="${TVM_FFI_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/apache_tvm_ffi-0.1.13.post3-cp313-cp313-linux_x86_64.whl}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-a39056b510db0843f4363328fbd78bcc47347617}"
+TVM_COMMIT="${TILELANG_TVM_COMMIT:-05020f4a40d53220981cfa86b786b95b745a2637}"
+TVM_FFI_COMMIT="${TILELANG_TVM_FFI_COMMIT:-971269563f912d7e4f3031cc1da4cf7c3fd624f2}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"
 
 # --- venv activation ---------------------------------------------------------
@@ -61,8 +61,8 @@ observed = metadata.version("tilelang")
 if observed != "0.1.9":
     raise SystemExit(f"unexpected TileLang version: {observed!r} != '0.1.9'")
 observed_ffi = metadata.version("apache-tvm-ffi")
-if observed_ffi != "0.1.13.post2":
-    raise SystemExit(f"unexpected tvm-ffi version: {observed_ffi!r} != '0.1.13.post2'")
+if observed_ffi != "0.1.13.post3":
+    raise SystemExit(f"unexpected tvm-ffi version: {observed_ffi!r} != '0.1.13.post3'")
 PY
 }
 
@@ -113,7 +113,7 @@ git submodule update --init --recursive
 test "$(git -C 3rdparty/tvm rev-parse HEAD)" = "${TVM_COMMIT}"
 test "$(git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD)" = "${TVM_FFI_COMMIT}"
 test -f 3rdparty/tvm/3rdparty/nvbench/l2_cache_flush.h
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post2 \
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post3 \
   pip install --force-reinstall --no-build-isolation --no-deps \
     3rdparty/tvm/3rdparty/tvm-ffi
 pip install -e . --no-build-isolation
