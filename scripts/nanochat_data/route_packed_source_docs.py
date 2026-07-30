@@ -17,9 +17,9 @@ from typing import Any, Iterable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from cppmega.data import symbol_identity as symbol_identity_schema
 from cppmega.data.nanochat_pipeline import packed_rows_schema as packed
 from cppmega.data.nanochat_pipeline import tokenized_enriched_schema as enriched
-from cppmega.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
 from scripts.nanochat_data import pack_enriched_rows as packer
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
@@ -86,6 +86,10 @@ def _implementation() -> dict[str, str]:
         "router_sha256": _sha256_file(Path(__file__).resolve()),
         "packer_sha256": _sha256_file(Path(packer.__file__).resolve()),
         "packed_schema_sha256": _sha256_file(Path(packed.__file__).resolve()),
+        "enriched_schema_sha256": _sha256_file(Path(enriched.__file__).resolve()),
+        "symbol_identity_schema_sha256": _sha256_file(
+            Path(symbol_identity_schema.__file__).resolve()
+        ),
     }
 
 
@@ -369,7 +373,8 @@ def _extract_document(
         if int(value) > 0
     }
     symbol_registry = {
-        int(entry["symbol_id"]): dict(entry) for entry in row[SYMBOL_IDENTITIES_COLUMN]
+        int(entry["symbol_id"]): dict(entry)
+        for entry in row[symbol_identity_schema.SYMBOL_IDENTITIES_COLUMN]
     }
     missing_symbol_ids = referenced_symbol_ids - set(symbol_registry)
     if missing_symbol_ids:
@@ -763,7 +768,7 @@ def _discover(input_root: Path, buckets: tuple[int, ...]) -> list[Path]:
         files.extend(sorted(bucket_root.glob("*.parquet")))
     if not files:
         raise RuntimeError(f"no packed parquet files found under {input_root}")
-    return files
+    return sorted(files, key=lambda path: path.relative_to(input_root).as_posix())
 
 
 def _parse_buckets(value: str) -> tuple[int, ...]:

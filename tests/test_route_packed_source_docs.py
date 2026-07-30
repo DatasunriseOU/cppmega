@@ -17,6 +17,8 @@ from scripts.nanochat_data.pack_enriched_rows import (
     rows_to_table,
 )
 from scripts.nanochat_data.route_packed_source_docs import (
+    _discover,
+    _implementation,
     _parse_buckets,
     main as route_main,
     route_file,
@@ -97,6 +99,24 @@ def test_bucket_routes_are_unique_and_ordered() -> None:
     assert _parse_buckets("1024,2048,4096") == (1024, 2048, 4096)
     with pytest.raises(argparse.ArgumentTypeError, match="strictly increasing"):
         _parse_buckets("2048,1024,1024")
+
+
+def test_discovery_and_resume_bindings_are_canonical(tmp_path) -> None:
+    for relative in ("16/z.parquet", "1024/a.parquet"):
+        artifact = tmp_path / relative
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.touch()
+    assert [
+        path.relative_to(tmp_path).as_posix()
+        for path in _discover(tmp_path, (16, 1024))
+    ] == ["1024/a.parquet", "16/z.parquet"]
+    assert {
+        "router_sha256",
+        "packer_sha256",
+        "packed_schema_sha256",
+        "enriched_schema_sha256",
+        "symbol_identity_schema_sha256",
+    } <= _implementation().keys()
 
 
 def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None:
