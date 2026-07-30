@@ -19,9 +19,12 @@ from ci_log_sidecars import (  # noqa: E402
     EDGE_IDS,
     SIDECAR_SCHEMA,
     TRAINING_SIDECAR_SCHEMA,
+    _EntityBuilder,
     _attach_chunk_semantic_rle,
     _attach_chunk_training_sidecars,
+    _extract_tests,
     _is_package_version,
+    _path_category,
     _physical_lines,
     canonicalize_ci_log,
     extract_ci_log_sidecar,
@@ -101,6 +104,36 @@ class _IterationTrackingSequence:
     def __iter__(self):
         self.iterations += 1
         return iter(self.values)
+
+
+class _PrefixSliceTrackingString(str):
+    unbounded_prefix_slices: int
+
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.unbounded_prefix_slices = 0
+        return instance
+
+    def __getitem__(self, key: object) -> str:
+        if (
+            isinstance(key, slice)
+            and key.start in (None, 0)
+            and key.stop is not None
+            and key.stop > 64
+        ):
+            self.unbounded_prefix_slices += 1
+        return super().__getitem__(key)
+
+
+def test_path_category_does_not_rescan_a_large_line_prefix() -> None:
+    line = _PrefixSliceTrackingString("x" * 1_000_000 + " -o   build/app")
+    path_start = line.index("build/app")
+
+    assert _path_category("build/app", line, path_start) == (
+        "output",
+        "OUTPUT",
+    )
+    assert line.unbounded_prefix_slices == 0
 
 
 def test_chunk_sidecar_attachment_buckets_each_record_sequence_once() -> None:
@@ -626,6 +659,25 @@ def test_bazel_pytest_gtest_ctest_failure_diagnostics_and_sanitizer() -> None:
         for edge in result["sidecar"]["edges"]
     )
     _assert_conserved(result)
+
+
+def test_large_failed_text_without_pytest_duration_is_not_a_summary() -> None:
+    text = "failed benchmark " + ("x" * 50_000)
+    _tests, summaries = _extract_tests(
+        [{"content": text, "index": 0, "start": 0, "end": len(text)}],
+        [
+            {
+                "ordinal": 0,
+                "line_start": 0,
+                "line_end": 1,
+                "step_ordinal": None,
+            }
+        ],
+        _EntityBuilder(text),
+        [],
+    )
+
+    assert not any(item["framework"] == "pytest" for item in summaries)
 
 
 def test_javascript_typescript_paths_are_auxiliary_language_evidence() -> None:

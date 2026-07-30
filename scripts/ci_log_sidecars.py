@@ -2345,7 +2345,11 @@ def _path_language(path: str) -> str:
     return "other"
 
 
-def _path_category(path: str, line_prefix: str) -> tuple[str, str]:
+def _path_category(
+    path: str,
+    line: str,
+    path_start: int,
+) -> tuple[str, str]:
     lowered = path.lower()
     basename = re.split(r"[/\\]", lowered)[-1]
     dot = basename.rfind(".")
@@ -2356,10 +2360,24 @@ def _path_category(path: str, line_prefix: str) -> tuple[str, str]:
         return "source", "SOURCE"
     if extension in _AUX_SOURCE_EXTENSIONS:
         return "source", "SOURCE"
-    if re.search(r"(?:^|\s)(?:-o|/out:|>)\s*$", line_prefix, re.IGNORECASE):
-        return "output", "OUTPUT"
-    if re.search(r"(?:^|\s)(?:-i|--input|<)\s*$", line_prefix, re.IGNORECASE):
-        return "input", "INPUT"
+    token_end = path_start
+    while token_end and line[token_end - 1].isspace():
+        token_end -= 1
+    for token, category, role in (
+        ("--input", "input", "INPUT"),
+        ("/out:", "output", "OUTPUT"),
+        ("-o", "output", "OUTPUT"),
+        ("-i", "input", "INPUT"),
+        (">", "output", "OUTPUT"),
+        ("<", "input", "INPUT"),
+    ):
+        token_start = token_end - len(token)
+        if (
+            token_start >= 0
+            and line[token_start:token_end].lower() == token
+            and (token_start == 0 or line[token_start - 1].isspace())
+        ):
+            return category, role
     if (
         extension in _BUILD_EXTENSIONS
         or basename
@@ -2407,7 +2425,11 @@ def _extract_paths(
             if (start, end) in seen:
                 continue
             seen.add((start, end))
-            category, role = _path_category(path, content[: match.start("path")])
+            category, role = _path_category(
+                path,
+                content,
+                match.start("path"),
+            )
             language = _path_language(path)
             domain = {
                 "C": "CPP",
@@ -3286,11 +3308,11 @@ def _extract_tests(
             }
         )
 
-    pytest_summary = re.compile(
-        r"(?:(?P<passed>\d+)\s+passed)?"
-        r"(?:,\s*)?(?:(?P<failed>\d+)\s+failed)?"
-        r"(?:,\s*)?(?:(?P<skipped>\d+)\s+skipped)?"
-        r".*?\bin\s+(?P<duration>\d+(?:\.\d+)?)s\b",
+    pytest_summary_event = re.compile(
+        r"\b(?:"
+        r"(?P<count>\d+)\s+(?P<result>passed|failed|skipped)"
+        r"|in\s+(?P<duration>\d+(?:\.\d+)?)s"
+        r")\b",
         re.IGNORECASE,
     )
     ctest_summary = re.compile(
@@ -3343,12 +3365,16 @@ def _extract_tests(
                 }
             )
             continue
-        if "passed" in content.lower() or "failed" in content.lower():
-            match = pytest_summary.search(content)
-            if match and any(match.group(name) for name in ("passed", "failed", "skipped")):
-                passed = int(match.group("passed") or 0)
-                failed = int(match.group("failed") or 0)
-                skipped = int(match.group("skipped") or 0)
+        pytest_counts: dict[str, int] = {}
+        for event in pytest_summary_event.finditer(content):
+            result = event.group("result")
+            if result is not None:
+                pytest_counts[result.lower()] = int(event.group("count"))
+                continue
+            if "passed" in pytest_counts or "failed" in pytest_counts:
+                passed = pytest_counts.get("passed", 0)
+                failed = pytest_counts.get("failed", 0)
+                skipped = pytest_counts.get("skipped", 0)
                 summaries.append(
                     {
                         "framework": "pytest",
@@ -3356,13 +3382,15 @@ def _extract_tests(
                         "failed": failed,
                         "skipped": skipped,
                         "total": passed + failed + skipped,
-                        "duration_ms": float(match.group("duration")) * 1000.0,
+                        "duration_ms": float(event.group("duration")) * 1000.0,
                         "line_index": int(line["index"]),
                         "confidence": _confidence(
                             1.0, source="pytest_summary_v1"
                         ),
                     }
                 )
+                break
+            pytest_counts.clear()
     return test_records, summaries
 
 
