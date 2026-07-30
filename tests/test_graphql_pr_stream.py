@@ -377,6 +377,82 @@ def test_transient_retry_budget_is_bounded_and_fails_loud():
 
 
 @pytest.mark.parametrize(
+    ("first_result", "expected_sleep"),
+    [
+        pytest.param(
+            http.client.IncompleteRead(b'{"data":', 10),
+            1.0,
+            id="transport",
+        ),
+        pytest.param(
+            (
+                503,
+                {"Retry-After": "120"},
+                {"message": "Service Unavailable"},
+            ),
+            30.0,
+            id="http-503",
+        ),
+    ],
+)
+def test_gap_filler_retries_transient_failure_with_exact_request(
+    first_result,
+    expected_sleep,
+):
+    from github_graphql_fallback import TokenPool, _request_graphql_page
+
+    variables = {"owner": "a", "name": "one", "number": 7}
+    calls: list[tuple[str, dict]] = []
+    sleeps: list[float] = []
+
+    def post(token: str, requested: dict) -> tuple[int, dict, dict]:
+        calls.append((token, dict(requested)))
+        if len(calls) == 1:
+            if isinstance(first_result, BaseException):
+                raise first_result
+            return first_result
+        return 200, {}, {"data": {"repository": {}}}
+
+    result = _request_graphql_page(
+        TokenPool(["first", "second"]),
+        variables,
+        context="a/one#7",
+        max_retries=2,
+        post_fn=post,
+        sleep_fn=sleeps.append,
+    )
+
+    assert result == {"data": {"repository": {}}}
+    assert calls == [("first", variables), ("first", variables)]
+    assert sleeps == [expected_sleep]
+
+
+def test_gap_filler_transient_retry_budget_is_bounded():
+    from github_graphql_fallback import TokenPool, _request_graphql_page
+
+    calls = 0
+    sleeps: list[float] = []
+
+    def post(_token: str, _variables: dict) -> tuple[int, dict, dict]:
+        nonlocal calls
+        calls += 1
+        return 503, {}, {"message": "Service Unavailable"}
+
+    with pytest.raises(SystemExit, match="transient retry budget exhausted"):
+        _request_graphql_page(
+            TokenPool(["first", "second"]),
+            {"owner": "a", "name": "one", "number": 7},
+            context="a/one#7",
+            max_retries=2,
+            post_fn=post,
+            sleep_fn=sleeps.append,
+        )
+
+    assert calls == 3
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.parametrize(
     ("failure", "exc_type", "match"),
     [
         pytest.param(
