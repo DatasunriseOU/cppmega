@@ -172,6 +172,18 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
         )
         == receipt
     )
+    tampered = json.loads(marker.read_text())
+    tampered["implementation"]["router_sha256"] = "0" * 64
+    marker.write_text(json.dumps(tampered))
+    with pytest.raises(ValueError, match="implementation changed after routing"):
+        route_file(
+            str(input_path),
+            input_root_str=str(input_root),
+            output_root_str=str(output_root),
+            compression_level=6,
+            resume=True,
+        )
+    marker.write_text(json.dumps(receipt))
 
     input_receipt = tmp_path / "input.receipt.json"
     source_inventory = [

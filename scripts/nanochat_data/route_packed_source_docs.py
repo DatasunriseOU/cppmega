@@ -81,6 +81,14 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _implementation() -> dict[str, str]:
+    return {
+        "router_sha256": _sha256_file(Path(__file__).resolve()),
+        "packer_sha256": _sha256_file(Path(packer.__file__).resolve()),
+        "packed_schema_sha256": _sha256_file(Path(packed.__file__).resolve()),
+    }
+
+
 def _write_json_atomic(path: Path, value: object) -> None:
     with atomic_output_file(path) as staged:
         staged.write_text(
@@ -622,6 +630,8 @@ def _verify_completed_file(
     receipt = json.loads(marker.read_text(encoding="utf-8"))
     if receipt.get("schema") != SCHEMA or receipt.get("status") != "complete":
         raise ValueError(f"{marker}: invalid route marker")
+    if receipt.get("implementation") != _implementation():
+        raise ValueError(f"{marker}: implementation changed after routing")
     if receipt["input"]["sha256"] != _sha256_file(input_path):
         raise ValueError(f"{marker}: input changed after routing")
     for route in ROUTES:
@@ -737,6 +747,7 @@ def route_file(
             ),
         },
         "mixed_rows_split": mixed_rows,
+        "implementation": _implementation(),
         "unresolved_count": 0,
     }
     _write_json_atomic(marker, receipt)
@@ -939,11 +950,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "output_schema_sha256": hashlib.sha256(
             packer.PACKED_ROW_OUTPUT_SCHEMA.serialize().to_pybytes()
         ).hexdigest(),
-        "implementation": {
-            "router_sha256": _sha256_file(Path(__file__).resolve()),
-            "packer_sha256": _sha256_file(Path(packer.__file__).resolve()),
-            "packed_schema_sha256": _sha256_file(Path(packed.__file__).resolve()),
-        },
+        "implementation": _implementation(),
         "files": receipts,
         "unresolved_count": 0,
     }
