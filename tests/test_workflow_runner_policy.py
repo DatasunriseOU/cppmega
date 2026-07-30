@@ -113,6 +113,28 @@ def test_workflow_delegates_to_authoritative_lanes_with_source_binding() -> None
     assert lanes["linux-contracts"]["test_profile"] == "portable-data"
 
 
+def test_linux_workflow_timeout_covers_the_authoritative_lane() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
+        encoding="utf-8"
+    )
+    jobs = {
+        match.group("name"): match.group("body")
+        for match in JOB_BLOCK.finditer(workflow.partition("\njobs:\n")[2])
+    }
+    assert "linux-portable" in jobs
+    timeout_match = re.search(
+        r"(?m)^\s+timeout-minutes:\s*(\d+)\s*$", jobs["linux-portable"]
+    )
+    assert timeout_match is not None
+    workflow_minutes = int(timeout_match.group(1))
+    payload = json.loads(
+        (REPO_ROOT / "configs" / "ci" / "lanes.json").read_text(encoding="utf-8")
+    )
+    lane = next(item for item in payload["lanes"] if item["id"] == "linux-contracts")
+
+    assert workflow_minutes * 60 >= lane["timeout_seconds"] + 300
+
+
 def test_macos_workflow_does_not_expand_an_empty_array_under_bash_3() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
         encoding="utf-8"
