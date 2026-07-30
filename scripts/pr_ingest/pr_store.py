@@ -23,7 +23,7 @@ from pathlib import Path
 import sqlite3
 import sys
 from typing import Any, Iterable, Optional
-
+import zlib
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prs (
@@ -89,6 +89,12 @@ CREATE TABLE IF NOT EXISTS linked_issues (
     body      TEXT NOT NULL DEFAULT '',
     UNIQUE (repo, pr_number, number)
 );
+CREATE TABLE IF NOT EXISTS pr_exact_records (
+    repo        TEXT NOT NULL,
+    pr_number   INTEGER NOT NULL,
+    record_zlib BLOB NOT NULL,
+    PRIMARY KEY (repo, pr_number)
+);
 """
 
 _PR_COLUMN_DEFINITIONS = {
@@ -138,6 +144,7 @@ _READONLY_REQUIRED_COLUMNS = {
         "created_at",
     },
     "linked_issues": {"repo", "pr_number", "number", "title", "body"},
+    "pr_exact_records": {"repo", "pr_number", "record_zlib"},
 }
 
 
@@ -317,9 +324,7 @@ def _normalize_review(review: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def record_content_sha256(rec: dict[str, Any]) -> str:
-    """Hash the authoritative PR fields populated by the GraphQL gap filler."""
-
+def _normalized_record_content(rec: dict[str, Any]) -> dict[str, Any]:
     comments = [_normalize_comment(dict(item)) for item in rec.get("comments", [])]
     reviews = [_normalize_review(dict(item)) for item in rec.get("reviews", [])]
     linked_issues = [
@@ -330,32 +335,44 @@ def record_content_sha256(rec: dict[str, Any]) -> str:
         }
         for item in rec.get("linked_issues", [])
     ]
-
-    def canonical_item(item: dict[str, Any]) -> str:
-        return json.dumps(
-            item,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-
-    payload = {
+    return {
         "repo": str(rec["repo"]),
         "pr_number": int(rec["pr_number"]),
         "merge_commit_sha": rec.get("merge_commit_sha"),
         "pr_title": str(rec.get("pr_title", rec.get("title")) or ""),
         "pr_body": str(rec.get("pr_body", rec.get("body")) or ""),
-        "comments": sorted(comments, key=canonical_item),
-        "reviews": sorted(reviews, key=canonical_item),
-        "linked_issues": sorted(linked_issues, key=canonical_item),
+        "comments": comments,
+        "reviews": reviews,
+        "linked_issues": linked_issues,
     }
-    encoded = json.dumps(
+
+
+def _record_content_bytes(rec: dict[str, Any], *, canonical: bool) -> bytes:
+    payload = _normalized_record_content(rec)
+    if canonical:
+
+        def canonical_item(item: dict[str, Any]) -> str:
+            return json.dumps(
+                item,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+
+        for field in ("comments", "reviews", "linked_issues"):
+            payload[field] = sorted(payload[field], key=canonical_item)
+    return json.dumps(
         payload,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+
+
+def record_content_sha256(rec: dict[str, Any]) -> str:
+    """Hash the authoritative PR fields populated by the GraphQL gap filler."""
+
+    return hashlib.sha256(_record_content_bytes(rec, canonical=True)).hexdigest()
 
 
 def _upsert_pr_meta(
@@ -378,6 +395,10 @@ def _upsert_pr_meta(
         raise ValueError(
             f"PR metadata requires repo+pr_number, got {repo!r} {pr_number!r}"
         )
+    conn.execute(
+        "DELETE FROM pr_exact_records WHERE repo=? AND pr_number=?",
+        (repo, int(pr_number)),
+    )
     row = conn.execute(
         "SELECT * FROM prs WHERE repo=? AND pr_number=?",
         (repo, int(pr_number)),
@@ -761,6 +782,18 @@ def upsert_record(
             ),
         )
     _sync_json_blobs(conn, repo, pr_number)
+    if replace_children:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pr_exact_records(repo, pr_number, record_zlib)
+            VALUES (?,?,?)
+            """,
+            (
+                repo,
+                pr_number,
+                zlib.compress(_record_content_bytes(rec, canonical=False)),
+            ),
+        )
     if commit:
         conn.commit()
 
@@ -978,6 +1011,44 @@ def _assemble(
             (repo, int(pr_number)),
         )
     ]
+    exact_row = conn.execute(
+        "SELECT record_zlib FROM pr_exact_records WHERE repo=? AND pr_number=?",
+        (repo, int(pr_number)),
+    ).fetchone()
+    if exact_row is not None:
+        try:
+            exact = json.loads(zlib.decompress(exact_row["record_zlib"]))
+        except (TypeError, zlib.error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid exact PR record for {repo}#{pr_number}: {exc}"
+            ) from exc
+        if (
+            not isinstance(exact, dict)
+            or exact.get("repo") != row["repo"]
+            or exact.get("pr_number") != row["pr_number"]
+        ):
+            raise ValueError(
+                f"exact PR record identity mismatch for {repo}#{pr_number}"
+            )
+        comments = [
+            _normalize_comment(item)
+            for item in _json_list(exact.get("comments"), field="exact comments")
+        ]
+        reviews = [
+            _normalize_review(item)
+            for item in _json_list(exact.get("reviews"), field="exact reviews")
+        ]
+        linked = [
+            {
+                "number": int(item["number"]),
+                "title": str(item.get("title") or ""),
+                "body": str(item.get("body") or ""),
+            }
+            for item in _json_list(
+                exact.get("linked_issues"),
+                field="exact linked_issues",
+            )
+        ]
     raw = None
     if row["raw_json"]:
         try:
@@ -987,12 +1058,24 @@ def _assemble(
                 f"invalid PR store raw_json for {repo}#{pr_number}: {exc}"
             ) from exc
 
-    title = row["pr_title"] or row["title"] or ""
-    body = row["pr_body"] or row["body"] or ""
+    title = (
+        str(exact.get("pr_title") or "")
+        if exact_row is not None
+        else row["pr_title"] or row["title"] or ""
+    )
+    body = (
+        str(exact.get("pr_body") or "")
+        if exact_row is not None
+        else row["pr_body"] or row["body"] or ""
+    )
     return {
         "repo": row["repo"],
         "pr_number": row["pr_number"],
-        "merge_commit_sha": row["merge_commit_sha"],
+        "merge_commit_sha": (
+            exact.get("merge_commit_sha")
+            if exact_row is not None
+            else row["merge_commit_sha"]
+        ),
         "pr_title": title,
         "pr_body": body,
         "title": title,

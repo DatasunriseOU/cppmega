@@ -578,6 +578,7 @@ jobs:
         if: success() && matrix.name == 'transformer_engine'
         run: |
           set -euo pipefail
+          python -m pip install pydantic
           python -m pip install --no-deps wheels/transformer_engine-*.whl
           python - <<'PY'
           import torch
