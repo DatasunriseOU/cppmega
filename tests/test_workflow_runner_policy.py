@@ -121,9 +121,12 @@ def test_linux_workflow_timeout_covers_the_authoritative_lane() -> None:
         match.group("name"): match.group("body")
         for match in JOB_BLOCK.finditer(workflow.partition("\njobs:\n")[2])
     }
-    workflow_minutes = int(
-        re.search(r"(?m)^\s+timeout-minutes:\s*(\d+)\s*$", jobs["linux-portable"])[1]
+    assert "linux-portable" in jobs
+    timeout_match = re.search(
+        r"(?m)^\s+timeout-minutes:\s*(\d+)\s*$", jobs["linux-portable"]
     )
+    assert timeout_match is not None
+    workflow_minutes = int(timeout_match.group(1))
     payload = json.loads(
         (REPO_ROOT / "configs" / "ci" / "lanes.json").read_text(encoding="utf-8")
     )
