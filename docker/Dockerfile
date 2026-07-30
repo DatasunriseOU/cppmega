@@ -56,7 +56,7 @@ RUN python -m pip install --extra-index-url ${TORCH_INDEX} \
         tensorboard wandb tqdm pytest \
         liger-kernel z3-solver \
         onnx onnxscript \
-        apache-tvm-ffi==0.1.9 \
+        apache-tvm-ffi==0.1.13 \
         nvidia-nccl-cu13
 
 # --- FA4 CuTe DSL runtime (Python-only, JIT-compiled kernels) ---------------
@@ -65,7 +65,7 @@ RUN python -m pip install --extra-index-url ${TORCH_INDEX} \
 # nvidia-cutlass-dsl[cu13] / quack-kernels dependency stack.
 RUN python -m pip install --no-cache-dir --pre \
         --extra-index-url https://pypi.nvidia.com \
-        "flash-attn-4[cu13]==4.0.0b19"
+        "flash-attn-4[cu13]==4.0.0b23"
 
 # --- prebuilt wheels (this layer changes whenever any wheel is rebuilt) -----
 COPY wheels/ /tmp/wheels/

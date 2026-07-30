@@ -7,6 +7,7 @@ import argparse
 from array import array
 from datetime import datetime, timezone
 import importlib
+from importlib import metadata
 import json
 import math
 import os
@@ -738,12 +739,18 @@ def validate_stack_compatibility(
     torch_version: object,
     cuda_runtime: object,
     transformer_engine_version: object,
+    runtime_distribution_versions: dict[str, object],
     imported_modules: Iterable[str],
 ) -> dict[str, object]:
     base = stack_lock.get("base")
     wheels = stack_lock.get("wheels")
-    if not isinstance(base, dict) or not isinstance(wheels, dict):
-        raise RuntimeError("STACK.lock lacks base/wheels contracts")
+    runtime_pypi = stack_lock.get("runtime_pypi")
+    if (
+        not isinstance(base, dict)
+        or not isinstance(wheels, dict)
+        or not isinstance(runtime_pypi, dict)
+    ):
+        raise RuntimeError("STACK.lock lacks base/wheels/runtime_pypi contracts")
     te = wheels.get("transformer_engine")
     if not isinstance(te, dict):
         raise RuntimeError("STACK.lock lacks transformer_engine contract")
@@ -785,12 +792,32 @@ def validate_stack_compatibility(
     missing = sorted(set(STACK_REQUIRED_IMPORTS) - imported)
     if missing:
         raise RuntimeError(f"required H200 extension imports are missing: {missing}")
+    runtime_versions = {}
+    for key in ("apache_tvm_ffi", "flash_attn_4"):
+        entry = runtime_pypi.get(key)
+        if not isinstance(entry, dict):
+            raise RuntimeError(  # noqa: TRY004
+                f"STACK.lock lacks runtime_pypi.{key} contract"
+            )
+        package = str(entry.get("package", ""))
+        _name, separator, expected = package.rpartition("==")
+        if not separator or not expected:
+            raise RuntimeError(
+                f"STACK.lock runtime_pypi.{key}.package must be an exact == pin"
+            )
+        actual = str(runtime_distribution_versions.get(key, ""))
+        if actual != expected:
+            raise RuntimeError(
+                f"{key} version mismatch: runtime={actual!r} STACK.lock={expected!r}"
+            )
+        runtime_versions[key] = expected
     return {
         "status": "verified",
         "python": expected_python,
         "torch": expected_torch,
         "cuda_runtime": expected_cuda,
         "transformer_engine": expected_te,
+        "runtime_pypi": runtime_versions,
         "required_imports": sorted(STACK_REQUIRED_IMPORTS),
     }
 
@@ -822,6 +849,10 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
         torch_version=torch.__version__,
         cuda_runtime=torch.version.cuda,
         transformer_engine_version=modules["transformer_engine"]["version"],
+        runtime_distribution_versions={
+            "apache_tvm_ffi": metadata.version("apache-tvm-ffi"),
+            "flash_attn_4": metadata.version("flash-attn-4"),
+        },
         imported_modules=modules,
     )
     nvidia_smi = subprocess.run(

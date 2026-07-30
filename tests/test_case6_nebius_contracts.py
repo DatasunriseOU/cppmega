@@ -516,6 +516,14 @@ def test_stack_contract_matches_pinned_runtime_and_import_set() -> None:
             "torch": "2.13.0.dev20260611+cu132",
         },
         "wheels": {"transformer_engine": {"version": 2.16}},
+        "runtime_pypi": {
+            "apache_tvm_ffi": {"package": "apache-tvm-ffi==0.1.13"},
+            "flash_attn_4": {"package": "flash-attn-4[cu13]==4.0.0b23"},
+        },
+    }
+    runtime_versions = {
+        "apache_tvm_ffi": "0.1.13",
+        "flash_attn_4": "4.0.0b23",
     }
     contract = validate_stack_compatibility(
         lock,
@@ -523,6 +531,7 @@ def test_stack_contract_matches_pinned_runtime_and_import_set() -> None:
         torch_version="2.13.0.dev20260611+cu132",
         cuda_runtime="13.2",
         transformer_engine_version="2.16.0.dev0+local",
+        runtime_distribution_versions=runtime_versions,
         imported_modules=STACK_REQUIRED_IMPORTS,
     )
     assert contract["status"] == "verified"
@@ -534,6 +543,7 @@ def test_stack_contract_matches_pinned_runtime_and_import_set() -> None:
             torch_version="2.13.0.dev20260612+cu132",
             cuda_runtime="13.2",
             transformer_engine_version="2.16.0.dev0+local",
+            runtime_distribution_versions=runtime_versions,
             imported_modules=STACK_REQUIRED_IMPORTS,
         )
 
@@ -544,7 +554,22 @@ def test_stack_contract_matches_pinned_runtime_and_import_set() -> None:
             torch_version="2.13.0.dev20260611+cu132",
             cuda_runtime="13.2",
             transformer_engine_version="2.16.0.dev0+local",
+            runtime_distribution_versions=runtime_versions,
             imported_modules=STACK_REQUIRED_IMPORTS[:-1],
+        )
+
+    with pytest.raises(RuntimeError, match="flash_attn_4 version mismatch"):
+        validate_stack_compatibility(
+            lock,
+            python_version=(3, 13),
+            torch_version="2.13.0.dev20260611+cu132",
+            cuda_runtime="13.2",
+            transformer_engine_version="2.16.0.dev0+local",
+            runtime_distribution_versions={
+                **runtime_versions,
+                "flash_attn_4": "4.0.0b19",
+            },
+            imported_modules=STACK_REQUIRED_IMPORTS,
         )
 
 

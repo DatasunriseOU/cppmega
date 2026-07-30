@@ -256,6 +256,16 @@ def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
     ) in workflow
 
 
+def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'git checkout --detach "${{ steps.src.outputs.sha }}"' in workflow
+    assert 'test "$(git rev-parse HEAD)" = "${{ steps.src.outputs.sha }}"' in workflow
+    assert "git checkout ${{ matrix.ref }}" not in workflow
+
+
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     tilelang_commit = "16531673a11723a4d8243f2b94eb96a157c74cfc"
     tvm_commit = "78f930edc805920428388518e12d111019383d2f"
