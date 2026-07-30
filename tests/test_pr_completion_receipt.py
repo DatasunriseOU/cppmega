@@ -400,7 +400,9 @@ def test_gap_completion_rejects_store_content_drift(tmp_path: Path) -> None:
         )
 
 
-def test_authoritative_gap_upsert_replaces_truncated_child_rows(tmp_path: Path) -> None:
+def test_authoritative_gap_upsert_replaces_rows_and_preserves_duplicates(
+    tmp_path: Path,
+) -> None:
     store = tmp_path / "prs.sqlite"
     conn = pr_store.connect(str(store), create=True)
     try:
@@ -427,14 +429,20 @@ def test_authoritative_gap_upsert_replaces_truncated_child_rows(tmp_path: Path) 
                     "user": "new",
                     "body": "authoritative full page",
                     "created_at": "2026-01-02T00:00:00Z",
-                }
+                },
+                {
+                    "user": "new",
+                    "body": "authoritative full page",
+                    "created_at": "2026-01-02T00:00:00Z",
+                },
             ],
         }
         pr_store.upsert_record(conn, complete, replace_children=True)
         stored = pr_store.get_by_pr(conn, "owner/one", 7)
         assert stored is not None
         assert [item["body"] for item in stored["comments"]] == [
-            "authoritative full page"
+            "authoritative full page",
+            "authoritative full page",
         ]
         assert pr_store.record_content_sha256(stored) == (
             pr_store.record_content_sha256(complete)
