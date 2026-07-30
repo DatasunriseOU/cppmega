@@ -78,9 +78,9 @@ def build_tilelang_wheel():
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
         if r.returncode != 0:
             if r.stdout:
-                print(r.stdout, file=sys.stderr)
+                print(f"STDOUT tail:\n{r.stdout[-24_000:]}", file=sys.stderr)
             if r.stderr:
-                print(f"STDERR: {r.stderr}", file=sys.stderr)
+                print(f"STDERR tail:\n{r.stderr[-24_000:]}", file=sys.stderr)
             raise RuntimeError(f"Command failed ({r.returncode}): {cmd}")
         if r.stdout:
             print(r.stdout[-4000:])
