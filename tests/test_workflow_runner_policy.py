@@ -307,8 +307,6 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     assert "Smoke TileLang wheel linkage and import" in workflow
     assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post1" in workflow
     assert "wheels/apache_tvm_ffi-*.whl" in workflow
-    assert "!inputs.tilelang_only || matrix.name == 'tilelang'" in workflow
-    assert "github.repository == 'DatasunriseOU/cppmega' && !inputs.tilelang_only" in workflow
     assert "'apache_tvm_ffi-*.whl'" in workflow
     assert "'apache_tvm_ffi-*.whl'" in image_workflow
     assert "Shared library: [libcuda_stub.so]" in workflow

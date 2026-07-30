@@ -17,11 +17,6 @@ on:
         description: "Release tag suffix (default: short SHA of triggering commit)"
         required: false
         type: string
-      tilelang_only:
-        description: "Build only the TileLang + matching tvm-ffi wheels"
-        required: false
-        default: false
-        type: boolean
   push:
     branches: [main]
     paths:
@@ -67,9 +62,7 @@ jobs:
           fi
 
   build:
-    if: |
-      github.repository == 'DatasunriseOU/cppmega' &&
-      (!inputs.tilelang_only || matrix.name == 'tilelang')
+    if: github.repository == 'DatasunriseOU/cppmega'
     needs: [resolve]
     runs-on: [self-hosted, Linux, X64, cppmega]
     timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
@@ -674,7 +667,7 @@ jobs:
           retention-days: 7
 
   release:
-    if: github.repository == 'DatasunriseOU/cppmega' && !inputs.tilelang_only
+    if: github.repository == 'DatasunriseOU/cppmega'
     needs: [resolve, build]
     runs-on: [self-hosted, Linux, X64, cppmega]
     steps:
