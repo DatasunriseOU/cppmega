@@ -772,6 +772,10 @@ def _parse_buckets(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(
             "buckets must be a non-empty comma-separated list"
         )
+    if buckets != tuple(sorted(set(buckets))):
+        raise argparse.ArgumentTypeError(
+            "buckets must be unique and strictly increasing"
+        )
     return buckets
 
 

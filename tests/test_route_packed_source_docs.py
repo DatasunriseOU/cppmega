@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 
@@ -16,6 +17,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     rows_to_table,
 )
 from scripts.nanochat_data.route_packed_source_docs import (
+    _parse_buckets,
     main as route_main,
     route_file,
     route_packed_row,
@@ -89,6 +91,12 @@ def _mixed_row() -> dict:
     assert overflow == []
     assert len(rows) == 1
     return rows[0]
+
+
+def test_bucket_routes_are_unique_and_ordered() -> None:
+    assert _parse_buckets("1024,2048,4096") == (1024, 2048, 4096)
+    with pytest.raises(argparse.ArgumentTypeError, match="strictly increasing"):
+        _parse_buckets("2048,1024,1024")
 
 
 def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None:
