@@ -163,7 +163,8 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - 16531673 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - f4e9d04 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #     and links TVM's CUDA driver calls to TileLang's lazy stub
             #   - vendored TVM submodule (DatasunriseOU/tvm@78f930ed) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
@@ -175,7 +176,7 @@ jobs:
             #     incompatible with FA4 beta23's >=0.1.12 floor.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: 16531673a11723a4d8243f2b94eb96a157c74cfc
+            ref: f4e9d04bc9a07ac40308eb89112250971f479667
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda
@@ -584,6 +585,37 @@ jobs:
       - name: List wheels
         if: success()
         run: ls -lh wheels/
+
+      - name: Smoke TileLang wheel linkage and import
+        if: success() && matrix.name == 'tilelang'
+        run: |
+          set -euo pipefail
+          python -m pip install --force-reinstall --no-deps wheels/tilelang-*.whl
+          runtime_lib=$(
+            python - <<'PY'
+          from importlib import metadata
+
+          distribution = metadata.distribution("tilelang")
+          matches = [
+              item
+              for item in distribution.files or ()
+              if str(item).endswith("tilelang/lib/libtvm_runtime.so")
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one libtvm_runtime.so, found {matches!r}")
+          print(distribution.locate_file(matches[0]))
+          PY
+          )
+          readelf -d "$runtime_lib" | grep -F 'Shared library: [libcuda_stub.so]'
+          if readelf -d "$runtime_lib" | grep -Fq 'Shared library: [libcuda.so'; then
+            echo "::error::TileLang wheel still links directly to libcuda.so"
+            exit 1
+          fi
+          python - <<'PY'
+          import tilelang
+
+          print("tilelang", tilelang.__version__, tilelang.__file__)
+          PY
 
       - name: Smoke TransformerEngine wheel ABI
         if: success() && matrix.name == 'transformer_engine'

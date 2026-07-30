@@ -267,7 +267,7 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "16531673a11723a4d8243f2b94eb96a157c74cfc"
+    tilelang_commit = "f4e9d04bc9a07ac40308eb89112250971f479667"
     tvm_commit = "78f930edc805920428388518e12d111019383d2f"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 
@@ -295,6 +295,8 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
         assert tvm_commit in text
     for text in (install, modal_build, modal_base):
         assert wheel_name in text
+    assert "Smoke TileLang wheel linkage and import" in workflow
+    assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
     assert "/tmp/cppmega_wheels" not in modal_base
     assert '_REPO_ROOT / "wheels"' in modal_base
