@@ -9,13 +9,13 @@
 #   (_ObjectSlotsMeta), but TileLang's vendored TVM (882a774) lacks the fix
 #   from apache/tvm#18938 (TVMDerivedObject.__slots__ = ("__dict__","__weakref__")).
 #   Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12, so it is
-#   NOT usable. The DatasunriseOU/tilelang fork at fff5cfcc is the clean path:
+#   NOT usable. The DatasunriseOU/tilelang fork at 1014a028 is the clean path:
 #     - carries upstream tile-ai/tilelang#2071 (removes the <0.1.10 cap)
-#     - vendored TVM submodule = DatasunriseOU/tvm@ada9cffb, which includes
+#     - vendored TVM submodule = DatasunriseOU/tvm@19a512a7, which includes
 #       apache/tvm#18938 (the __slots__ fix) and restores the nvbench CUDA
 #       L2-cache-flush header that TVM still compiles
-#     - vendored tvm-ffi = DatasunriseOU/tvm-ffi@4e74cb45
-#       (v0.1.13.post1), exactly matching the linked TVM runtime ABI
+#     - vendored tvm-ffi = DatasunriseOU/tvm-ffi@44996556
+#       (v0.1.13.post2), exactly matching the linked TVM runtime ABI
 #     - adapts AdjustMatmulOrder to the fork's boxed-Integer permute_dims API
 #     - completes the lazy CUDA driver stub for CUDA 13.2 TVM
 #   This script clones that fork commit, ensures the TVM submodule is checked
@@ -31,21 +31,21 @@
 #
 # Env overrides:
 #   TILELANG_REPO    fork repo URL   (default: DatasunriseOU/tilelang)
-#   TILELANG_REF     fork commit     (default: fff5cfcc...)
-#   TILELANG_TVM_REF vendored TVM commit (default: ada9cffb...)
-#   TILELANG_TVM_FFI_REF vendored tvm-ffi commit (default: 4e74cb45...)
+#   TILELANG_REF     fork commit     (default: 1014a028...)
+#   TILELANG_TVM_REF vendored TVM commit (default: 19a512a7...)
+#   TILELANG_TVM_FFI_REF vendored tvm-ffi commit (default: 44996556...)
 #   TILELANG_SRC_DIR clone dir        (default: $HOME/tilelang-build)
 #   WHEELS_DIR       output dir       (default: <repo>/wheels)
 
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-fff5cfcc60fed16d163f13cca991256b6ebe1573}"
+TILELANG_REF="${TILELANG_REF:-1014a028963afc498d422f07f4ecbe09bbfbb43c}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.
-TILELANG_TVM_REF="${TILELANG_TVM_REF:-ada9cffbb381695651e265039f77c326c146d6b7}"
-TILELANG_TVM_FFI_REF="${TILELANG_TVM_FFI_REF:-4e74cb45fbcf6117b69a9864bbe5548f1a7e17a2}"
+TILELANG_TVM_REF="${TILELANG_TVM_REF:-19a512a70eaf4674da9efa8f1f74b9eff5033150}"
+TILELANG_TVM_FFI_REF="${TILELANG_TVM_FFI_REF:-44996556b6937a9ced7972f2d2a5b7e86b7dcb1e}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHEELS_DIR="${WHEELS_DIR:-${REPO_ROOT}/wheels}"
@@ -115,7 +115,7 @@ python -m pip install --retries 10 --timeout 60 \
 # --- build the ABI-matched wheels -------------------------------------------
 mkdir -p "${WHEELS_DIR}"
 echo "[rebuild-tilelang] building matching tvm-ffi wheel → ${WHEELS_DIR}"
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post1 \
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post2 \
   pip wheel 3rdparty/tvm/3rdparty/tvm-ffi \
     --no-build-isolation --no-deps -w "${WHEELS_DIR}" -v
 echo "[rebuild-tilelang] building TileLang wheel → ${WHEELS_DIR}"

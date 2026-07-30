@@ -163,14 +163,14 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - fff5cfcc carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - 1014a028 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
             #     and links TVM's CUDA driver calls, including cuFuncGetAttribute,
             #     to TileLang's lazy stub
-            #   - vendored TVM submodule (DatasunriseOU/tvm@ada9cffb) includes
+            #   - vendored TVM submodule (DatasunriseOU/tvm@19a512a7) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
-            #   - vendored tvm-ffi is v0.1.13.post1: official v0.1.13 plus the
-            #     two compatibility seams required by this TVM/TileLang fork
+            #   - vendored tvm-ffi is v0.1.13.post2: official v0.1.13 plus the
+            #     compatibility seams required by this TVM/TileLang fork
             #   - the same TVM pin restores nvbench/l2_cache_flush.h, which
             #     TileLang's CUDA runtime still compiles.
             #   - the TVM pin adapts AdjustMatmulOrder's axes to this fork's
@@ -179,7 +179,7 @@ jobs:
             #     incompatible with FA4 beta23's >=0.1.12 floor.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: fff5cfcc60fed16d163f13cca991256b6ebe1573
+            ref: 1014a028963afc498d422f07f4ecbe09bbfbb43c
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda
@@ -586,8 +586,8 @@ jobs:
         run: |
           set -euo pipefail
           ffi_dir="$GITHUB_WORKSPACE/src/3rdparty/tvm/3rdparty/tvm-ffi"
-          test "$(git -C "$ffi_dir" rev-parse HEAD)" = "4e74cb45fbcf6117b69a9864bbe5548f1a7e17a2"
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post1 \
+          test "$(git -C "$ffi_dir" rev-parse HEAD)" = "44996556b6937a9ced7972f2d2a5b7e86b7dcb1e"
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post2 \
             pip wheel "$ffi_dir" --no-build-isolation --no-deps \
               -w "$GITHUB_WORKSPACE/wheels" -v
 
@@ -630,7 +630,7 @@ jobs:
           from importlib import metadata
           import tilelang
 
-          assert metadata.version("apache-tvm-ffi") == "0.1.13.post1"
+          assert metadata.version("apache-tvm-ffi") == "0.1.13.post2"
           print("tilelang", tilelang.__version__, tilelang.__file__)
           PY
 

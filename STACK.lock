@@ -87,17 +87,17 @@ wheels:
 
   tvm_ffi:
     repo: DatasunriseOU/tvm-ffi
-    ref: 4e74cb45fbcf6117b69a9864bbe5548f1a7e17a2
-    version: 0.1.13.post1
+    ref: 44996556b6937a9ced7972f2d2a5b7e86b7dcb1e
+    version: 0.1.13.post2
     build_with: tilelang
     produces:
       - apache_tvm_ffi-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at fff5cfcc carries:
+    # DatasunriseOU/tilelang fork at 1014a028 carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
-    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@ada9cffb, which includes
+    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@19a512a7, which includes
     #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
     #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
     #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
@@ -108,13 +108,13 @@ wheels:
     #   - links TVM CUDA driver calls through TileLang's lazy libcuda_stub,
     #     including cuFuncGetAttribute required by CUDA 13.2 TVM, so wheel
     #     repair cannot leave libtvm_runtime.so with unresolved cu* symbols.
-    #   - vendored tvm-ffi is DatasunriseOU/tvm-ffi@4e74cb45
-    #     (v0.1.13.post1), matching both FA4's >=0.1.12 contract and the C++
+    #   - vendored tvm-ffi is DatasunriseOU/tvm-ffi@44996556
+    #     (v0.1.13.post2), matching both FA4's >=0.1.12 contract and the C++
     #     ABI used to link libtvm_runtime.so.
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: fff5cfcc60fed16d163f13cca991256b6ebe1573
+    ref: 1014a028963afc498d422f07f4ecbe09bbfbb43c
     version: 0.1.9
     submodules: true
     build: |
@@ -137,7 +137,7 @@ runtime_pypi:
   apache_tvm_ffi:
     # Final runtime version comes from wheels.tvm_ffi; PyPI v0.1.13 is only
     # the cacheable bootstrap dependency before local wheels are installed.
-    package: "apache-tvm-ffi==0.1.13.post1"
+    package: "apache-tvm-ffi==0.1.13.post2"
 
   flash_attn_4:
     # FA4 CuTe DSL package. This installs the flash_attn.cute namespace and

@@ -3,8 +3,8 @@
 Builds ABI-matched tvm-ffi and TileLang wheels on a Modal H100, then installs
 flash-attn-4==4.0.0b23 and verifies the complete stack imports cleanly.
 
-The fork at fff5cfcc carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
-restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@ada9cffb,
+The fork at 1014a028 carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
+restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@19a512a7,
 removes the apache-tvm-ffi<0.1.10 cap, and completes the CUDA driver stub.
 
 The clone and build directory are disposable container scratch. The compressed
@@ -22,12 +22,12 @@ import pathlib
 import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
-TILELANG_COMMIT = "fff5cfcc60fed16d163f13cca991256b6ebe1573"
-TILELANG_TVM_COMMIT = "ada9cffbb381695651e265039f77c326c146d6b7"
-TILELANG_TVM_FFI_COMMIT = "4e74cb45fbcf6117b69a9864bbe5548f1a7e17a2"
+TILELANG_COMMIT = "1014a028963afc498d422f07f4ecbe09bbfbb43c"
+TILELANG_TVM_COMMIT = "19a512a70eaf4674da9efa8f1f74b9eff5033150"
+TILELANG_TVM_FFI_COMMIT = "44996556b6937a9ced7972f2d2a5b7e86b7dcb1e"
 EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 EXPECTED_TVM_FFI_WHEEL = (
-    "apache_tvm_ffi-0.1.13.post1-cp313-cp313-linux_x86_64.whl"
+    "apache_tvm_ffi-0.1.13.post2-cp313-cp313-linux_x86_64.whl"
 )
 
 PYTHON_VERSION = "3.13"
@@ -115,7 +115,7 @@ def build_tilelang_wheel():
     run("mkdir -p /tmp/tilelang-wheel-out")
     run(
         "cd /tmp/tilelang && "
-        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post1 "
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post2 "
         "pip wheel 3rdparty/tvm/3rdparty/tvm-ffi --no-build-isolation --no-deps "
         "-w /tmp/tilelang-wheel-out 2>&1 | tail -20"
     )
@@ -152,7 +152,7 @@ import flash_attn
 from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
 import tvm.ffi
 assert tilelang.__version__ == "0.1.9", tilelang.__version__
-assert metadata.version("apache-tvm-ffi") == "0.1.13.post1"
+assert metadata.version("apache-tvm-ffi") == "0.1.13.post2"
 print(f"tilelang version: {tilelang.__version__}")
 print(f"flash_attn version: {flash_attn.__version__}")
 print(f"tvm.ffi version: {tvm.ffi.__version__}")
