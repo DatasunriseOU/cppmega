@@ -591,6 +591,7 @@ jobs:
         if: success() && matrix.name == 'tilelang'
         run: |
           set -euo pipefail
+          python -m pip install --no-deps "apache-tvm-ffi==0.1.13"
           python -m pip install --force-reinstall --no-deps wheels/tilelang-*.whl
           runtime_lib=$(
             python - <<'PY'
