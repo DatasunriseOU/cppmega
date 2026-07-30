@@ -309,6 +309,11 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     assert "wheels/apache_tvm_ffi-*.whl" in workflow
     assert "'apache_tvm_ffi-*.whl'" in workflow
     assert "'apache_tvm_ffi-*.whl'" in image_workflow
+    assert rebuild.index("git submodule update --init --recursive 3rdparty/tvm") < (
+        rebuild.index("3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD")
+    )
+    assert "python - <<'PY'" in modal_build
+    assert 'python -c "{verify_code.strip()}"' not in modal_build
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
     assert "version: 0.1.13.post1" in stack

@@ -64,7 +64,6 @@ if [[ ! -d "${SRC_DIR}/.git" ]]; then
   git clone "${TILELANG_REPO}" "${SRC_DIR}"
 fi
 cd "${SRC_DIR}"
-test "$(git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD)" = "${TILELANG_TVM_FFI_REF}"
 git fetch origin
 git checkout "${TILELANG_REF}"
 
@@ -77,6 +76,7 @@ cd 3rdparty/tvm
 git fetch origin
 git checkout "${TILELANG_TVM_REF}"
 cd "${SRC_DIR}"
+test "$(git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD)" = "${TILELANG_TVM_FFI_REF}"
 
 # Verify the __slots__ fix is actually present in the checked-out TVM. Without
 # this, the wheel imports under tvm-ffi >=0.1.10 and crashes at runtime.

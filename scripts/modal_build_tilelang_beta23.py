@@ -158,7 +158,7 @@ print(f"flash_attn version: {flash_attn.__version__}")
 print(f"tvm.ffi version: {tvm.ffi.__version__}")
 print("COMPAT OK: tilelang + flash-attn-4 beta23 + tvm-ffi all import cleanly")
 """
-    run(f'python -c "{verify_code.strip()}"')
+    run(f"python - <<'PY'\n{verify_code.strip()}\nPY")
 
     # --- 7. Commit wheel to volume ---
     wheels_vol.commit()
