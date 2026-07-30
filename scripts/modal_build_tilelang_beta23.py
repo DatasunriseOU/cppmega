@@ -123,7 +123,7 @@ def build_tilelang_wheel():
         "-w /tmp/tilelang-wheel-out"
     )
     run(
-        "cd /tmp/tilelang && pip wheel . --no-build-isolation "
+        "cd /tmp/tilelang && pip wheel . --no-build-isolation --no-deps "
         "-w /tmp/tilelang-wheel-out"
     )
 

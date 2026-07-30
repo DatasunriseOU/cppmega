@@ -314,6 +314,7 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     )
     assert "python - <<'PY'" in modal_build
     assert 'python -c "{verify_code.strip()}"' not in modal_build
+    assert "pip wheel . --no-build-isolation --no-deps" in modal_build
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
     assert "version: 0.1.13.post5" in stack
