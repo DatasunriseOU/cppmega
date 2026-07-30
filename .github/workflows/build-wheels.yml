@@ -169,7 +169,7 @@ jobs:
             #   - vendored TVM submodule (DatasunriseOU/tvm@434a6af4) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
-            #   - vendored tvm-ffi is v0.1.13.post4: official v0.1.13 plus the
+            #   - vendored tvm-ffi is v0.1.13.post5: official v0.1.13 plus the
             #     compatibility seams required by this TVM/TileLang fork
             #   - the same TVM pin restores nvbench/l2_cache_flush.h, which
             #     TileLang's CUDA runtime still compiles.
@@ -179,7 +179,7 @@ jobs:
             #     incompatible with FA4 beta23's >=0.1.12 floor.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: fbf423cd744f2fde50da462721103640c84e82fb
+            ref: b2f15f79b4587779936229c7d167c4d66f7d5e9b
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda
@@ -586,8 +586,8 @@ jobs:
         run: |
           set -euo pipefail
           ffi_dir="$GITHUB_WORKSPACE/src/3rdparty/tvm/3rdparty/tvm-ffi"
-          test "$(git -C "$ffi_dir" rev-parse HEAD)" = "df4a1262d2ffed5e8b592d47dd7bd62126456b2d"
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post4 \
+          test "$(git -C "$ffi_dir" rev-parse HEAD)" = "521efeb30bfd9e4946b248b3d76e6391028233a3"
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5 \
             pip wheel "$ffi_dir" --no-build-isolation --no-deps \
               -w "$GITHUB_WORKSPACE/wheels" -v
 
@@ -630,7 +630,7 @@ jobs:
           from importlib import metadata
           import tilelang
 
-          assert metadata.version("apache-tvm-ffi") == "0.1.13.post4"
+          assert metadata.version("apache-tvm-ffi") == "0.1.13.post5"
           print("tilelang", tilelang.__version__, tilelang.__file__)
           PY
 

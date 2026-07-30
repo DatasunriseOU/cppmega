@@ -267,12 +267,12 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "fbf423cd744f2fde50da462721103640c84e82fb"
-    tvm_commit = "434a6af4366526e7272da490466b56a5241b5532"
-    tvm_ffi_commit = "df4a1262d2ffed5e8b592d47dd7bd62126456b2d"
+    tilelang_commit = "b2f15f79b4587779936229c7d167c4d66f7d5e9b"
+    tvm_commit = "0ce49f82441514cb7b8cc22f6f81686e72076a18"
+    tvm_ffi_commit = "521efeb30bfd9e4946b248b3d76e6391028233a3"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
     ffi_wheel_name = (
-        "apache_tvm_ffi-0.1.13.post4-cp313-cp313-linux_x86_64.whl"
+        "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
     )
 
     workflow = (
@@ -305,7 +305,7 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
         assert wheel_name in text
         assert ffi_wheel_name in text
     assert "Smoke TileLang wheel linkage and import" in workflow
-    assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post4" in workflow
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5" in workflow
     assert "wheels/apache_tvm_ffi-*.whl" in workflow
     assert "'apache_tvm_ffi-*.whl'" in workflow
     assert "'apache_tvm_ffi-*.whl'" in image_workflow
@@ -316,6 +316,6 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     assert 'python -c "{verify_code.strip()}"' not in modal_build
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
-    assert "version: 0.1.13.post4" in stack
+    assert "version: 0.1.13.post5" in stack
     assert "/tmp/cppmega_wheels" not in modal_base
     assert '_REPO_ROOT / "wheels"' in modal_base
