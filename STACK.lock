@@ -94,10 +94,10 @@ wheels:
       - apache_tvm_ffi-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at b2f15f79 carries:
+    # DatasunriseOU/tilelang fork at ecbe82ac carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
-    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@0ce49f82, which includes
+    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@dd4ccab5, which includes
     #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
     #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
     #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
@@ -114,7 +114,7 @@ wheels:
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: b2f15f79b4587779936229c7d167c4d66f7d5e9b
+    ref: ecbe82ac85c4abae2d177b6b16d21bcf1bbd7780
     version: 0.1.9
     submodules: true
     build: |

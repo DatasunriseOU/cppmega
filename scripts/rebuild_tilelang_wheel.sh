@@ -40,11 +40,11 @@
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-b2f15f79b4587779936229c7d167c4d66f7d5e9b}"
+TILELANG_REF="${TILELANG_REF:-ecbe82ac85c4abae2d177b6b16d21bcf1bbd7780}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.
-TILELANG_TVM_REF="${TILELANG_TVM_REF:-0ce49f82441514cb7b8cc22f6f81686e72076a18}"
+TILELANG_TVM_REF="${TILELANG_TVM_REF:-dd4ccab545571945b1443b83196d87b55f821f90}"
 TILELANG_TVM_FFI_REF="${TILELANG_TVM_FFI_REF:-521efeb30bfd9e4946b248b3d76e6391028233a3}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
