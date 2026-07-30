@@ -62,7 +62,7 @@ def _image() -> modal.Image:
     if not USE_BETA23:
         wheel_dir = _REPO_ROOT / "wheels"
         ffi_wheel = wheel_dir / (
-            "apache_tvm_ffi-0.1.13.post3-cp313-cp313-linux_x86_64.whl"
+            "apache_tvm_ffi-0.1.13.post4-cp313-cp313-linux_x86_64.whl"
         )
         tilelang_wheel = wheel_dir / "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
         missing = [
