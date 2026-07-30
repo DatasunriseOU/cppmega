@@ -296,6 +296,7 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     for text in (install, modal_build, modal_base):
         assert wheel_name in text
     assert "Smoke TileLang wheel linkage and import" in workflow
+    assert 'python -m pip install --no-deps "apache-tvm-ffi==0.1.13"' in workflow
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
     assert "/tmp/cppmega_wheels" not in modal_base
