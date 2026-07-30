@@ -246,7 +246,14 @@ def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
 
     assert "NVTE_CUDA_ARCHS='90;100;120'" in workflow
     assert " CUDAARCHS=" not in workflow
-    assert "python -m pip install pydantic" in workflow
+    assert (
+        "python -m pip install pydantic importlib-metadata nvdlfw-inspect onnx "
+        "onnxscript"
+    ) in workflow
+    assert (
+        "python -m pip install --force-reinstall --no-deps "
+        "wheels/transformer_engine-*.whl"
+    ) in workflow
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
