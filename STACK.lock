@@ -57,7 +57,7 @@ wheels:
 
   mamba_ssm:
     repo: state-spaces/mamba
-    ref: 31f3d7b
+    ref: 31f3d7baba69d0ccad1635ace1e477367899e408
     version: 2.3.1
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
@@ -120,12 +120,15 @@ wheels:
       - qoptim_cuda-*.whl
 
 runtime_pypi:
+  apache_tvm_ffi:
+    package: "apache-tvm-ffi==0.1.13"
+
   flash_attn_4:
     # FA4 CuTe DSL package. This installs the flash_attn.cute namespace and
     # matching nvidia-cutlass-dsl[cu13] / quack-kernels runtime dependencies.
     # H100/H200 training uses FA3; FA4 is kept for the B200/GB10 CuTe path and
     # for cppmega's cute_dsl_mimo modules.
-    package: "flash-attn-4[cu13]==4.0.0b19"
+    package: "flash-attn-4[cu13]==4.0.0b23"
     extra_index_url: https://pypi.nvidia.com
 
 # Repos cloned at runtime in the final image (not built as wheels).

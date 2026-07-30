@@ -148,7 +148,7 @@ jobs:
               FLASH_ATTENTION_DISABLE_SPLIT=TRUE
           - name: mamba_ssm
             repo: state-spaces/mamba
-            ref: 31f3d7b
+            ref: 31f3d7baba69d0ccad1635ace1e477367899e408
             submodules: "false"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: causal_conv1d
@@ -206,10 +206,20 @@ jobs:
         run: |
           set -euo pipefail
           REPO_URL="https://github.com/${{ matrix.repo }}.git"
-          SHA=$(git ls-remote "$REPO_URL" ${{ matrix.ref }} | awk '{print $1}' | head -1)
-          if [ -z "$SHA" ]; then SHA="${{ matrix.ref }}"; fi
+          REF="${{ matrix.ref }}"
+          SHA=$(git ls-remote "$REPO_URL" "${REF}^{}" | awk 'NR == 1 {print $1}')
+          if [ -z "$SHA" ]; then
+            SHA=$(git ls-remote "$REPO_URL" "$REF" | awk 'NR == 1 {print $1}')
+          fi
+          if [ -z "$SHA" ] && [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            SHA="$REF"
+          fi
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unable to resolve ${{ matrix.repo }}@$REF to an exact commit"
+            exit 1
+          fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Resolved ${{ matrix.repo }}@${{ matrix.ref }} → $SHA"
+          echo "Resolved ${{ matrix.repo }}@$REF → $SHA"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -446,7 +456,8 @@ jobs:
           REPO_URL="https://github.com/${{ matrix.repo }}.git"
           git clone "$REPO_URL" src
           cd src
-          git checkout ${{ matrix.ref }}
+          git checkout --detach "${{ steps.src.outputs.sha }}"
+          test "$(git rev-parse HEAD)" = "${{ steps.src.outputs.sha }}"
           if [[ "${{ matrix.submodules }}" == "true" ]]; then
             git submodule update --init --recursive --depth 1
           fi
