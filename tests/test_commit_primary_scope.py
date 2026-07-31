@@ -160,6 +160,43 @@ def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> Non
 
 
 @pytest.mark.native_toolchain
+def test_short_domain_commit_uses_the_shared_fifty_char_gate(tmp_path: Path) -> None:
+    from tools.clang_indexer.process_commits import process_record
+
+    old_content = "SELECT id, status FROM builds WHERE status = 'queued';\n"
+    new_content = "SELECT id, status FROM builds WHERE status = 'passed';\n"
+    diff = (
+        "diff --git a/query.sql b/query.sql\n"
+        "--- a/query.sql\n"
+        "+++ b/query.sql\n"
+        "@@ -1 +1 @@\n"
+        f"-{old_content}"
+        f"+{new_content}"
+    )
+
+    documents = process_record(
+        {
+            "repo": "tests/commit-domain",
+            "filepath": "query.sql",
+            "commit_hash": "b" * 40,
+            "old_content": old_content,
+            "new_content": new_content,
+            "diff": diff,
+        },
+        None,
+        str(tmp_path),
+        4096,
+        200_000,
+        "both",
+        5,
+    )
+
+    assert 50 <= len(new_content) < 100
+    assert len(documents) == 1
+    assert documents[0]["text"] == new_content
+
+
+@pytest.mark.native_toolchain
 def test_domain_commit_dedup_keeps_distinct_incremental_changes(
     tmp_path: Path,
 ) -> None:

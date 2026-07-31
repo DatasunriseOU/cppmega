@@ -2736,7 +2736,7 @@ def _process_domain_record(
     chunk_claim_stats: dict[str, int] | None,
 ) -> list[dict]:
     tokens = count_tokens(new_content)
-    if tokens > max_tokens or len(new_content) < 100:
+    if tokens > max_tokens:
         return []
     claimed = _claim_semantic_chunk(
         new_content,
