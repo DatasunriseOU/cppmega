@@ -29,6 +29,15 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
     },
     {
+      "project_id": "eclipse-threadx/threadx",
+      "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
+      "size_bytes": 61551,
+      "sha256": "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294",
+      "classification": "generated_binary_blob",
+      "detected_format": "mixed_utf8_utf16le_c_array",
+      "reason": "Generated UTF-16LE C byte array embedding a ThreadX module ELF, prefixed by a UTF-8 license block"
+    },
+    {
       "project_id": "xemu-project/xemu",
       "relative_path": "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/PoliciesP1234subsubCAP123P12CertreversecrossCertificatePair.cp",
       "size_bytes": 955,

@@ -36,6 +36,7 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_crash_fixture",
         "clang_debug_crash_pragma",
     ),
+    ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
 }
@@ -228,6 +229,50 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
                 "but the deliberate crash signature is absent or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "mixed_utf8_utf16le_c_array":
+        payload = path.read_bytes()
+        marker = "/* \n\n   Input ELF file:".encode("utf-16le")
+        boundary = payload.find(marker)
+        if boundary <= 0:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                "but the UTF-16LE generated-array header is absent"
+            )
+        try:
+            prefix = payload[:boundary].decode("utf-8")
+            generated = payload[boundary:].decode("utf-16le")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                f"but an encoded section is invalid: {exc}"
+            ) from exc
+        required_prefix = (
+            "Eclipse ThreadX contributors",
+            "SPDX-License-Identifier: MIT",
+        )
+        required_generated = (
+            "Input ELF file:",
+            "Output C Array file:",
+            "__align(4096) unsigned char  module_code[] = {",
+            "/* Address",
+        )
+        byte_literals = re.findall(
+            r"(?<![0-9A-F])0x[0-9A-F]{2}(?![0-9A-F])",
+            generated,
+        )
+        if (
+            not all(marker in prefix for marker in required_prefix)
+            or not all(marker in generated for marker in required_generated)
+            or len(byte_literals) < 1024
+            or "\x00" in generated
+            or not generated.rstrip().endswith("};")
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                "but the generated binary-array contract is incomplete"
             )
         return
 
