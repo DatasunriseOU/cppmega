@@ -463,31 +463,31 @@ def test_short_domain_commit_uses_the_shared_fifty_char_gate(tmp_path: Path) -> 
 
 
 @pytest.mark.native_toolchain
-def test_domain_commit_dedup_keeps_distinct_incremental_changes(
+def test_domain_commit_dedup_keeps_distinct_changes_with_same_post_state(
     tmp_path: Path,
 ) -> None:
     from cppmega.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
     from tools.clang_indexer.dedup_store import DedupStore
     from tools.clang_indexer.process_commits import process_jsonl_file
 
-    states = [
+    old_states = [
         (
             "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n"
             "CREATE INDEX builds_status_idx ON builds(status);\n"
         ),
         (
             "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
-            "platform TEXT NOT NULL);\n"
-            "CREATE INDEX builds_status_idx ON builds(status);\n"
-        ),
-        (
-            "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
-            "platform TEXT NOT NULL, runner TEXT NOT NULL);\n"
+            "runner TEXT);\n"
             "CREATE INDEX builds_status_idx ON builds(status);\n"
         ),
     ]
+    new_content = (
+        "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+        "platform TEXT NOT NULL);\n"
+        "CREATE INDEX builds_status_idx ON builds(status);\n"
+    )
     records = []
-    for index, (old_content, new_content) in enumerate(zip(states, states[1:])):
+    for index, old_content in enumerate(old_states):
         diff = (
             "diff --git a/schema.sql b/schema.sql\n"
             "--- a/schema.sql\n"

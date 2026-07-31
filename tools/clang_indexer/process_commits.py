@@ -2735,23 +2735,10 @@ def _process_domain_record(
     max_tokens: int,
     project_id: str,
     build_info: dict[str, object],
-    dedup_store,
-    dedup_tokenizer,
-    chunk_claim_stats: dict[str, int] | None,
 ) -> list[dict]:
     document_text = new_content or old_content
     tokens = count_tokens(document_text)
     if tokens > max_tokens:
-        return []
-    claimed = _claim_semantic_chunk(
-        document_text,
-        dedup_store=dedup_store,
-        dedup_tokenizer=dedup_tokenizer,
-    )
-    if chunk_claim_stats is not None:
-        key = 'commit_chunks_claimed' if claimed else 'commit_chunks_skipped'
-        chunk_claim_stats[key] = chunk_claim_stats.get(key, 0) + 1
-    if not claimed:
         return []
 
     document = build_build_doc(
@@ -2857,9 +2844,6 @@ def process_record(
             max_tokens=max_tokens,
             project_id=project_id,
             build_info=build_info,
-            dedup_store=dedup_store,
-            dedup_tokenizer=dedup_tokenizer,
-            chunk_claim_stats=chunk_claim_stats,
         )
     if clang_index is None:
         raise ValueError("C/C++ commit processing requires a libclang index")
