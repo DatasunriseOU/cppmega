@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from cppmega.data.domain_ingestion import resolve_domain_parser
 
@@ -42,6 +43,28 @@ _RAW_BUILD_SUFFIXES = {
     ".sln": "msvc",
 }
 _CPP_SUFFIX_OVERRIDES = {".tcc"}
+_SHELL_ADAPTERS = {
+    "bash",
+    "posix-sh",
+    "zsh",
+    "tcsh",
+    "ksh",
+    "powershell",
+    "cmd",
+}
+_NATIVE_WORKFLOW_PATH = re.compile(
+    r"(?:^|[/_.-])"
+    r"(?:build|compile|configure|make|cmake|ninja|test|tests|runtests|run|runner|"
+    r"bench|benchmark|ci|github|toolchain)"
+    r"(?:$|[/_.-])",
+    re.IGNORECASE,
+)
+
+
+def is_native_workflow_shell_path(path: str) -> bool:
+    """Return whether a shell path is explicitly tied to native build/test work."""
+
+    return bool(_NATIVE_WORKFLOW_PATH.search(path.replace("\\", "/")))
 
 
 def classify_primary_commit_path(path: str, text: str = "") -> str | None:
@@ -56,4 +79,7 @@ def classify_primary_commit_path(path: str, text: str = "") -> str | None:
         return explicit_kind
     if path_obj.suffix.lower() in _CPP_SUFFIX_OVERRIDES:
         return "cpp"
-    return _ADAPTER_BUILD_KINDS.get(resolve_domain_parser(path_obj, text).name)
+    adapter = resolve_domain_parser(path_obj, text).name
+    if adapter in _SHELL_ADAPTERS and not is_native_workflow_shell_path(path):
+        return None
+    return _ADAPTER_BUILD_KINDS.get(adapter)

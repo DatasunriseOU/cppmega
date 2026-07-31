@@ -18,14 +18,43 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cppmega.data import symbol_identity as symbol_identity_schema
+from cppmega.data.commit_scope import is_native_workflow_shell_path
 from cppmega.data.nanochat_pipeline import packed_rows_schema as packed
 from cppmega.data.nanochat_pipeline import tokenized_enriched_schema as enriched
 from scripts.nanochat_data import pack_enriched_rows as packer
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
-SCHEMA = "cppmega_packed_source_route_v1"
+SCHEMA = "cppmega_packed_source_route_v2"
 PYTHON_BUILD_KIND = "python"
-ROUTES = ("primary", "aux_python")
+EXCLUDED_ROUTE = "excluded_non_primary"
+ROUTES = ("primary", "aux_python", EXCLUDED_ROUTE)
+_SHELL_BUILD_KINDS = frozenset(
+    {"bash", "sh", "zsh", "tcsh", "ksh", "powershell", "cmd"}
+)
+_PRIMARY_BUILD_KINDS = frozenset(
+    {
+        "autoconf",
+        "automake",
+        "bazel",
+        "build_diagnostic",
+        "cmake",
+        "compiler_diagnostic",
+        "compile_commands",
+        "conan",
+        "configure",
+        "dockerfile",
+        "gn",
+        "linker_diagnostic",
+        "make",
+        "meson",
+        "msvc",
+        "ninja",
+        "sanitizer_output",
+        "scons",
+        "vcpkg",
+        "xmake",
+    }
+)
 _ALLOWED_LEGACY_MISSING_COLUMNS = frozenset({packed.SOURCE_COMMIT_HASHES_COLUMN})
 _ALIGNED_TO_CHRONOLOGY = {
     packed.SOURCE_REPO_STABLE_IDS_COLUMN: enriched.REPO_STABLE_ID_COLUMN,
@@ -505,10 +534,75 @@ def _assert_routed_content(
             raise ValueError(f"routed {column} is not lossless")
 
 
+def _source_path_for_doc(
+    row: dict[str, Any],
+    *,
+    token_start: int,
+    token_end: int,
+) -> str:
+    registry = {
+        int(entry["source_identity_id"]): entry["source"]
+        for entry in row[enriched.SOURCE_IDENTITY_REGISTRY_COLUMN]
+    }
+    paths: set[str] = set()
+    for raw_identity in row[enriched.TOKEN_SOURCE_IDENTITY_IDS_COLUMN][
+        token_start:token_end
+    ]:
+        identity = int(raw_identity)
+        if identity <= 0:
+            continue
+        source = registry.get(identity)
+        if not isinstance(source, str):
+            raise ValueError(f"missing source identity registry entry {identity}")
+        try:
+            provenance = json.loads(source)
+        except json.JSONDecodeError as exc:
+            raise ValueError("source identity provenance is not canonical JSON") from exc
+        if not isinstance(provenance, dict):
+            continue
+        path = provenance.get("filepath") or provenance.get("source_path")
+        if isinstance(path, str) and path:
+            paths.add(path)
+    if len(paths) > 1:
+        raise ValueError(f"shell document has ambiguous source paths: {sorted(paths)}")
+    return next(iter(paths), "")
+
+
+def _source_doc_route(
+    row: dict[str, Any],
+    *,
+    build_kind: object,
+    doc_type: object,
+    token_start: int,
+    token_end: int,
+) -> str:
+    if build_kind is None:
+        return "primary" if doc_type in {"code", "code_header"} else EXCLUDED_ROUTE
+    kind = str(build_kind).casefold()
+    if kind == PYTHON_BUILD_KIND:
+        return "aux_python"
+    if kind == "sql" or kind.startswith("sql:") or kind in _PRIMARY_BUILD_KINDS:
+        return "primary"
+    if kind in _SHELL_BUILD_KINDS and is_native_workflow_shell_path(
+        _source_path_for_doc(
+            row,
+            token_start=token_start,
+            token_end=token_end,
+        )
+    ):
+        return "primary"
+    return EXCLUDED_ROUTE
+
+
 def route_packed_row(
     raw_row: dict[str, Any],
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
-    """Return primary, auxiliary-Python, and mixed-row flag for one packed row."""
+) -> tuple[
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    bool,
+]:
+    """Return primary, Python, excluded, and mixed-row flag for one packed row."""
 
     row = _upgrade_legacy_row(raw_row)
     kinds = [
@@ -519,16 +613,34 @@ def route_packed_row(
             num_docs=int(row[packed.NUM_DOCS_COLUMN]),
         )
     ]
-    python_docs = [value == PYTHON_BUILD_KIND for value in kinds]
-    if all(python_docs):
-        return None, row, False
-    if not any(python_docs):
-        return row, None, False
-
+    doc_types = _aligned_values(
+        row,
+        packed.SOURCE_DOC_TYPES_COLUMN,
+        num_docs=int(row[packed.NUM_DOCS_COLUMN]),
+    )
     lengths = [int(value) for value in row[packer.SOURCE_DOC_TOKEN_LENGTHS_COLUMN]]
     offsets = [0]
     for length in lengths:
         offsets.append(offsets[-1] + length)
+    routes = [
+        _source_doc_route(
+            row,
+            build_kind=kind,
+            doc_type=doc_types[index],
+            token_start=offsets[index],
+            token_end=offsets[index + 1],
+        )
+        for index, kind in enumerate(kinds)
+    ]
+    if len(set(routes)) == 1:
+        only_route = routes[0]
+        return (
+            row if only_route == "primary" else None,
+            row if only_route == "aux_python" else None,
+            row if only_route == EXCLUDED_ROUTE else None,
+            False,
+        )
+
     docs = [
         _extract_document(
             row,
@@ -538,27 +650,28 @@ def route_packed_row(
         )
         for index in range(len(lengths))
     ]
-    primary_indices = [
-        index for index, is_python in enumerate(python_docs) if not is_python
-    ]
-    aux_indices = [index for index, is_python in enumerate(python_docs) if is_python]
     capacity = len(row[packed.INPUT_IDS_COLUMN])
     pad_token_id = int(row[packed.TARGET_IDS_COLUMN][-1])
-    primary = packer._materialize_packed_row(
-        _chain_documents([docs[index] for index in primary_indices]),
-        target_length=capacity,
-        pad_token_id=pad_token_id,
-        pack_id=int(row[packed.PACK_ID_COLUMN]),
+    routed: dict[str, dict[str, Any] | None] = {}
+    for route in ROUTES:
+        indices = [index for index, value in enumerate(routes) if value == route]
+        if not indices:
+            routed[route] = None
+            continue
+        routed_row = packer._materialize_packed_row(
+            _chain_documents([docs[index] for index in indices]),
+            target_length=capacity,
+            pad_token_id=pad_token_id,
+            pack_id=int(row[packed.PACK_ID_COLUMN]),
+        )
+        _assert_routed_content(row, routed_row, doc_indices=indices)
+        routed[route] = routed_row
+    return (
+        routed["primary"],
+        routed["aux_python"],
+        routed[EXCLUDED_ROUTE],
+        True,
     )
-    auxiliary = packer._materialize_packed_row(
-        _chain_documents([docs[index] for index in aux_indices]),
-        target_length=capacity,
-        pad_token_id=pad_token_id,
-        pack_id=int(row[packed.PACK_ID_COLUMN]),
-    )
-    _assert_routed_content(row, primary, doc_indices=primary_indices)
-    _assert_routed_content(row, auxiliary, doc_indices=aux_indices)
-    return primary, auxiliary, True
 
 
 def _empty_counts() -> dict[str, int]:
@@ -583,14 +696,17 @@ def _assert_conservation(
     source: dict[str, int],
     primary: dict[str, int],
     auxiliary: dict[str, int],
+    excluded: dict[str, int],
     *,
     where: Path,
 ) -> None:
     for key in ("valid_tokens", "trained_tokens", "documents"):
-        if source[key] != primary[key] + auxiliary[key]:
+        routed = primary[key] + auxiliary[key] + excluded[key]
+        if source[key] != routed:
             raise ValueError(
                 f"{where}: {key} is not conserved: source={source[key]} "
-                f"primary={primary[key]} aux_python={auxiliary[key]}"
+                f"primary={primary[key]} aux_python={auxiliary[key]} "
+                f"{EXCLUDED_ROUTE}={excluded[key]}"
             )
 
 
@@ -660,8 +776,10 @@ def route_file(
     input_root = Path(input_root_str)
     output_root = Path(output_root_str)
     relative = input_path.relative_to(input_root)
-    primary_path = output_root / "primary" / relative
-    auxiliary_path = output_root / "aux_python" / relative
+    route_paths = {
+        route: output_root / route / relative
+        for route in ROUTES
+    }
     marker = output_root / "state" / relative.with_suffix(".route.json")
     if marker.exists():
         if not resume:
@@ -676,45 +794,37 @@ def route_file(
     batch_size = max(1, 131_072 // bucket)
     counts = {
         "source": _empty_counts(),
-        "primary": _empty_counts(),
-        "aux_python": _empty_counts(),
+        **{route: _empty_counts() for route in ROUTES},
     }
     mixed_rows = 0
     with ExitStack() as stack:
-        primary_stage = stack.enter_context(atomic_output_file(primary_path))
-        auxiliary_stage = stack.enter_context(atomic_output_file(auxiliary_path))
         writers = {
-            "primary": pq.ParquetWriter(
-                primary_stage,
+            route: pq.ParquetWriter(
+                stack.enter_context(atomic_output_file(route_paths[route])),
                 packer.PACKED_ROW_OUTPUT_SCHEMA,
                 compression="zstd",
                 compression_level=compression_level,
                 use_dictionary=True,
-            ),
-            "aux_python": pq.ParquetWriter(
-                auxiliary_stage,
-                packer.PACKED_ROW_OUTPUT_SCHEMA,
-                compression="zstd",
-                compression_level=compression_level,
-                use_dictionary=True,
-            ),
+            )
+            for route in ROUTES
         }
         try:
             for batch in parquet.iter_batches(batch_size=batch_size):
                 routed_rows: dict[str, list[dict[str, Any]]] = {
-                    "primary": [],
-                    "aux_python": [],
+                    route: [] for route in ROUTES
                 }
                 for raw_row in batch.to_pylist():
                     _add_row(counts["source"], raw_row)
-                    primary, auxiliary, mixed = route_packed_row(raw_row)
+                    primary, auxiliary, excluded, mixed = route_packed_row(raw_row)
                     mixed_rows += int(mixed)
-                    if primary is not None:
-                        _add_row(counts["primary"], primary)
-                        routed_rows["primary"].append(primary)
-                    if auxiliary is not None:
-                        _add_row(counts["aux_python"], auxiliary)
-                        routed_rows["aux_python"].append(auxiliary)
+                    for route, routed_row in zip(
+                        ROUTES,
+                        (primary, auxiliary, excluded),
+                        strict=True,
+                    ):
+                        if routed_row is not None:
+                            _add_row(counts[route], routed_row)
+                            routed_rows[route].append(routed_row)
                 for route, rows in routed_rows.items():
                     if rows:
                         writers[route].write_table(
@@ -731,6 +841,7 @@ def route_file(
         counts["source"],
         counts["primary"],
         counts["aux_python"],
+        counts[EXCLUDED_ROUTE],
         where=input_path,
     )
     receipt = {
@@ -744,12 +855,10 @@ def route_file(
             **counts["source"],
         },
         "routes": {
-            "primary": _artifact(
-                primary_path, counts["primary"], output_root=output_root
-            ),
-            "aux_python": _artifact(
-                auxiliary_path, counts["aux_python"], output_root=output_root
-            ),
+            route: _artifact(
+                route_paths[route], counts[route], output_root=output_root
+            )
+            for route in ROUTES
         },
         "mixed_rows_split": mixed_rows,
         "implementation": _implementation(),
@@ -921,6 +1030,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         totals["source"],
         totals["primary"],
         totals["aux_python"],
+        totals[EXCLUDED_ROUTE],
         where=input_root,
     )
     global_receipt = {
@@ -935,8 +1045,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         },
         "output_root": str(output_root),
         "routing": {
-            "primary": "source_build_kinds != 'python'",
+            "primary": (
+                "C/C++/SQL/native build diagnostics plus native-workflow "
+                "path-bound shell"
+            ),
             "aux_python": "source_build_kinds == 'python'",
+            EXCLUDED_ROUTE: "annotated but outside the primary training scope",
             "mixed_rows": sum(int(receipt["mixed_rows_split"]) for receipt in receipts),
             "legacy_schema_upgrade": {
                 "added_column": packed.SOURCE_COMMIT_HASHES_COLUMN,

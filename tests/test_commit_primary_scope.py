@@ -58,6 +58,8 @@ def test_commit_scope_routes_only_primary_native_domains() -> None:
     assert classify_primary_commit_path("tools/helper.py") is None
     assert classify_primary_commit_path("web/build.js") is None
     assert classify_primary_commit_path("README.md") is None
+    assert classify_primary_commit_path("scripts/backup.sh") is None
+    assert classify_primary_commit_path("tools/release.ps1") is None
 
 
 def test_extractor_membership_uses_primary_native_scope(tmp_path: Path) -> None:

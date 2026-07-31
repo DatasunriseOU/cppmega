@@ -32,12 +32,14 @@ def _doc(
     tokens: list[int],
     build_kind: str | None,
     symbol_key: str,
+    filepath: str | None = None,
 ):
+    source_path = filepath or f"src/{source_doc_index}.cpp"
     symbol_id = compute_symbol_id(symbol_key)
     identity = source_identity(
         {
             "repo": "owner/repo",
-            "filepath": f"src/{source_doc_index}.cpp",
+            "filepath": source_path,
             "source_doc_id": source_doc_index + 100,
         }
     )
@@ -45,8 +47,8 @@ def _doc(
         {
             "token_ids": tokens,
             "repo": "owner/repo",
-            "filepath": f"src/{source_doc_index}.cpp",
-            "doc_type": "code",
+            "filepath": source_path,
+            "doc_type": "shell" if build_kind == "sh" else "code",
             "build_kind": build_kind,
             "platform_ids": [7 + source_doc_index],
             "token_symbol_ids": [symbol_id] + [0] * (len(tokens) - 1),
@@ -88,8 +90,22 @@ def _mixed_row() -> dict:
             build_kind="cmake",
             symbol_key="symbol:cmake",
         ),
+        _doc(
+            source_doc_index=3,
+            tokens=[40, 41, 42, 43],
+            build_kind="sh",
+            symbol_key="symbol:build-shell",
+            filepath="scripts/build_native.sh",
+        ),
+        _doc(
+            source_doc_index=4,
+            tokens=[50, 51, 52, 53],
+            build_kind="sh",
+            symbol_key="symbol:generic-shell",
+            filepath="scripts/release.sh",
+        ),
     ]
-    rows, overflow = pack_documents(docs, target_length=16, strategy="sequential")
+    rows, overflow = pack_documents(docs, target_length=24, strategy="sequential")
     assert overflow == []
     assert len(rows) == 1
     return rows[0]
@@ -121,11 +137,12 @@ def test_discovery_and_resume_bindings_are_canonical(tmp_path) -> None:
 
 def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None:
     source = _mixed_row()
-    primary, auxiliary, mixed = route_packed_row(source)
+    primary, auxiliary, excluded, mixed = route_packed_row(source)
     assert mixed is True
     assert primary is not None
     assert auxiliary is not None
-    assert primary[packed.INPUT_IDS_COLUMN][:8] == [
+    assert excluded is not None
+    assert primary[packed.INPUT_IDS_COLUMN][:12] == [
         10,
         11,
         12,
@@ -134,33 +151,47 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
         31,
         32,
         33,
+        40,
+        41,
+        42,
+        43,
     ]
     assert auxiliary[packed.INPUT_IDS_COLUMN][:4] == [20, 21, 22, 23]
-    assert primary[packed.SOURCE_BUILD_KINDS_COLUMN] == [None, "cmake"]
+    assert excluded[packed.INPUT_IDS_COLUMN][:4] == [50, 51, 52, 53]
+    assert primary[packed.SOURCE_BUILD_KINDS_COLUMN] == [None, "cmake", "sh"]
     assert auxiliary[packed.SOURCE_BUILD_KINDS_COLUMN] == ["python"]
-    assert primary[enriched.TOKEN_CHUNK_STARTS_COLUMN] == [0, 2, 4, 6]
+    assert excluded[packed.SOURCE_BUILD_KINDS_COLUMN] == ["sh"]
+    assert primary[enriched.TOKEN_CHUNK_STARTS_COLUMN] == [0, 2, 4, 6, 8, 10]
     assert primary[enriched.TOKEN_CALL_EDGES_COLUMN] == [
         {"from": 0, "to": 1},
         {"from": 2, "to": 3},
+        {"from": 4, "to": 5},
     ]
     assert primary[enriched.TOKEN_DOMAIN_EDGES_COLUMN] == [
         {"from": 0, "to": 3, "kind": 1},
         {"from": 4, "to": 7, "kind": 1},
+        {"from": 8, "to": 11, "kind": 1},
     ]
-    assert [item["symbol_id"] for item in primary["symbol_identities"]] == [
-        compute_symbol_id("symbol:cpp"),
-        compute_symbol_id("symbol:cmake"),
-    ]
+    assert [item["symbol_id"] for item in primary["symbol_identities"]] == sorted(
+        [
+            compute_symbol_id("symbol:cpp"),
+            compute_symbol_id("symbol:cmake"),
+            compute_symbol_id("symbol:build-shell"),
+        ]
+    )
     assert [item["symbol_id"] for item in auxiliary["symbol_identities"]] == [
         compute_symbol_id("symbol:python")
     ]
     assert (
         primary[packed.VALID_TOKEN_COUNT_COLUMN]
         + auxiliary[packed.VALID_TOKEN_COUNT_COLUMN]
+        + excluded[packed.VALID_TOKEN_COUNT_COLUMN]
         == source[packed.VALID_TOKEN_COUNT_COLUMN]
     )
     assert (
-        primary["trained_token_count"] + auxiliary["trained_token_count"]
+        primary["trained_token_count"]
+        + auxiliary["trained_token_count"]
+        + excluded["trained_token_count"]
         == source["trained_token_count"]
     )
 
@@ -178,14 +209,15 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
     )
     assert receipt["unresolved_count"] == 0
     assert receipt["mixed_rows_split"] == 1
-    assert receipt["routes"]["primary"]["valid_tokens"] == 8
+    assert receipt["routes"]["primary"]["valid_tokens"] == 12
     assert receipt["routes"]["aux_python"]["valid_tokens"] == 4
+    assert receipt["routes"]["excluded_non_primary"]["valid_tokens"] == 4
     assert {
         pq.ParquetFile(output_root / route / "16" / "fixture.parquet")
         .metadata.row_group(0)
         .column(0)
         .compression
-        for route in ("primary", "aux_python")
+        for route in ("primary", "aux_python", "excluded_non_primary")
     } == {"ZSTD"}
 
     marker = output_root / "state" / "16" / "fixture.route.json"
@@ -289,6 +321,9 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
         == 0
     )
     global_receipt = json.loads((cli_output / "route.receipt.json").read_text())
-    assert global_receipt["totals"]["source"]["valid_tokens"] == 12
-    assert global_receipt["totals"]["primary"]["valid_tokens"] == 8
+    assert global_receipt["totals"]["source"]["valid_tokens"] == 20
+    assert global_receipt["totals"]["primary"]["valid_tokens"] == 12
     assert global_receipt["totals"]["aux_python"]["valid_tokens"] == 4
+    assert (
+        global_receipt["totals"]["excluded_non_primary"]["valid_tokens"] == 4
+    )
