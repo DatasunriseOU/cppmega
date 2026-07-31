@@ -453,6 +453,22 @@ def _canonical_summary(connection: sqlite3.Connection) -> tuple[dict[str, object
             ).encode("utf-8")
         )
     sidecar_set_sha256 = sidecar_digest.hexdigest()
+    binding_upgrades = [
+        {
+            "binding_key": str(row["binding_key"]),
+            "from_sha256": str(row["from_sha256"]),
+            "to_sha256": str(row["to_sha256"]),
+            "reason": str(row["reason"]),
+            "upgraded_at": str(row["upgraded_at"]),
+        }
+        for row in connection.execute(
+            """
+            SELECT binding_key,from_sha256,to_sha256,reason,upgraded_at
+            FROM binding_upgrades
+            ORDER BY id
+            """
+        )
+    ]
     return (
         {
             "attempt_statuses": statuses,
@@ -464,6 +480,7 @@ def _canonical_summary(connection: sqlite3.Connection) -> tuple[dict[str, object
                 connection.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0]
             ),
             "sidecar_set_sha256": sidecar_set_sha256,
+            "binding_upgrades": binding_upgrades,
         },
         sidecar_set_sha256,
     )

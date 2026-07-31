@@ -1075,6 +1075,8 @@ def _downgrade_fetch_state_to_legacy_v3(
         connection.close()
     stat_result = state_path.stat()
     binding = receipt["frozen_fetch_state"]
+    receipt["fetch_state"].pop("binding_upgrades", None)
+    binding["summary"].pop("binding_upgrades", None)
     binding["schema"] = LEGACY_FETCH_STATE_SCHEMA
     binding["artifact"].update(
         {

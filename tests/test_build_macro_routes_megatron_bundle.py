@@ -25,6 +25,10 @@ from cppmega.data.pr_primary_membership import (
     publish_primary_pr_membership_inputs,
 )
 from cppmega.data.source_conveyor_composition import SourceComposition
+from scripts.ci_source_binding_projection import (
+    REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+    REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
+)
 import scripts.data.build_macro_routes_megatron_bundle as builder
 from scripts.canonical_parquet_ledger import CanonicalParquetLedgerWriter
 from scripts.data.build_macro_routes_megatron_bundle import (
@@ -866,6 +870,79 @@ def test_content_store_export_allowlist_binds_all_split_shards(
     assert metadata["source_completion"][
         "cas_reserve_exact_unique_payload_tokens"
     ] == 200_000_000
+
+
+def test_content_store_export_accepts_only_reviewed_primary_equivalent_transition(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    current = builder.target_parser_script_sha256()
+    upgrade = {
+        "binding_key": "parser_script_sha256",
+        "from_sha256": REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+        "to_sha256": current,
+        "reason": REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
+        "upgraded_at": "2026-07-30T13:38:03Z",
+    }
+    manifest["input_fetch_state"]["summary"] = {
+        "binding_upgrades": [upgrade]
+    }
+    manifest["parser_generation_policy"] = {
+        "mode": "reviewed-primary-equivalent-transition",
+        "expected_current_parser_script_sha256": current,
+        "observed_parser_lineage": [
+            REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+            current,
+        ],
+        "current_singleton": False,
+    }
+    manifest["source_binding_projection"].update(
+        {
+            "mode": "mixed_lineage_projection",
+            "parser_lineage": [
+                REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+                current,
+            ],
+            "selection_policy": (
+                "stored-binding-semantics-current-first-v1"
+            ),
+            "selection_counts": {},
+        }
+    )
+    manifest["source_binding_projection"]["coverage"][
+        "source_input_count"
+    ] = 0
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    allowed, _metadata = _load_ci_manifest_allowlist(
+        manifest_path,
+        ci_root,
+        builder.DEFAULT_BUCKETS,
+        cppmega_mlx_commit="unused",
+        cppmega_mlx_tree_sha256="unused",
+    )
+    assert set(allowed) == {
+        ("ci", bucket) for bucket in builder.DEFAULT_BUCKETS
+    }
+
+    upgrade["reason"] = "unreviewed parser transition"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="parser generation is not reviewed"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
 
 
 def test_content_store_export_rejects_legacy_fetch_state_schema(

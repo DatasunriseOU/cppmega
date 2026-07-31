@@ -123,6 +123,7 @@ from scripts.ci_source_binding_projection import (  # noqa: E402
     SourceBindingProjectionError,
     SourceBindingProjector,
     SourceBindingProjectionRouter,
+    is_reviewed_primary_equivalent_parser_transition,
     projection_record_key,
     projection_script_sha256,
     target_parser_script_sha256,
@@ -2085,6 +2086,22 @@ class FrozenFetchState:
             )
         self.sidecar_set_sha256 = sidecar_digest.hexdigest()
         self.sqlite_logical_sha256 = _fetch_state_logical_digest(self.connection)
+        binding_upgrades = [
+            {
+                "binding_key": str(row["binding_key"]),
+                "from_sha256": str(row["from_sha256"]),
+                "to_sha256": str(row["to_sha256"]),
+                "reason": str(row["reason"]),
+                "upgraded_at": str(row["upgraded_at"]),
+            }
+            for row in self.connection.execute(
+                """
+                SELECT binding_key,from_sha256,to_sha256,reason,upgraded_at
+                FROM binding_upgrades
+                ORDER BY id
+                """
+            )
+        ]
         self.summary = {
             "attempt_statuses": dict(sorted(status_counts.items())),
             "attempts_terminal": int(totals["attempts"]),
@@ -2097,6 +2114,7 @@ class FrozenFetchState:
                 ).fetchone()[0]
             ),
             "sidecar_set_sha256": self.sidecar_set_sha256,
+            "binding_upgrades": binding_upgrades,
         }
 
     def _load_attempt(
@@ -4738,10 +4756,6 @@ def export_store(
         raise ExportError(
             f"unsupported completion mode: {completion_mode!r}"
         )
-    if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
-        # A production receipt must prove current-parser singleton input even
-        # when a caller omitted the redundant CLI hardening flag.
-        require_current_parser_only = True
     production_provenance: dict[str, object] | None = None
     production_paths: tuple[Path, Path, Path, Path] | None = None
     if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
@@ -4880,6 +4894,34 @@ def export_store(
                     f"generation {current_parser_sha256}; observed lineage "
                     f"{list(parser_lineage)}"
                 )
+            reviewed_primary_equivalent_transition = (
+                is_reviewed_primary_equivalent_parser_transition(
+                    parser_lineage,
+                    frozen_fetch_state.summary["binding_upgrades"],
+                )
+            )
+            if (
+                completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                and parser_lineage != (current_parser_sha256,)
+                and not reviewed_primary_equivalent_transition
+            ):
+                raise ExportError(
+                    "production export requires current-parser singleton data "
+                    "or the exact reviewed primary-equivalent parser transition; "
+                    f"observed lineage {list(parser_lineage)}"
+                )
+            parser_generation_mode = (
+                "current-singleton-required"
+                if parser_lineage == (current_parser_sha256,)
+                and (
+                    require_current_parser_only
+                    or completion_mode
+                    == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                )
+                else "reviewed-primary-equivalent-transition"
+                if reviewed_primary_equivalent_transition
+                else "audited-lineage"
+            )
             source_binding_projector = SourceBindingProjectionRouter(
                 parser_lineage,
                 authorized_legacy_sha256=(
@@ -6160,11 +6202,7 @@ def export_store(
                 },
                 "input_fetch_state": frozen_fetch_state.receipt_binding(),
                 "parser_generation_policy": {
-                    "mode": (
-                        "current-singleton-required"
-                        if require_current_parser_only
-                        else "audited-lineage"
-                    ),
+                    "mode": parser_generation_mode,
                     "expected_current_parser_script_sha256": (
                         current_parser_sha256
                     ),

@@ -28,7 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts import ci_log_sidecars
+from scripts import ci_log_sidecars  # noqa: E402
 
 SOURCE_BINDING_PROJECTION_SCHEMA = "cppmega_ci_source_binding_projection_v1"
 SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN = (
@@ -37,6 +37,13 @@ SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN = (
 MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES = 4 * 1024 * 1024
 LEGACY_PARSER_SHA256 = (
     "c05ff198d9b2bd817d6baa45773f08268683ef8bdc9b191c220edf1b23e1331b"
+)
+REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256 = (
+    "e2d021137717be1011c332f63e59daf7c3d42cc293eade83d2835e3e05e14962"
+)
+REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON = (
+    "linear giant-line path and pytest-summary scans validated on "
+    "clickhouse/clickhouse run 24857659503 attempt 3"
 )
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -68,6 +75,57 @@ _RECORD_FIELDS = frozenset(
         "reason",
     }
 )
+
+
+def is_reviewed_primary_equivalent_parser_transition(
+    parser_lineage: Iterable[str],
+    binding_upgrades: Iterable[Mapping[str, object]],
+) -> bool:
+    """Recognize the one reviewed parser edge that preserves primary scope."""
+
+    current = target_parser_script_sha256()
+    fields = {
+        "binding_key",
+        "from_sha256",
+        "to_sha256",
+        "reason",
+        "upgraded_at",
+    }
+    records = tuple(binding_upgrades)
+    if any(
+        not isinstance(upgrade, Mapping)
+        or set(upgrade) != fields
+        or _HEX64_RE.fullmatch(str(upgrade.get("from_sha256"))) is None
+        or _HEX64_RE.fullmatch(str(upgrade.get("to_sha256"))) is None
+        or not isinstance(upgrade.get("reason"), str)
+        or not upgrade["reason"]
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            str(upgrade.get("upgraded_at")),
+        )
+        is None
+        for upgrade in records
+    ):
+        return False
+    upgrades = [
+        upgrade
+        for upgrade in records
+        if upgrade.get("binding_key") == "parser_script_sha256"
+    ]
+    if (
+        tuple(parser_lineage)
+        != (REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256, current)
+        or len(upgrades) != 1
+    ):
+        return False
+    upgrade = upgrades[0]
+    return (
+        upgrade.get("from_sha256")
+        == REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256
+        and upgrade.get("to_sha256") == current
+        and upgrade.get("reason")
+        == REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON
+    )
 _CHANGE_REASONS = {
     "unchanged": {
         "current_binding_verified",

@@ -73,6 +73,7 @@ from cppmega.data.ci_training_scope import (  # noqa: E402
     training_scope_policy,
 )
 from scripts.ci_source_binding_projection import (  # noqa: E402
+    is_reviewed_primary_equivalent_parser_transition,
     projection_script_sha256,
     target_parser_script_sha256,
 )
@@ -640,19 +641,45 @@ def _load_content_store_ci_export_allowlist(
         )
     current_parser_sha256 = target_parser_script_sha256()
     parser_generation = manifest.get("parser_generation_policy")
+    fetch_summary = input_fetch_state.get("summary")
+    observed_parser_lineage = (
+        parser_generation.get("observed_parser_lineage")
+        if isinstance(parser_generation, dict)
+        else None
+    )
+    binding_upgrades = (
+        fetch_summary.get("binding_upgrades")
+        if isinstance(fetch_summary, dict)
+        else None
+    )
+    current_singleton = (
+        isinstance(parser_generation, dict)
+        and parser_generation.get("mode") == "current-singleton-required"
+        and observed_parser_lineage == [current_parser_sha256]
+        and parser_generation.get("current_singleton") is True
+    )
+    reviewed_transition = (
+        isinstance(parser_generation, dict)
+        and parser_generation.get("mode")
+        == "reviewed-primary-equivalent-transition"
+        and isinstance(observed_parser_lineage, list)
+        and isinstance(binding_upgrades, list)
+        and parser_generation.get("current_singleton") is False
+        and is_reviewed_primary_equivalent_parser_transition(
+            observed_parser_lineage,
+            binding_upgrades,
+        )
+    )
     if (
         not isinstance(parser_generation, dict)
-        or parser_generation.get("mode") != "current-singleton-required"
         or parser_generation.get("expected_current_parser_script_sha256")
         != current_parser_sha256
-        or parser_generation.get("observed_parser_lineage")
-        != [current_parser_sha256]
-        or parser_generation.get("current_singleton") is not True
         or fetch_settings.get("parser_script_sha256")
         != current_parser_sha256
+        or not (current_singleton or reviewed_transition)
     ):
         raise RuntimeError(
-            f"{manifest_path}: CI export is not current-parser singleton data"
+            f"{manifest_path}: CI export parser generation is not reviewed"
         )
     production_provenance = (
         _require_content_store_export_completion_semantics(
@@ -722,8 +749,34 @@ def _load_content_store_ci_export_allowlist(
         or not isinstance(source_binding_projection, dict)
     ):
         raise RuntimeError(f"{manifest_path}: CI export accounting is incomplete")
+    projection_mode_valid = (
+        source_binding_projection.get("mode") == "current_audit"
+        if current_singleton
+        else (
+            source_binding_projection.get("mode")
+            == "mixed_lineage_projection"
+            and source_binding_projection.get("parser_lineage")
+            == observed_parser_lineage
+            and source_binding_projection.get("selection_policy")
+            == "stored-binding-semantics-current-first-v1"
+            and isinstance(
+                source_binding_projection.get("selection_counts"),
+                dict,
+            )
+            and set(source_binding_projection["selection_counts"])
+            <= {"current_audit"}
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                for value in source_binding_projection[
+                    "selection_counts"
+                ].values()
+            )
+        )
+    )
     if (
-        source_binding_projection.get("mode") != "current_audit"
+        not projection_mode_valid
         or source_binding_projection.get("projection_script_sha256")
         != projection_script_sha256()
         or source_binding_projection.get("input_parser_script_sha256")
@@ -732,7 +785,7 @@ def _load_content_store_ci_export_allowlist(
         != current_parser_sha256
     ):
         raise RuntimeError(
-            f"{manifest_path}: CI source-binding projection is not current-audit"
+            f"{manifest_path}: CI source-binding projection is not reviewed"
         )
 
     def positive_int(value: object, *, where: str) -> int:
@@ -768,6 +821,21 @@ def _load_content_store_ci_export_allowlist(
         ),
         where="source-binding projection occurrence count",
     )
+    if reviewed_transition:
+        selection_counts = source_binding_projection["selection_counts"]
+        source_input_count = nonnegative_int(
+            (
+                projection_coverage.get("source_input_count")
+                if isinstance(projection_coverage, dict)
+                else None
+            ),
+            where="source-binding projection source input count",
+        )
+        if sum(selection_counts.values()) != source_input_count:
+            raise RuntimeError(
+                f"{manifest_path}: CI source-binding projection selection "
+                "coverage drifted"
+            )
     if (
         occurrence_metadata.get("schema")
         != "cppmega_ci_case5_occurrence_metadata_v1"
