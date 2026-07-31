@@ -100,7 +100,7 @@ jobs:
             # this wheel build. GB10-specific sm_120f/121 fixes must live as
             # local patches in this repo if we re-enable that path.
             repo: Dao-AILab/flash-attention
-            ref: main
+            ref: c75d019dea9d910312974417bc28f190dfdda6d9
             submodules: "false"
             patch: upstream_prs/flash_attn_setup_sm120f.patch
             arch_override: "12.1"
@@ -126,7 +126,7 @@ jobs:
             # prevents the sm80 instantiation entirely, and PackGQA collapses to
             # false everywhere for arch=90.
             repo: Dao-AILab/flash-attention
-            ref: main
+            ref: c75d019dea9d910312974417bc28f190dfdda6d9
             submodules: "false"
             subdir: hopper
             arch_override: "9.0"
@@ -153,12 +153,12 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: causal_conv1d
             repo: Dao-AILab/causal-conv1d
-            ref: v1.6.1
+            ref: c51519fb10d92ffa257c1982e1831d3243454b2f
             submodules: "false"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: fast_hadamard_transform
             repo: Dao-AILab/fast-hadamard-transform
-            ref: master
+            ref: e7706faf8d1c3b9f241e36860640ad1dac644ede
             submodules: "false"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
@@ -186,7 +186,7 @@ jobs:
             extra_env: ""
           - name: qoptim_cuda
             repo: NVlabs/COAT
-            ref: main
+            ref: 80ec99f47aaa09231b07ace1fd04c30a1e30ec18
             submodules: "false"
             subdir: coat/optimizer/kernels
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
@@ -708,6 +708,12 @@ jobs:
             fi
           done
 
+      - name: Write wheel checksums
+        run: |
+          set -euo pipefail
+          (cd wheels && sha256sum *.whl > SHA256SUMS)
+          (cd wheels && sha256sum -c SHA256SUMS)
+
       - name: Create / update Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -718,4 +724,4 @@ jobs:
               --title "cppmega wheels ${{ needs.resolve.outputs.tag }}" \
               --notes "Auto-built by build-wheels.yml from commit ${{ github.sha }}." \
               --prerelease
-          gh release upload "$TAG" wheels/*.whl --clobber
+          gh release upload "$TAG" wheels/*.whl wheels/SHA256SUMS --clobber

@@ -2,7 +2,7 @@
 # Bump a pin → CI rebuilds only the affected wheel(s) thanks to ccache + buildx cache.
 
 base:
-  cuda_image: nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
+  cuda_image: nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04@sha256:6435dc5a825b0095648d87a3c91240fd7788a85fafaf215739544d389ab74366
   python: "3.13"
   gcc: "15"           # via ppa:ubuntu-toolchain-r/test; needs nvcc --allow-unsupported-compiler
   # CUDA extension wheels must be built and consumed with the same exact
@@ -32,7 +32,7 @@ wheels:
     # Keep flash_attn.cute excluded: FA4 is installed separately from PyPI as
     # flash-attn-4 with its own CUTLASS/quack dependency contract.
     repo: Dao-AILab/flash-attention
-    ref: main
+    ref: c75d019dea9d910312974417bc28f190dfdda6d9
     patch: upstream_prs/flash_attn_setup_sm120f.patch
     version: 2.x.x
     build: |
@@ -47,7 +47,7 @@ wheels:
     # so it co-installs with flash_attn (FA2/FA4) without conflict. For H100/H200
     # on Modal — useless for B200/GB10 but ships for code parity.
     repo: Dao-AILab/flash-attention
-    ref: main
+    ref: c75d019dea9d910312974417bc28f190dfdda6d9
     version: 3.x
     subdir: hopper
     build: |
@@ -68,7 +68,7 @@ wheels:
 
   causal_conv1d:
     repo: Dao-AILab/causal-conv1d
-    ref: v1.6.1
+    ref: c51519fb10d92ffa257c1982e1831d3243454b2f
     version: 1.6.1
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
@@ -78,7 +78,7 @@ wheels:
 
   fast_hadamard_transform:
     repo: Dao-AILab/fast-hadamard-transform
-    ref: master
+    ref: e7706faf8d1c3b9f241e36860640ad1dac644ede
     version: 1.1.0
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
@@ -127,7 +127,7 @@ wheels:
 
   qoptim_cuda:
     repo: NVlabs/COAT
-    ref: main
+    ref: 80ec99f47aaa09231b07ace1fd04c30a1e30ec18
     version: 0.0.0
     subdir: coat/optimizer/kernels
     build: |
@@ -158,7 +158,7 @@ runtime_pypi:
 sources:
   megatron_lm:
     repo: NVIDIA/Megatron-LM
-    ref: core_v0.18.0
+    ref: ba7b5ebce12af60627a80985792a1449ce45f46c
     install_path: /opt/megatron-lm
     install_mode: editable    # `pip install -e .`
     recovered_patches:

@@ -76,7 +76,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p wheels
-          gh release download "${{ steps.rel.outputs.tag }}" --dir wheels --pattern '*.whl'
+          gh release download "${{ steps.rel.outputs.tag }}" --dir wheels \
+            --pattern '*.whl' --pattern SHA256SUMS
+          (cd wheels && sha256sum -c SHA256SUMS)
           ls -lh wheels/
 
       - name: Verify required wheels

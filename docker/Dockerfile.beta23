@@ -22,7 +22,7 @@
 #   --cache-from=type=registry,ref=ghcr.io/datasunriseou/cppmega:buildcache
 #   --cache-to=type=registry,ref=ghcr.io/datasunriseou/cppmega:buildcache,mode=max
 
-ARG CUDA_IMAGE=nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
+ARG CUDA_IMAGE=nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04@sha256:6435dc5a825b0095648d87a3c91240fd7788a85fafaf215739544d389ab74366
 FROM ${CUDA_IMAGE} AS runtime
 
 LABEL org.opencontainers.image.version="beta23"
@@ -88,9 +88,13 @@ RUN python -m pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
 # --- megatron-lm with cppmega patches (editable so runtime patches resolve) -
 ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
-ARG MEGATRON_REF=core_v0.18.0
+ARG MEGATRON_REF=ba7b5ebce12af60627a80985792a1449ce45f46c
 RUN set -eu; \
-    git clone --depth=1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megatron-lm; \
+    git init /opt/megatron-lm; \
+    git -C /opt/megatron-lm remote add origin "${MEGATRON_REPO}"; \
+    git -C /opt/megatron-lm fetch --depth=1 origin "${MEGATRON_REF}"; \
+    git -C /opt/megatron-lm checkout --detach FETCH_HEAD; \
+    test "$(git -C /opt/megatron-lm rev-parse HEAD)" = "${MEGATRON_REF}"; \
     cd /opt/megatron-lm; \
     python -m pip install -e . --no-build-isolation --no-deps
 

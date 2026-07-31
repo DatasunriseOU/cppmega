@@ -270,6 +270,44 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
     assert "git checkout ${{ matrix.ref }}" not in workflow
 
 
+def test_wheel_and_image_sources_are_content_addressed() -> None:
+    stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
+    wheel_workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+    image_workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-image.yml"
+    ).read_text(encoding="utf-8")
+    dockerfiles = [
+        (REPO_ROOT / name).read_text(encoding="utf-8")
+        for name in ("docker/Dockerfile", "docker/Dockerfile.beta23")
+    ]
+
+    stack_refs = re.findall(r"^    ref: (\S+)$", stack, re.MULTILINE)
+    wheel_refs = re.findall(
+        r"^            ref: (\S+)$", wheel_workflow, re.MULTILINE
+    )
+    assert len(stack_refs) == 10
+    assert len(wheel_refs) == 8
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in stack_refs)
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in wheel_refs)
+    assert "sha256sum *.whl > SHA256SUMS" in wheel_workflow
+    assert "wheels/SHA256SUMS --clobber" in wheel_workflow
+    assert "--pattern SHA256SUMS" in image_workflow
+    assert "sha256sum -c SHA256SUMS" in image_workflow
+    for dockerfile in dockerfiles:
+        assert (
+            "nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04"
+            "@sha256:6435dc5a825b0095648d87a3c91240fd7788a85fafaf215739544d389ab74366"
+        ) in dockerfile
+        assert (
+            "ARG MEGATRON_REF=ba7b5ebce12af60627a80985792a1449ce45f46c"
+            in dockerfile
+        )
+        assert 'git -C /opt/megatron-lm checkout --detach FETCH_HEAD' in dockerfile
+        assert 'rev-parse HEAD)" = "${MEGATRON_REF}"' in dockerfile
+
+
 def test_image_build_binds_triggering_source_and_wheel_release() -> None:
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-image.yml"
