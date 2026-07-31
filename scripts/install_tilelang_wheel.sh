@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@b2f15f79 into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@ecbe82ac into the active
 # (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
 # Fallback:     clone DatasunriseOU/tilelang at the exact pinned commit.
 #
 # This fork commit carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix,
-# via vendored TVM DatasunriseOU/tvm@0ce49f82), restores the nvbench CUDA
+# via vendored TVM DatasunriseOU/tvm@dd4ccab5), restores the nvbench CUDA
 # L2-cache-flush header, and removes the apache-tvm-ffi<0.1.10 cap (upstream
 # PR #2071), so it imports cleanly under tvm-ffi >=0.1.12 as required by FA4
 # beta23. Its lazy driver stub also exports cuFuncGetAttribute required by the

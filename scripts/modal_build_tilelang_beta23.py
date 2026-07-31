@@ -146,6 +146,8 @@ def build_tilelang_wheel():
         "'flash-attn-4[cu13]==4.0.0b23'"
     )
     run(f"pip install --force-reinstall --no-deps {ffi_wheel_path} {wheel_path}")
+    run(f"pip install {wheel_path}")
+    run("pip check")
 
     # --- 6. Verify imports ---
     verify_code = """
