@@ -117,13 +117,7 @@ def cppmega_base_image() -> modal.Image:
         p = wheels_path / whl
         img = img.add_local_file(str(p), f"/wheels/{whl}", copy=True)
     img = img.run_commands(
-        # Ensure libz3.so.4.15 symlink exists even if z3-solver ships a
-        # slightly different minor version.
-        "Z3LIB=/usr/local/lib/python3.13/site-packages/z3/lib && "
-        "ls $Z3LIB && "
-        "if [ ! -f $Z3LIB/libz3.so.4.15 ]; then "
-        "  ln -sf $Z3LIB/libz3.so $Z3LIB/libz3.so.4.15; fi && "
-        "ls $Z3LIB/libz3*",
+        "test -f /usr/local/lib/python3.13/site-packages/z3/lib/libz3.so.4.15",
     ).run_commands(
         # Install all local wheels with --no-deps (torch/TE already installed).
         "pip install --no-deps /wheels/*.whl && "

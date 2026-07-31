@@ -48,6 +48,12 @@ def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
         source = _read(path)
         assert version_check in source, path
         assert "flash_attn.__version__" not in source, path
+        if path != "scripts/modal_build_tilelang_beta23.py":
+            assert (
+                "test -f /usr/local/lib/python3.13/site-packages/z3/lib/"
+                "libz3.so.4.15"
+            ) in source
+            assert "ln -sf" not in source
     for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
         dockerfile = _read(path)
         assert "apache-tvm-ffi==0.1.13" in dockerfile, path

@@ -126,9 +126,7 @@ def cppmega_base_image() -> modal.Image:
         if p.exists():
             img = img.add_local_file(str(p), f"/wheels/{whl}", copy=True)
     img = img.run_commands(
-        "Z3LIB=/usr/local/lib/python3.13/site-packages/z3/lib && "
-        "if [ ! -f $Z3LIB/libz3.so.4.15 ]; then "
-        "  ln -sf $Z3LIB/libz3.so $Z3LIB/libz3.so.4.15; fi && ls $Z3LIB/libz3*",
+        "test -f /usr/local/lib/python3.13/site-packages/z3/lib/libz3.so.4.15",
     ).run_commands(
         "pip install --no-deps /wheels/*.whl && "
         "python -c 'import transformer_engine.pytorch as te; print(\"TE Linear ok:\", te.Linear)' && "
