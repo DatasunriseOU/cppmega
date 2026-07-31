@@ -7,7 +7,7 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
-  - tilelang 0.1.9 from DatasunriseOU/tilelang@fbf423cd (local abi3 wheel;
+  - tilelang 0.1.9 from DatasunriseOU/tilelang@334266af (local abi3 wheel;
     carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
     the apache-tvm-ffi<0.1.10 cap)
   - qoptim_cuda 0.0.0 (local wheel)
@@ -81,7 +81,7 @@ def cppmega_base_image() -> modal.Image:
         # TE + wheel-pkg declared deps (must be present BEFORE installing
         # our --no-deps wheels, because mamba_ssm/TE import time needs them).
         .pip_install(
-            # Bootstrap FA4's dependency; the matching local post4 wheel
+            # Bootstrap FA4's dependency; the matching local post5 wheel
             # replaces it in the compressed wheel layer below.
             "apache-tvm-ffi==0.1.13",
             "transformer-engine-cu13==2.13.0",

@@ -163,7 +163,7 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - fbf423cd carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - 334266af carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
             #     and links TVM's CUDA driver calls, including cuFuncGetAttribute,
             #     to TileLang's lazy stub
             #   - vendored TVM submodule (DatasunriseOU/tvm@911772cf) includes
