@@ -5,18 +5,13 @@ name: build-wheels
 # persistent self-hosted Linux x86_64 runner.
 #
 # Each matrix entry caches its own ~/.ccache between runs, keyed on source
-# git commit. Wheels are uploaded as a single GH Release `wheels-${{ inputs.tag }}`.
+# git commit. Wheels are uploaded as `wheels-<full triggering commit SHA>`.
 #
 # Trigger manually after bumping STACK.lock; or on push to STACK.lock /
 # upstream_prs/*.patch.
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag suffix (default: short SHA of triggering commit)"
-        required: false
-        type: string
   push:
     branches: [main]
     paths:
@@ -54,12 +49,7 @@ jobs:
       tag: ${{ steps.t.outputs.tag }}
     steps:
       - id: t
-        run: |
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
-          fi
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
   build:
     if: github.repository == 'DatasunriseOU/cppmega'
@@ -721,7 +711,16 @@ jobs:
           TAG="wheels-${{ needs.resolve.outputs.tag }}"
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" \
+              --target "${{ github.sha }}" \
               --title "cppmega wheels ${{ needs.resolve.outputs.tag }}" \
               --notes "Auto-built by build-wheels.yml from commit ${{ github.sha }}." \
               --prerelease
+          read -r tag_type tag_sha < <(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \
+              --jq '.object.type + " " + .object.sha'
+          )
+          if [[ "$tag_type" != "commit" || "$tag_sha" != "${{ github.sha }}" ]]; then
+            echo "::error::wheel release tag $TAG is not bound to ${{ github.sha }}"
+            exit 1
+          fi
           gh release upload "$TAG" wheels/*.whl wheels/SHA256SUMS --clobber

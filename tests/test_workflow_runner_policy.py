@@ -296,8 +296,14 @@ def test_wheel_and_image_sources_are_content_addressed() -> None:
     )
     assert "sha256sum *.whl > SHA256SUMS" in wheel_workflow
     assert "wheels/SHA256SUMS --clobber" in wheel_workflow
+    assert 'echo "tag=${{ github.sha }}"' in wheel_workflow
+    assert '--target "${{ github.sha }}"' in wheel_workflow
+    assert '"$tag_sha" != "${{ github.sha }}"' in wheel_workflow
+    assert "inputs.tag" not in wheel_workflow
     assert "--pattern SHA256SUMS" in image_workflow
     assert "sha256sum -c SHA256SUMS" in image_workflow
+    assert "awk '{print $2}' SHA256SUMS" in image_workflow
+    assert "<(printf '%s\\n' *.whl" in image_workflow
     for dockerfile in dockerfiles:
         assert (
             "nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04"
@@ -317,7 +323,10 @@ def test_image_build_binds_triggering_source_and_wheel_release() -> None:
     ).read_text(encoding="utf-8")
 
     assert workflow.count("github.event.workflow_run.head_sha") == 2
-    assert 'TAG="wheels-${SOURCE_SHA:0:7}"' in workflow
+    assert 'TAG="wheels-${SOURCE_SHA}"' in workflow
+    assert "inputs.wheels_tag" not in workflow
+    assert "git/ref/tags/${TAG}" in workflow
+    assert '"$tag_sha" != "$SOURCE_SHA"' in workflow
     assert "type=raw,value=sha-${{ steps.rel.outputs.source_sha }}" in workflow
     assert "type=raw,value=${{ steps.rel.outputs.short_sha }}" in workflow
     assert "{{is_default_branch}}" not in workflow

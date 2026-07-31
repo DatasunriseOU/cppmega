@@ -6,11 +6,6 @@ name: build-image
 
 on:
   workflow_dispatch:
-    inputs:
-      wheels_tag:
-        description: "Wheel release tag (without 'wheels-' prefix). Empty = triggering commit."
-        required: false
-        type: string
   workflow_run:
     workflows: [build-wheels]
     types: [completed]
@@ -53,7 +48,6 @@ jobs:
         id: rel
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REQUESTED_WHEELS_TAG: ${{ inputs.wheels_tag }}
           SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
@@ -61,10 +55,14 @@ jobs:
             echo "Invalid source SHA: $SOURCE_SHA" >&2
             exit 1
           fi
-          if [[ -n "$REQUESTED_WHEELS_TAG" ]]; then
-            TAG="wheels-${REQUESTED_WHEELS_TAG}"
-          else
-            TAG="wheels-${SOURCE_SHA:0:7}"
+          TAG="wheels-${SOURCE_SHA}"
+          read -r tag_type tag_sha < <(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \
+              --jq '.object.type + " " + .object.sha'
+          )
+          if [[ "$tag_type" != "commit" || "$tag_sha" != "$SOURCE_SHA" ]]; then
+            echo "Wheel release tag $TAG is not bound to source $SOURCE_SHA" >&2
+            exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
@@ -75,10 +73,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p wheels
           gh release download "${{ steps.rel.outputs.tag }}" --dir wheels \
             --pattern '*.whl' --pattern SHA256SUMS
-          (cd wheels && sha256sum -c SHA256SUMS)
+          (
+            cd wheels
+            sha256sum -c SHA256SUMS
+            diff -u \
+              <(awk '{print $2}' SHA256SUMS | LC_ALL=C sort) \
+              <(printf '%s\n' *.whl | LC_ALL=C sort)
+          )
           ls -lh wheels/
 
       - name: Verify required wheels
