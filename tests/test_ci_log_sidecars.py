@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -20,6 +21,7 @@ from ci_log_sidecars import (  # noqa: E402
     SIDECAR_SCHEMA,
     TRAINING_SIDECAR_SCHEMA,
     _EntityBuilder,
+    _PATH_RE,
     _attach_chunk_semantic_rle,
     _attach_chunk_training_sidecars,
     _extract_tests,
@@ -134,6 +136,13 @@ def test_path_category_does_not_rescan_a_large_line_prefix() -> None:
         "OUTPUT",
     )
     assert line.unbounded_prefix_slices == 0
+
+
+def test_path_regex_stays_linear_on_long_progress_line() -> None:
+    started = time.monotonic()
+
+    assert list(_PATH_RE.finditer("." * 10_000)) == []
+    assert time.monotonic() - started < 0.5
 
 
 def test_chunk_sidecar_attachment_buckets_each_record_sequence_once() -> None:
