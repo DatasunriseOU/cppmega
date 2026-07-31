@@ -9499,7 +9499,7 @@ def emit_build_documents(
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
     with invalid text RAISES. NUL-bearing or malformed supported-encoding
     explicit domain inputs also raise before any chunk is emitted. UTF-8,
-    BOM-marked UTF-16, filename-declared legacy SQL encodings, and strict
+    BOM-marked UTF-16/32, filename-declared legacy SQL encodings, and strict
     Windows-1252 are decoded without replacement. Only zero-length inputs are
     skipped; whitespace is source content and remains losslessly represented.
     """
@@ -9579,6 +9579,8 @@ def emit_build_documents(
                     "invalid UTF-8 or Windows-1252 domain input",
                     "invalid UTF-16LE domain input",
                     "invalid UTF-16BE domain input",
+                    "invalid UTF-32LE domain input",
+                    "invalid UTF-32BE domain input",
                     "binary shell/domain input contains NUL byte",
                     "invalid UTF-8 shell/domain input",
                 )

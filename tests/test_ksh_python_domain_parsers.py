@@ -248,6 +248,46 @@ def test_utf16be_chunks_do_not_split_non_bmp_code_points(tmp_path: Path) -> None
         assert raw.decode("utf-16-be") == chunk.text
 
 
+@pytest.mark.parametrize(
+    ("codec", "bom"),
+    [
+        ("utf-32-le", b"\xff\xfe\0\0"),
+        ("utf-32-be", b"\0\0\xfe\xff"),
+    ],
+)
+def test_utf32_cmake_chunks_preserve_original_encoded_byte_spans(
+    tmp_path: Path,
+    codec: str,
+    bom: bytes,
+) -> None:
+    from cppmega.data.domain_ingestion import (
+        DiscoveredDomainFile,
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    text = "set(VALUE \"😀\")\n" * 12
+    encoded = bom + text.encode(codec)
+    path = tmp_path / "BOM-UTF-32.cmake"
+    path.write_bytes(encoded)
+
+    assert discover_project_domain_files(tmp_path) == [
+        DiscoveredDomainFile(
+            path=path,
+            domain=DomainKind.CMAKE,
+            adapter="cmake",
+        )
+    ]
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=40))
+    assert "".join(chunk.text for chunk in chunks) == text
+    assert {chunk.source_encoding for chunk in chunks} == {codec}
+    for chunk in chunks:
+        raw = encoded[chunk.byte_start : chunk.byte_end]
+        if chunk.index == 0:
+            raw = raw[len(bom) :]
+        assert raw.decode(codec) == chunk.text
+
+
 def test_windows_1252_sql_is_decoded_without_replacement(tmp_path: Path) -> None:
     from cppmega.data.domain_ingestion import iter_domain_file_chunks
 
