@@ -19,6 +19,7 @@ PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
 RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
+RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 
 
 def _xml_bytes() -> bytes:
@@ -63,6 +64,26 @@ def _certificate_pair_bytes() -> bytes:
         + _der(0x03, b"\x00\x01"),
     )
     return _der(0x30, _der(0xA1, certificate))
+
+
+def _mixed_utf8_utf16le_c_array_bytes(*, byte_count: int = 1024) -> bytes:
+    prefix = (
+        "/* Copyright (c) 2026 Eclipse ThreadX contributors */\n"
+        "/* SPDX-License-Identifier: MIT */\n\n"
+    ).encode()
+    byte_literals = ", ".join(
+        f"0x{value % 256:02X}" for value in range(byte_count)
+    )
+    generated = (
+        "/* \n\n"
+        "   Input ELF file: sample_threadx_module.axf\n\n"
+        "   Output C Array file: module_code.c\n\n"
+        "*/\n\n"
+        "__align(4096) unsigned char  module_code[] = {\n"
+        "/* Address  Contents */\n"
+        f"/* 0x00000000 */ {byte_literals}}};\n"
+    ).encode("utf-16le")
+    return prefix + generated
 
 
 def _write_manifest(
@@ -237,6 +258,52 @@ def test_exact_quarantine_filters_der_x509_certificate_pair(
     )
 
 
+def test_exact_quarantine_filters_mixed_utf16_generated_binary_blob(
+    tmp_path: Path,
+) -> None:
+    payload = _mixed_utf8_utf16le_c_array_bytes()
+    candidate = tmp_path / RELATIVE_GENERATED_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="generated_binary_blob",
+        detected_format="mixed_utf8_utf16le_c_array",
+        relative_path=RELATIVE_GENERATED_BLOB,
+        reason="generated binary blob fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["classification"] == "generated_binary_blob"
+
+
+def test_generated_binary_blob_quarantine_rejects_small_c_array(
+    tmp_path: Path,
+) -> None:
+    payload = _mixed_utf8_utf16le_c_array_bytes(byte_count=16)
+    candidate = tmp_path / RELATIVE_GENERATED_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="generated_binary_blob",
+        detected_format="mixed_utf8_utf16le_c_array",
+        relative_path=RELATIVE_GENERATED_BLOB,
+        reason="forged generated binary blob",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_certificate_pair_quarantine_rejects_non_certificate_der(
     tmp_path: Path,
 ) -> None:
@@ -305,6 +372,27 @@ def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> 
     )
     assert entry["classification"] == "mislabeled_non_cpp"
     assert entry["detected_format"] == "asn1_der_x509_certificate_pair"
+
+
+def test_checked_in_threadx_generated_blob_manifest_matches_upstream_receipt() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "eclipse-threadx/threadx"
+    )
+
+    assert entry["size_bytes"] == 61551
+    assert entry["sha256"] == (
+        "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294"
+    )
+    assert entry["classification"] == "generated_binary_blob"
+    assert entry["detected_format"] == "mixed_utf8_utf16le_c_array"
 
 
 def test_clang_crash_quarantine_requires_independent_fixture_signature(
