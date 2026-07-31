@@ -29,6 +29,20 @@ EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 EXPECTED_TVM_FFI_WHEEL = (
     "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
 )
+VERIFY_CODE = """
+from importlib import metadata
+import tilelang
+import flash_attn
+from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
+import tvm.ffi
+assert tilelang.__version__ == "0.1.9", tilelang.__version__
+assert metadata.version("apache-tvm-ffi") == "0.1.13.post5"
+assert flash_attn.__version__ == "4.0.0b23", flash_attn.__version__
+print(f"tilelang version: {tilelang.__version__}")
+print(f"flash_attn version: {flash_attn.__version__}")
+print(f"tvm.ffi version: {tvm.ffi.__version__}")
+print("COMPAT OK: tilelang + flash-attn-4 beta23 + tvm-ffi all import cleanly")
+"""
 
 PYTHON_VERSION = "3.13"
 CUDA_BASE = "nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04"
@@ -150,26 +164,51 @@ def build_tilelang_wheel():
     run("pip check")
 
     # --- 6. Verify imports ---
-    verify_code = """
-from importlib import metadata
-import tilelang
-import flash_attn
-from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
-import tvm.ffi
-assert tilelang.__version__ == "0.1.9", tilelang.__version__
-assert metadata.version("apache-tvm-ffi") == "0.1.13.post5"
-print(f"tilelang version: {tilelang.__version__}")
-print(f"flash_attn version: {flash_attn.__version__}")
-print(f"tvm.ffi version: {tvm.ffi.__version__}")
-print("COMPAT OK: tilelang + flash-attn-4 beta23 + tvm-ffi all import cleanly")
-"""
-    run(f"python - <<'PY'\n{verify_code.strip()}\nPY")
+    run(f"python - <<'PY'\n{VERIFY_CODE.strip()}\nPY")
 
     # --- 7. Commit wheel to volume ---
     wheels_vol.commit()
     print(f"\nSUCCESS: {wheel_name} written to cppmega-wheels volume")
     print(f"Expected filename: {EXPECTED_WHEEL}")
     return wheel_name
+
+
+@app.function(
+    image=_build_image(),
+    gpu="H100:1",
+    timeout=1800,
+    volumes={"/wheels": wheels_vol},
+)
+def verify_existing_wheels():
+    """Verify the committed exact wheels without rebuilding native code."""
+    import subprocess
+    import sys
+
+    wheel_path = f"/wheels/{EXPECTED_WHEEL}"
+    ffi_wheel_path = f"/wheels/{EXPECTED_TVM_FFI_WHEEL}"
+    commands = [
+        [
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "--extra-index-url", "https://download.pytorch.org/whl/cu132",
+            "torch==2.13.0+cu132",
+        ],
+        [
+            sys.executable, "-m", "pip", "install", "--pre", "--quiet",
+            "--extra-index-url", "https://pypi.nvidia.com",
+            "flash-attn-4[cu13]==4.0.0b23",
+        ],
+        [
+            sys.executable, "-m", "pip", "install", "--force-reinstall",
+            "--no-deps", ffi_wheel_path, wheel_path,
+        ],
+        [sys.executable, "-m", "pip", "install", wheel_path],
+        [sys.executable, "-m", "pip", "check"],
+        [sys.executable, "-c", VERIFY_CODE],
+    ]
+    for index, command in enumerate(commands, start=1):
+        print(f"STAGE {index}/{len(commands)}: {' '.join(command)}", flush=True)
+        subprocess.run(command, check=True)
+    return EXPECTED_WHEEL
 
 
 @app.local_entrypoint()
