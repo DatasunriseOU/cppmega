@@ -267,8 +267,8 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "ecbe82ac85c4abae2d177b6b16d21bcf1bbd7780"
-    tvm_commit = "dd4ccab545571945b1443b83196d87b55f821f90"
+    tilelang_commit = "334266afd448ae06e7893119a0ebb72d7fe1e776"
+    tvm_commit = "911772cf9d9e597b51a55ccdb96539034a69cfe6"
     tvm_ffi_commit = "521efeb30bfd9e4946b248b3d76e6391028233a3"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
     ffi_wheel_name = (

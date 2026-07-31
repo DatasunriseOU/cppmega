@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@ecbe82ac into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@334266af into the active
 # (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
 # Fallback:     clone DatasunriseOU/tilelang at the exact pinned commit.
 #
 # This fork commit carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix,
-# via vendored TVM DatasunriseOU/tvm@dd4ccab5), restores the nvbench CUDA
+# via vendored TVM DatasunriseOU/tvm@911772cf), restores the nvbench CUDA
 # L2-cache-flush header, and removes the apache-tvm-ffi<0.1.10 cap (upstream
 # PR #2071), so it imports cleanly under tvm-ffi >=0.1.12 as required by FA4
 # beta23. Its lazy driver stub also exports cuFuncGetAttribute required by the
@@ -27,8 +27,8 @@ set -euo pipefail
 
 WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
 TVM_FFI_WHEEL_URL="${TVM_FFI_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-ecbe82ac85c4abae2d177b6b16d21bcf1bbd7780}"
-TVM_COMMIT="${TILELANG_TVM_COMMIT:-dd4ccab545571945b1443b83196d87b55f821f90}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-334266afd448ae06e7893119a0ebb72d7fe1e776}"
+TVM_COMMIT="${TILELANG_TVM_COMMIT:-911772cf9d9e597b51a55ccdb96539034a69cfe6}"
 TVM_FFI_COMMIT="${TILELANG_TVM_FFI_COMMIT:-521efeb30bfd9e4946b248b3d76e6391028233a3}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"
 

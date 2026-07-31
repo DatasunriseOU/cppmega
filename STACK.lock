@@ -94,15 +94,17 @@ wheels:
       - apache_tvm_ffi-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at ecbe82ac carries:
+    # DatasunriseOU/tilelang fork at 334266af carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
-    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@dd4ccab5, which includes
+    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@911772cf, which includes
     #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
     #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
     #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
     #   - restored 3rdparty/nvbench/l2_cache_flush.h at the exact historical
     #     blob still required by TVM's CUDA runtime source.
+    #   - lazily imports tvm.testing from the RPC-only ref_count helper, so a
+    #     production import does not require the test-only pytest package.
     #   - adapts AdjustMatmulOrder's ND axes to this fork's boxed-Integer
     #     permute_dims API (the upstream int64_t form does not compile here).
     #   - links TVM CUDA driver calls through TileLang's lazy libcuda_stub,
@@ -114,7 +116,7 @@ wheels:
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: ecbe82ac85c4abae2d177b6b16d21bcf1bbd7780
+    ref: 334266afd448ae06e7893119a0ebb72d7fe1e776
     version: 0.1.9
     submodules: true
     build: |
