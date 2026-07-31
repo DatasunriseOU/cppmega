@@ -31,6 +31,23 @@ def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
 
     assert 'package: "apache-tvm-ffi==0.1.13.post5"' in stack
     assert 'package: "flash-attn-4[cu13]==4.0.0b23"' in stack
+    for path, version_check in (
+        (
+            "scripts/modal_build_tilelang_beta23.py",
+            'metadata.version("flash-attn-4")',
+        ),
+        (
+            "scripts/modal_cppmega_base.py",
+            'metadata.version(\\"flash-attn-4\\")',
+        ),
+        (
+            "scripts/modal_nan_sweep_h100.py",
+            'metadata.version(\\"flash-attn-4\\")',
+        ),
+    ):
+        source = _read(path)
+        assert version_check in source, path
+        assert "flash_attn.__version__" not in source, path
     for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
         dockerfile = _read(path)
         assert "apache-tvm-ffi==0.1.13" in dockerfile, path

@@ -132,9 +132,11 @@ def cppmega_base_image() -> modal.Image:
     ).run_commands(
         "pip install --no-deps /wheels/*.whl && "
         "python -c 'import transformer_engine.pytorch as te; print(\"TE Linear ok:\", te.Linear)' && "
-        "python -c 'import mamba_ssm, flash_attn, tilelang; "
+        "python -c 'from importlib import metadata; "
+        "assert metadata.version(\"flash-attn-4\") == \"4.0.0b23\"; "
+        "import mamba_ssm, flash_attn, tilelang; "
         "print(\"mamba_ssm\", mamba_ssm.__version__, "
-        "\"flash_attn\", flash_attn.__version__, "
+        "\"flash-attn-4\", metadata.version(\"flash-attn-4\"), "
         "\"tilelang\", tilelang.__version__)' && "
         "python -c 'from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo; print(\"mamba3_mimo ok\")'",
     ).run_commands(

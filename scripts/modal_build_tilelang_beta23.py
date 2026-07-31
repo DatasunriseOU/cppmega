@@ -37,9 +37,9 @@ from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
 import tvm.ffi
 assert tilelang.__version__ == "0.1.9", tilelang.__version__
 assert metadata.version("apache-tvm-ffi") == "0.1.13.post5"
-assert flash_attn.__version__ == "4.0.0b23", flash_attn.__version__
+assert metadata.version("flash-attn-4") == "4.0.0b23"
 print(f"tilelang version: {tilelang.__version__}")
-print(f"flash_attn version: {flash_attn.__version__}")
+print(f"flash-attn-4 version: {metadata.version('flash-attn-4')}")
 print(f"tvm.ffi version: {tvm.ffi.__version__}")
 print("COMPAT OK: tilelang + flash-attn-4 beta23 + tvm-ffi all import cleanly")
 """
