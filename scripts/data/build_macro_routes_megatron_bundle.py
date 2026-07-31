@@ -83,11 +83,15 @@ from scripts.ci_source_sidecars import (  # noqa: E402
 from scripts.ci_stream_fetch import (  # noqa: E402
     SCHEMA_VERSION as CI_FETCH_STATE_SCHEMA,
 )
+from scripts.nanochat_data.route_packed_source_docs import (  # noqa: E402
+    load_primary_route_receipt,
+)
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
-BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v2"
-SNAPSHOT_PLAN_SCHEMA = "cppmega_macro_routes_snapshot_plan_v1"
+BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v3"
+SNAPSHOT_PLAN_SCHEMA = "cppmega_macro_routes_snapshot_plan_v2"
+SOURCE_ROUTE_SET_SCHEMA = "cppmega_packed_source_primary_routes_v1"
 CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
@@ -1817,6 +1821,8 @@ def _snapshot_sources(
     source_composition: dict[str, object],
     ci_manifest: dict[str, object] | None = None,
     pr_manifest: dict[str, object] | None = None,
+    source_routes: dict[str, object] | None = None,
+    expected_source_sha256: dict[tuple[str, int, str], str] | None = None,
 ) -> dict[str, object]:
     manifest_path = snapshot_root / "source_manifest.json"
     if manifest_path.exists():
@@ -1826,6 +1832,7 @@ def _snapshot_sources(
             or existing.get("source_composition") != source_composition
             or existing.get("ci_manifest") != ci_manifest
             or existing.get("pr_manifest") != pr_manifest
+            or existing.get("source_routes") != source_routes
         ):
             raise RuntimeError("existing source snapshot does not match build inputs")
         return existing
@@ -1885,6 +1892,13 @@ def _snapshot_sources(
     ) -> dict[str, object]:
         kind, bucket, source, target, rows = candidate
         copied = _copy_stable_snapshot_file(source, target)
+        expected_sha256 = (expected_source_sha256 or {}).get(
+            (kind, bucket, source.name)
+        )
+        if expected_sha256 is not None and copied["sha256"] != expected_sha256:
+            raise RuntimeError(
+                f"{kind}/{bucket}/{source.name}: routed source SHA-256 drifted"
+            )
         return {
             "kind": kind,
             "bucket": bucket,
@@ -1920,6 +1934,7 @@ def _snapshot_sources(
         "file_count": len(records),
         "by_kind_bucket": by_kind_bucket,
         "source_composition": source_composition,
+        "source_routes": source_routes,
         "ci_manifest": ci_manifest,
         "pr_manifest": pr_manifest,
         "files": records,
@@ -2620,6 +2635,7 @@ def _create_build_plan(
     output_dir: Path,
     objective_artifacts: dict[int, Path],
     source_composition: dict[str, object],
+    source_routes: dict[str, object],
     builder_revision: dict[str, object],
     ci_manifest: dict[str, object],
     pr_manifest: dict[str, object],
@@ -2637,12 +2653,17 @@ def _create_build_plan(
     plan = {
         "output_dir": str(output_dir),
         "source_roots": {
-            "code": str(args.code_root.resolve()),
-            "commits": str(args.commit_root.resolve()),
+            "code": str(source_routes["code"]["primary_root"]),
+            "commits": str(source_routes["commits"]["primary_root"]),
             "ci": str(args.ci_root.resolve()),
             "pr": str(args.pr_root.resolve()),
         },
+        "source_input_roots": {
+            "code": str(args.code_root.resolve()),
+            "commits": str(args.commit_root.resolve()),
+        },
         "source_composition": source_composition,
+        "source_routes": source_routes,
         "ci_manifest": ci_manifest,
         "pr_manifest": pr_manifest,
         "implementation": _producer_binding_from_local_revision(
@@ -2695,6 +2716,7 @@ def _create_snapshot_plan(
     buckets: tuple[int, ...],
     output_dir: Path,
     source_composition: dict[str, object],
+    source_routes: dict[str, object],
     builder_revision: dict[str, object],
     ci_manifest: dict[str, object],
     pr_manifest: dict[str, object],
@@ -2702,12 +2724,17 @@ def _create_snapshot_plan(
     plan = {
         "output_dir": str(output_dir),
         "source_roots": {
-            "code": str(args.code_root.resolve()),
-            "commits": str(args.commit_root.resolve()),
+            "code": str(source_routes["code"]["primary_root"]),
+            "commits": str(source_routes["commits"]["primary_root"]),
             "ci": str(args.ci_root.resolve()),
             "pr": str(args.pr_root.resolve()),
         },
+        "source_input_roots": {
+            "code": str(args.code_root.resolve()),
+            "commits": str(args.commit_root.resolve()),
+        },
         "source_composition": source_composition,
+        "source_routes": source_routes,
         "ci_manifest": ci_manifest,
         "pr_manifest": pr_manifest,
         "implementation": _producer_binding_from_local_revision(
@@ -2841,6 +2868,11 @@ def _assert_build_plan_inputs(
         code_root=args.code_root,
         commit_root=args.commit_root,
     )
+    source_routes = _load_source_routes(
+        args=args,
+        buckets=buckets,
+        source_composition=source_composition,
+    )
     _ci_allowed, ci_manifest = _load_ci_manifest_allowlist(
         args.ci_manifest.resolve(),
         args.ci_root.resolve(),
@@ -2861,6 +2893,10 @@ def _assert_build_plan_inputs(
         output_dir=output_dir,
         objective_artifacts=objective_artifacts,
         source_composition=source_composition.receipt,
+        source_routes={
+            kind: dict(route["binding"])
+            for kind, route in source_routes.items()
+        },
         builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
@@ -3003,6 +3039,46 @@ def _stage_source_composition(
     }
 
 
+def _stage_source_routes(
+    source_routes: dict[str, dict[str, object]],
+    *,
+    partial_dir: Path,
+    provenance_root: Path,
+) -> dict[str, object]:
+    target_root = provenance_root / "source_routes"
+    target_root.mkdir(parents=True, exist_ok=True)
+    routes: dict[str, dict[str, object]] = {}
+    for kind in ("code", "commits"):
+        route = source_routes[kind]
+        binding = route["binding"]
+        if not isinstance(binding, dict):
+            raise RuntimeError(f"{kind} source route binding is malformed")
+        source = Path(str(route["receipt_path"]))
+        target = target_root / f"{kind}.route.receipt.json"
+        shutil.copy2(source, target)
+        digest = _sha256(target)
+        if digest != binding.get("receipt_sha256"):
+            raise RuntimeError(f"staged {kind} source route receipt drifted")
+        totals = binding.get("totals")
+        if not isinstance(totals, dict) or not isinstance(
+            totals.get("primary"), dict
+        ):
+            raise RuntimeError(f"{kind} source route totals are malformed")
+        routes[kind] = {
+            "path": target.relative_to(partial_dir).as_posix(),
+            "sha256": digest,
+            "route_schema": binding["schema"],
+            "input_inventory_sha256": binding["input_inventory_sha256"],
+            "output_inventory_sha256": binding["output_inventory_sha256"],
+            "primary": totals["primary"],
+        }
+    return {
+        "schema": SOURCE_ROUTE_SET_SCHEMA,
+        "policy": "primary-only-code-and-commit-snapshot",
+        "routes": routes,
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -3016,6 +3092,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="explicit root containing bucketed commit parquet shards",
+    )
+    parser.add_argument(
+        "--code-route-receipt",
+        type=Path,
+        default=None,
+        help="completed native-primary route receipt for --code-root",
+    )
+    parser.add_argument(
+        "--commit-route-receipt",
+        type=Path,
+        default=None,
+        help="completed native-primary route receipt for --commit-root",
     )
     parser.add_argument(
         "--ci-root",
@@ -3135,6 +3223,8 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
         for attribute, option in (
             ("code_root", "--code-root"),
             ("commit_root", "--commit-root"),
+            ("code_route_receipt", "--code-route-receipt"),
+            ("commit_route_receipt", "--commit-route-receipt"),
             ("ci_root", "--ci-root"),
             ("ci_manifest", "--ci-manifest"),
             ("pr_root", "--pr-root"),
@@ -3153,6 +3243,31 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
         )
 
 
+def _load_source_routes(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    source_composition: SourceComposition,
+) -> dict[str, dict[str, object]]:
+    routes: dict[str, dict[str, object]] = {}
+    for kind, receipt_attribute, input_root in (
+        ("code", "code_route_receipt", args.code_root),
+        ("commits", "commit_route_receipt", args.commit_root),
+    ):
+        route = load_primary_route_receipt(
+            getattr(args, receipt_attribute),
+            input_root=input_root,
+            expected_allowlist=source_composition.allowlist,
+            kind=kind,
+            buckets=buckets,
+        )
+        binding = dict(route["binding"])
+        binding["receipt_path"] = str(route["receipt_path"])
+        route["binding"] = binding
+        routes[kind] = route
+    return routes
+
+
 def _load_snapshot_inputs(
     *,
     args: argparse.Namespace,
@@ -3163,6 +3278,8 @@ def _load_snapshot_inputs(
     dict[tuple[str, int], dict[str, int]],
     dict[str, object],
     dict[str, object],
+    dict[str, dict[str, object]],
+    dict[tuple[str, int, str], str],
 ]:
     builder_revision = _verify_local_cppmega_revision(
         expected_commit=args.cppmega_commit,
@@ -3174,8 +3291,20 @@ def _load_snapshot_inputs(
         code_root=args.code_root,
         commit_root=args.commit_root,
     )
+    source_routes = _load_source_routes(
+        args=args,
+        buckets=buckets,
+        source_composition=source_composition,
+    )
     allowlist = {
-        key: dict(files) for key, files in source_composition.allowlist.items()
+        key: dict(files)
+        for route in source_routes.values()
+        for key, files in route["allowlist"].items()
+    }
+    source_sha256 = {
+        key: str(value)
+        for route in source_routes.values()
+        for key, value in route["sha256"].items()
     }
     ci_allowlist, ci_manifest = _load_ci_manifest_allowlist(
         args.ci_manifest.resolve(),
@@ -3205,6 +3334,8 @@ def _load_snapshot_inputs(
         allowlist,
         ci_manifest,
         pr_manifest,
+        source_routes,
+        source_sha256,
     )
 
 
@@ -3221,12 +3352,18 @@ def _assert_snapshot_plan_inputs(
         _allowlist,
         ci_manifest,
         pr_manifest,
+        source_routes,
+        _source_sha256,
     ) = _load_snapshot_inputs(args=args, buckets=buckets)
     actual = _create_snapshot_plan(
         args=args,
         buckets=buckets,
         output_dir=output_dir,
         source_composition=source_composition.receipt,
+        source_routes={
+            kind: dict(route["binding"])
+            for kind, route in source_routes.items()
+        },
         builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
@@ -3248,6 +3385,7 @@ def _prepare_objective_snapshot(
     dict[str, object],
     dict[str, object],
     SourceComposition,
+    dict[str, dict[str, object]],
     dict[str, object],
     dict[str, object],
     dict[str, object],
@@ -3261,12 +3399,18 @@ def _prepare_objective_snapshot(
         allowlist,
         ci_manifest,
         pr_manifest,
+        source_routes,
+        source_sha256,
     ) = _load_snapshot_inputs(args=args, buckets=buckets)
+    source_route_bindings = {
+        kind: dict(route["binding"]) for kind, route in source_routes.items()
+    }
     snapshot_plan = _create_snapshot_plan(
         args=args,
         buckets=buckets,
         output_dir=output_dir,
         source_composition=source_composition.receipt,
+        source_routes=source_route_bindings,
         builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
@@ -3275,8 +3419,8 @@ def _prepare_objective_snapshot(
 
     snapshot_root = partial_dir / "snapshot"
     source_manifest = _snapshot_sources(
-        code_root=args.code_root.resolve(),
-        commit_root=args.commit_root.resolve(),
+        code_root=Path(str(source_routes["code"]["primary_root"])),
+        commit_root=Path(str(source_routes["commits"]["primary_root"])),
         ci_root=args.ci_root.resolve(),
         pr_root=args.pr_root.resolve(),
         snapshot_root=snapshot_root,
@@ -3285,6 +3429,8 @@ def _prepare_objective_snapshot(
         hash_jobs=args.hash_jobs,
         allowed=allowlist,
         source_composition=source_composition.receipt,
+        source_routes=source_route_bindings,
+        expected_source_sha256=source_sha256,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
     )
@@ -3385,6 +3531,7 @@ def _prepare_objective_snapshot(
         repair_receipt,
         audit_receipt,
         source_composition,
+        source_routes,
         ci_manifest,
         pr_manifest,
         preparation_receipt,
@@ -3405,6 +3552,7 @@ def _run_prepare_objective_snapshot(
         _repair_receipt,
         _audit_receipt,
         _source_composition,
+        _source_routes,
         _ci_manifest,
         _pr_manifest,
         preparation_receipt,
@@ -3441,6 +3589,7 @@ def _run_build(
         repair_receipt,
         audit_receipt,
         source_composition,
+        source_routes,
         ci_manifest,
         pr_manifest,
         _preparation_receipt,
@@ -3464,6 +3613,10 @@ def _run_build(
         output_dir=output_dir,
         objective_artifacts=objective_artifacts,
         source_composition=source_composition.receipt,
+        source_routes={
+            kind: dict(route["binding"])
+            for kind, route in source_routes.items()
+        },
         builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
@@ -3499,6 +3652,11 @@ def _run_build(
     )
     staged_source_composition = _stage_source_composition(
         source_composition,
+        partial_dir=partial_dir,
+        provenance_root=provenance_root,
+    )
+    staged_source_routes = _stage_source_routes(
+        source_routes,
         partial_dir=partial_dir,
         provenance_root=provenance_root,
     )
@@ -3585,7 +3743,7 @@ def _run_build(
     artifact_set_sha256 = _artifact_set_sha256(artifacts)
     audit_total = audit_receipt["total"]
     manifest = {
-        "schema": "cppmega_megatron_bundle_v3",
+        "schema": "cppmega_megatron_bundle_v4",
         "bundle_id": f"{output_dir.name}-{artifact_set_sha256[:16]}",
         "created_at": _utc_now(),
         "tokenizer_contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
@@ -3614,6 +3772,7 @@ def _run_build(
             "manifest": "provenance/source_manifest.json",
             "repaired_manifest": "provenance/repaired_snapshot_manifest.json",
             "source_composition": staged_source_composition,
+            "source_routes": staged_source_routes,
             "ci_manifest": {
                 "path": "provenance/ci_manifest.json",
                 "sha256": _sha256(staged_ci_manifest),

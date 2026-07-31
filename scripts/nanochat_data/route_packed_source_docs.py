@@ -940,6 +940,224 @@ def _complete_input_receipt(
     return _sha256_file(path), inventory_sha256, normalized
 
 
+def load_primary_route_receipt(
+    receipt_path: Path,
+    *,
+    input_root: Path,
+    expected_allowlist: dict[tuple[str, int], dict[str, int]],
+    kind: str,
+    buckets: tuple[int, ...],
+) -> dict[str, Any]:
+    """Validate one completed route and return its primary snapshot inputs."""
+
+    if kind not in {"code", "commits"}:
+        raise ValueError(f"unsupported source route kind: {kind!r}")
+    receipt_path = receipt_path.expanduser()
+    if receipt_path.is_symlink():
+        raise ValueError(f"source route receipt must not be a symlink: {receipt_path}")
+    receipt_path = receipt_path.resolve()
+    if not receipt_path.is_file():
+        raise FileNotFoundError(receipt_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema") != SCHEMA
+        or receipt.get("status") != "complete"
+        or receipt.get("unresolved_count") != 0
+        or receipt.get("implementation") != _implementation()
+    ):
+        raise ValueError(f"{receipt_path}: source route receipt is not complete")
+
+    input_root = input_root.expanduser().resolve()
+    if Path(str(receipt.get("input_root"))).expanduser().resolve() != input_root:
+        raise ValueError(f"{receipt_path}: source route input root drifted")
+    output_root = Path(str(receipt.get("output_root"))).expanduser().resolve()
+    primary_root = output_root / "primary"
+    if output_root.is_symlink() or not primary_root.is_dir():
+        raise ValueError(f"{receipt_path}: source route output root is invalid")
+
+    expected_paths: dict[str, int] = {}
+    for bucket in buckets:
+        files = expected_allowlist.get((kind, bucket))
+        if files is None:
+            raise ValueError(f"source composition lacks {kind}/{bucket} allowlist")
+        for filename, rows in files.items():
+            relative = f"{bucket}/{filename}"
+            if relative in expected_paths:
+                raise ValueError(f"duplicate source route input path: {relative}")
+            expected_paths[relative] = int(rows)
+
+    input_binding = receipt.get("input_receipt")
+    if not isinstance(input_binding, dict):
+        raise ValueError(f"{receipt_path}: source route input receipt is missing")
+    bound_input_receipt = Path(str(input_binding.get("path"))).expanduser().resolve()
+    input_sha256, inventory_sha256, source_inventory = _complete_input_receipt(
+        bound_input_receipt
+    )
+    if input_binding != {
+        "path": str(bound_input_receipt),
+        "sha256": input_sha256,
+        "source_inventory_sha256": inventory_sha256,
+    }:
+        raise ValueError(f"{receipt_path}: source route input receipt drifted")
+    inventory_by_path = {record["path"]: record for record in source_inventory}
+    if set(inventory_by_path) != set(expected_paths):
+        raise ValueError(
+            f"{receipt_path}: source route inventory differs from source composition"
+        )
+
+    raw_files = receipt.get("files")
+    if not isinstance(raw_files, list):
+        raise ValueError(f"{receipt_path}: source route file receipts are missing")
+    file_receipts: dict[str, dict[str, Any]] = {}
+    counts = {
+        "source": _empty_counts(),
+        **{route: _empty_counts() for route in ROUTES},
+    }
+    primary_allowlist: dict[tuple[str, int], dict[str, int]] = {
+        (kind, bucket): {} for bucket in buckets
+    }
+    primary_sha256: dict[tuple[str, int, str], str] = {}
+    output_inventory: list[dict[str, str]] = []
+    for raw_file in raw_files:
+        if not isinstance(raw_file, dict):
+            raise ValueError(f"{receipt_path}: malformed source route file receipt")
+        source = raw_file.get("input")
+        routes = raw_file.get("routes")
+        if (
+            raw_file.get("schema") != SCHEMA
+            or raw_file.get("status") != "complete"
+            or raw_file.get("unresolved_count") != 0
+            or raw_file.get("implementation") != receipt["implementation"]
+            or not isinstance(source, dict)
+            or not isinstance(routes, dict)
+            or set(routes) != set(ROUTES)
+        ):
+            raise ValueError(f"{receipt_path}: malformed source route file receipt")
+        relative = source.get("path")
+        if not isinstance(relative, str) or relative in file_receipts:
+            raise ValueError(f"{receipt_path}: invalid source route input path")
+        expected_rows = expected_paths.get(relative)
+        inventory = inventory_by_path.get(relative)
+        if (
+            expected_rows is None
+            or not isinstance(inventory, dict)
+            or source.get("rows") != expected_rows
+            or source.get("sha256") != inventory["sha256"]
+            or source.get("size") != inventory["size"]
+        ):
+            raise ValueError(
+                f"{receipt_path}: source route input binding drifted: {relative}"
+            )
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or len(relative_path.parts) != 2
+            or not relative_path.parts[0].isdigit()
+            or int(relative_path.parts[0]) not in buckets
+            or relative_path.suffix != ".parquet"
+        ):
+            raise ValueError(f"{receipt_path}: unsafe source route path: {relative}")
+        bucket = int(relative_path.parts[0])
+        filename = relative_path.name
+        marker = output_root / "state" / relative_path.with_suffix(".route.json")
+        if marker.is_symlink() or not marker.is_file():
+            raise ValueError(f"{receipt_path}: source route marker is missing: {marker}")
+        if json.loads(marker.read_text(encoding="utf-8")) != raw_file:
+            raise ValueError(f"{receipt_path}: source route marker drifted: {marker}")
+
+        for key in _empty_counts():
+            value = source.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"{receipt_path}: invalid source {key} for {relative}"
+                )
+            counts["source"][key] += value
+        for route in ROUTES:
+            artifact = routes[route]
+            if not isinstance(artifact, dict):
+                raise ValueError(
+                    f"{receipt_path}: malformed {route} artifact for {relative}"
+                )
+            expected_artifact_path = f"{route}/{relative}"
+            artifact_path = output_root / expected_artifact_path
+            digest = artifact.get("sha256")
+            if (
+                artifact.get("path") != expected_artifact_path
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or artifact_path.is_symlink()
+                or not artifact_path.is_file()
+                or artifact.get("size") != artifact_path.stat().st_size
+            ):
+                raise ValueError(
+                    f"{receipt_path}: {route} artifact binding drifted: {relative}"
+                )
+            _validate_output(artifact_path, expected_rows=int(artifact.get("rows", -1)))
+            for key in _empty_counts():
+                value = artifact.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"{receipt_path}: invalid {route} {key} for {relative}"
+                    )
+                counts[route][key] += value
+            output_inventory.append(
+                {
+                    "route": route,
+                    "path": expected_artifact_path,
+                    "sha256": digest,
+                }
+            )
+        _assert_conservation(
+            {key: int(source[key]) for key in _empty_counts()},
+            {key: int(routes["primary"][key]) for key in _empty_counts()},
+            {key: int(routes["aux_python"][key]) for key in _empty_counts()},
+            {
+                key: int(routes[EXCLUDED_ROUTE][key])
+                for key in _empty_counts()
+            },
+            where=input_root / relative_path,
+        )
+        primary = routes["primary"]
+        primary_allowlist[(kind, bucket)][filename] = int(primary["rows"])
+        primary_sha256[(kind, bucket, filename)] = primary["sha256"]
+        file_receipts[relative] = raw_file
+
+    if set(file_receipts) != set(expected_paths):
+        raise ValueError(f"{receipt_path}: source route file set is incomplete")
+    if (
+        receipt.get("totals") != counts
+        or receipt.get("input_inventory_sha256")
+        != _canonical_sha256(source_inventory)
+        or receipt.get("output_inventory_sha256")
+        != _canonical_sha256(output_inventory)
+        or receipt.get("output_schema_sha256")
+        != hashlib.sha256(
+            packer.PACKED_ROW_OUTPUT_SCHEMA.serialize().to_pybytes()
+        ).hexdigest()
+    ):
+        raise ValueError(f"{receipt_path}: source route aggregate binding drifted")
+    return {
+        "binding": {
+            "schema": SCHEMA,
+            "kind": kind,
+            "receipt_sha256": _sha256_file(receipt_path),
+            "input_root": str(input_root),
+            "output_root": str(output_root),
+            "primary_root": str(primary_root),
+            "input_inventory_sha256": receipt["input_inventory_sha256"],
+            "output_inventory_sha256": receipt["output_inventory_sha256"],
+            "totals": counts,
+            "implementation": receipt["implementation"],
+        },
+        "receipt_path": receipt_path,
+        "primary_root": primary_root,
+        "allowlist": primary_allowlist,
+        "sha256": primary_sha256,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", type=Path, required=True)

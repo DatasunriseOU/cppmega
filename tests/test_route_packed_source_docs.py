@@ -20,9 +20,13 @@ from scripts.nanochat_data.route_packed_source_docs import (
     _discover,
     _implementation,
     _parse_buckets,
+    load_primary_route_receipt,
     main as route_main,
     route_file,
     route_packed_row,
+)
+from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
+    _validate_source_route_payloads,
 )
 
 
@@ -326,4 +330,78 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
     assert global_receipt["totals"]["aux_python"]["valid_tokens"] == 4
     assert (
         global_receipt["totals"]["excluded_non_primary"]["valid_tokens"] == 4
+    )
+    primary_route = load_primary_route_receipt(
+        cli_output / "route.receipt.json",
+        input_root=input_root,
+        expected_allowlist={("code", 16): {"fixture.parquet": 1}},
+        kind="code",
+        buckets=(16,),
+    )
+    assert primary_route["primary_root"] == cli_output / "primary"
+    assert primary_route["allowlist"] == {
+        ("code", 16): {"fixture.parquet": 1}
+    }
+    assert primary_route["sha256"][("code", 16, "fixture.parquet")] == (
+        global_receipt["files"][0]["routes"]["primary"]["sha256"]
+    )
+
+    commit_route = load_primary_route_receipt(
+        cli_output / "route.receipt.json",
+        input_root=input_root,
+        expected_allowlist={("commits", 16): {"fixture.parquet": 1}},
+        kind="commits",
+        buckets=(16,),
+    )
+    bundle = tmp_path / "bundle"
+    provenance = bundle / "provenance"
+    route_provenance = provenance / "source_routes"
+    route_provenance.mkdir(parents=True)
+    route_receipt_bytes = (cli_output / "route.receipt.json").read_bytes()
+    route_digest = hashlib.sha256(route_receipt_bytes).hexdigest()
+    staged_routes = {}
+    for kind, route in (("code", primary_route), ("commits", commit_route)):
+        staged = route_provenance / f"{kind}.route.receipt.json"
+        staged.write_bytes(route_receipt_bytes)
+        binding = route["binding"]
+        staged_routes[kind] = {
+            "path": staged.relative_to(bundle).as_posix(),
+            "sha256": route_digest,
+            "route_schema": binding["schema"],
+            "input_inventory_sha256": binding["input_inventory_sha256"],
+            "output_inventory_sha256": binding["output_inventory_sha256"],
+            "primary": binding["totals"]["primary"],
+        }
+    primary_artifact = global_receipt["files"][0]["routes"]["primary"]
+    primary_path = cli_output / primary_artifact["path"]
+    source_manifest = {
+        "source_routes": {
+            "code": primary_route["binding"],
+            "commits": commit_route["binding"],
+        },
+        "files": [
+            {
+                "kind": kind,
+                "source": str(primary_path.resolve()),
+                "size": primary_artifact["size"],
+                "sha256": primary_artifact["sha256"],
+                "rows": primary_artifact["rows"],
+            }
+            for kind in ("code", "commits")
+        ],
+    }
+    source_manifest_path = provenance / "source_manifest.json"
+    source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+    _validate_source_route_payloads(
+        bundle,
+        {
+            "source_snapshot": {
+                "manifest": source_manifest_path.relative_to(bundle).as_posix(),
+                "source_routes": {
+                    "schema": "cppmega_packed_source_primary_routes_v1",
+                    "policy": "primary-only-code-and-commit-snapshot",
+                    "routes": staged_routes,
+                },
+            }
+        },
     )
