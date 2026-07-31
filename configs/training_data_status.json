@@ -1,0 +1,29 @@
+{
+  "schema": "cppmega_training_data_status_config_v1",
+  "batch_size": 192,
+  "output_dir": "/Volumes/external/sources/cppmega.mlx/outputs/training_data_status",
+  "source": {
+    "root": "/Users/dave/cppmega_data/source_full501_ec31cd49",
+    "completion_receipt": "/Users/dave/cppmega_data/source_full501_ec31cd49/conveyor/_done.json"
+  },
+  "sealed_megatron": {
+    "manifest": "/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/manifest.json"
+  },
+  "validation_bundle": {
+    "manifest": "/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/case5_v4_20260714_093120_mini9/manifest.json"
+  },
+  "pr": {
+    "completion_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/pr_completion.verify7.json",
+    "gap_completion_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/graphql_gap_completion.verify6.json",
+    "export_launch_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/primary_pr_export_e25dd481.launch_receipt.json",
+    "export_cancellation_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/primary_pr_export_e25dd481.cancelled.20260729T191649Z.json",
+    "quarantine_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/unverified_store_quarantine_227.receipt.json"
+  },
+  "ci": {
+    "progress_receipts": [
+      "/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260422_20260721/fetch.progress.json",
+      "/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260721_20260730/fetch.progress.json"
+    ],
+    "legacy_parquet_root": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_ci_20260726_152207-28057_ci"
+  }
+}
