@@ -71,6 +71,7 @@ from tools.clang_indexer.index_project import (
     _symbol_part_metadata,
     _used_macro_defs,
     canonical_symbol_identity,
+    build_build_doc,
     FunctionDef,
     MacroDef,
     PartInfo,
@@ -98,6 +99,7 @@ from cppmega.symbol_identity import (
     require_project_identity,
 )
 from cppmega.data.build_context import detect_build_context
+from cppmega.data.commit_scope import classify_primary_commit_path
 from scripts.data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.data.atomic_publish import atomic_output_file
 from scripts.pr_ingest import pr_store as _pr_store_mod
@@ -2158,6 +2160,29 @@ def _copy_clang_ast_part(
     ast_node_type[offset:end] = src_node_type
 
 
+def _attach_commit_provenance(result: dict, record: dict) -> None:
+    result['repo'] = record.get('repo', '')
+    result['filepath'] = record.get('filepath', '')
+    result['commit_hash'] = record.get('commit_hash', record.get('commit', ''))
+    result['timestamp'] = record.get('timestamp', '')
+    result['pr_number'] = parse_pr_number(record)
+    result['pr_title'] = record.get('pr_title', '')
+    result['pr_discussion'] = record.get('pr_discussion', '')
+    result['source_branch'] = record.get('source_branch', '')
+    result['parent_hashes'] = list(record.get('parent_hashes', []) or [])
+    result['parent_count'] = record.get('parent_count')
+    result['is_merge_commit'] = record.get('is_merge_commit')
+    result['author_timestamp'] = record.get('author_timestamp')
+    result['commit_timestamp'] = record.get('commit_timestamp')
+    result['repo_stable_id'] = record.get('repo_stable_id')
+    result['filepath_stable_id'] = record.get('filepath_stable_id')
+    result['file_local_commit_index'] = record.get('file_local_commit_index')
+    result['has_ambiguous_reconstruction'] = record.get(
+        'has_ambiguous_reconstruction', False
+    )
+    result['has_rename_ambiguity'] = record.get('has_rename_ambiguity', False)
+
+
 def _build_enriched_from_parts(
     parts_info: list[PartInfo],
     old_analysis: FileAnalysis,
@@ -2515,28 +2540,7 @@ def _build_enriched_from_parts(
     # dict so clang_enriched_to_parquet.py can populate the parquet columns.
     # Without this the SHA + timestamp columns end up 0% populated and the later
     # GitHub-Archive PR-text join has no key.
-    result['repo'] = record.get('repo', '')
-    result['filepath'] = record.get('filepath', '')
-    result['commit_hash'] = record.get('commit_hash', record.get('commit', ''))
-    result['timestamp'] = record.get('timestamp', '')
-    result['pr_number'] = parse_pr_number(record)
-    result['pr_title'] = record.get('pr_title', '')
-    # Tier-2: round-trip the joined PR discussion (title+body+thread+reviews+
-    # linked issues) so it survives into the parquet column alongside the keys.
-    result['pr_discussion'] = record.get('pr_discussion', '')
-    result['source_branch'] = record.get('source_branch', '')
-    result['parent_hashes'] = list(record.get('parent_hashes', []) or [])
-    result['parent_count'] = record.get('parent_count')
-    result['is_merge_commit'] = record.get('is_merge_commit')
-    result['author_timestamp'] = record.get('author_timestamp')
-    result['commit_timestamp'] = record.get('commit_timestamp')
-    result['repo_stable_id'] = record.get('repo_stable_id')
-    result['filepath_stable_id'] = record.get('filepath_stable_id')
-    result['file_local_commit_index'] = record.get('file_local_commit_index')
-    result['has_ambiguous_reconstruction'] = record.get(
-        'has_ambiguous_reconstruction', False
-    )
-    result['has_rename_ambiguity'] = record.get('has_rename_ambiguity', False)
+    _attach_commit_provenance(result, record)
 
     # Platform info detection mirrors the source-indexer path.
     _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2717,9 +2721,80 @@ def _claim_semantic_chunk(
 # Main processing
 # ---------------------------------------------------------------------------
 
+def _process_domain_record(
+    record: dict,
+    *,
+    filepath: str,
+    build_kind: str,
+    old_content: str,
+    new_content: str,
+    max_tokens: int,
+    project_id: str,
+    build_info: dict[str, object],
+    dedup_store,
+    dedup_tokenizer,
+    chunk_claim_stats: dict[str, int] | None,
+) -> list[dict]:
+    tokens = count_tokens(new_content)
+    if tokens > max_tokens or len(new_content) < 100:
+        return []
+    claimed = _claim_semantic_chunk(
+        new_content,
+        dedup_store=dedup_store,
+        dedup_tokenizer=dedup_tokenizer,
+    )
+    if chunk_claim_stats is not None:
+        key = 'commit_chunks_claimed' if claimed else 'commit_chunks_skipped'
+        chunk_claim_stats[key] = chunk_claim_stats.get(key, 0) + 1
+    if not claimed:
+        return []
+
+    document = build_build_doc(
+        filepath,
+        new_content,
+        build_kind,
+        project_id=project_id,
+        build_info=build_info,
+    )
+    typed_message = '\n\n'.join(
+        value.strip()
+        for value in (record.get('subject'), record.get('body'))
+        if isinstance(value, str) and value.strip()
+    )
+    document.update(
+        {
+            'ifim_instruction_text': typed_message,
+            'commit_msg_text': typed_message,
+            'pre_text': old_content,
+            'post_text': new_content,
+            'diff_text': (
+                record.get('diff', '')
+                if isinstance(record.get('diff', ''), str)
+                else ''
+            ),
+            'changed_symbol_ids': [],
+            'ripple_candidates': [],
+        }
+    )
+    empty_analysis = FileAnalysis(preamble='')
+    document.update(
+        _build_commit_temporal_metadata(
+            new_content,
+            [new_content],
+            ['n'],
+            record=record,
+            old_analysis=empty_analysis,
+            new_analysis=empty_analysis,
+        )
+    )
+    _attach_commit_provenance(document, record)
+    document['actual_token_count'] = tokens
+    return [document]
+
+
 def process_record(
     record: dict,
-    clang_index: Index,
+    clang_index: Index | None,
     tmpdir: str,
     max_tokens: int,
     max_file_bytes: int,
@@ -2747,6 +2822,9 @@ def process_record(
         return []
 
     filepath = record.get('filepath', 'source.cpp')
+    primary_kind = classify_primary_commit_path(filepath, new_content)
+    if primary_kind is None:
+        return []
     project_id = require_project_identity(
         record.get("repo"),
         source=f"commit record {record.get('commit_hash') or '<unknown>'}",
@@ -2760,6 +2838,23 @@ def process_record(
             record.setdefault("compile_args", compile_args)
         if build_info:
             record.setdefault("build_info", build_info)
+
+    if primary_kind != 'cpp':
+        return _process_domain_record(
+            record,
+            filepath=filepath,
+            build_kind=primary_kind,
+            old_content=old_content,
+            new_content=new_content,
+            max_tokens=max_tokens,
+            project_id=project_id,
+            build_info=build_info,
+            dedup_store=dedup_store,
+            dedup_tokenizer=dedup_tokenizer,
+            chunk_claim_stats=chunk_claim_stats,
+        )
+    if clang_index is None:
+        raise ValueError("C/C++ commit processing requires a libclang index")
 
     # Parse old and new with clang (use separate temp subdirs to avoid conflicts)
     old_dir = os.path.join(tmpdir, 'old')

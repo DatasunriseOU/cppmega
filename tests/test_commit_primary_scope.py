@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from scripts.nanochat_data.extract_git_history import should_skip_path
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from cppmega.data.commit_scope import classify_primary_commit_path
+from scripts.nanochat_data.extract_git_history import (
+    get_commit_cpp_files,
+    should_skip_path,
+)
 
 
 def test_commit_scope_keeps_cpp_tests_and_benchmarks() -> None:
@@ -14,3 +23,135 @@ def test_commit_scope_still_excludes_vendored_and_generated_sources() -> None:
     assert should_skip_path("third_party/sqlite/sqlite3.c")
     assert should_skip_path("vendor/library/source.cpp")
     assert should_skip_path("generated/protocol.pb.cc")
+
+
+def test_commit_scope_routes_only_primary_native_domains() -> None:
+    expected = {
+        "src/main.cpp": "cpp",
+        "include/templates.tcc": "cpp",
+        "kernels/attention.cu": "cpp",
+        "schema/migrate.sql": "sql",
+        "CMakeLists.txt": "cmake",
+        "Makefile": "make",
+        "build.ninja": "ninja",
+        "BUILD.bazel": "bazel",
+        "meson.build": "meson",
+        "BUILD.gn": "gn",
+        "SConstruct": "scons",
+        "xmake.lua": "xmake",
+        "compile_commands.json": "compile_commands",
+        "Dockerfile": "dockerfile",
+        "scripts/build.sh": "sh",
+        "scripts/test.ps1": "powershell",
+        "scripts/run.cmd": "cmd",
+        "conanfile.py": "conan",
+        "vcpkg.json": "vcpkg",
+    }
+    assert {
+        path: classify_primary_commit_path(path) for path in expected
+    } == expected
+    assert classify_primary_commit_path("tools/helper.py") is None
+    assert classify_primary_commit_path("web/build.js") is None
+    assert classify_primary_commit_path("README.md") is None
+
+
+def test_extractor_membership_uses_primary_native_scope(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Scope Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "scope@example.invalid"],
+        check=True,
+    )
+    files = {
+        "schema.sql": "CREATE TABLE builds (id INTEGER PRIMARY KEY);\n",
+        "CMakeLists.txt": "cmake_minimum_required(VERSION 3.25)\nproject(scope)\n",
+        "one.cpp": "int one() { return 1; }\n",
+        "two.c": "int two(void) { return 2; }\n",
+        "three.h": "int three(void);\n",
+        "four.cu": "__global__ void four() {}\n",
+        "helper.py": "print('not primary')\n",
+        "build.js": "console.log('not primary');\n",
+    }
+    for name, text in files.items():
+        (repo / name).write_text(text, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+    for name, text in files.items():
+        (repo / name).write_text(text + "# changed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "modify"], check=True)
+    commit_hash = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert set(get_commit_cpp_files(str(repo), commit_hash) or []) == {
+        "CMakeLists.txt",
+        "four.cu",
+        "one.cpp",
+        "schema.sql",
+        "three.h",
+        "two.c",
+    }
+
+
+@pytest.mark.native_toolchain
+def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> None:
+    from tools.clang_indexer.process_commits import process_record
+
+    old_content = (
+        "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n"
+        "CREATE INDEX builds_status_idx ON builds(status);\n"
+    )
+    new_content = (
+        "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+        "platform TEXT NOT NULL);\n"
+        "CREATE INDEX builds_status_idx ON builds(status);\n"
+    )
+    diff = (
+        "diff --git a/schema.sql b/schema.sql\n"
+        "--- a/schema.sql\n"
+        "+++ b/schema.sql\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n"
+        "+CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+        "platform TEXT NOT NULL);\n"
+        " CREATE INDEX builds_status_idx ON builds(status);\n"
+    )
+    documents = process_record(
+        {
+            "repo": "tests/commit-domain",
+            "filepath": "schema.sql",
+            "commit_hash": "a" * 40,
+            "subject": "Track the build platform",
+            "body": "Keep CI receipts attributable to their platform.",
+            "old_content": old_content,
+            "new_content": new_content,
+            "diff": diff,
+        },
+        None,
+        str(tmp_path),
+        4096,
+        200_000,
+        "both",
+        5,
+    )
+
+    assert len(documents) == 1
+    document = documents[0]
+    assert document["text"] == new_content
+    assert document["doc_type"] == "sql"
+    assert document["domain_parse_info"]["parser"] == "sql-lexical"
+    assert len(document["domain_ids"]) == len(new_content)
+    assert document["pre_text"] == old_content
+    assert document["post_text"] == new_content
+    assert document["diff_text"] == diff
+    assert document["commit_msg_text"].startswith("Track the build platform")
+    assert any(document["change_mask_post"])

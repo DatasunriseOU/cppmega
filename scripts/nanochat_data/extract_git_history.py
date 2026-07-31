@@ -61,6 +61,7 @@ from scripts.nanochat_data.memory_guard import (  # noqa: E402
     check_memory_limit,
     start_memory_guard,
 )
+from cppmega.data.commit_scope import classify_primary_commit_path  # noqa: E402
 from cppmega.symbol_identity import (  # noqa: E402
     SymbolIdentityError,
     require_project_identity,
@@ -108,25 +109,6 @@ class _ExtractionStats(TypedDict):
     records_written: int
 
 
-# C/C++ file extensions
-CPP_EXTENSIONS = {
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".c++",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".h++",
-    ".inl",
-    ".inc",
-    ".ipp",
-    ".tcc",
-    ".tpp",
-}
-
 # Files/paths to skip
 SKIP_PATTERNS = {
     "third_party/",
@@ -145,7 +127,6 @@ SKIP_PATTERNS = {
 }
 
 MAX_DIFF_CHARS = 50000
-MAX_FILES_PER_COMMIT = 5
 MIN_DIFF_CHARS = 50
 
 
@@ -213,8 +194,8 @@ def stable_filepath_id(repo_name: str, filepath: str) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
-def is_cpp_file(path: str) -> bool:
-    return Path(path).suffix.lower() in CPP_EXTENSIONS
+def is_primary_commit_file(path: str) -> bool:
+    return classify_primary_commit_path(path) is not None
 
 
 def should_skip_path(path: str) -> bool:
@@ -523,8 +504,8 @@ def precompute_cpp_file_changes(
     refactor.
 
     Counting over the cheaper name-status-only set (:func:`get_commit_cpp_files`:
-    ``is_cpp_file`` / ``should_skip_path`` / ``status == 'M'`` /
-    ``MAX_FILES_PER_COMMIT``) is NOT equivalent: it counts diff-filtered commits
+    ``is_primary_commit_file`` / ``should_skip_path`` / ``status == 'M'``) is
+    NOT equivalent: it counts diff-filtered commits
     that are never emitted, silently inflating and gapping the indices for any
     file with an interspersed rejected-diff commit (e.g. 0, 2, 3 instead of
     0, 1, 2). That is a semantic change that makes corpora built before/after
@@ -555,7 +536,7 @@ def precompute_cpp_file_changes(
 
 
 def get_commit_cpp_files(repo_path: str, commit_hash: str) -> Optional[list[str]]:
-    """Return modified C/C++ file paths for a commit without reading blobs/diffs."""
+    """Return modified primary native-domain paths without reading blobs/diffs."""
     name_status = run_git_unit(
         repo_path,
         ["diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash],
@@ -582,7 +563,7 @@ def get_commit_cpp_files(repo_path: str, commit_hash: str) -> Optional[list[str]
             )
         status = parts[0][0]
         filepath = parts[-1]
-        if not is_cpp_file(filepath):
+        if not is_primary_commit_file(filepath):
             continue
         if should_skip_path(filepath):
             continue
@@ -590,9 +571,7 @@ def get_commit_cpp_files(repo_path: str, commit_hash: str) -> Optional[list[str]
             continue
         files.append(filepath)
 
-    if not files or len(files) > MAX_FILES_PER_COMMIT:
-        return None
-    return files
+    return files or None
 
 
 def get_file_diff(
@@ -644,7 +623,7 @@ def get_commit_diffs(
     commit_hash: str,
     files: Optional[list[str]] = None,
 ) -> Optional[list[dict]]:
-    """Get per-file diffs for C/C++ files in a commit."""
+    """Get per-file diffs for primary native-domain files in a commit."""
     if files is None:
         files = get_commit_cpp_files(repo_path, commit_hash)
     if not files:
