@@ -115,7 +115,7 @@ test "$(git -C 3rdparty/tvm rev-parse HEAD)" = "${TVM_COMMIT}"
 test "$(git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD)" = "${TVM_FFI_COMMIT}"
 test -f 3rdparty/tvm/3rdparty/nvbench/l2_cache_flush.h
 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5 \
-  pip install --force-reinstall --no-build-isolation --no-deps \
+  pip install --force-reinstall --no-deps \
     3rdparty/tvm/3rdparty/tvm-ffi
-pip install -e . --no-build-isolation
+pip install -e .
 verify_import

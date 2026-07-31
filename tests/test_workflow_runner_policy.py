@@ -333,6 +333,7 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     for text in (install, modal_build, modal_base):
         assert wheel_name in text
         assert ffi_wheel_name in text
+    assert "--no-build-isolation" not in install
     assert "Smoke TileLang wheel linkage and import" in workflow
     assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5" in workflow
     assert "wheels/apache_tvm_ffi-*.whl" in workflow
