@@ -2,7 +2,7 @@
 # Install TileLang 0.1.9 from DatasunriseOU/tilelang@334266af into the active
 # (or given) venv.
 #
-# Primary path: download prebuilt x86_64 wheel from GS, pip install.
+# Primary path: download the prebuilt x86_64 TileLang/tvm-ffi wheel pair.
 # Fallback:     clone DatasunriseOU/tilelang at the exact pinned commit.
 #
 # This fork commit carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix,

@@ -1,6 +1,6 @@
 name: build-wheels
 
-# Build all custom CUDA wheels (TE 2.16.0.dev0, flash-attn, mamba_ssm,
+# Build all custom CUDA wheels (TE 2.16.0, flash-attn, mamba_ssm,
 # causal_conv1d, fast_hadamard, tilelang, qoptim_cuda) on the repository's
 # persistent self-hosted Linux x86_64 runner.
 #
@@ -72,7 +72,7 @@ jobs:
         include:
           - name: transformer_engine
             repo: NVIDIA/TransformerEngine
-            ref: v2.16
+            ref: 4220403e831d29e93868f7793693ea83f6b8b05b
             submodules: "true"
             # MAX_JOBS=1 NVCC_THREADS=2 — without these, ninja saturates the
             # 4-core / 7 GB runner and the job gets cancelled at ~1h30m with

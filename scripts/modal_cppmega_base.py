@@ -14,7 +14,7 @@ Stack (all cp313 prebuilt, no source builds):
   - qoptim_cuda 0.0.0 (local wheel)
   - fast_hadamard_transform 1.1.0 (local wheel)
   - apache-tvm-ffi 0.1.13.post5 (local wheel matching TileLang's linked TVM ABI)
-  - megatron-core 0.18 from origin/dev HEAD (editable)
+  - megatron-core from commit 980211ae (editable)
 
 Wheels are downloaded once into the repository-owned wheels/ directory (or
 CPPMEGA_WHEELS_DIR) and baked into the image via add_local_file(copy=True).

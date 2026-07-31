@@ -240,10 +240,14 @@ def test_fa2_wheel_build_uses_upstream_arch_knob_and_exact_kernel_trim() -> None
 
 
 def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
+    transformer_engine_commit = "4220403e831d29e93868f7793693ea83f6b8b05b"
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
     ).read_text(encoding="utf-8")
+    stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
 
+    assert f"ref: {transformer_engine_commit}" in workflow
+    assert f"ref: {transformer_engine_commit}" in stack
     assert "NVTE_CUDA_ARCHS='90;100;120'" in workflow
     assert " CUDAARCHS=" not in workflow
     assert (

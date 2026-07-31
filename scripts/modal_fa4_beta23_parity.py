@@ -11,8 +11,7 @@ PREREQUISITES:
       docker push ghcr.io/datasunriseou/cppmega:beta23
   - Set GHCR_DIGEST_BETA23 to the real digest:
       docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/datasunriseou/cppmega:beta23
-  - TileLang ref must be bumped to a tvm-ffi>=0.1.12-compatible commit
-    (see docs/fa4_beta23_upgrade_plan.md section 4 and 12.4).
+  - The image must contain the TileLang/tvm-ffi pair pinned in STACK.lock.
 
 Usage:
     # With the beta23 GHCR image (preferred):

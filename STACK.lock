@@ -12,11 +12,12 @@ base:
   torch_index: https://download.pytorch.org/whl/cu132
   torch_arch_list: "9.0;10.0;12.1"   # H100 / B200 / GB10
 
-# Wheels built in matrix on ubuntu-latest (x86_64), uploaded to GH Release as assets.
+# Wheels built on the repository's self-hosted Linux x86_64 runner and uploaded
+# to a GH Release as assets.
 wheels:
   transformer_engine:
     repo: NVIDIA/TransformerEngine
-    ref: v2.16
+    ref: 4220403e831d29e93868f7793693ea83f6b8b05b
     version: 2.16
     build: |
       NVTE_FRAMEWORK=pytorch \

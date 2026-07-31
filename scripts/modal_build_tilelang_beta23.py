@@ -13,7 +13,9 @@ wheel is written to the durable cppmega-wheels Modal Volume.
 Usage:
     modal run scripts/modal_build_tilelang_beta23.py
 
-Output wheel: tilelang-0.1.9-cp38-abi3-linux_x86_64.whl
+Output wheels:
+  - tilelang-0.1.9-cp38-abi3-linux_x86_64.whl
+  - apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl
 """
 from __future__ import annotations
 
