@@ -267,17 +267,23 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
             / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
-    entry = next(
+    entries = [
         item
         for item in manifest["entries"]
-        if item["project_id"] == "google/filament"
-    )
+        if item["project_id"]
+        in {"google/filament", "microsoft/DirectXShaderCompiler"}
+    ]
 
     assert len(payload) == 271
-    assert entry["size_bytes"] == len(payload)
-    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
-    assert entry["classification"] == "deliberate_compiler_crash_fixture"
-    assert entry["detected_format"] == "clang_debug_crash_pragma"
+    assert {entry["project_id"] for entry in entries} == {
+        "google/filament",
+        "microsoft/DirectXShaderCompiler",
+    }
+    for entry in entries:
+        assert entry["size_bytes"] == len(payload)
+        assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert entry["classification"] == "deliberate_compiler_crash_fixture"
+        assert entry["detected_format"] == "clang_debug_crash_pragma"
 
 
 def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> None:
