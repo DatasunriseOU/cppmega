@@ -1,10 +1,10 @@
 """Build pinned TileLang on Modal and verify the FA4 beta23 compatibility lane.
 
-Builds the tilelang wheel (cp38-abi3, CUDA) on a Modal H100, then installs
-flash-attn-4==4.0.0b23 + apache-tvm-ffi>=0.1.12 and verifies both import cleanly.
+Builds ABI-matched tvm-ffi and TileLang wheels on a Modal H100, then installs
+flash-attn-4==4.0.0b23 and verifies the complete stack imports cleanly.
 
-The fork at b2545eaa carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
-restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@78f930ed,
+The fork at 334266af carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
+restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@911772cf,
 removes the apache-tvm-ffi<0.1.10 cap, and completes the CUDA driver stub.
 
 The clone and build directory are disposable container scratch. The compressed
@@ -13,7 +13,9 @@ wheel is written to the durable cppmega-wheels Modal Volume.
 Usage:
     modal run scripts/modal_build_tilelang_beta23.py
 
-Output wheel: tilelang-0.1.9-cp38-abi3-linux_x86_64.whl
+Output wheels:
+  - tilelang-0.1.9-cp38-abi3-linux_x86_64.whl
+  - apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl
 """
 from __future__ import annotations
 
@@ -22,9 +24,27 @@ import pathlib
 import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
-TILELANG_COMMIT = "b2545eaa3f11610a31e5b8371aab97c369e95f27"
-TILELANG_TVM_COMMIT = "78f930edc805920428388518e12d111019383d2f"
+TILELANG_COMMIT = "334266afd448ae06e7893119a0ebb72d7fe1e776"
+TILELANG_TVM_COMMIT = "911772cf9d9e597b51a55ccdb96539034a69cfe6"
+TILELANG_TVM_FFI_COMMIT = "521efeb30bfd9e4946b248b3d76e6391028233a3"
 EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+EXPECTED_TVM_FFI_WHEEL = (
+    "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
+)
+VERIFY_CODE = """
+from importlib import metadata
+import tilelang
+import flash_attn
+from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
+import tvm.ffi
+assert tilelang.__version__ == "0.1.9", tilelang.__version__
+assert metadata.version("apache-tvm-ffi") == "0.1.13.post5"
+assert metadata.version("flash-attn-4") == "4.0.0b23"
+print(f"tilelang version: {tilelang.__version__}")
+print(f"flash-attn-4 version: {metadata.version('flash-attn-4')}")
+print(f"tvm.ffi version: {tvm.ffi.__version__}")
+print("COMPAT OK: tilelang + flash-attn-4 beta23 + tvm-ffi all import cleanly")
+"""
 
 PYTHON_VERSION = "3.13"
 CUDA_BASE = "nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04"
@@ -43,7 +63,8 @@ def _build_image() -> modal.Image:
         )
         .pip_install(
             "pip>=24.0", "setuptools", "wheel",
-            "scikit-build-core>=0.10", "cython", "z3-solver",
+            "scikit-build-core>=0.10", "setuptools-scm", "cython",
+            "z3-solver==4.15.4.0",
             "numpy", "packaging", "pybind11",
         )
         .env({
@@ -72,11 +93,14 @@ def build_tilelang_wheel():
     def run(cmd: str, **kw):
         print(f"+ {cmd}")
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+        if r.returncode != 0:
+            if r.stdout:
+                print(f"STDOUT tail:\n{r.stdout[-24_000:]}", file=sys.stderr)
+            if r.stderr:
+                print(f"STDERR tail:\n{r.stderr[-24_000:]}", file=sys.stderr)
+            raise RuntimeError(f"Command failed ({r.returncode}): {cmd}")
         if r.stdout:
             print(r.stdout[-4000:])
-        if r.returncode != 0:
-            print(f"STDERR: {r.stderr[-4000:]}", file=sys.stderr)
-            raise RuntimeError(f"Command failed ({r.returncode}): {cmd}")
         return r.stdout
 
     # --- 1. Clone tilelang at the pinned commit with submodules ---
@@ -94,6 +118,11 @@ def build_tilelang_wheel():
     assert TILELANG_TVM_COMMIT in out, (
         f"Expected TVM submodule at {TILELANG_TVM_COMMIT}, got: {out}"
     )
+    out = run(
+        "cd /tmp/tilelang && "
+        "git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD"
+    )
+    assert out.strip() == TILELANG_TVM_FFI_COMMIT, out
     run("test -f /tmp/tilelang/3rdparty/tvm/3rdparty/nvbench/l2_cache_flush.h")
 
     # --- 2. Install torch (needed for build) ---
@@ -102,11 +131,17 @@ def build_tilelang_wheel():
         "'torch==2.13.0+cu132' --quiet"
     )
 
-    # --- 3. Build the wheel ---
+    # --- 3. Build the ABI-matched wheels ---
     run("mkdir -p /tmp/tilelang-wheel-out")
     run(
-        "cd /tmp/tilelang && pip wheel . --no-build-isolation "
-        "-w /tmp/tilelang-wheel-out 2>&1 | tail -20"
+        "cd /tmp/tilelang && "
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5 "
+        "pip wheel 3rdparty/tvm/3rdparty/tvm-ffi --no-build-isolation --no-deps "
+        "-w /tmp/tilelang-wheel-out"
+    )
+    run(
+        "cd /tmp/tilelang && pip wheel . --no-build-isolation --no-deps "
+        "-w /tmp/tilelang-wheel-out"
     )
 
     # --- 4. Verify wheel was produced ---
@@ -117,35 +152,66 @@ def build_tilelang_wheel():
     wheel_name = pathlib.Path(wheel_path).name
     print(f"Wheel: {wheel_name}")
     shutil.copy2(wheel_path, f"/wheels/{EXPECTED_WHEEL}")
+    ffi_wheel_path = f"/tmp/tilelang-wheel-out/{EXPECTED_TVM_FFI_WHEEL}"
+    assert pathlib.Path(ffi_wheel_path).is_file(), ffi_wheel_path
+    shutil.copy2(ffi_wheel_path, f"/wheels/{EXPECTED_TVM_FFI_WHEEL}")
 
-    # --- 5. Install the built wheel + FA4 beta23 + tvm-ffi ---
-    run(f"pip install --no-deps {wheel_path}")
+    # --- 5. Install FA4 beta23, then the exact linked FFI + TileLang wheels ---
     run(
         "pip install --pre --quiet "
         "--extra-index-url https://pypi.nvidia.com "
-        "'flash-attn-4[cu13]==4.0.0b23' "
-        "'apache-tvm-ffi>=0.1.12,<0.2'"
+        "'flash-attn-4[cu13]==4.0.0b23'"
     )
+    run(f"pip install --force-reinstall --no-deps {ffi_wheel_path} {wheel_path}")
+    run(f"pip install {wheel_path}")
+    run("pip check")
 
     # --- 6. Verify imports ---
-    verify_code = """
-import tilelang
-import flash_attn
-from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
-import tvm.ffi
-assert tilelang.__version__ == "0.1.9", tilelang.__version__
-print(f"tilelang version: {tilelang.__version__}")
-print(f"flash_attn version: {flash_attn.__version__}")
-print(f"tvm.ffi version: {tvm.ffi.__version__}")
-print("COMPAT OK: tilelang + flash-attn-4 beta23 + tvm-ffi all import cleanly")
-"""
-    run(f'python -c "{verify_code.strip()}"')
+    run(f"python - <<'PY'\n{VERIFY_CODE.strip()}\nPY")
 
     # --- 7. Commit wheel to volume ---
     wheels_vol.commit()
     print(f"\nSUCCESS: {wheel_name} written to cppmega-wheels volume")
     print(f"Expected filename: {EXPECTED_WHEEL}")
     return wheel_name
+
+
+@app.function(
+    image=_build_image(),
+    gpu="H100:1",
+    timeout=1800,
+    volumes={"/wheels": wheels_vol},
+)
+def verify_existing_wheels():
+    """Verify the committed exact wheels without rebuilding native code."""
+    import subprocess
+    import sys
+
+    wheel_path = f"/wheels/{EXPECTED_WHEEL}"
+    ffi_wheel_path = f"/wheels/{EXPECTED_TVM_FFI_WHEEL}"
+    commands = [
+        [
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "--extra-index-url", "https://download.pytorch.org/whl/cu132",
+            "torch==2.13.0+cu132",
+        ],
+        [
+            sys.executable, "-m", "pip", "install", "--pre", "--quiet",
+            "--extra-index-url", "https://pypi.nvidia.com",
+            "flash-attn-4[cu13]==4.0.0b23",
+        ],
+        [
+            sys.executable, "-m", "pip", "install", "--force-reinstall",
+            "--no-deps", ffi_wheel_path, wheel_path,
+        ],
+        [sys.executable, "-m", "pip", "install", wheel_path],
+        [sys.executable, "-m", "pip", "check"],
+        [sys.executable, "-c", VERIFY_CODE],
+    ]
+    for index, command in enumerate(commands, start=1):
+        print(f"STAGE {index}/{len(commands)}: {' '.join(command)}", flush=True)
+        subprocess.run(command, check=True)
+    return EXPECTED_WHEEL
 
 
 @app.local_entrypoint()

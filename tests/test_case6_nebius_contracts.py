@@ -517,12 +517,12 @@ def test_stack_contract_matches_pinned_runtime_and_import_set() -> None:
         },
         "wheels": {"transformer_engine": {"version": 2.16}},
         "runtime_pypi": {
-            "apache_tvm_ffi": {"package": "apache-tvm-ffi==0.1.13"},
+            "apache_tvm_ffi": {"package": "apache-tvm-ffi==0.1.13.post5"},
             "flash_attn_4": {"package": "flash-attn-4[cu13]==4.0.0b23"},
         },
     }
     runtime_versions = {
-        "apache_tvm_ffi": "0.1.13",
+        "apache_tvm_ffi": "0.1.13.post5",
         "flash_attn_4": "4.0.0b23",
     }
     contract = validate_stack_compatibility(

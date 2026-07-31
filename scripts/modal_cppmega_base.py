@@ -7,13 +7,14 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
-  - tilelang 0.1.9 from DatasunriseOU/tilelang@b2545eaa (local abi3 wheel;
+  - flash-attn-4 4.0.0b23 (NVIDIA PyPI)
+  - tilelang 0.1.9 from DatasunriseOU/tilelang@334266af (local abi3 wheel;
     carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
     the apache-tvm-ffi<0.1.10 cap)
   - qoptim_cuda 0.0.0 (local wheel)
   - fast_hadamard_transform 1.1.0 (local wheel)
-  - apache-tvm-ffi 0.1.9 (pypi; fork also imports cleanly under >=0.1.12 for FA4 beta23)
-  - megatron-core 0.18 from origin/dev HEAD (editable)
+  - apache-tvm-ffi 0.1.13.post5 (local wheel matching TileLang's linked TVM ABI)
+  - megatron-core from commit 980211ae (editable)
 
 Wheels are downloaded once into the repository-owned wheels/ directory (or
 CPPMEGA_WHEELS_DIR) and baked into the image via add_local_file(copy=True).
@@ -49,6 +50,7 @@ _WHEEL_FILES = [
     "causal_conv1d-1.6.1-cp313-cp313-linux_x86_64.whl",
     "flash_attn-2.8.3-cp313-cp313-linux_x86_64.whl",
     "qoptim_cuda-0.0.0-cp313-cp313-linux_x86_64.whl",
+    "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl",
     "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl",
     "fast_hadamard_transform-1.1.0-cp313-cp313-linux_x86_64.whl",
 ]
@@ -80,7 +82,9 @@ def cppmega_base_image() -> modal.Image:
         # TE + wheel-pkg declared deps (must be present BEFORE installing
         # our --no-deps wheels, because mamba_ssm/TE import time needs them).
         .pip_install(
-            "apache-tvm-ffi==0.1.9",
+            # Bootstrap FA4's dependency; the matching local post5 wheel
+            # replaces it in the compressed wheel layer below.
+            "apache-tvm-ffi==0.1.13",
             "transformer-engine-cu13==2.13.0",
             "transformer-engine==2.13.0",
             "nvidia-nccl-cu13",
@@ -88,8 +92,8 @@ def cppmega_base_image() -> modal.Image:
             "onnxscript", "onnx",
             "pydantic", "nvdlfw-inspect",
             # TileLang dev wheel was linked against libz3.so.4.15 specifically.
-            # Pin to 4.15.x (latest release branch that ships .4.15 file).
-            "z3-solver==4.15.*",
+            # Match the exact ABI used while building the TileLang wheel.
+            "z3-solver==4.15.4.0",
             # TileLang dev runtime deps (cloudpickle, psutil, pynvml etc.)
             "cloudpickle", "psutil", "pynvml", "typing-extensions",
             # mamba_ssm / flash_attn import-time deps
@@ -98,6 +102,10 @@ def cppmega_base_image() -> modal.Image:
             "datasets", "accelerate", "tensorboard",
             "wandb", "tqdm", "pytest", "filelock",
             "liger-kernel",
+        )
+        .pip_install(
+            "flash-attn-4[cu13]==4.0.0b23",
+            extra_index_url="https://pypi.nvidia.com",
         )
     )
     # Add durable, compressed local wheel inputs as one image layer. Missing
@@ -114,20 +122,17 @@ def cppmega_base_image() -> modal.Image:
         p = wheels_path / whl
         img = img.add_local_file(str(p), f"/wheels/{whl}", copy=True)
     img = img.run_commands(
-        # Ensure libz3.so.4.15 symlink exists even if z3-solver ships a
-        # slightly different minor version.
-        "Z3LIB=/usr/local/lib/python3.13/site-packages/z3/lib && "
-        "ls $Z3LIB && "
-        "if [ ! -f $Z3LIB/libz3.so.4.15 ]; then "
-        "  ln -sf $Z3LIB/libz3.so $Z3LIB/libz3.so.4.15; fi && "
-        "ls $Z3LIB/libz3*",
+        "test -f /usr/local/lib/python3.13/site-packages/z3/lib/libz3.so.4.15",
     ).run_commands(
         # Install all local wheels with --no-deps (torch/TE already installed).
         "pip install --no-deps /wheels/*.whl && "
         "python -c 'import transformer_engine.pytorch as te; print(\"TE Linear ok:\", te.Linear)' && "
-        "python -c 'import mamba_ssm, flash_attn, tilelang; "
+        "python -c 'from importlib import metadata; "
+        "assert metadata.version(\"apache-tvm-ffi\") == \"0.1.13.post5\"; "
+        "assert metadata.version(\"flash-attn-4\") == \"4.0.0b23\"; "
+        "import mamba_ssm, flash_attn, tilelang; "
         "print(\"mamba_ssm\", mamba_ssm.__version__, "
-        "\"flash_attn\", flash_attn.__version__, "
+        "\"flash-attn-4\", metadata.version(\"flash-attn-4\"), "
         "\"tilelang\", tilelang.__version__)' && "
         "python -c 'from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo; print(\"mamba3_mimo ok\")'",
     ).run_commands(

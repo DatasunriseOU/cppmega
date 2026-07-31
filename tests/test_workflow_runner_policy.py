@@ -240,10 +240,14 @@ def test_fa2_wheel_build_uses_upstream_arch_knob_and_exact_kernel_trim() -> None
 
 
 def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
+    transformer_engine_commit = "4220403e831d29e93868f7793693ea83f6b8b05b"
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
     ).read_text(encoding="utf-8")
+    stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
 
+    assert f"ref: {transformer_engine_commit}" in workflow
+    assert f"ref: {transformer_engine_commit}" in stack
     assert "NVTE_CUDA_ARCHS='90;100;120'" in workflow
     assert " CUDAARCHS=" not in workflow
     assert (
@@ -266,13 +270,35 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
     assert "git checkout ${{ matrix.ref }}" not in workflow
 
 
+def test_image_build_binds_triggering_source_and_wheel_release() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-image.yml"
+    ).read_text(encoding="utf-8")
+
+    assert workflow.count("github.event.workflow_run.head_sha") == 2
+    assert 'TAG="wheels-${SOURCE_SHA:0:7}"' in workflow
+    assert "type=raw,value=sha-${{ steps.rel.outputs.source_sha }}" in workflow
+    assert "type=raw,value=${{ steps.rel.outputs.short_sha }}" in workflow
+    assert "{{is_default_branch}}" not in workflow
+    assert "github.event.workflow_run.head_branch" in workflow
+    assert "gh release list" not in workflow
+    assert "type=sha," not in workflow
+
+
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "b2545eaa3f11610a31e5b8371aab97c369e95f27"
-    tvm_commit = "78f930edc805920428388518e12d111019383d2f"
+    tilelang_commit = "334266afd448ae06e7893119a0ebb72d7fe1e776"
+    tvm_commit = "911772cf9d9e597b51a55ccdb96539034a69cfe6"
+    tvm_ffi_commit = "521efeb30bfd9e4946b248b3d76e6391028233a3"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+    ffi_wheel_name = (
+        "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
+    )
 
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+    image_workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-image.yml"
     ).read_text(encoding="utf-8")
     stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
     rebuild = (REPO_ROOT / "scripts" / "rebuild_tilelang_wheel.sh").read_text(
@@ -287,17 +313,52 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     modal_base = (REPO_ROOT / "scripts" / "modal_cppmega_base.py").read_text(
         encoding="utf-8"
     )
+    modal_runtime = [
+        (REPO_ROOT / path).read_text(encoding="utf-8")
+        for path in (
+            "scripts/modal_fa4_beta23_parity.py",
+        )
+    ]
+    dockerfiles = [
+        (REPO_ROOT / path).read_text(encoding="utf-8")
+        for path in ("docker/Dockerfile", "docker/Dockerfile.beta23")
+    ]
 
     assert f"ref: {tilelang_commit}" in workflow
     assert f"ref: {tilelang_commit}" in stack
     for text in (rebuild, install, modal_build):
         assert tilelang_commit in text
         assert tvm_commit in text
+        assert tvm_ffi_commit in text
     for text in (install, modal_build, modal_base):
         assert wheel_name in text
+        assert ffi_wheel_name in text
+    assert "--no-build-isolation" not in install
     assert "Smoke TileLang wheel linkage and import" in workflow
-    assert 'python -m pip install --no-deps "apache-tvm-ffi==0.1.13"' in workflow
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5" in workflow
+    assert "wheels/apache_tvm_ffi-*.whl" in workflow
+    assert "'apache_tvm_ffi-*.whl'" in workflow
+    assert "'apache_tvm_ffi-*.whl'" in image_workflow
+    assert rebuild.index("git submodule update --init --recursive 3rdparty/tvm") < (
+        rebuild.index("3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD")
+    )
+    assert "python - <<'PY'" in modal_build
+    assert 'python -c "{verify_code.strip()}"' not in modal_build
+    assert "pip wheel . --no-build-isolation --no-deps" in modal_build
+    for text in (
+        workflow,
+        stack,
+        rebuild,
+        install,
+        modal_build,
+        modal_base,
+        *modal_runtime,
+        *dockerfiles,
+    ):
+        assert "z3-solver==4.15.4.0" in text
+    assert 'f"STDERR tail:\\n{r.stderr[-24_000:]}"' in modal_build
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack
+    assert "version: 0.1.13.post5" in stack
     assert "/tmp/cppmega_wheels" not in modal_base
     assert '_REPO_ROOT / "wheels"' in modal_base

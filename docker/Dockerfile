@@ -54,7 +54,7 @@ RUN python -m pip install --extra-index-url ${TORCH_INDEX} \
         cloudpickle psutil pynvml \
         huggingface_hub transformers tokenizers datasets accelerate \
         tensorboard wandb tqdm pytest \
-        liger-kernel z3-solver \
+        liger-kernel "z3-solver==4.15.4.0" \
         onnx onnxscript \
         apache-tvm-ffi==0.1.13 \
         nvidia-nccl-cu13
@@ -94,6 +94,9 @@ ENV CUDA_HOME=/usr/local/cuda \
 # Note: flash_attn ships FA2 kernels, flash_attn_3 is the separate FA3 Hopper
 # package, and flash-attn-4 owns flash_attn.cute for CuTe DSL kernels.
 RUN python -c "\
+from importlib import metadata; \
+assert metadata.version('apache-tvm-ffi') == '0.1.13.post5'; \
+assert metadata.version('flash-attn-4') == '4.0.0b23'; \
 import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \
 import transformer_engine.pytorch; \

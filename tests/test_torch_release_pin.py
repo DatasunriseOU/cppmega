@@ -29,13 +29,46 @@ def test_cuda_stack_uses_stable_torch_213_release() -> None:
 def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
     stack = _read("STACK.lock")
 
-    assert 'package: "apache-tvm-ffi==0.1.13"' in stack
+    assert 'package: "apache-tvm-ffi==0.1.13.post5"' in stack
     assert 'package: "flash-attn-4[cu13]==4.0.0b23"' in stack
+    for path, version_check in (
+        (
+            "scripts/modal_build_tilelang_beta23.py",
+            'metadata.version("flash-attn-4")',
+        ),
+        (
+            "scripts/modal_cppmega_base.py",
+            'metadata.version(\\"flash-attn-4\\")',
+        ),
+    ):
+        source = _read(path)
+        assert version_check in source, path
+        assert "flash_attn.__version__" not in source, path
+        if path != "scripts/modal_build_tilelang_beta23.py":
+            assert (
+                "test -f /usr/local/lib/python3.13/site-packages/z3/lib/"
+                "libz3.so.4.15"
+            ) in source
+            assert "ln -sf" not in source
     for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
         dockerfile = _read(path)
         assert "apache-tvm-ffi==0.1.13" in dockerfile, path
+        assert "metadata.version('apache-tvm-ffi') == '0.1.13.post5'" in dockerfile
+        assert "metadata.version('flash-attn-4') == '4.0.0b23'" in dockerfile
         assert '"flash-attn-4[cu13]==4.0.0b23"' in dockerfile, path
         assert '"flash-attn-4[cu13]==4.0.0b19"' not in dockerfile, path
+
+
+def test_fa4_h200_gate_exercises_visible_bias_and_is_not_mislabeled() -> None:
+    source = _read("scripts/modal_fa4_beta23_parity.py")
+
+    assert "call_edges[0, 0] = torch.tensor([1, 0])" in source
+    assert "visible_bias_nonzero" in source
+    assert "manual_bias_effect" in source
+    assert "te_manual_max_diff" in source
+    assert "fa4_manual_max_diff" in source
+    assert "test_fa4_miniblock_training_step" in source
+    assert "test_megatron_training_step" not in source
 
 
 def test_h200_images_include_dependency_free_bundle_restore_runtime() -> None:

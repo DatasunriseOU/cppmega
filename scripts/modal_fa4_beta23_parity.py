@@ -1,8 +1,9 @@
-"""Modal H200: TE<->FA4 parity + Megatron training step on the beta23 image.
+"""Modal H200: TE<->FA4 parity + FA4 miniblock smoke on the beta23 image.
 
 Validates the FA4 beta23 (flash-attn-4 4.0.0b23) chunk-native score_mod path
-against the TE dense post_scale_bias reference, then runs a single Megatron
-training step (forward + backward + optimizer.step) and checkpoint save/reload.
+against TE dense post_scale_bias and a manual attention reference, then runs
+forward/backward/optimizer/checkpoint smoke on a small PyTorch block.  This is
+not a Megatron training proof; that uses the separate production launcher.
 
 PREREQUISITES:
   - The beta23 image must be built and pushed to GHCR:
@@ -10,8 +11,7 @@ PREREQUISITES:
       docker push ghcr.io/datasunriseou/cppmega:beta23
   - Set GHCR_DIGEST_BETA23 to the real digest:
       docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/datasunriseou/cppmega:beta23
-  - TileLang ref must be bumped to a tvm-ffi>=0.1.12-compatible commit
-    (see docs/fa4_beta23_upgrade_plan.md section 4 and 12.4).
+  - The image must contain the TileLang/tvm-ffi pair pinned in STACK.lock.
 
 Usage:
     # With the beta23 GHCR image (preferred):
@@ -57,13 +57,30 @@ def _image() -> modal.Image:
         "WANDB_MODE": "disabled",
         "CPPMEGA_FA4_SCORE_MOD": "1",
     })
-    # When using the default b19 image, upgrade to beta23 + tvm-ffi at runtime.
-    # The dedicated beta23 GHCR image already ships these pins.
+    # The default image needs both matching local wheels; upgrading only
+    # tvm-ffi recreates the TileLang C++ ABI mismatch.
     if not USE_BETA23:
-        img = img.run_commands(
-            "pip install --pre 'apache-tvm-ffi>=0.1.12,<0.2' "
-            "'flash-attn-4[cu13]==4.0.0b23' "
-            "--extra-index-url https://pypi.nvidia.com 2>&1 | tail -5"
+        wheel_dir = _REPO_ROOT / "wheels"
+        ffi_wheel = wheel_dir / (
+            "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
+        )
+        tilelang_wheel = wheel_dir / "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
+        missing = [
+            wheel for wheel in (ffi_wheel, tilelang_wheel) if not wheel.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(f"missing beta23 compatibility wheels: {missing}")
+        img = (
+            img.add_local_file(str(ffi_wheel), "/tmp/tvm_ffi.whl", copy=True)
+            .add_local_file(str(tilelang_wheel), "/tmp/tilelang.whl", copy=True)
+            .run_commands(
+                "pip install --pre 'apache-tvm-ffi>=0.1.12,<0.2' "
+                "'z3-solver==4.15.4.0' "
+                "'flash-attn-4[cu13]==4.0.0b23' "
+                "--extra-index-url https://pypi.nvidia.com && "
+                "pip install --force-reinstall --no-deps "
+                "/tmp/tvm_ffi.whl /tmp/tilelang.whl"
+            )
         )
     img = (
         img.add_local_dir(str(_REPO_ROOT / "cppmega"), remote_path="/opt/cppmega/cppmega", copy=True)
@@ -144,8 +161,10 @@ def test_te_fa4_parity() -> dict[str, Any]:
     chunk_counts = torch.full((B,), num_chunks, dtype=torch.long, device=device)
 
     call_edges = torch.zeros(B, 4, 2, dtype=torch.long, device=device)
-    call_edges[0, 0] = torch.tensor([0, 1])
-    call_edges[0, 1] = torch.tensor([1, 2])
+    # Past-facing edges remain visible under the causal mask. Future-facing
+    # edges would make this a false parity test because their bias is masked.
+    call_edges[0, 0] = torch.tensor([1, 0])
+    call_edges[0, 1] = torch.tensor([2, 1])
     call_edge_counts = torch.tensor([2], dtype=torch.long, device=device)
 
     structure_batch = {
@@ -165,7 +184,7 @@ def test_te_fa4_parity() -> dict[str, Any]:
     chunk_bias = bias_state.chunk_bias  # [B, C+1, C+1]
     t2c_q = bias_state.token_to_chunk_q  # [B, S]
     t2c_k = bias_state.token_to_chunk_k  # [B, S]
-    # Keep float32 reference for mathematical comparison (FA4 vs manual PyTorch)
+    # Keep float32 reference for mathematical comparison.
     dense_bias_f32 = torch.zeros(B, 1, S, S, device=device, dtype=torch.float32)
     for b in range(B):
         for qi in range(S):
@@ -175,6 +194,34 @@ def test_te_fa4_parity() -> dict[str, Any]:
                 dense_bias_f32[b, 0, qi, ki] = chunk_bias[b, qc, kc]
     # TE 2.16 requires bias dtype to match QKV dtype (bf16) for post_scale_bias
     dense_bias = dense_bias_f32.to(torch.bfloat16)
+
+    # --- Manual float32 reference and test-input integrity ---
+    causal_mask = torch.ones(S, S, dtype=torch.bool, device=device).triu(1)
+    visible_bias = dense_bias_f32[0, 0].masked_select(~causal_mask)
+    visible_bias_nonzero = int(torch.count_nonzero(visible_bias).item())
+    results["visible_bias_nonzero"] = visible_bias_nonzero
+    if visible_bias_nonzero == 0:
+        results["status"] = "FAIL (graph bias fully masked)"
+        return results
+
+    q_ref = q_bshd.float()
+    k_ref = k_bshd.float()
+    v_ref = v_bshd.float()
+    plain_scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_ref) * (D**-0.5)
+    biased_scores = plain_scores + dense_bias_f32
+    plain_scores = plain_scores.masked_fill(causal_mask, float("-inf"))
+    biased_scores = biased_scores.masked_fill(causal_mask, float("-inf"))
+    manual_plain = torch.einsum(
+        "bhqk,bkhd->bqhd", torch.softmax(plain_scores, dim=-1), v_ref
+    )
+    manual_biased = torch.einsum(
+        "bhqk,bkhd->bqhd", torch.softmax(biased_scores, dim=-1), v_ref
+    )
+    manual_bias_effect = (manual_biased - manual_plain).abs().max().item()
+    results["manual_bias_effect"] = manual_bias_effect
+    if manual_bias_effect == 0.0:
+        results["status"] = "FAIL (graph bias has no mathematical effect)"
+        return results
 
     # --- TE reference: DotProductAttention with post_scale_bias ---
     try:
@@ -223,30 +270,41 @@ def test_te_fa4_parity() -> dict[str, Any]:
     # TE output: [B, S, H*D], FA4 output: [S, B, H*D]
     te_flat = te_out.reshape(B, S, H * D)
     fa4_flat = fa4_out.transpose(0, 1).reshape(B, S, H * D)
+    manual_flat = manual_biased.reshape(B, S, H * D)
 
     max_diff = (te_flat - fa4_flat).abs().max().item()
     mean_diff = (te_flat - fa4_flat).abs().mean().item()
+    te_manual_max_diff = (te_flat.float() - manual_flat).abs().max().item()
+    fa4_manual_max_diff = (fa4_flat.float() - manual_flat).abs().max().item()
     results["max_diff"] = max_diff
     results["mean_diff"] = mean_diff
+    results["te_manual_max_diff"] = te_manual_max_diff
+    results["fa4_manual_max_diff"] = fa4_manual_max_diff
     results["te_norm"] = te_flat.norm().item()
     results["fa4_norm"] = fa4_flat.norm().item()
+    results["manual_norm"] = manual_flat.norm().item()
 
     # bf16 tolerance: < 0.1 for S=128 with additive bias
     PARITY_THRESHOLD = 0.1
-    results["parity_pass"] = max_diff < PARITY_THRESHOLD
+    worst_diff = max(max_diff, te_manual_max_diff, fa4_manual_max_diff)
+    results["parity_pass"] = worst_diff < PARITY_THRESHOLD
     results["threshold"] = PARITY_THRESHOLD
-    results["status"] = "PASS" if max_diff < PARITY_THRESHOLD else f"FAIL (max_diff={max_diff:.6f})"
+    results["status"] = (
+        "PASS"
+        if worst_diff < PARITY_THRESHOLD
+        else f"FAIL (worst_diff={worst_diff:.6f})"
+    )
     return results
 
 
 # ---------------------------------------------------------------------------
-# TEST 2: Single Megatron training step (forward + backward + optimizer.step)
+# TEST 2: PyTorch FA4 miniblock (forward + backward + optimizer.step)
 # ---------------------------------------------------------------------------
 
 
 @app.function(image=_image(), gpu=GPU_SPEC, timeout=900, volumes={"/results": results_vol})
-def test_megatron_training_step() -> dict[str, Any]:
-    """Run a single Megatron training step with FA4 score_mod attention.
+def test_fa4_miniblock_training_step() -> dict[str, Any]:
+    """Run a small PyTorch transformer-like block with FA4 score_mod attention.
 
     Exercises: model forward, loss computation, backward, optimizer.step,
     checkpoint save, and checkpoint reload.
@@ -259,7 +317,7 @@ def test_megatron_training_step() -> dict[str, Any]:
     import torch
 
     sys.path.insert(0, "/opt/cppmega")
-    results: dict[str, Any] = {"test": "megatron_training_step_beta23"}
+    results: dict[str, Any] = {"test": "fa4_miniblock_training_step_beta23"}
 
     # --- Environment ---
     try:
@@ -396,6 +454,15 @@ def test_megatron_training_step() -> dict[str, Any]:
         results["backward_ok"] = True
         results["grad_norms"] = grad_norms
         results["total_grad_norm"] = sum(v**2 for v in grad_norms.values()) ** 0.5
+        results["grads_finite"] = all(
+            bool(torch.isfinite(p.grad).all().item())
+            for p in model.parameters()
+            if p.grad is not None
+        )
+        results["grads_nonzero"] = any(value > 0.0 for value in grad_norms.values())
+        if not results["grads_finite"] or not results["grads_nonzero"]:
+            results["status"] = "FAIL (invalid gradients)"
+            return results
     except Exception as e:
         results["error"] = f"Backward failed: {e}"
         results["traceback"] = traceback.format_exc()
@@ -483,10 +550,15 @@ def test_megatron_training_step() -> dict[str, Any]:
     all_pass = all([
         results.get("forward_ok"),
         results.get("backward_ok"),
+        results.get("grads_finite"),
+        results.get("grads_nonzero"),
         results.get("optimizer_step_ok"),
+        results.get("params_changed", 0) > 0,
         results.get("checkpoint_save_ok"),
         results.get("checkpoint_reload_ok"),
         results.get("reload_exact", False),
+        results.get("second_forward_ok"),
+        results.get("second_output_finite"),
     ])
     results["status"] = "PASS" if all_pass else "FAIL"
     return results
@@ -499,7 +571,7 @@ def test_megatron_training_step() -> dict[str, Any]:
 
 @app.local_entrypoint()
 def main() -> None:
-    """Run TE<->FA4 parity and Megatron training step on beta23."""
+    """Run TE<->FA4 parity and the FA4 miniblock smoke on beta23."""
     import json
 
     print(f"Image: {GHCR_REF}")
@@ -513,9 +585,9 @@ def main() -> None:
     print(json.dumps(r1, indent=2, default=str))
 
     print("\n" + "=" * 70)
-    print("TEST 2: Megatron training step (fwd + bwd + optim + ckpt)")
+    print("TEST 2: FA4 miniblock smoke (fwd + bwd + optim + ckpt)")
     print("-" * 70)
-    r2 = test_megatron_training_step.remote()
+    r2 = test_fa4_miniblock_training_step.remote()
     print(json.dumps(r2, indent=2, default=str))
 
     print("\n" + "=" * 70)
@@ -524,7 +596,7 @@ def main() -> None:
     print(f"  TE<->FA4 Parity:       {r1.get('status', 'UNKNOWN')}")
     if r1.get("max_diff") is not None:
         print(f"    max_diff={r1['max_diff']:.6f} (threshold={r1.get('threshold', 0.1)})")
-    print(f"  Megatron Training Step: {r2.get('status', 'UNKNOWN')}")
+    print(f"  FA4 Miniblock Smoke:    {r2.get('status', 'UNKNOWN')}")
     if r2.get("loss") is not None:
         print(f"    loss={r2['loss']:.6f}")
     if r2.get("reload_max_diff") is not None:

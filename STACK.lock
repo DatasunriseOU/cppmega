@@ -12,11 +12,12 @@ base:
   torch_index: https://download.pytorch.org/whl/cu132
   torch_arch_list: "9.0;10.0;12.1"   # H100 / B200 / GB10
 
-# Wheels built in matrix on ubuntu-latest (x86_64), uploaded to GH Release as assets.
+# Wheels built on the repository's self-hosted Linux x86_64 runner and uploaded
+# to a GH Release as assets.
 wheels:
   transformer_engine:
     repo: NVIDIA/TransformerEngine
-    ref: v2.16
+    ref: 4220403e831d29e93868f7793693ea83f6b8b05b
     version: 2.16
     build: |
       NVTE_FRAMEWORK=pytorch \
@@ -85,25 +86,38 @@ wheels:
     produces:
       - fast_hadamard_transform-*.whl
 
+  tvm_ffi:
+    repo: DatasunriseOU/tvm-ffi
+    ref: 521efeb30bfd9e4946b248b3d76e6391028233a3
+    version: 0.1.13.post5
+    build_with: tilelang
+    produces:
+      - apache_tvm_ffi-*.whl
+
   tilelang:
-    # DatasunriseOU/tilelang fork at b2545eaa carries:
+    # DatasunriseOU/tilelang fork at 334266af carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
-    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@78f930ed, which includes
+    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@911772cf, which includes
     #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
     #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
     #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
     #   - restored 3rdparty/nvbench/l2_cache_flush.h at the exact historical
     #     blob still required by TVM's CUDA runtime source.
+    #   - lazily imports tvm.testing from the RPC-only ref_count helper, so a
+    #     production import does not require the test-only pytest package.
     #   - adapts AdjustMatmulOrder's ND axes to this fork's boxed-Integer
     #     permute_dims API (the upstream int64_t form does not compile here).
     #   - links TVM CUDA driver calls through TileLang's lazy libcuda_stub,
     #     including cuFuncGetAttribute required by CUDA 13.2 TVM, so wheel
     #     repair cannot leave libtvm_runtime.so with unresolved cu* symbols.
+    #   - vendored tvm-ffi is DatasunriseOU/tvm-ffi@521efeb3
+    #     (v0.1.13.post5), matching both FA4's >=0.1.12 contract and the C++
+    #     ABI used to link libtvm_runtime.so.
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: b2545eaa3f11610a31e5b8371aab97c369e95f27
+    ref: 334266afd448ae06e7893119a0ebb72d7fe1e776
     version: 0.1.9
     submodules: true
     build: |
@@ -123,8 +137,14 @@ wheels:
       - qoptim_cuda-*.whl
 
 runtime_pypi:
+  z3_solver:
+    # libtilelang is linked to this wheel's libz3.so.4.15 SONAME.
+    package: "z3-solver==4.15.4.0"
+
   apache_tvm_ffi:
-    package: "apache-tvm-ffi==0.1.13"
+    # Final runtime version comes from wheels.tvm_ffi; PyPI v0.1.13 is only
+    # the cacheable bootstrap dependency before local wheels are installed.
+    package: "apache-tvm-ffi==0.1.13.post5"
 
   flash_attn_4:
     # FA4 CuTe DSL package. This installs the flash_attn.cute namespace and
