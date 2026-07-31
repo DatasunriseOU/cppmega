@@ -323,12 +323,17 @@ def test_image_build_binds_triggering_source_and_wheel_release() -> None:
     ).read_text(encoding="utf-8")
 
     assert workflow.count("github.event.workflow_run.head_sha") == 2
+    assert workflow.count("inputs.source_sha") == 2
     assert 'TAG="wheels-${SOURCE_SHA}"' in workflow
     assert "inputs.wheels_tag" not in workflow
     assert "git/ref/tags/${TAG}" in workflow
     assert '"$tag_sha" != "$SOURCE_SHA"' in workflow
     assert "type=raw,value=sha-${{ steps.rel.outputs.source_sha }}" in workflow
     assert "type=raw,value=${{ steps.rel.outputs.short_sha }}" in workflow
+    assert (
+        "org.opencontainers.image.revision="
+        "${{ steps.rel.outputs.source_sha }}"
+    ) in workflow
     assert "{{is_default_branch}}" not in workflow
     assert "github.event.workflow_run.head_branch" in workflow
     assert "gh release list" not in workflow

@@ -61,6 +61,7 @@ from scripts.nanochat_data.memory_guard import (  # noqa: E402
     check_memory_limit,
     start_memory_guard,
 )
+from cppmega.data.commit_scope import classify_primary_commit_path  # noqa: E402
 from cppmega.symbol_identity import (  # noqa: E402
     SymbolIdentityError,
     require_project_identity,
@@ -68,7 +69,7 @@ from cppmega.symbol_identity import (  # noqa: E402
 
 
 CHECKPOINT_SCHEMA_VERSION = 1
-EXTRACTION_CONTRACT_VERSION = 1
+EXTRACTION_CONTRACT_VERSION = 3
 DEFAULT_CHECKPOINT_COMMITS = 250
 CHECKPOINT_SUFFIX = ".extract-checkpoint"
 
@@ -108,24 +109,11 @@ class _ExtractionStats(TypedDict):
     records_written: int
 
 
-# C/C++ file extensions
-CPP_EXTENSIONS = {
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".c++",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".h++",
-    ".inl",
-    ".inc",
-    ".ipp",
-    ".tcc",
-    ".tpp",
-}
+class _CommitFileChange(TypedDict):
+    status: str
+    old_filepath: Optional[str]
+    new_filepath: Optional[str]
+
 
 # Files/paths to skip
 SKIP_PATTERNS = {
@@ -144,8 +132,7 @@ SKIP_PATTERNS = {
     ".gen.h",
 }
 
-MAX_DIFF_CHARS = 50000
-MAX_FILES_PER_COMMIT = 5
+MAX_FILE_BYTES = 200_000
 MIN_DIFF_CHARS = 50
 
 
@@ -213,8 +200,8 @@ def stable_filepath_id(repo_name: str, filepath: str) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
-def is_cpp_file(path: str) -> bool:
-    return Path(path).suffix.lower() in CPP_EXTENSIONS
+def is_primary_commit_file(path: str) -> bool:
+    return classify_primary_commit_path(path) is not None
 
 
 def should_skip_path(path: str) -> bool:
@@ -357,14 +344,14 @@ def resolve_owner_repo(repo_path: str) -> Optional[str]:
 
 
 def get_commit_list(repo_path: str, max_commits: int = 0) -> list[str]:
-    args = ["log", "--format=%H", "--no-merges", "--diff-filter=M"]
+    args = ["log", "--format=%H", "--no-merges", "--diff-filter=ACDMRT"]
     if max_commits > 0:
         args.extend(["-n", str(max_commits)])
     output = run_git_required(
         repo_path,
         args,
         timeout=120,
-        operation="list non-merge modified commits",
+        operation="list non-merge primary change commits",
     )
     if not output.strip():
         return []
@@ -507,14 +494,17 @@ def compute_file_local_commit_indices(
 def precompute_cpp_file_changes(
     repo_path: str,
     commit_hashes: list[str],
-) -> tuple[dict[tuple[str, str], int], dict[str, list[str]]]:
+) -> tuple[
+    dict[tuple[str, str], int],
+    dict[str, list[_CommitFileChange]],
+]:
     """Precompute per-file temporal commit indices over the EMITTED set.
 
     Contract: ``file_local_commit_index`` for ``(commit, filepath)`` is the
     0-based count of EARLIER commits (chronological, oldest-first) that modified
     the same file AND were ACCEPTED by :func:`get_commit_diffs` -- i.e. that
-    passed the identical None-blob / diff-length
-    (``MIN_DIFF_CHARS``..``MAX_DIFF_CHARS``) / content-size (``200000``)
+    passed the identical primary-domain / diff-length
+    (``MIN_DIFF_CHARS`` or larger) / content-size (``MAX_FILE_BYTES``)
     acceptance gate used when records are written. A commit whose diff is
     rejected by that gate produces no record and therefore MUST NOT advance the
     counter, so the indices carried on emitted records are contiguous
@@ -522,9 +512,8 @@ def precompute_cpp_file_changes(
     ``compute_file_local_commit_indices`` produced before the precompute
     refactor.
 
-    Counting over the cheaper name-status-only set (:func:`get_commit_cpp_files`:
-    ``is_cpp_file`` / ``should_skip_path`` / ``status == 'M'`` /
-    ``MAX_FILES_PER_COMMIT``) is NOT equivalent: it counts diff-filtered commits
+    Counting over the cheaper name-status-only candidate set is NOT equivalent:
+    it counts diff-filtered commits
     that are never emitted, silently inflating and gapping the indices for any
     file with an interspersed rejected-diff commit (e.g. 0, 2, 3 instead of
     0, 1, 2). That is a semantic change that makes corpora built before/after
@@ -540,118 +529,316 @@ def precompute_cpp_file_changes(
     """
     counters: dict[str, int] = {}
     indices: dict[tuple[str, str], int] = {}
-    files_by_commit: dict[str, list[str]] = {}
+    files_by_commit: dict[str, list[_CommitFileChange]] = {}
     for commit_hash in reversed(commit_hashes):
         file_diffs = get_commit_diffs(repo_path, commit_hash)
         if not file_diffs:
             continue
-        accepted = [item["filepath"] for item in file_diffs]
-        files_by_commit[commit_hash] = accepted
-        for filepath in accepted:
+        accepted_paths = [item["filepath"] for item in file_diffs]
+        files_by_commit[commit_hash] = [
+            item["_source_change"] for item in file_diffs
+        ]
+        for filepath in accepted_paths:
             next_index = counters.get(filepath, 0)
             indices[(commit_hash, filepath)] = next_index
             counters[filepath] = next_index + 1
     return indices, files_by_commit
 
 
-def get_commit_cpp_files(repo_path: str, commit_hash: str) -> Optional[list[str]]:
-    """Return modified C/C++ file paths for a commit without reading blobs/diffs."""
+def _path_may_be_primary(path: str) -> bool:
+    return (
+        not should_skip_path(path)
+        and (is_primary_commit_file(path) or not Path(path).suffix)
+    )
+
+
+def get_commit_file_changes(
+    repo_path: str,
+    commit_hash: str,
+) -> Optional[list[_CommitFileChange]]:
+    """Return deterministic primary-domain candidates, including A/D/R changes."""
+
     name_status = run_git_unit(
         repo_path,
-        ["diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash],
+        [
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--find-renames=50%",
+            "-l0",
+            "--diff-filter=ACDMRT",
+            "--name-status",
+            "-z",
+            commit_hash,
+        ],
         commit_hash=commit_hash,
         filepath=None,
         operation="commit_paths",
     )
-    if not name_status.strip():
+    fields = name_status.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if not fields:
         return None
 
-    files = []
-    for line in name_status.strip().split("\n"):
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2 or not parts[0]:
+    changes: list[_CommitFileChange] = []
+    index = 0
+    while index < len(fields):
+        raw_status = fields[index]
+        index += 1
+        if not raw_status:
             raise UnitExtractionError(
                 repo_path=repo_path,
                 commit_hash=commit_hash,
                 filepath=None,
                 operation="commit_paths_parse",
                 error_type="MalformedGitOutput",
-                detail=f"invalid --name-status line: {line!r}",
+                detail=f"empty status field at NUL field {index - 1}",
             )
-        status = parts[0][0]
-        filepath = parts[-1]
-        if not is_cpp_file(filepath):
+        status = raw_status[0]
+        required_paths = 2 if status in {"R", "C"} else 1
+        if index + required_paths > len(fields):
+            raise UnitExtractionError(
+                repo_path=repo_path,
+                commit_hash=commit_hash,
+                filepath=None,
+                operation="commit_paths_parse",
+                error_type="MalformedGitOutput",
+                detail=(
+                    f"status {raw_status!r} requires {required_paths} path fields, "
+                    f"only {len(fields) - index} remain"
+                ),
+            )
+        paths = fields[index:index + required_paths]
+        index += required_paths
+        if status in {"R", "C"}:
+            old_filepath, new_filepath = paths
+        else:
+            filepath = paths[0]
+            old_filepath = None if status == "A" else filepath
+            new_filepath = None if status == "D" else filepath
+        if not any(
+            _path_may_be_primary(path)
+            for path in (old_filepath, new_filepath)
+            if path is not None
+        ):
             continue
-        if should_skip_path(filepath):
-            continue
-        if status not in ("M",):
-            continue
-        files.append(filepath)
+        changes.append(
+            {
+                "status": status,
+                "old_filepath": old_filepath,
+                "new_filepath": new_filepath,
+            }
+        )
 
-    if not files or len(files) > MAX_FILES_PER_COMMIT:
+    return changes or None
+
+
+def get_commit_cpp_files(repo_path: str, commit_hash: str) -> Optional[list[str]]:
+    """Return canonical paths for primary native-domain change candidates."""
+
+    changes = get_commit_file_changes(repo_path, commit_hash)
+    if not changes:
         return None
-    return files
+    return [
+        change["new_filepath"] or change["old_filepath"] or ""
+        for change in changes
+    ]
+
+
+def _first_parent_or_empty_tree(repo_path: str, commit_hash: str) -> str:
+    parent_line = run_git_unit(
+        repo_path,
+        ["rev-list", "--parents", "-n", "1", commit_hash],
+        commit_hash=commit_hash,
+        filepath=None,
+        operation="commit_parent",
+    ).strip()
+    fields = parent_line.split()
+    if not fields or fields[0] != commit_hash:
+        raise UnitExtractionError(
+            repo_path=repo_path,
+            commit_hash=commit_hash,
+            filepath=None,
+            operation="commit_parent_parse",
+            error_type="MalformedGitOutput",
+            detail=f"invalid rev-list --parents output: {parent_line!r}",
+        )
+    if len(fields) > 1:
+        return fields[1]
+    return run_git_unit(
+        repo_path,
+        ["hash-object", "-t", "tree", "/dev/null"],
+        commit_hash=commit_hash,
+        filepath=None,
+        operation="empty_tree",
+    ).strip()
+
+
+def _bounded_blob_size(
+    repo_path: str,
+    commit_hash: str,
+    *,
+    object_spec: str,
+    filepath: str,
+    operation: str,
+) -> Optional[int]:
+    raw_size = run_git_unit(
+        repo_path,
+        ["cat-file", "-s", object_spec],
+        commit_hash=commit_hash,
+        filepath=filepath,
+        operation=operation,
+        timeout=30,
+    ).strip()
+    try:
+        size = int(raw_size)
+    except ValueError as exc:
+        raise UnitExtractionError(
+            repo_path=repo_path,
+            commit_hash=commit_hash,
+            filepath=filepath,
+            operation=f"{operation}_parse",
+            error_type="MalformedGitOutput",
+            detail=f"invalid blob size: {raw_size!r}",
+        ) from exc
+    return size if size <= MAX_FILE_BYTES else None
 
 
 def get_file_diff(
     repo_path: str,
     commit_hash: str,
-    filepath: str,
-) -> Optional[dict[str, str]]:
-    """Read and gate one modified file, raising with exact unit provenance."""
-    old_content = run_git_unit(
-        repo_path,
-        ["show", f"{commit_hash}^:{filepath}"],
-        commit_hash=commit_hash,
-        filepath=filepath,
-        operation="old_blob",
-        timeout=30,
-    )
-    new_content = run_git_unit(
-        repo_path,
-        ["show", f"{commit_hash}:{filepath}"],
-        commit_hash=commit_hash,
-        filepath=filepath,
-        operation="new_blob",
-        timeout=30,
+    change: _CommitFileChange,
+    *,
+    parent_hash: Optional[str] = None,
+) -> Optional[dict]:
+    """Read one bounded A/D/M/R change and keep only primary-domain text."""
+
+    base = parent_hash or _first_parent_or_empty_tree(repo_path, commit_hash)
+    old_filepath = change["old_filepath"]
+    new_filepath = change["new_filepath"]
+    error_filepath = new_filepath or old_filepath or "<unknown>"
+
+    old_content = ""
+    if old_filepath is not None:
+        old_spec = f"{base}:{old_filepath}"
+        if _bounded_blob_size(
+            repo_path,
+            commit_hash,
+            object_spec=old_spec,
+            filepath=old_filepath,
+            operation="old_blob_size",
+        ) is None:
+            return None
+        old_content = run_git_unit(
+            repo_path,
+            ["show", old_spec],
+            commit_hash=commit_hash,
+            filepath=old_filepath,
+            operation="old_blob",
+            timeout=30,
+        )
+
+    new_content = ""
+    if new_filepath is not None:
+        new_spec = f"{commit_hash}:{new_filepath}"
+        if _bounded_blob_size(
+            repo_path,
+            commit_hash,
+            object_spec=new_spec,
+            filepath=new_filepath,
+            operation="new_blob_size",
+        ) is None:
+            return None
+        new_content = run_git_unit(
+            repo_path,
+            ["show", new_spec],
+            commit_hash=commit_hash,
+            filepath=new_filepath,
+            operation="new_blob",
+            timeout=30,
+        )
+
+    pathspecs = list(
+        dict.fromkeys(
+            path
+            for path in (old_filepath, new_filepath)
+            if path is not None
+        )
     )
     diff = run_git_unit(
         repo_path,
-        ["diff", f"{commit_hash}^", commit_hash, "--", filepath],
+        [
+            "diff",
+            "--find-renames=50%",
+            "-l0",
+            base,
+            commit_hash,
+            "--",
+            *pathspecs,
+        ],
         commit_hash=commit_hash,
-        filepath=filepath,
+        filepath=error_filepath,
         operation="file_diff",
         timeout=30,
     )
 
-    diff_len = len(diff)
-    if diff_len < MIN_DIFF_CHARS or diff_len > MAX_DIFF_CHARS:
+    if len(diff) < MIN_DIFF_CHARS:
         return None
-    if len(old_content) > 200000 or len(new_content) > 200000:
+
+    old_kind = (
+        classify_primary_commit_path(old_filepath, old_content)
+        if old_filepath is not None and not should_skip_path(old_filepath)
+        else None
+    )
+    new_kind = (
+        classify_primary_commit_path(new_filepath, new_content)
+        if new_filepath is not None and not should_skip_path(new_filepath)
+        else None
+    )
+    if old_kind is None and new_kind is None:
         return None
+
+    filepath = new_filepath if new_kind is not None else old_filepath
+    if filepath is None:
+        raise AssertionError("primary commit change has no canonical filepath")
+    effective_status = change["status"]
+    if old_kind is None:
+        effective_status = "A"
+    elif new_kind is None:
+        effective_status = "D"
     return {
         "filepath": filepath,
-        "old_content": old_content,
-        "new_content": new_content,
+        "old_filepath": old_filepath or "",
+        "new_filepath": new_filepath or "",
+        "change_status": effective_status,
+        "old_content": old_content if old_kind is not None else "",
+        "new_content": new_content if new_kind is not None else "",
         "diff": diff,
+        "_source_change": change,
     }
 
 
 def get_commit_diffs(
     repo_path: str,
     commit_hash: str,
-    files: Optional[list[str]] = None,
+    files: Optional[list[_CommitFileChange]] = None,
 ) -> Optional[list[dict]]:
-    """Get per-file diffs for C/C++ files in a commit."""
+    """Get per-file diffs for primary native-domain files in a commit."""
     if files is None:
-        files = get_commit_cpp_files(repo_path, commit_hash)
+        files = get_commit_file_changes(repo_path, commit_hash)
     if not files:
         return None
+    parent_hash = _first_parent_or_empty_tree(repo_path, commit_hash)
     results = []
-    for filepath in files:
-        file_diff = get_file_diff(repo_path, commit_hash, filepath)
+    for change in files:
+        file_diff = get_file_diff(
+            repo_path,
+            commit_hash,
+            change,
+            parent_hash=parent_hash,
+        )
         if file_diff is not None:
             results.append(file_diff)
 
@@ -1272,7 +1459,7 @@ def _extract_commit_records(
     use_notes: bool,
 ) -> list[bytes]:
     try:
-        files = get_commit_cpp_files(repo_path, commit_hash)
+        changes = get_commit_file_changes(repo_path, commit_hash)
     except UnitExtractionError as exc:
         checkpoint.record_bad_unit(
             exc,
@@ -1281,13 +1468,33 @@ def _extract_commit_records(
             max_bad_units=max_bad_units,
         )
         return []
-    if not files:
+    if not changes:
+        return []
+    try:
+        parent_hash = _first_parent_or_empty_tree(repo_path, commit_hash)
+    except UnitExtractionError as exc:
+        checkpoint.record_bad_unit(
+            exc,
+            chunk_index=chunk_index,
+            policy=policy,
+            max_bad_units=max_bad_units,
+        )
         return []
 
-    accepted: list[tuple[dict[str, str], int]] = []
-    for filepath in files:
+    accepted: list[tuple[dict, int]] = []
+    for change in changes:
+        filepath = (
+            change["new_filepath"]
+            or change["old_filepath"]
+            or "<unknown>"
+        )
         try:
-            file_diff = get_file_diff(repo_path, commit_hash, filepath)
+            file_diff = get_file_diff(
+                repo_path,
+                commit_hash,
+                change,
+                parent_hash=parent_hash,
+            )
         except UnitExtractionError as exc:
             checkpoint.record_bad_unit(
                 exc,
@@ -1353,6 +1560,8 @@ def _extract_commit_records(
             "old_content": file_diff["old_content"],
             "new_content": file_diff["new_content"],
             "diff": file_diff["diff"],
+            "change_status": file_diff["change_status"],
+            "old_filepath": file_diff["old_filepath"],
             "subject": commit_info["subject"],
             "body": commit_info["body"],
             "filepath": filepath,
@@ -1829,6 +2038,8 @@ def process_repo(
                 "old_content": fd["old_content"],
                 "new_content": fd["new_content"],
                 "diff": fd["diff"],
+                "change_status": fd["change_status"],
+                "old_filepath": fd["old_filepath"],
                 "subject": commit_info["subject"],
                 "body": commit_info["body"],
                 "filepath": fd["filepath"],

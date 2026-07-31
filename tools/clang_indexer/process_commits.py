@@ -71,6 +71,7 @@ from tools.clang_indexer.index_project import (
     _symbol_part_metadata,
     _used_macro_defs,
     canonical_symbol_identity,
+    build_build_doc,
     FunctionDef,
     MacroDef,
     PartInfo,
@@ -98,6 +99,7 @@ from cppmega.symbol_identity import (
     require_project_identity,
 )
 from cppmega.data.build_context import detect_build_context
+from cppmega.data.commit_scope import classify_primary_commit_path
 from scripts.data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.data.atomic_publish import atomic_output_file
 from scripts.pr_ingest import pr_store as _pr_store_mod
@@ -843,6 +845,8 @@ def _build_commit_temporal_metadata(
     new_line_ops, new_line_hunk = compute_new_line_edit_ops(diff)
     old_line_hunk = compute_old_line_hunk(hunks)
     old_changed_ranges = _line_ranges_for_changed_functions(old_analysis, old_changed_lines)
+    if not old_changed_ranges and old_changed_lines:
+        old_changed_ranges = [(min(old_changed_lines), max(old_changed_lines))]
     old_content = str(record.get('old_content', '') or '')
     new_content = str(record.get('new_content', '') or '')
     old_line_ranges = _line_ranges_by_number(str(record.get('old_content', '') or ''))
@@ -2158,6 +2162,31 @@ def _copy_clang_ast_part(
     ast_node_type[offset:end] = src_node_type
 
 
+def _attach_commit_provenance(result: dict, record: dict) -> None:
+    result['repo'] = record.get('repo', '')
+    result['filepath'] = record.get('filepath', '')
+    result['commit_hash'] = record.get('commit_hash', record.get('commit', ''))
+    result['timestamp'] = record.get('timestamp', '')
+    result['pr_number'] = parse_pr_number(record)
+    result['pr_title'] = record.get('pr_title', '')
+    result['pr_discussion'] = record.get('pr_discussion', '')
+    result['source_branch'] = record.get('source_branch', '')
+    result['parent_hashes'] = list(record.get('parent_hashes', []) or [])
+    result['parent_count'] = record.get('parent_count')
+    result['is_merge_commit'] = record.get('is_merge_commit')
+    result['author_timestamp'] = record.get('author_timestamp')
+    result['commit_timestamp'] = record.get('commit_timestamp')
+    result['repo_stable_id'] = record.get('repo_stable_id')
+    result['filepath_stable_id'] = record.get('filepath_stable_id')
+    result['file_local_commit_index'] = record.get('file_local_commit_index')
+    result['has_ambiguous_reconstruction'] = record.get(
+        'has_ambiguous_reconstruction', False
+    )
+    result['has_rename_ambiguity'] = record.get('has_rename_ambiguity', False)
+    result['change_status'] = record.get('change_status', '')
+    result['old_filepath'] = record.get('old_filepath', '')
+
+
 def _build_enriched_from_parts(
     parts_info: list[PartInfo],
     old_analysis: FileAnalysis,
@@ -2515,28 +2544,7 @@ def _build_enriched_from_parts(
     # dict so clang_enriched_to_parquet.py can populate the parquet columns.
     # Without this the SHA + timestamp columns end up 0% populated and the later
     # GitHub-Archive PR-text join has no key.
-    result['repo'] = record.get('repo', '')
-    result['filepath'] = record.get('filepath', '')
-    result['commit_hash'] = record.get('commit_hash', record.get('commit', ''))
-    result['timestamp'] = record.get('timestamp', '')
-    result['pr_number'] = parse_pr_number(record)
-    result['pr_title'] = record.get('pr_title', '')
-    # Tier-2: round-trip the joined PR discussion (title+body+thread+reviews+
-    # linked issues) so it survives into the parquet column alongside the keys.
-    result['pr_discussion'] = record.get('pr_discussion', '')
-    result['source_branch'] = record.get('source_branch', '')
-    result['parent_hashes'] = list(record.get('parent_hashes', []) or [])
-    result['parent_count'] = record.get('parent_count')
-    result['is_merge_commit'] = record.get('is_merge_commit')
-    result['author_timestamp'] = record.get('author_timestamp')
-    result['commit_timestamp'] = record.get('commit_timestamp')
-    result['repo_stable_id'] = record.get('repo_stable_id')
-    result['filepath_stable_id'] = record.get('filepath_stable_id')
-    result['file_local_commit_index'] = record.get('file_local_commit_index')
-    result['has_ambiguous_reconstruction'] = record.get(
-        'has_ambiguous_reconstruction', False
-    )
-    result['has_rename_ambiguity'] = record.get('has_rename_ambiguity', False)
+    _attach_commit_provenance(result, record)
 
     # Platform info detection mirrors the source-indexer path.
     _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2717,9 +2725,68 @@ def _claim_semantic_chunk(
 # Main processing
 # ---------------------------------------------------------------------------
 
+def _process_domain_record(
+    record: dict,
+    *,
+    filepath: str,
+    build_kind: str,
+    old_content: str,
+    new_content: str,
+    max_tokens: int,
+    project_id: str,
+    build_info: dict[str, object],
+) -> list[dict]:
+    document_text = new_content or old_content
+    tokens = count_tokens(document_text)
+    if tokens > max_tokens:
+        return []
+
+    document = build_build_doc(
+        filepath,
+        document_text,
+        build_kind,
+        project_id=project_id,
+        build_info=build_info,
+    )
+    typed_message = '\n\n'.join(
+        value.strip()
+        for value in (record.get('subject'), record.get('body'))
+        if isinstance(value, str) and value.strip()
+    )
+    document.update(
+        {
+            'ifim_instruction_text': typed_message,
+            'commit_msg_text': typed_message,
+            'pre_text': old_content,
+            'post_text': new_content,
+            'diff_text': (
+                record.get('diff', '')
+                if isinstance(record.get('diff', ''), str)
+                else ''
+            ),
+            'changed_symbol_ids': [],
+            'ripple_candidates': [],
+        }
+    )
+    empty_analysis = FileAnalysis(preamble='')
+    document.update(
+        _build_commit_temporal_metadata(
+            document_text,
+            [document_text],
+            ['n' if new_content else 'o'],
+            record=record,
+            old_analysis=empty_analysis,
+            new_analysis=empty_analysis,
+        )
+    )
+    _attach_commit_provenance(document, record)
+    document['actual_token_count'] = tokens
+    return [document]
+
+
 def process_record(
     record: dict,
-    clang_index: Index,
+    clang_index: Index | None,
     tmpdir: str,
     max_tokens: int,
     max_file_bytes: int,
@@ -2739,7 +2806,7 @@ def process_record(
 
     if len(old_content) > max_file_bytes or len(new_content) > max_file_bytes:
         return []
-    if len(old_content) < 50 or len(new_content) < 50:
+    if max(len(old_content), len(new_content)) < 50:
         return []
 
     hunks = parse_hunk_ranges(diff)
@@ -2747,6 +2814,12 @@ def process_record(
         return []
 
     filepath = record.get('filepath', 'source.cpp')
+    primary_kind = classify_primary_commit_path(
+        filepath,
+        new_content or old_content,
+    )
+    if primary_kind is None:
+        return []
     project_id = require_project_identity(
         record.get("repo"),
         source=f"commit record {record.get('commit_hash') or '<unknown>'}",
@@ -2760,6 +2833,20 @@ def process_record(
             record.setdefault("compile_args", compile_args)
         if build_info:
             record.setdefault("build_info", build_info)
+
+    if primary_kind != 'cpp':
+        return _process_domain_record(
+            record,
+            filepath=filepath,
+            build_kind=primary_kind,
+            old_content=old_content,
+            new_content=new_content,
+            max_tokens=max_tokens,
+            project_id=project_id,
+            build_info=build_info,
+        )
+    if clang_index is None:
+        raise ValueError("C/C++ commit processing requires a libclang index")
 
     # Parse old and new with clang (use separate temp subdirs to avoid conflicts)
     old_dir = os.path.join(tmpdir, 'old')
@@ -2865,10 +2952,27 @@ def process_record(
     return documents
 
 
+def _uses_typed_change_unit_dedup(document: dict) -> bool:
+    return bool(
+        document.get('doc_type') in {'build', 'shell', 'sql'}
+        and document.get('commit_hash')
+        and document.get('diff_text')
+    )
+
+
+def _commit_document_dedup_text(document: dict) -> str:
+    if _uses_typed_change_unit_dedup(document):
+        return (
+            f"COMMIT MESSAGE\n{document.get('commit_msg_text') or ''}\n\n"
+            f"UNIFIED DIFF\n{document['diff_text']}"
+        )
+    return str(document.get('text', ''))
+
+
 def process_jsonl_file(
     input_path: str,
     output_file,
-    clang_index: Index,
+    clang_index: Index | None,
     tmpdir: str,
     max_tokens: int,
     max_file_bytes: int,
@@ -2885,11 +2989,12 @@ def process_jsonl_file(
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output.
 
-    A commit is an ATOMIC change-unit: each commit DOC is deduped by the
-    tokenized hash of the WHOLE doc (drops identical commits, e.g. cherry-picks),
-    keeping route-by-fit downstream. When ``dedup_store`` is given the dedup is
-    GLOBAL + resumable + cross-stream (shared SQLite with the code stream). When
-    absent, a per-file in-RAM md5 set is used.
+    A commit is an ATOMIC change-unit. C/C++ rows dedup their rendered document;
+    domain rows exact-dedup the typed message plus unified diff and intentionally
+    skip lossy near-dedup so similar consecutive post-state files do not erase
+    distinct changes. When ``dedup_store`` is given the dedup is GLOBAL +
+    resumable + cross-stream (shared SQLite with the code stream). When absent,
+    a per-file in-RAM md5 set is used.
     """
     stats = {
         'records_read': 0,
@@ -2968,17 +3073,22 @@ def process_jsonl_file(
                 continue
 
             for doc in docs:
+                dedup_text = _commit_document_dedup_text(doc)
                 if dedup_store is not None:
-                    # CANONICAL: tokenized-hash dedup of the WHOLE commit doc.
-                    token_ids = dedup_tokenizer.encode(doc['text'])
+                    # CANONICAL: tokenized-hash dedup of the atomic change unit.
+                    token_ids = dedup_tokenizer.encode(dedup_text)
                     if dedup_store.seen_exact_tokens(token_ids):
                         stats['records_skipped'] += 1
                         continue
-                    if dedup_near and dedup_store.seen_near_tokens(token_ids):
+                    if (
+                        dedup_near
+                        and not _uses_typed_change_unit_dedup(doc)
+                        and dedup_store.seen_near_tokens(token_ids)
+                    ):
                         stats['records_skipped'] += 1
                         continue
                 else:
-                    doc_hash = hashlib.md5(doc['text'].encode()).hexdigest()
+                    doc_hash = hashlib.md5(dedup_text.encode()).hexdigest()
                     if doc_hash in seen_hashes:
                         stats['records_skipped'] += 1
                         continue

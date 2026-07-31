@@ -995,6 +995,17 @@ def test_validate_bundle_requires_source_composition_descriptor(tmp_path) -> Non
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
+def test_v4_bundle_requires_primary_source_routes(tmp_path) -> None:
+    _bundle(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema"] = "cppmega_megatron_bundle_v4"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source route descriptor"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+
+
 def test_validate_bundle_rejects_incomplete_source_composition_coverage(
     tmp_path,
 ) -> None:

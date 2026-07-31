@@ -53,6 +53,7 @@ _PORTABLE_TEST_ALLOWLIST = frozenset(
         "tests/test_nebius_h200_megatron_cpp_world_sweep.py",
         "tests/test_subset_megatron_sidecar_prefix.py",
         "tests/test_build_macro_routes_megatron_bundle.py",
+        "tests/test_commit_primary_scope.py",
         "tests/test_publish_megatron_bundle_to_nebius_s3.py",
         "tests/test_graphql_pr_stream.py",
         "tests/test_pr_completion_receipt.py",

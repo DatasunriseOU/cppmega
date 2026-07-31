@@ -1921,6 +1921,36 @@ def test_source_composition_allowlist_excludes_uncommitted_parquet_orphans(
     )
 
 
+def test_snapshot_rejects_routed_source_hash_drift(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    _write(code_root / "1024/repo.parquet", b"code")
+    _write(commit_root / "1024/repo_r0.parquet", b"commit")
+
+    with pytest.raises(RuntimeError, match="routed source SHA-256 drifted"):
+        _snapshot_sources(
+            code_root=code_root,
+            commit_root=commit_root,
+            snapshot_root=tmp_path / "snapshot",
+            buckets=(1024,),
+            min_age_seconds=0,
+            hash_jobs=1,
+            allowed={
+                ("code", 1024): {"repo.parquet": 1},
+                ("commits", 1024): {"repo_r0.parquet": 1},
+            },
+            expected_source_sha256={
+                ("code", 1024, "repo.parquet"): "0" * 64,
+                ("commits", 1024, "repo_r0.parquet"): hashlib.sha256(
+                    b"commit"
+                ).hexdigest(),
+            },
+            source_composition={
+                "schema": "cppmega_source_conveyor_composition_v1"
+            },
+        )
+
+
 def test_repaired_snapshot_manifest_hashes_and_binds_replaced_files(
     tmp_path: Path,
 ) -> None:
