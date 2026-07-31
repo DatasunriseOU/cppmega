@@ -84,11 +84,33 @@ def is_reviewed_primary_equivalent_parser_transition(
     """Recognize the one reviewed parser edge that preserves primary scope."""
 
     current = target_parser_script_sha256()
+    fields = {
+        "binding_key",
+        "from_sha256",
+        "to_sha256",
+        "reason",
+        "upgraded_at",
+    }
+    records = tuple(binding_upgrades)
+    if any(
+        not isinstance(upgrade, Mapping)
+        or set(upgrade) != fields
+        or _HEX64_RE.fullmatch(str(upgrade.get("from_sha256"))) is None
+        or _HEX64_RE.fullmatch(str(upgrade.get("to_sha256"))) is None
+        or not isinstance(upgrade.get("reason"), str)
+        or not upgrade["reason"]
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            str(upgrade.get("upgraded_at")),
+        )
+        is None
+        for upgrade in records
+    ):
+        return False
     upgrades = [
         upgrade
-        for upgrade in binding_upgrades
-        if isinstance(upgrade, Mapping)
-        and upgrade.get("binding_key") == "parser_script_sha256"
+        for upgrade in records
+        if upgrade.get("binding_key") == "parser_script_sha256"
     ]
     if (
         tuple(parser_lineage)
@@ -98,25 +120,11 @@ def is_reviewed_primary_equivalent_parser_transition(
         return False
     upgrade = upgrades[0]
     return (
-        set(upgrade)
-        == {
-            "binding_key",
-            "from_sha256",
-            "to_sha256",
-            "reason",
-            "upgraded_at",
-        }
-        and upgrade.get("from_sha256")
+        upgrade.get("from_sha256")
         == REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256
         and upgrade.get("to_sha256") == current
         and upgrade.get("reason")
         == REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON
-        and isinstance(upgrade.get("upgraded_at"), str)
-        and re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
-            str(upgrade["upgraded_at"]),
-        )
-        is not None
     )
 _CHANGE_REASONS = {
     "unchanged": {
