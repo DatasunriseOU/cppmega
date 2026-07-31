@@ -294,6 +294,10 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     modal_base = (REPO_ROOT / "scripts" / "modal_cppmega_base.py").read_text(
         encoding="utf-8"
     )
+    dockerfiles = [
+        (REPO_ROOT / path).read_text(encoding="utf-8")
+        for path in ("docker/Dockerfile", "docker/Dockerfile.beta23")
+    ]
 
     assert f"ref: {tilelang_commit}" in workflow
     assert f"ref: {tilelang_commit}" in stack
@@ -315,6 +319,8 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     assert "python - <<'PY'" in modal_build
     assert 'python -c "{verify_code.strip()}"' not in modal_build
     assert "pip wheel . --no-build-isolation --no-deps" in modal_build
+    for text in (workflow, rebuild, modal_build, *dockerfiles):
+        assert '"z3-solver>=4.13.0,<4.15.5"' in text
     assert 'f"STDERR tail:\\n{r.stderr[-24_000:]}"' in modal_build
     assert "Shared library: [libcuda_stub.so]" in workflow
     assert "version: 0.1.9" in stack

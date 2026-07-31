@@ -452,7 +452,7 @@ jobs:
         # numpy must be present for torch's tensor_numpy.cpp at build time.
         # z3-solver: tilelang's CMake calls 'import z3' during configure (FindZ3.cmake).
         # cython: tilelang ships a .pyx module (jit/adapter/cython/cython_wrapper.pyx).
-        run: pip install --retries 10 --timeout 60 ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0" cython
+        run: pip install --retries 10 --timeout 60 ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0,<4.15.5" cython
 
       - name: Clone source (any ref — branch / tag / SHA)
         run: |
