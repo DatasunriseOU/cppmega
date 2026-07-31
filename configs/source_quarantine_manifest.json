@@ -20,6 +20,15 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
     },
     {
+      "project_id": "microsoft/DirectXShaderCompiler",
+      "relative_path": "tools/clang/test/Parser/crash-report.c",
+      "size_bytes": 271,
+      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
       "project_id": "xemu-project/xemu",
       "relative_path": "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/PoliciesP1234subsubCAP123P12CertreversecrossCertificatePair.cp",
       "size_bytes": 955,
