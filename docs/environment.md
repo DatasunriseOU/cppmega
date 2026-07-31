@@ -1,9 +1,13 @@
 # CppMega Environment Contract
 
-This checkout uses a source checkout of Megatron-LM. The repository-local
-`.venv` is not an owned environment: on the current machine it is a symlink
-to `/Volumes/external/sources/nanochat/.venv`. Do not install packages, run
-`uv sync`, or change processes through that path.
+This checkout uses a source checkout of Megatron-LM. Since 2026-08-01 the
+repository-local `.venv` is a symlink to the shared dedicated environment
+`/Volumes/external/sources/.venvs/cppmega.mlx`, which is also used by the
+sibling `cppmega.mlx` checkout; see
+[Shared venv Receipt](#shared-venv-receipt-2026-08-01). Before that date it
+resolved to `/Volumes/external/sources/nanochat/.venv`; the dated drift
+record below is kept for provenance. Do not install packages, run
+`uv sync`, or change processes through the repository `.venv` path.
 
 The small stdlib-only tool in
 [`scripts/env/cppmega_env.py`](../scripts/env/cppmega_env.py) provides two
@@ -182,6 +186,48 @@ This returns `PASS`, including the exact source origin, dependency contract,
 representative Megatron imports, and `pip check`. Pytest also reads the same
 environment manifest before probing legacy sibling checkouts, so an omitted
 `MEGATRON_LM_REPO` does not silently select the dirty source tree.
+
+## Shared venv Receipt (2026-08-01)
+
+Since 2026-08-01 both sibling checkouts share one dedicated environment:
+`/Volumes/external/sources/cppmega/.venv` and
+`/Volumes/external/sources/cppmega.mlx/.venv` are symlinks to
+`/Volumes/external/sources/.venvs/cppmega.mlx` (CPython 3.13.12, torch
+2.13.0, mlx 0.32.0). The venv prefix carries the cppmega environment
+manifest, so pytest needs no environment variables:
+
+```json
+{
+  "schema": 1,
+  "repo_root": "/Volumes/external/sources/cppmega",
+  "megatron_root": "/Volumes/external/sources/Megatron-LM-test-e40feed4",
+  "megatron_commit": "e40feed4a060a84cd4cd1e5096316cc487014c87",
+  "source_dirty": false
+}
+```
+
+The manifest selects `Megatron-LM-test-e40feed4` instead of the locked
+`Megatron-LM-core_v0.18.0` worktree because `megatron.core` at
+`ba7b5ebce12af60627a80985792a1449ce45f46c` eagerly imports Triton from
+`megatron/core/transformer/moe/paged_stash.py`, and Triton is not available
+on macOS. `ba7b5eb` remains the pin for the GHCR/H200 CUDA image; only the
+local Mac receipt moved to `e40feed4`.
+
+Test invocation formulas, run from each checkout:
+
+```bash
+cd /Volumes/external/sources/cppmega && .venv/bin/python -m pytest <files> -q
+CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest <files> -q  # data/CI tests
+cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest <files> -q
+```
+
+The default lane needs no environment variables: `conftest.py` reads
+`cppmega-environment.json` from `sys.prefix` and validates the recorded
+Megatron commit and clean source state before importing. The older explicit
+formula `MEGATRON_LM_REPO=<root>` plus `CPPMEGA_MEGATRON_COMMIT=<sha>`
+remains valid; when the explicit root matches the manifest, conftest
+cross-checks it against the receipt, and a root outside the receipt still
+requires the exact commit contract.
 
 ## Profiles
 
