@@ -1,6 +1,7 @@
 import ast
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,14 +38,19 @@ def _load_pinned_megatron_tp_helper():
         pytest.skip("pinned Megatron-LM git checkout is unavailable")
 
     stack_lock = (_REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
-    assert "ref: core_v0.18.0" in stack_lock
+    match = re.search(
+        r"(?ms)^sources:\n.*?^  megatron_lm:\n.*?^    ref: ([0-9a-f]{40})$",
+        stack_lock,
+    )
+    assert match is not None
+    megatron_ref = match.group(1)
     source = subprocess.run(
         [
             "git",
             "-C",
             str(megatron_root),
             "show",
-            "core_v0.18.0:megatron/core/utils.py",
+            f"{megatron_ref}:megatron/core/utils.py",
         ],
         check=True,
         capture_output=True,
@@ -58,7 +64,7 @@ def _load_pinned_megatron_tp_helper():
     )
     namespace = {"torch": torch}
     exec(
-        compile(ast.Module(body=[function], type_ignores=[]), "<core_v0.18.0>", "exec"),
+        compile(ast.Module(body=[function], type_ignores=[]), f"<{megatron_ref}>", "exec"),
         namespace,
     )
     return namespace["get_batch_on_this_tp_rank"]
