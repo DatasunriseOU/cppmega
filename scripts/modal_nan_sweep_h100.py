@@ -112,7 +112,7 @@ def cppmega_base_image() -> modal.Image:
             "nvidia-nccl-cu13",
             "onnxscript", "onnx",
             "pydantic", "nvdlfw-inspect",
-            "z3-solver==4.15.*",
+            "z3-solver==4.15.4.0",
             "cloudpickle", "psutil", "pynvml", "typing-extensions",
             "huggingface_hub", "transformers", "tokenizers",
             "datasets", "accelerate", "tensorboard",

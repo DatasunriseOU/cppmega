@@ -110,7 +110,7 @@ echo "[rebuild-tilelang] apache-tvm-ffi cap removed: OK"
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install --retries 10 --timeout 60 \
   ninja packaging pybind11 cmake numpy einops \
-  scikit-build-core setuptools-scm "z3-solver>=4.13.0,<4.15.5" "cython>=3.1.0"
+  scikit-build-core setuptools-scm "z3-solver==4.15.4.0" "cython>=3.1.0"
 
 # --- build the ABI-matched wheels -------------------------------------------
 mkdir -p "${WHEELS_DIR}"

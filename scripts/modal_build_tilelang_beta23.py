@@ -62,7 +62,7 @@ def _build_image() -> modal.Image:
         .pip_install(
             "pip>=24.0", "setuptools", "wheel",
             "scikit-build-core>=0.10", "setuptools-scm", "cython",
-            "z3-solver>=4.13.0,<4.15.5",
+            "z3-solver==4.15.4.0",
             "numpy", "packaging", "pybind11",
         )
         .env({

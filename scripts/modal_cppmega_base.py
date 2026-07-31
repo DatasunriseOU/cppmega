@@ -91,8 +91,8 @@ def cppmega_base_image() -> modal.Image:
             "onnxscript", "onnx",
             "pydantic", "nvdlfw-inspect",
             # TileLang dev wheel was linked against libz3.so.4.15 specifically.
-            # Pin to 4.15.x (latest release branch that ships .4.15 file).
-            "z3-solver==4.15.*",
+            # Match the exact ABI used while building the TileLang wheel.
+            "z3-solver==4.15.4.0",
             # TileLang dev runtime deps (cloudpickle, psutil, pynvml etc.)
             "cloudpickle", "psutil", "pynvml", "typing-extensions",
             # mamba_ssm / flash_attn import-time deps

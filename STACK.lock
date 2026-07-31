@@ -136,6 +136,10 @@ wheels:
       - qoptim_cuda-*.whl
 
 runtime_pypi:
+  z3_solver:
+    # libtilelang is linked to this wheel's libz3.so.4.15 SONAME.
+    package: "z3-solver==4.15.4.0"
+
   apache_tvm_ffi:
     # Final runtime version comes from wheels.tvm_ffi; PyPI v0.1.13 is only
     # the cacheable bootstrap dependency before local wheels are installed.

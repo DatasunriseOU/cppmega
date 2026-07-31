@@ -75,6 +75,7 @@ def _image() -> modal.Image:
             .add_local_file(str(tilelang_wheel), "/tmp/tilelang.whl", copy=True)
             .run_commands(
                 "pip install --pre 'apache-tvm-ffi>=0.1.12,<0.2' "
+                "'z3-solver==4.15.4.0' "
                 "'flash-attn-4[cu13]==4.0.0b23' "
                 "--extra-index-url https://pypi.nvidia.com && "
                 "pip install --force-reinstall --no-deps "

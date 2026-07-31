@@ -49,6 +49,7 @@ echo "[tilelang] python:      $(python --version 2>&1)"
 echo "[tilelang] arch:        $(uname -m)"
 
 ARCH="$(uname -m)"
+pip install "z3-solver==4.15.4.0"
 
 # --- helper: verify import succeeds -----------------------------------------
 verify_import() {
