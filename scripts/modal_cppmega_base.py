@@ -7,6 +7,7 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
+  - flash-attn-4 4.0.0b23 (NVIDIA PyPI)
   - tilelang 0.1.9 from DatasunriseOU/tilelang@334266af (local abi3 wheel;
     carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
     the apache-tvm-ffi<0.1.10 cap)
@@ -101,6 +102,10 @@ def cppmega_base_image() -> modal.Image:
             "datasets", "accelerate", "tensorboard",
             "wandb", "tqdm", "pytest", "filelock",
             "liger-kernel",
+        )
+        .pip_install(
+            "flash-attn-4[cu13]==4.0.0b23",
+            extra_index_url="https://pypi.nvidia.com",
         )
     )
     # Add durable, compressed local wheel inputs as one image layer. Missing

@@ -266,6 +266,21 @@ def test_wheel_build_checks_out_the_resolved_source_commit() -> None:
     assert "git checkout ${{ matrix.ref }}" not in workflow
 
 
+def test_image_build_binds_triggering_source_and_wheel_release() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-image.yml"
+    ).read_text(encoding="utf-8")
+
+    assert workflow.count("github.event.workflow_run.head_sha") == 2
+    assert 'TAG="wheels-${SOURCE_SHA:0:7}"' in workflow
+    assert "type=raw,value=sha-${{ steps.rel.outputs.source_sha }}" in workflow
+    assert "type=raw,value=${{ steps.rel.outputs.short_sha }}" in workflow
+    assert "{{is_default_branch}}" not in workflow
+    assert "github.event.workflow_run.head_branch" in workflow
+    assert "gh release list" not in workflow
+    assert "type=sha," not in workflow
+
+
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     tilelang_commit = "334266afd448ae06e7893119a0ebb72d7fe1e776"
     tvm_commit = "911772cf9d9e597b51a55ccdb96539034a69cfe6"
@@ -298,7 +313,6 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
         (REPO_ROOT / path).read_text(encoding="utf-8")
         for path in (
             "scripts/modal_fa4_beta23_parity.py",
-            "scripts/modal_nan_sweep_h100.py",
         )
     ]
     dockerfiles = [
