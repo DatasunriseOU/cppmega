@@ -6,6 +6,11 @@ name: build-image
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact commit owning the wheel release to rebuild
+        required: false
+        type: string
   workflow_run:
     workflows: [build-wheels]
     types: [completed]
@@ -30,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_sha || github.sha }}
 
       - name: Verify persistent runner capacity
         shell: bash
@@ -48,7 +53,7 @@ jobs:
         id: rel
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -129,6 +134,8 @@ jobs:
             type=raw,value=${{ steps.rel.outputs.short_sha }}
             type=raw,value=latest,enable=${{ (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == github.event.repository.default_branch) || (github.event_name != 'workflow_run' && github.ref_name == github.event.repository.default_branch) }}
             type=raw,value=${{ steps.rel.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.rel.outputs.source_sha }}
 
       - name: Build & push (cache to/from registry)
         uses: docker/build-push-action@v6
