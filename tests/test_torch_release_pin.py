@@ -59,6 +59,18 @@ def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
         assert '"flash-attn-4[cu13]==4.0.0b19"' not in dockerfile, path
 
 
+def test_fa4_h200_gate_exercises_visible_bias_and_is_not_mislabeled() -> None:
+    source = _read("scripts/modal_fa4_beta23_parity.py")
+
+    assert "call_edges[0, 0] = torch.tensor([1, 0])" in source
+    assert "visible_bias_nonzero" in source
+    assert "manual_bias_effect" in source
+    assert "te_manual_max_diff" in source
+    assert "fa4_manual_max_diff" in source
+    assert "test_fa4_miniblock_training_step" in source
+    assert "test_megatron_training_step" not in source
+
+
 def test_h200_images_include_dependency_free_bundle_restore_runtime() -> None:
     for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
         dockerfile = _read(path)
