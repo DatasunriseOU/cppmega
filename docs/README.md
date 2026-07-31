@@ -14,6 +14,9 @@ Use this file as the front door for repo documentation.
   versus upstream Megatron, Transformer Engine, TileLang, or other projects.
 - [objective_mixture_contract.md](objective_mixture_contract.md) defines the
   typed pre-materialized objective handoff and fail-closed Megatron/H200 gates.
+- [status/training_data_inventory.md](status/training_data_inventory.md) is the
+  canonical entry point for live corpus counts, sidecars, physical paths,
+  training eligibility, and the append-only data-status changelog.
 
 ## Session And Probe Notes
 

@@ -1,5 +1,21 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-07-31: Canonical live training-data inventory
+
+Added `scripts/report_training_data_status.py` and the pinned
+`configs/training_data_status.json` catalog. The reporter scans physical
+five-bucket Parquet, binds sealed Megatron audits, PR completion receipts, and
+both live CI CAS intervals, then atomically publishes `current.json`,
+`current.md`, and an append-only semantic changelog on `/Volumes/external`.
+
+The first publication records 3.525B valid / 3.516B trainable live source
+tokens, the independently overlapping sealed 4.133B / 4.124B Megatron bundle,
+2,794,562 staged PR records with zero eligible Parquet tokens, and 12.256B
+store-local CI-unique tokens with zero eligible Parquet tokens. It also makes
+the DirectXTK receipt collision, mixed Python rows, incomplete source
+conveyor, cancelled PR export, and unfinished CI union/export explicit
+release blockers.
+
 ## 2026-04-14: FP8 paths exploration + Mamba3 MIMO P1 + pipeline topology closures
 
 Multi-stream session across europe H200, bench3 H200, and GB10 sm_121.

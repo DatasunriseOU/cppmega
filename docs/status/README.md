@@ -36,6 +36,7 @@ Use one of these labels in new docs and in index rows:
 | Quantized Muon momentum | [../quantized_muon_momentum.md](../quantized_muon_momentum.md) | q8 momentum state, BF16 owned path status, and Wave18B MXFP8 carrier probe. |
 | Upstream bugs | [../upstream_bugs.md](../upstream_bugs.md) | Known upstream issues and local workarounds. |
 | Data preparation | [../data_preparation.md](../data_preparation.md) | Dataset/tokenizer pipeline. |
+| Training-data inventory | [training_data_inventory.md](training_data_inventory.md) | Live token counts, versions, sidecars, Parquet paths, eligibility, and changelog. |
 | Long-context roadmap | [../long_context_roadmap.md](../long_context_roadmap.md) | Context-length thresholds and deferred work. |
 
 ## Active Dated Notes
