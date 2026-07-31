@@ -1,0 +1,750 @@
+"""Runtime isolation for logical documents packed into one Megatron row."""
+
+from __future__ import annotations
+
+import inspect
+import os
+from functools import wraps
+from itertools import accumulate
+from typing import Any, Callable
+
+import torch
+
+_PATCH_MARKER = "__cppmega_document_isolation_patched__"
+_layout_cache: dict[str, Any] = {"key": None, "value": None}
+_received_document_ids: dict[int, torch.Tensor] = {}
+
+
+def _structure_enabled() -> bool:
+    return os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _current_structure_batch() -> dict[str, torch.Tensor] | None:
+    from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
+
+    return _get_current_structure_batch()
+
+
+def _set_current_document_ids(document_ids: torch.Tensor) -> None:
+    from cppmega.megatron.structure_dataset_patch import (
+        _get_current_structure_batch,
+        _set_current_structure_batch,
+    )
+
+    current = dict(_get_current_structure_batch() or {})
+    current["document_ids"] = document_ids
+    _set_current_structure_batch(current)
+
+
+def bind_current_structure_batch(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep the originating microbatch sidecars during checkpoint recomputation."""
+
+    current = _current_structure_batch()
+    if current is None:
+        if _structure_enabled():
+            _raw_document_ids()
+        return function
+    snapshot = dict(current)
+    if "document_ids" not in snapshot and "graph_document_ids" not in snapshot:
+        if _structure_enabled():
+            _raw_document_ids()
+        return function
+
+    @wraps(function)
+    def bound(*args, **kwargs):
+        from cppmega.megatron.structure_dataset_patch import (
+            _get_current_structure_batch,
+            _set_current_structure_batch,
+        )
+
+        previous = _get_current_structure_batch()
+        _set_current_structure_batch(snapshot)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _set_current_structure_batch(previous)
+
+    return bound
+
+
+def _raw_document_ids(*, required: bool | None = None) -> torch.Tensor | None:
+    current = _current_structure_batch()
+    document_ids = None if current is None else current.get("document_ids")
+    if document_ids is None and current is not None:
+        # Compatibility with graph-route batches produced before document_ids
+        # became a model-wide sidecar.
+        document_ids = current.get("graph_document_ids")
+    if document_ids is None:
+        if _structure_enabled() if required is None else required:
+            raise RuntimeError(
+                "CPPMEGA_STRUCTURE_ENABLED=1 requires document_ids on every model stage"
+            )
+        return None
+    if not isinstance(document_ids, torch.Tensor):
+        raise TypeError("document_ids must be a torch.Tensor")
+    return document_ids
+
+
+def document_layout(
+    *,
+    batch_size: int,
+    sequence_length: int,
+    device: torch.device | None = None,
+    required: bool | None = None,
+) -> tuple[torch.Tensor | None, tuple[tuple[tuple[int, int], ...], ...], bool]:
+    """Return validated IDs, row spans, and whether any row packs multiple docs."""
+
+    raw = _raw_document_ids(required=required)
+    if raw is None:
+        return None, (), False
+    if raw.dim() == 1:
+        raw = raw.unsqueeze(0)
+    if tuple(raw.shape) != (batch_size, sequence_length):
+        raise ValueError(
+            "document_ids shape "
+            f"{tuple(raw.shape)} != expected {(batch_size, sequence_length)}"
+        )
+    if raw.is_floating_point() or raw.dtype == torch.bool:
+        raise TypeError(f"document_ids must use an integer dtype, got {raw.dtype}")
+
+    target_device = raw.device if device is None else torch.device(device)
+    key = (id(raw), raw._version, tuple(raw.shape), target_device)
+    if _layout_cache["key"] == key:
+        return _layout_cache["value"]
+
+    rows = raw.detach().cpu().tolist()
+    all_spans: list[tuple[tuple[int, int], ...]] = []
+    multiple = False
+    for batch_index, row in enumerate(rows):
+        spans: list[tuple[int, int]] = []
+        start = 0
+        previous = int(row[0]) if row else 0
+        expected_positive = 1
+        if previous not in (0, 1):
+            raise ValueError(
+                f"document_ids row {batch_index} must start at 1 or be padding, got {previous}"
+            )
+        for position, value_raw in enumerate(row):
+            value = int(value_raw)
+            if value < 0:
+                raise ValueError("document_ids cannot contain negative values")
+            if previous == 0 and value != 0:
+                raise ValueError(
+                    f"document_ids row {batch_index} contains non-padding after padding"
+                )
+            if value != previous:
+                spans.append((start, position))
+                start = position
+                if value == 0:
+                    previous = value
+                    continue
+                if value != expected_positive + 1:
+                    raise ValueError(
+                        f"document_ids row {batch_index} must contain contiguous runs 1..N"
+                    )
+                expected_positive = value
+                previous = value
+        if row:
+            spans.append((start, len(row)))
+        positive_spans = sum(1 for start, _ in spans if row[start] > 0)
+        multiple |= positive_spans > 1
+        all_spans.append(tuple(spans))
+
+    ids = raw.to(device=target_device, dtype=torch.long, non_blocking=True)
+    value = (ids, tuple(all_spans), multiple)
+    _layout_cache["key"] = key
+    _layout_cache["value"] = value
+    return value
+
+
+def map_sequence_by_document(
+    hidden_states: torch.Tensor,
+    function: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    pad_to: int = 1,
+) -> torch.Tensor:
+    """Run a stateful sequence function independently for each packed document."""
+
+    if hidden_states.dim() != 3:
+        raise ValueError("hidden_states must have shape [S,B,H]")
+    if pad_to < 1:
+        raise ValueError("pad_to must be positive")
+    raw = _raw_document_ids()
+    if raw is None:
+        return function(hidden_states)
+    if raw.dim() == 1:
+        raw = raw.unsqueeze(0)
+    batch_size, sequence_length = raw.shape
+    _ids, row_spans, multiple = document_layout(
+        batch_size=int(batch_size),
+        sequence_length=int(sequence_length),
+        device=hidden_states.device,
+    )
+    if not multiple:
+        return function(hidden_states)
+    if hidden_states.shape[:2] != (sequence_length, batch_size):
+        raise NotImplementedError(
+            "multi-document state isolation does not support sequence-sharded hidden states"
+        )
+
+    # ponytail: batch padded document segments for exact state resets; switch to
+    # the TileLang varlen kernel once cppmega's custom autograd supports cu_seqlens.
+    segments = [
+        hidden_states[start:end, batch_index]
+        for batch_index, spans in enumerate(row_spans)
+        for start, end in spans
+    ]
+    target_length = max(segment.shape[0] for segment in segments)
+    target_length += (-target_length) % pad_to
+    padded = torch.stack(
+        [
+            torch.cat(
+                (
+                    segment,
+                    segment.new_zeros(
+                        (target_length - segment.shape[0], segment.shape[1])
+                    ),
+                )
+            )
+            for segment in segments
+        ],
+        dim=1,
+    )
+    mapped = function(padded)
+    if mapped.shape != padded.shape:
+        raise RuntimeError(
+            f"isolated sequence function returned {tuple(mapped.shape)} "
+            f"for input {tuple(padded.shape)}"
+        )
+    cursor = 0
+    rows = []
+    for spans in row_spans:
+        parts = []
+        for start, end in spans:
+            parts.append(mapped[: end - start, cursor])
+            cursor += 1
+        rows.append(torch.cat(parts, dim=0))
+    return torch.stack(rows, dim=1)
+
+
+def roll_tensor_by_document(
+    tensor: torch.Tensor,
+    *,
+    shifts: int = -1,
+    dims: int = -1,
+    cp_group: Any = None,
+    packed_seq_params: Any = None,
+    fallback: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Megatron MTP roll that zeroes every logical-document boundary."""
+
+    raw = _raw_document_ids()
+    if raw is None:
+        return fallback(
+            tensor,
+            shifts=shifts,
+            dims=dims,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+    if raw.dim() == 1:
+        raw = raw.unsqueeze(0)
+    batch_size, sequence_length = raw.shape
+    ids, _spans, multiple = document_layout(
+        batch_size=int(batch_size),
+        sequence_length=int(sequence_length),
+        device=tensor.device,
+    )
+    if not multiple:
+        return fallback(
+            tensor,
+            shifts=shifts,
+            dims=dims,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+    if ids is None:
+        raise RuntimeError("validated document layout did not return document_ids")
+    if shifts != -1:
+        raise NotImplementedError("packed-document MTP supports only shifts=-1")
+    if packed_seq_params is not None:
+        raise RuntimeError(
+            "document_ids and upstream packed_seq_params cannot both drive MTP"
+        )
+    if cp_group is not None and cp_group.size() > 1:
+        raise NotImplementedError(
+            "packed-document MTP does not support context parallelism"
+        )
+
+    sequence_dim = dims % tensor.dim()
+    valid = torch.zeros_like(ids, dtype=torch.bool)
+    valid[:, :-1] = (ids[:, :-1] > 0) & (ids[:, :-1] == ids[:, 1:])
+    rolled = torch.roll(tensor, shifts=-1, dims=sequence_dim)
+    if tensor.shape[:2] == (batch_size, sequence_length) and sequence_dim == 1:
+        mask = valid
+    elif tensor.shape[:2] == (sequence_length, batch_size) and sequence_dim == 0:
+        mask = valid.transpose(0, 1)
+    else:
+        raise ValueError(
+            "cannot align document_ids with rolled tensor shape "
+            f"{tuple(tensor.shape)} along dim {sequence_dim}"
+        )
+    while mask.dim() < rolled.dim():
+        mask = mask.unsqueeze(-1)
+    rolled = torch.where(
+        mask, rolled, torch.zeros((), dtype=rolled.dtype, device=rolled.device)
+    )
+    return rolled, rolled.sum()
+
+
+def mask_sparse_topk_by_document(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Replace cross-document DSA selections with the kernels' -1 sentinel."""
+
+    if topk_indices.dim() != 3:
+        raise ValueError("topk_indices must have shape [B,S,K]")
+    batch_size, sequence_length, _ = topk_indices.shape
+    ids, _spans, multiple = document_layout(
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        device=topk_indices.device,
+    )
+    if not multiple:
+        return topk_indices
+    if ids is None:
+        raise RuntimeError("validated document layout did not return document_ids")
+
+    safe = topk_indices.clamp(0, sequence_length - 1).long()
+    selected_docs = ids.gather(1, safe.reshape(batch_size, -1)).view_as(topk_indices)
+    query_docs = ids.unsqueeze(-1)
+    query_positions = torch.arange(
+        sequence_length, device=topk_indices.device, dtype=topk_indices.dtype
+    ).view(1, -1, 1)
+    invalid = (
+        (topk_indices < 0)
+        | (topk_indices >= sequence_length)
+        | (query_docs <= 0)
+        | (selected_docs != query_docs)
+        | (topk_indices > query_positions)
+    )
+    return topk_indices.masked_fill(invalid, -1)
+
+
+def _document_attention_mask(ids: torch.Tensor) -> torch.Tensor:
+    sequence_length = ids.shape[1]
+    cross_document = ids[:, :, None] != ids[:, None, :]
+    future = torch.triu(
+        torch.ones(
+            (sequence_length, sequence_length),
+            dtype=torch.bool,
+            device=ids.device,
+        ),
+        diagonal=1,
+    )
+    return (cross_document | future).unsqueeze(1)
+
+
+def _reshape_te_output(result: Any, *, batch_size: int, sequence_length: int) -> Any:
+    if isinstance(result, tuple):
+        return (
+            result[0]
+            .reshape(batch_size, sequence_length, -1)
+            .transpose(0, 1)
+            .contiguous(),
+            result[1],
+        )
+    return result.reshape(batch_size, sequence_length, -1).transpose(0, 1).contiguous()
+
+
+def _slice_attention_tensor(
+    tensor: torch.Tensor | None,
+    *,
+    batch_index: int,
+    batch_size: int,
+    start: int,
+    end: int,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.dim() < 2:
+        raise ValueError("attention mask/bias must have query and key dimensions")
+    index: list[Any] = [slice(None)] * tensor.dim()
+    if tensor.dim() >= 3 and tensor.shape[0] in (1, batch_size):
+        source_batch = 0 if tensor.shape[0] == 1 else batch_index
+        index[0] = slice(source_batch, source_batch + 1)
+    index[-2] = slice(start, end)
+    index[-1] = slice(start, end)
+    return tensor[tuple(index)]
+
+
+def _patch_te_attention() -> None:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    installed = getattr(TEDotProductAttention, "forward", None)
+    if not isinstance(TEDotProductAttention, type) or not callable(installed):
+        # Megatron exposes a MagicMock placeholder when TE is not installed.
+        return
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+    signature = inspect.signature(installed)
+
+    @wraps(installed)
+    def isolated_forward(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        query = bound.arguments["query"]
+        if query.dim() != 4:
+            return installed(*bound.args, **bound.kwargs)
+        sequence_length, batch_size = query.shape[:2]
+        _ids, row_spans, multiple = document_layout(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=query.device,
+        )
+        if not multiple:
+            return installed(*bound.args, **bound.kwargs)
+        if bound.arguments["packed_seq_params"] is not None:
+            raise RuntimeError(
+                "document_ids isolation cannot be combined with upstream packed_seq_params"
+            )
+        if int(getattr(self.config, "context_parallel_size", 1)) != 1:
+            raise NotImplementedError(
+                "packed-document TE attention does not support context parallelism"
+            )
+
+        attention_bias = bound.arguments["attention_bias"]
+        if attention_bias is None:
+            lengths = [end - start for spans in row_spans for start, end in spans]
+            cu_seqlens = torch.tensor(
+                [0, *accumulate(lengths)],
+                dtype=torch.int32,
+                device=query.device,
+            )
+            bound.arguments["query"] = query.transpose(0, 1).reshape(
+                batch_size * sequence_length, *query.shape[2:]
+            )
+            for name in ("key", "value"):
+                tensor = bound.arguments[name]
+                bound.arguments[name] = tensor.transpose(0, 1).reshape(
+                    batch_size * sequence_length, *tensor.shape[2:]
+                )
+            bound.arguments["attention_mask"] = None
+            bound.arguments["packed_seq_params"] = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max(lengths),
+                max_seqlen_kv=max(lengths),
+            )
+            return _reshape_te_output(
+                installed(*bound.args, **bound.kwargs),
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+            )
+        if not isinstance(attention_bias, torch.Tensor):
+            raise RuntimeError(
+                "FA4 chunk-native graph bias does not yet support multi-document rows"
+            )
+
+        row_outputs = []
+        auxiliary = None
+        base_arguments = dict(bound.arguments)
+        for batch_index, spans in enumerate(row_spans):
+            parts = []
+            for start, end in spans:
+                call = dict(base_arguments)
+                for name in ("query", "key", "value"):
+                    call[name] = base_arguments[name][
+                        start:end, batch_index : batch_index + 1
+                    ]
+                for name in ("attention_mask", "attention_bias"):
+                    call[name] = _slice_attention_tensor(
+                        base_arguments[name],
+                        batch_index=batch_index,
+                        batch_size=batch_size,
+                        start=start,
+                        end=end,
+                    )
+                result = installed(
+                    self,
+                    **{name: value for name, value in call.items() if name != "self"},
+                )
+                if isinstance(result, tuple):
+                    parts.append(result[0])
+                    if result[1] is not None:
+                        auxiliary = (
+                            result[1]
+                            if auxiliary is None
+                            else torch.maximum(auxiliary, result[1])
+                        )
+                else:
+                    parts.append(result)
+            row_outputs.append(torch.cat(parts, dim=0))
+        output = torch.cat(row_outputs, dim=1)
+        return (output, auxiliary) if auxiliary is not None else output
+
+    setattr(isolated_forward, _PATCH_MARKER, True)
+    setattr(TEDotProductAttention, "forward", isolated_forward)
+
+
+def _patch_torch_attention() -> None:
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+
+    installed = DotProductAttention.forward
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+    signature = inspect.signature(installed)
+
+    @wraps(installed)
+    def isolated_forward(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        query = bound.arguments["query"]
+        key = bound.arguments["key"]
+        sequence_length, batch_size = query.shape[:2]
+        if key.shape[0] != sequence_length:
+            if _raw_document_ids() is not None:
+                raise NotImplementedError(
+                    "packed-document torch attention does not support rectangular decode"
+                )
+            return installed(*bound.args, **bound.kwargs)
+        ids, _spans, multiple = document_layout(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=query.device,
+        )
+        if not multiple:
+            return installed(*bound.args, **bound.kwargs)
+        if ids is None:
+            raise RuntimeError("validated document layout did not return document_ids")
+        mask = _document_attention_mask(ids)
+        existing_mask = bound.arguments["attention_mask"]
+        if isinstance(existing_mask, torch.Tensor):
+            mask |= existing_mask.to(device=mask.device, dtype=torch.bool)
+        bound.arguments["attention_mask"] = mask
+        return installed(*bound.args, **bound.kwargs)
+
+    setattr(isolated_forward, _PATCH_MARKER, True)
+    DotProductAttention.forward = isolated_forward
+
+
+def _patch_dsa_attention() -> None:
+    from megatron.core.transformer.experimental_attention_variant import dsa as dsa_mod
+
+    installed = dsa_mod.DSAttention.forward
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+    signature = inspect.signature(installed)
+
+    @wraps(installed)
+    def isolated_forward(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        query = bound.arguments["query"]
+        sequence_length, batch_size = query.shape[:2]
+        ids, _spans, multiple = document_layout(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=query.device,
+        )
+        if not multiple:
+            return installed(*bound.args, **bound.kwargs)
+        if ids is None:
+            raise RuntimeError("validated document layout did not return document_ids")
+        if bound.arguments["packed_seq_params"] is not None:
+            raise RuntimeError("DSA document isolation owns packed boundaries")
+        backend = dsa_mod.unfused_dsa_fn
+        if not getattr(backend, "__cppmega_document_isolation__", False):
+            raise RuntimeError(
+                "active DSA sparse backend does not support document-isolated -1 indices"
+            )
+        mask = _document_attention_mask(ids)
+        existing_mask = bound.arguments["attention_mask"]
+        if isinstance(existing_mask, torch.Tensor):
+            mask |= existing_mask.to(device=mask.device, dtype=torch.bool)
+        bound.arguments["attention_mask"] = mask
+        bound.arguments["attn_mask_type"] = None
+        return installed(*bound.args, **bound.kwargs)
+
+    setattr(isolated_forward, _PATCH_MARKER, True)
+    dsa_mod.DSAttention.forward = isolated_forward
+
+
+def _patch_mtp_roll() -> None:
+    from megatron.core.transformer import multi_token_prediction as mtp
+
+    installed = mtp.roll_tensor
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+
+    @wraps(installed)
+    def isolated_roll(
+        tensor,
+        shifts=-1,
+        dims=-1,
+        cp_group=None,
+        packed_seq_params=None,
+    ):
+        return roll_tensor_by_document(
+            tensor,
+            shifts=shifts,
+            dims=dims,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            fallback=installed,
+        )
+
+    setattr(isolated_roll, _PATCH_MARKER, True)
+    mtp.roll_tensor = isolated_roll
+
+
+def _patch_megatron_checkpoint() -> None:
+    from megatron.core import tensor_parallel
+    from megatron.core.tensor_parallel import random as random_module
+
+    installed = random_module.checkpoint
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+
+    @wraps(installed)
+    def isolated_checkpoint(function, distribute_saved_activations, *args):
+        return installed(
+            bind_current_structure_batch(function),
+            distribute_saved_activations,
+            *args,
+        )
+
+    setattr(isolated_checkpoint, _PATCH_MARKER, True)
+    random_module.checkpoint = isolated_checkpoint
+    tensor_parallel.checkpoint = isolated_checkpoint
+
+
+def _exchange_pipeline_document_ids(
+    communicator: Any,
+    *,
+    tensor_send_next: torch.Tensor | None,
+    tensor_recv_prev: torch.Tensor | None,
+) -> None:
+    send_ids = None
+    if tensor_send_next is not None:
+        if tensor_send_next.dim() < 2:
+            raise ValueError("pipeline activation must have [S,B,...] dimensions")
+        sequence_length, batch_size = tensor_send_next.shape[:2]
+        send_ids, _spans, _multiple = document_layout(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=tensor_send_next.device,
+        )
+
+    recv_ids = None
+    if tensor_recv_prev is not None:
+        if tensor_recv_prev.dim() < 2:
+            raise ValueError("pipeline activation must have [S,B,...] dimensions")
+        sequence_length, batch_size = tensor_recv_prev.shape[:2]
+        recv_ids = torch.empty(
+            (batch_size, sequence_length),
+            dtype=torch.long,
+            device=tensor_recv_prev.device,
+        )
+
+    ops = []
+    if send_ids is not None:
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_ids.contiguous(),
+                communicator.next_rank,
+                communicator.pp_group,
+            )
+        )
+    if recv_ids is not None:
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_ids,
+                communicator.prev_rank,
+                communicator.pp_group,
+            )
+        )
+    if ops:
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
+    if recv_ids is not None:
+        _received_document_ids[id(tensor_recv_prev)] = recv_ids
+
+
+def _patch_pipeline_transport() -> None:
+    from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+
+    installed = P2PCommunicator._communicate
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+
+    @wraps(installed)
+    def isolated_communicate(self, **kwargs):
+        result = installed(self, **kwargs)
+        if _structure_enabled():
+            _exchange_pipeline_document_ids(
+                self,
+                tensor_send_next=kwargs["tensor_send_next"],
+                tensor_recv_prev=result[0],
+            )
+        return result
+
+    setattr(isolated_communicate, _PATCH_MARKER, True)
+    P2PCommunicator._communicate = isolated_communicate
+
+
+def _patch_model_input_transport(model_class: type) -> None:
+    installed = model_class.set_input_tensor
+    if getattr(installed, _PATCH_MARKER, False):
+        return
+
+    @wraps(installed)
+    def isolated_set_input_tensor(self, input_tensor):
+        tensor = input_tensor[0] if isinstance(input_tensor, list) else input_tensor
+        if _structure_enabled() and isinstance(tensor, torch.Tensor):
+            document_ids = _received_document_ids.pop(id(tensor), None)
+            if document_ids is None:
+                raise RuntimeError(
+                    f"{model_class.__name__} received a pipeline activation without document_ids"
+                )
+            _set_current_document_ids(document_ids)
+        return installed(self, input_tensor)
+
+    setattr(isolated_set_input_tensor, _PATCH_MARKER, True)
+    model_class.set_input_tensor = isolated_set_input_tensor
+
+
+def apply_document_isolation_patch() -> bool:
+    """Install all pinned Megatron seams used by packed cppmega training."""
+
+    _patch_mtp_roll()
+    _patch_te_attention()
+    _patch_torch_attention()
+    _patch_dsa_attention()
+    _patch_pipeline_transport()
+    _patch_megatron_checkpoint()
+
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mamba.mamba_model import MambaModel
+
+    for model_class in (GPTModel, HybridModel, MambaModel):
+        _patch_model_input_transport(model_class)
+    return True
+
+
+__all__ = [
+    "apply_document_isolation_patch",
+    "bind_current_structure_batch",
+    "document_layout",
+    "map_sequence_by_document",
+    "mask_sparse_topk_by_document",
+    "roll_tensor_by_document",
+]

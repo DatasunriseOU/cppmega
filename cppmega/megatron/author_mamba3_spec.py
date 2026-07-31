@@ -20,6 +20,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from cppmega.features.mamba3 import build_author_mamba3_config
+from cppmega.megatron.document_isolation import map_sequence_by_document
 from cppmega.megatron.mamba_local_spec import build_cppmega_local_stack_spec
 from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combined
 
@@ -150,13 +151,21 @@ class AuthorMamba3Mixer(nn.Module):
         # in upstream MambaLayer).
         hidden_states = self.pre_norm(hidden_states)
 
-        batch_first = hidden_states.transpose(0, 1).contiguous()
-        out = self.mixer(batch_first)
-        if out.shape != batch_first.shape:
-            raise RuntimeError(
-                f"AuthorMamba3Mixer returned shape {tuple(out.shape)} for input {tuple(batch_first.shape)}"
-            )
-        return out.transpose(0, 1).contiguous(), None
+        def mix(segment):
+            batch_first = segment.transpose(0, 1).contiguous()
+            out = self.mixer(batch_first)
+            if out.shape != batch_first.shape:
+                raise RuntimeError(
+                    f"AuthorMamba3Mixer returned shape {tuple(out.shape)} "
+                    f"for input {tuple(batch_first.shape)}"
+                )
+            return out.transpose(0, 1).contiguous()
+
+        return map_sequence_by_document(
+            hidden_states,
+            mix,
+            pad_to=self.mixer.chunk_size,
+        ), None
 
     def mamba_state_shapes_per_request(self):
         raise NotImplementedError("AuthorMamba3Mixer does not support Megatron inference cache shapes yet")

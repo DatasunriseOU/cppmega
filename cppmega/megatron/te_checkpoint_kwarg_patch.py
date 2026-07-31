@@ -19,6 +19,8 @@ import importlib
 from types import ModuleType
 from typing import Any
 
+from cppmega.megatron.document_isolation import bind_current_structure_batch
+
 
 _PATCH_FLAG = "_cppmega_te_checkpoint_kwarg_patch_applied"
 _ORIGINAL_ATTR = "_cppmega_te_checkpoint_original"
@@ -78,6 +80,7 @@ def apply_te_checkpoint_kwarg_patch(module: ModuleType | Any | None = None) -> b
             if call_kwargs:
                 forward_func = functools.partial(forward_func, **call_kwargs)
             kwargs = control_kwargs
+        forward_func = bind_current_structure_batch(forward_func)
         return original(
             forward_func,
             distribute_saved_activations,

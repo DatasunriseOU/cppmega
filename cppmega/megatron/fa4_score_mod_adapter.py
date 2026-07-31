@@ -1360,6 +1360,18 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
 
         batch_size, seqlen_q, num_heads, head_dim = q.shape
         _, seqlen_k, num_kv_heads, _ = k.shape
+        from cppmega.megatron.document_isolation import document_layout
+
+        _ids, _spans, multiple_documents = document_layout(
+            batch_size=batch_size,
+            sequence_length=seqlen_q,
+            device=q.device,
+        )
+        if multiple_documents:
+            raise RuntimeError(
+                "FA4 score_mod does not yet expose cppmega document mask_mod; "
+                "refusing a multi-document row"
+            )
 
         if num_heads % num_kv_heads != 0:
             raise ValueError(

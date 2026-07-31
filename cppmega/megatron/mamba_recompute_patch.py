@@ -22,6 +22,8 @@ import logging
 import torch
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from cppmega.megatron.document_isolation import bind_current_structure_batch
+
 logger = logging.getLogger(__name__)
 
 # Import Megatron's CUDA graph state checkers (PR #3919 pattern).
@@ -61,7 +63,11 @@ class _CheckpointedMambaLayerWrapper(torch.nn.Module):
         def _run(hs):
             return self.layer(hidden_states=hs, **kwargs)
 
-        return torch_checkpoint(_run, hidden_states, use_reentrant=False)
+        return torch_checkpoint(
+            bind_current_structure_batch(_run),
+            hidden_states,
+            use_reentrant=False,
+        )
 
     def __getattr__(self, name):
         if name in ("layer", "layer_number", "training"):

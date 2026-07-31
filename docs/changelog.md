@@ -1,5 +1,21 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-07-31: Packed-document model isolation
+
+Promoted canonical packed `doc_ids` from graph-only metadata to a required
+model-wide sidecar. Logical documents are now isolated in FA3/TE and DSA
+attention, Mamba3 and M²RNN recurrent state, MTP label/loss rolling, checkpoint
+recomputation, and PP activation transport; the loader rejects non-zero loss at
+document transitions. Custom FA4 multi-document paths and sequence-sharded
+stateful paths fail closed until they have native boundary support.
+
+Verification: 178 focused tests passed (12 CUDA/TileLang skips), including
+real two-process Gloo PP transport and checkpoint backward. The full local
+suite reached 2,472 passed / 164 skipped / 9 unrelated failures caused by
+missing MLX peer checkouts/parity environment, a missing MLX module, and an
+independent source-conveyor fixture omission. Live H200/TE/TileLang execution
+is still required before calling the production path proven.
+
 ## 2026-07-31: Canonical live training-data inventory
 
 Added `scripts/report_training_data_status.py` and the pinned

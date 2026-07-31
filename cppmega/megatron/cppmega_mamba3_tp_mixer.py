@@ -61,6 +61,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 
 from cppmega.features.mamba3 import build_author_mamba3_config
+from cppmega.megatron.document_isolation import map_sequence_by_document
 from cppmega.megatron.mamba_local_spec import build_cppmega_local_stack_spec
 from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combined
 
@@ -422,6 +423,13 @@ class CppmegaMamba3TPMixer(MegatronModule):
                 "CppmegaMamba3TPMixer expects hidden_states shaped [seq, batch, hidden]"
             )
 
+        return map_sequence_by_document(
+            hidden_states,
+            self._forward_unpacked,
+            pad_to=self.chunk_size,
+        ), None
+
+    def _forward_unpacked(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # ------------------------------------------------------------------
         # 1) angle_proj on the (possibly sequence-parallel) hidden_states.
         #    With SP, hidden_states is sharded as (L/tp, B, H) and
@@ -553,7 +561,7 @@ class CppmegaMamba3TPMixer(MegatronModule):
         y = rearrange(y, "b l h p -> b l (h p)")
         y = rearrange(y, "b l d -> l b d").contiguous()
         out, _out_bias = self.out_proj(y.to(hidden_states.dtype))
-        return out, None
+        return out
 
     # ------------------------------------------------------------------
     # Inference cache shapes -- not yet supported

@@ -16,6 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.extensions.transformer_engine import TENorm as _NormClass
 
 from cppmega.features.m2rnn import build_cppmega_m2rnn_config
+from cppmega.megatron.document_isolation import map_sequence_by_document
 from cppmega.megatron.mamba_local_spec import CppMegaLocalMambaStack
 
 # Fused Triton M²RNN kernel (replaces the pure-Python seq loop below).  When
@@ -241,6 +242,9 @@ class CppMegaM2RNNMixer(nn.Module):
         if hidden_states.ndim != 3:
             raise ValueError("CppMegaM2RNNMixer expects hidden_states shaped [seq, batch, hidden]")
 
+        return map_sequence_by_document(hidden_states, self._forward_unpacked), None
+
+    def _forward_unpacked(self, hidden_states):
         x = hidden_states.transpose(0, 1).contiguous()
         batch, seq, _ = x.shape
         projected = self.input_projection(x)
@@ -288,7 +292,7 @@ class CppMegaM2RNNMixer(nn.Module):
         out = out * F.silu(g)
         out = self.g_norm(out)
         out = self.output_projection(out)
-        return out.transpose(0, 1).contiguous(), None
+        return out.transpose(0, 1).contiguous()
 
     def mamba_state_shapes_per_request(self):
         raise NotImplementedError("CppMegaM2RNNMixer does not support Megatron inference cache shapes yet")

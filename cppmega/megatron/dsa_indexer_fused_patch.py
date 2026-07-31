@@ -124,6 +124,7 @@ _GRAPH_ROUTE_BATCH_KEYS = (
     "graph_chunk_kinds",
     "graph_chunk_dep_levels",
     "graph_chunk_counts",
+    "document_ids",
     "graph_document_ids",
 )
 _INTEGER_TORCH_DTYPES = frozenset(
@@ -927,29 +928,31 @@ def build_graph_objective_tensors(
         seqlen_k=seqlen_k,
         device=device,
     ).gt(0)
-    document_ids = structure_batch.get("graph_document_ids")
+    document_ids = structure_batch.get("document_ids")
+    if document_ids is None:
+        document_ids = structure_batch.get("graph_document_ids")
     if not isinstance(document_ids, torch.Tensor):
         raise KeyError(
-            "graph auxiliary loss requires graph_document_ids derived from "
+            "graph auxiliary loss requires document_ids derived from "
             "packed document boundaries"
         )
-    _require_integer_tensor(document_ids, name="graph_document_ids")
+    _require_integer_tensor(document_ids, name="document_ids")
     if document_ids.dim() == 1:
         document_ids = document_ids.unsqueeze(0)
     if document_ids.dim() != 2:
         raise ValueError(
-            "graph_document_ids must have shape [B,S] or [S], got "
+            "document_ids must have shape [B,S] or [S], got "
             f"{tuple(document_ids.shape)}"
         )
     if int(document_ids.shape[0]) == 1 and batch_size > 1:
         document_ids = document_ids.expand(batch_size, -1)
     if int(document_ids.shape[0]) != batch_size:
         raise ValueError(
-            f"graph_document_ids batch {int(document_ids.shape[0])} != {batch_size}"
+            f"document_ids batch {int(document_ids.shape[0])} != {batch_size}"
         )
     if int(document_ids.shape[1]) < max(seqlen_q, seqlen_k):
         raise ValueError(
-            f"graph_document_ids length {int(document_ids.shape[1])} is shorter "
+            f"document_ids length {int(document_ids.shape[1])} is shorter "
             f"than graph score shape ({seqlen_q}, {seqlen_k})"
         )
     document_ids = document_ids.to(device=device, dtype=torch.long)

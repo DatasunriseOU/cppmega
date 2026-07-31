@@ -910,6 +910,18 @@ class CppMegaFA4DotProductAttention(torch.nn.Module):
 
         batch_size, seqlen_q, num_heads, head_dim = query.shape
         _, seqlen_k, num_kv_heads, _ = key.shape
+        from cppmega.megatron.document_isolation import document_layout
+
+        _ids, _spans, multiple_documents = document_layout(
+            batch_size=batch_size,
+            sequence_length=seqlen_q,
+            device=query.device,
+        )
+        if multiple_documents:
+            raise RuntimeError(
+                "FA4 graph attention does not yet expose cppmega document mask_mod; "
+                "refusing a multi-document row"
+            )
 
         if num_heads % num_kv_heads != 0:
             raise ValueError(

@@ -56,7 +56,6 @@ def patch_mtp_loss_with_liger():
     _orig_process_mtp_loss = mtp_mod.process_mtp_loss
 
     # Keep references to helpers we need inside the replacement.
-    _roll_tensor = mtp_mod.roll_tensor
     _MTPLossLoggingHelper = mtp_mod.MTPLossLoggingHelper
     _MTPLossAutoScaler = mtp_mod.MTPLossAutoScaler
 
@@ -135,14 +134,14 @@ def patch_mtp_loss_with_liger():
             h_2d = h.reshape(s * b, hdim)
 
             # Roll labels and loss_mask (same as original)
-            mtp_labels, _ = _roll_tensor(
+            mtp_labels, _ = mtp_mod.roll_tensor(
                 mtp_labels,
                 shifts=-1,
                 dims=-1,
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
             )
-            loss_mask, num_tokens = _roll_tensor(
+            loss_mask, num_tokens = mtp_mod.roll_tensor(
                 loss_mask,
                 shifts=-1,
                 dims=-1,

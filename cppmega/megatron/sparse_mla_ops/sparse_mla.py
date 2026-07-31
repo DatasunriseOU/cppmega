@@ -49,6 +49,8 @@ from typing import Optional
 
 import torch
 
+from cppmega.megatron.document_isolation import mask_sparse_topk_by_document
+
 log = logging.getLogger(__name__)
 
 _TE_TENSORWISE_SPARSE_MLA_ALIASES = {
@@ -585,6 +587,7 @@ def sparse_mla_fp8_as_unfused_dsa(
     sq, b, np_, hn = query.shape
     sk = key.shape[0]
     hnv = value.shape[3]
+    topk_indices = mask_sparse_topk_by_document(topk_indices)
 
     q = query.permute(1, 0, 2, 3).contiguous()
     kv = key.permute(1, 0, 2, 3)[:, :, 0:1, :].contiguous()
@@ -648,6 +651,7 @@ def sparse_mla_as_unfused_dsa(
     sq, b, np_, hn = query.shape
     sk = key.shape[0]
     hnv = value.shape[3]
+    topk_indices = mask_sparse_topk_by_document(topk_indices)
 
     # ---- Q: [sq, b, np, hn] -> [b, sq, np, hn] ----
     q = query.permute(1, 0, 2, 3).contiguous()
@@ -684,6 +688,10 @@ def sparse_mla_as_unfused_dsa(
     # ---- Output: [b, sq, np, hnv] -> [sq, b, np * hnv] ----
     output = out.permute(1, 0, 2, 3).contiguous().reshape(sq, b, np_ * hnv)
     return output
+
+
+setattr(sparse_mla_fp8_as_unfused_dsa, "__cppmega_document_isolation__", True)
+setattr(sparse_mla_as_unfused_dsa, "__cppmega_document_isolation__", True)
 
 
 def fused_sparse_mla_absorbed_fp8(

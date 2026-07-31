@@ -136,9 +136,11 @@ _GRAPH_BATCH_COLS = (
     "graph_chunk_kinds",
     "graph_chunk_dep_levels",
     "graph_chunk_counts",
+    # Compatibility input accepted from pre-isolation graph batches.
     "graph_document_ids",
 )
 
+_DOCUMENT_BATCH_COLS = ("document_ids",)
 _OBJECTIVE_BATCH_COLS = ("objective_ids",)
 _OBJECTIVE_ID_TO_TASK = {value: task for task, value in OBJECTIVE_IDS.items()}
 
@@ -204,7 +206,12 @@ _LOSS_MASK_ALIGNMENT = "source_token_predicts_next_v1"
 
 _GRAPH_ROUTE_COLS = GRAPH_ROUTE_COLUMNS
 
-_CPPMEGA_BATCH_COLS = _TOKEN_BATCH_COLS + _GRAPH_BATCH_COLS + _OBJECTIVE_BATCH_COLS
+_CPPMEGA_BATCH_COLS = (
+    _TOKEN_BATCH_COLS
+    + _DOCUMENT_BATCH_COLS
+    + _GRAPH_BATCH_COLS
+    + _OBJECTIVE_BATCH_COLS
+)
 _TP_SIDECAR_MAX_DIMS = 4
 _TP_BRIDGE_OK = 0
 _TP_BRIDGE_MISSING = 1
@@ -266,7 +273,12 @@ def _validate_production_objective_batch(
         )
     if objective_ids.is_floating_point() or objective_ids.dtype == torch.bool:
         raise ValueError("production objective_ids must use an integer dtype")
-    for name in ("structure_ids", "source_doc_ids", "graph_document_ids"):
+    for name in (
+        "structure_ids",
+        "source_doc_ids",
+        "document_ids",
+        "graph_document_ids",
+    ):
         marker = structure_batch.get(name)
         if marker is None:
             continue
@@ -290,7 +302,12 @@ def _validate_production_objective_batch(
         raise ValueError(f"production objective_ids contain unknown objective IDs: {unknown}")
 
     valid_tokens = tokens.ne(0) | labels.ne(0) | loss_mask.ne(0)
-    for name in ("structure_ids", "source_doc_ids", "graph_document_ids"):
+    for name in (
+        "structure_ids",
+        "source_doc_ids",
+        "document_ids",
+        "graph_document_ids",
+    ):
         marker = structure_batch.get(name)
         if isinstance(marker, torch.Tensor):
             valid_tokens |= marker.ne(0)
@@ -1345,12 +1362,12 @@ def _sample_document_ids(
     *,
     target_len: int,
 ) -> torch.Tensor:
-    """Remap packed row-local IDs to unique sample-local graph segments."""
+    """Remap packed row-local IDs to unique sample-local document segments."""
 
     values = raw_document_ids.reshape(-1).to(dtype=torch.long)
     if target_len < 1:
         raise ValueError(
-            f"graph document target_len must be positive, got {target_len}"
+            f"document target_len must be positive, got {target_len}"
         )
     result = torch.zeros((target_len,), dtype=torch.long, device=values.device)
     cursor = 0
@@ -1370,7 +1387,7 @@ def _sample_document_ids(
             raise ValueError("sample document-id cursor exceeded source sidecar")
         if target_start + available > target_len:
             raise ValueError(
-                f"sample span {span_index} exceeds graph document target length"
+                f"sample span {span_index} exceeds document target length"
             )
         segment = values[cursor : cursor + available]
         if bool((segment <= 0).any().item()):
@@ -1400,6 +1417,27 @@ def _sample_document_ids(
             f"{int(values.numel())}"
         )
     return result
+
+
+def _validate_document_loss_boundaries(
+    document_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> None:
+    """Require loss to be zero at padding and every document transition."""
+
+    if tuple(document_ids.shape) != tuple(loss_mask.shape):
+        raise ValueError(
+            f"document_ids shape {tuple(document_ids.shape)} != "
+            f"loss_mask shape {tuple(loss_mask.shape)}"
+        )
+    boundary = document_ids <= 0
+    if document_ids.numel() > 1:
+        boundary[:-1] |= document_ids[:-1] != document_ids[1:]
+    boundary[-1] = True
+    if bool((loss_mask[boundary] != 0).any().item()):
+        raise ValueError(
+            "loss_mask must be zero at padding and every document transition"
+        )
 
 
 def _slice_graph_doc(cache_entry: dict[str, Any], real_doc: int) -> np.ndarray:
@@ -1649,6 +1687,11 @@ try:
             # Padded sequence: return zero tensors matching the tokens shape
             for col in _TOKEN_BATCH_COLS:
                 sample[col] = _padded_token_sidecar_tensor(sample["tokens"], col=col)
+            sample["document_ids"] = torch.zeros(
+                sample["tokens"].shape,
+                dtype=torch.long,
+                device=sample["tokens"].device,
+            )
             if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0") == "1":
                 max_edges = _graph_capacity("CPPMEGA_GRAPH_MAX_EDGES")
                 max_chunks = _graph_capacity("CPPMEGA_GRAPH_MAX_CHUNKS")
@@ -1704,11 +1747,6 @@ try:
                     max_edges=max_edges,
                     max_chunks=max_chunks,
                 )
-                graph["graph_document_ids"] = torch.zeros(
-                    sample["tokens"].shape,
-                    dtype=torch.long,
-                    device=sample["tokens"].device,
-                )
                 sample.update(graph)
             if objective_id_mmap is not None:
                 sample["objective_ids"] = torch.zeros(
@@ -1730,17 +1768,12 @@ try:
         # enabled is a real misconfiguration and RAISES with WHERE+WHAT.
         indices = _get_absolute_token_indices(self, idx)
         target_len = int(sample["tokens"].shape[-1])
-        spans = (
-            _get_sample_token_spans(self, idx)
-            if objective_id_mmap is not None
-            or _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED")
-            else None
-        )
+        spans = _get_sample_token_spans(self, idx)
+        if spans is None:
+            raise RuntimeError(
+                "[cppmega-patch] document_ids require sampled document spans"
+            )
         if objective_id_mmap is not None:
-            if spans is None:
-                raise RuntimeError(
-                    "[cppmega-patch] objective IDs require sampled document spans"
-                )
             sample["objective_ids"] = _sample_objective_ids(
                 objective_id_mmap,
                 spans,
@@ -1820,6 +1853,28 @@ try:
                     flush=True,
                 )
 
+        document_entry = side_channels.get("doc_ids")
+        if document_entry is None:
+            raise KeyError(
+                "[cppmega-patch] packed doc_ids sidecar is required for "
+                "model-wide attention, state, and loss isolation"
+            )
+        doc_ids_vals = document_entry["mmap"][indices]
+        if document_entry.get("widen_to_uint64"):
+            doc_ids_vals = doc_ids_vals.astype(np.uint64)
+        raw_document_ids = torch.from_numpy(doc_ids_vals).long()
+        if self.config.add_extra_token_to_sequence:
+            raw_document_ids = raw_document_ids[:-1]
+        sample["document_ids"] = _sample_document_ids(
+            raw_document_ids,
+            spans,
+            target_len=target_len,
+        )
+        _validate_document_loss_boundaries(
+            sample["document_ids"],
+            sample["loss_mask"],
+        )
+
         if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
             graph_sidecars = _lazy_init_graph_sidecars(self)
             if not graph_sidecars:
@@ -1839,24 +1894,6 @@ try:
                 target_len=int(sample["tokens"].shape[-1]),
                 max_edges=max_edges,
                 max_chunks=max_chunks,
-            )
-            document_entry = side_channels.get("doc_ids")
-            if document_entry is None:
-                raise KeyError(
-                    "[cppmega-patch] graph auxiliary loss requires the packed "
-                    "doc_ids sidecar; token_source_doc_ids is provenance and "
-                    "cannot substitute for segment boundaries"
-                )
-            doc_ids_vals = document_entry["mmap"][indices]
-            if document_entry.get("widen_to_uint64"):
-                doc_ids_vals = doc_ids_vals.astype(np.uint64)
-            raw_document_ids = torch.from_numpy(doc_ids_vals).long()
-            if self.config.add_extra_token_to_sequence:
-                raw_document_ids = raw_document_ids[:-1]
-            graph["graph_document_ids"] = _sample_document_ids(
-                raw_document_ids,
-                spans,
-                target_len=int(sample["tokens"].shape[-1]),
             )
             sample.update(graph)
 
@@ -1953,3 +1990,17 @@ except ImportError:
     pass
 except Exception as e:
     raise RuntimeError(f"[cppmega-patch] failed to patch GPTModel.forward: {e}") from e
+
+
+try:
+    from cppmega.megatron.document_isolation import apply_document_isolation_patch
+
+    apply_document_isolation_patch()
+    print("[cppmega-patch] Successfully installed document isolation", flush=True)
+except ImportError:
+    if _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
+        raise
+except Exception as e:
+    raise RuntimeError(
+        f"[cppmega-patch] failed to install document isolation: {e}"
+    ) from e

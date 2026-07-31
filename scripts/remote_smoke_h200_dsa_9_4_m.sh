@@ -301,13 +301,11 @@ if _ilc is not None:
     TransformerConfig.__post_init__ = _ilc_post_init
     print(f"[cppmega_mimo_shim] dsa_indexer_loss_coeff overridden to {_ilc_val}")
 
-# (12.5) DSA indexer fused per-head accumulation patch — UNCONDITIONAL since
-# dd4da34. Eliminates the [sq, b, h, sk] FP32 intermediate inside
-# _compute_index_scores (saves ~40 GiB at MBS=10 NAM56R). Must run BEFORE
-# lemyx/IndexCache so those patches see the fused implementation when they
-# call fused_qk_topk_naive. No env gate; raises on install failure.
-from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
-apply_dsa_indexer_fused_patch()
+# (12.5) Canonical Megatron stack — includes the fused DSA indexer plus
+# structure ingress and packed-document attention/state/loss isolation.
+# Must run BEFORE lemyx/IndexCache and MTP so they capture the patched seams.
+from cppmega.megatron.patch_install import install_cppmega_stack
+install_cppmega_stack()
 
 # (13) lemyx fused DSA warmup kernel (CPPMEGA_LEMYX_DSA=1)
 if os.environ.get("CPPMEGA_LEMYX_DSA", "0") == "1":

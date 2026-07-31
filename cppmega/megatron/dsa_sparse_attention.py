@@ -27,6 +27,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from cppmega.megatron.document_isolation import mask_sparse_topk_by_document
+
 
 def sparse_dsa_fn(
     query: torch.Tensor,
@@ -55,6 +57,7 @@ def sparse_dsa_fn(
         raise ValueError("sparse_dsa_fn requires at least one key/value token")
     if topk <= 0:
         raise ValueError("sparse_dsa_fn requires at least one selected index")
+    topk_indices = mask_sparse_topk_by_document(topk_indices)
 
     # ===================================================================
     # 1) Permute Q/K/V to batch-first for efficient gathering
@@ -136,3 +139,6 @@ def sparse_dsa_fn(
     # ===================================================================
     output = output.permute(2, 0, 1, 3).contiguous().reshape(sq, b, np_ * hnv)
     return output
+
+
+setattr(sparse_dsa_fn, "__cppmega_document_isolation__", True)
