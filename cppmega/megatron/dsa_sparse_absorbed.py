@@ -1,5 +1,8 @@
 """Sparse gather-scatter for absorbed-MLA DSA attention.
 
+Deprecated 2026-08-01: retained for historical reference; scheduled for
+removal.  Use ``dsa_sparse_attention.py`` instead (clamp/mask already ported).
+
 Replaces ``_unfused_absorbed_dsa_fn`` in PR #3674's DSA code which does a
 full ``torch.matmul(q.float(), k.float())`` = 7 GiB at [b, np, sq, sk].
 

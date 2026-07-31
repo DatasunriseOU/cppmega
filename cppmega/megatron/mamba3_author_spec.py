@@ -1,5 +1,9 @@
 """Author Mamba3 stack spec: CppMegaMamba3TE (Author kernels) + upstream TE submodules.
 
+Deprecated 2026-08-01: replaced by ``author_mamba3_spec.py``; retained for
+historical reference and scheduled for removal.  Import is gated by
+``deprecated_paths.require_deprecated_ack`` (see below).
+
 Uses CppMegaMamba3TE as the Mamba mixer — this is the REAL Mamba3 with:
   - Trapezoidal discretization (mamba3_siso_combined Triton kernel)
   - QK-Norm + learnable B/C bias

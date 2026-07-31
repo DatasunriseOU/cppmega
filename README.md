@@ -457,7 +457,7 @@ local `dev_latest` branch until noted otherwise.
   - `dsa_indexer_fused_patch.py` — per-head fused accumulation replacement for Megatron's `_compute_index_scores` (bf16)
   - `dsa_splitk_indexer_loss.py` — split-K Triton fused indexer KL loss (port of NVIDIA Megatron-LM PR #4039); ~60% memory save
   - `dsa_sparse_attention.py` — sparse gather/scatter replacement for Megatron's `unfused_dsa_fn`; avoids the 7 GiB full `[b*np, sq, sk]` FP32 scores tensor
-  - `dsa_sparse_absorbed.py` — same sparse-gather replacement for the absorbed-MLA DSA path (`_unfused_absorbed_dsa_fn`, PR #3674)
+  - `dsa_sparse_absorbed.py` (deprecated 2026-08-01, see module docstring) — same sparse-gather replacement for the absorbed-MLA DSA path (`_unfused_absorbed_dsa_fn`, PR #3674)
   - `index_cache_patch.py` — reuses indexer top-k across DSA-Shared layers (3 Full + 6 Shared pattern)
   - No try/except fallbacks in any of the above — fused kernel unavailable = crash
 - **No _apply guard**: D/dt_bias stay bf16 after Float16Module, use .float() in forward

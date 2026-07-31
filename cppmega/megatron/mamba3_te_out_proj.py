@@ -1,5 +1,8 @@
 """TE-fused out_proj for Author Mamba3.
 
+Deprecated 2026-08-01: retained for historical reference; scheduled for
+removal.  Use ``author_mamba3_spec.py`` instead.
+
 Replaces Mamba3's ``nn.Linear`` out_proj with ``TERowParallelLinear`` so the
 output projection participates in Megatron's tensor-parallel all-reduce and
 sequence-parallel scatter.

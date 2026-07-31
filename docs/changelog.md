@@ -450,8 +450,8 @@ MBS=2, GBS=16, NAM56R feature plan with MLA+MTP+MoE:
 | Path | Spec                                    | FP8 result                   | iter 3-5 ms                                                                                                                     |
 | ---- | --------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | A    | `mamba3_te_stack_spec`                  | PASS                         | 1116/1082/1064                                                                                                                  |
-| B    | `mamba3_author_spec` (SISO)             | PASS                         | 1416/1082/1047                                                                                                                  |
-| C    | `mamba3_author_spec` + MIMO rank=4      | FAIL (historical on one env) | backward originally failed in one local `mamba3_mimo_bwd.py` install; this was later fixed and is not the current TP bottleneck |
+| B    | `mamba3_author_spec` (SISO; deprecated 2026-08-01, see module docstring)             | PASS                         | 1416/1082/1047                                                                                                                  |
+| C    | `mamba3_author_spec` + MIMO rank=4 (deprecated 2026-08-01, see module docstring)      | FAIL (historical on one env) | backward originally failed in one local `mamba3_mimo_bwd.py` install; this was later fixed and is not the current TP bottleneck |
 | D    | `nam56r_noconv_spec` (NoConvBC + M2RNN) | PASS                         | 38279/37625/37909                                                                                                               |
 
 Path C's failure above was a historical local-environment issue in one
@@ -1047,7 +1047,7 @@ cannot participate in TE CUDA graph capture, breaking the fusion pipeline.
 | --------------------------------------------------------- | ----------------------------------------------- | -------------------------------- |
 | **M²RNN** (Mamba3 R-layers)                               | Author Mamba3 / accelerated-model-architectures | **Not implemented**              |
 | **MIMO** (multi-input multi-output SSM)                   | `mamba3_mimo_combined` kernel                   | Kernel reference only, not wired |
-| **Output projection norm** (RMSNormGated before out_proj) | `mamba3_te_out_proj.py`                         | Built, not benchmarked           |
+| **Output projection norm** (RMSNormGated before out_proj) | `mamba3_te_out_proj.py` (deprecated 2026-08-01, see module docstring) | Built, not benchmarked           |
 
 ### Path Forward for Mamba3 at Production Speed
 
