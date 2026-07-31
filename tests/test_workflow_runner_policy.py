@@ -291,6 +291,9 @@ def test_wheel_and_image_sources_are_content_addressed() -> None:
     assert len(wheel_refs) == 8
     assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in stack_refs)
     assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in wheel_refs)
+    assert re.search(
+        r"^  cuda_image: \S+@sha256:[0-9a-f]{64}$", stack, re.MULTILINE
+    )
     assert "sha256sum *.whl > SHA256SUMS" in wheel_workflow
     assert "wheels/SHA256SUMS --clobber" in wheel_workflow
     assert "--pattern SHA256SUMS" in image_workflow
