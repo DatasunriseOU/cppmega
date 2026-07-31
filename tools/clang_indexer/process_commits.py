@@ -845,6 +845,8 @@ def _build_commit_temporal_metadata(
     new_line_ops, new_line_hunk = compute_new_line_edit_ops(diff)
     old_line_hunk = compute_old_line_hunk(hunks)
     old_changed_ranges = _line_ranges_for_changed_functions(old_analysis, old_changed_lines)
+    if not old_changed_ranges and old_changed_lines:
+        old_changed_ranges = [(min(old_changed_lines), max(old_changed_lines))]
     old_content = str(record.get('old_content', '') or '')
     new_content = str(record.get('new_content', '') or '')
     old_line_ranges = _line_ranges_by_number(str(record.get('old_content', '') or ''))
@@ -2181,6 +2183,8 @@ def _attach_commit_provenance(result: dict, record: dict) -> None:
         'has_ambiguous_reconstruction', False
     )
     result['has_rename_ambiguity'] = record.get('has_rename_ambiguity', False)
+    result['change_status'] = record.get('change_status', '')
+    result['old_filepath'] = record.get('old_filepath', '')
 
 
 def _build_enriched_from_parts(
@@ -2735,11 +2739,12 @@ def _process_domain_record(
     dedup_tokenizer,
     chunk_claim_stats: dict[str, int] | None,
 ) -> list[dict]:
-    tokens = count_tokens(new_content)
+    document_text = new_content or old_content
+    tokens = count_tokens(document_text)
     if tokens > max_tokens:
         return []
     claimed = _claim_semantic_chunk(
-        new_content,
+        document_text,
         dedup_store=dedup_store,
         dedup_tokenizer=dedup_tokenizer,
     )
@@ -2751,7 +2756,7 @@ def _process_domain_record(
 
     document = build_build_doc(
         filepath,
-        new_content,
+        document_text,
         build_kind,
         project_id=project_id,
         build_info=build_info,
@@ -2779,9 +2784,9 @@ def _process_domain_record(
     empty_analysis = FileAnalysis(preamble='')
     document.update(
         _build_commit_temporal_metadata(
-            new_content,
-            [new_content],
-            ['n'],
+            document_text,
+            [document_text],
+            ['n' if new_content else 'o'],
             record=record,
             old_analysis=empty_analysis,
             new_analysis=empty_analysis,
@@ -2814,7 +2819,7 @@ def process_record(
 
     if len(old_content) > max_file_bytes or len(new_content) > max_file_bytes:
         return []
-    if len(old_content) < 50 or len(new_content) < 50:
+    if max(len(old_content), len(new_content)) < 50:
         return []
 
     hunks = parse_hunk_ranges(diff)
@@ -2822,7 +2827,10 @@ def process_record(
         return []
 
     filepath = record.get('filepath', 'source.cpp')
-    primary_kind = classify_primary_commit_path(filepath, new_content)
+    primary_kind = classify_primary_commit_path(
+        filepath,
+        new_content or old_content,
+    )
     if primary_kind is None:
         return []
     project_id = require_project_identity(
