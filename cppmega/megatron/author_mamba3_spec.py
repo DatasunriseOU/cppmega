@@ -20,17 +20,12 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from cppmega.features.mamba3 import build_author_mamba3_config
-from cppmega.megatron.document_isolation import map_sequence_by_document
+from cppmega.megatron.document_isolation import (
+    _validate_model_parallel_topology,
+    map_sharded_sequence_by_document,
+)
 from cppmega.megatron.mamba_local_spec import build_cppmega_local_stack_spec
 from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combined
-
-
-def _group_world_size(group) -> int:
-    if group is None:
-        return 1
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return 1
-    return torch.distributed.get_world_size(group=group)
 
 
 class AuthorMamba3Mixer(nn.Module):
@@ -56,15 +51,17 @@ class AuthorMamba3Mixer(nn.Module):
         if pg_collection is None:
             raise ValueError("pg_collection must be provided for AuthorMamba3Mixer")
 
-        tp_world_size = _group_world_size(pg_collection.tp)
-        cp_world_size = _group_world_size(getattr(pg_collection, "cp", None))
+        self.tp_group = getattr(pg_collection, "tp", None)
+        self.cp_group = getattr(pg_collection, "cp", None)
+        tp_world_size, _cp_world_size = _validate_model_parallel_topology(
+            config,
+            tp_group=self.tp_group,
+            cp_group=self.cp_group,
+            component="AuthorMamba3Mixer",
+        )
         if tp_world_size != 1:
             raise NotImplementedError(
                 "AuthorMamba3Mixer currently supports tensor-model-parallel-size=1 only"
-            )
-        if cp_world_size != 1:
-            raise NotImplementedError(
-                "AuthorMamba3Mixer currently supports context-parallel-size=1 only"
             )
         try:
             from mamba_ssm.modules.mamba3 import Mamba3
@@ -161,9 +158,10 @@ class AuthorMamba3Mixer(nn.Module):
                 )
             return out.transpose(0, 1).contiguous()
 
-        return map_sequence_by_document(
+        return map_sharded_sequence_by_document(
             hidden_states,
             mix,
+            context_parallel_group=self.cp_group,
             pad_to=self.mixer.chunk_size,
         ), None
 

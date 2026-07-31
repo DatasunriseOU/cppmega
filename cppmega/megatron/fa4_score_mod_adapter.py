@@ -10,8 +10,8 @@ boundaries.
 This yields ~89x-1600x HBM reduction vs the dense path while keeping FA4's
 pipelined Hopper/Blackwell kernels on the fast path.
 
-The module is importable and testable WITHOUT a GPU: ``flash_attn.cute`` is
-imported lazily inside the forward pass so unit tests can mock it.
+The module is importable without a GPU because ``flash_attn.cute`` is imported
+lazily. Kernel integration is exercised against the real FA4 runtime on H200.
 
 Enable with ``CPPMEGA_FA4_SCORE_MOD=1`` (default ``"0"``).
 
@@ -52,6 +52,8 @@ __all__ = [
     "chunk_native_score_mod_bwd_ref",
     "chunk_native_score_mod_ref",
     "fa4_score_mod_enabled",
+    "_build_document_mask_aux",
+    "_make_document_causal_mask_mod",
     "_make_graph_score_mod",
     "_make_graph_score_mod_bwd",
 ]
@@ -1212,6 +1214,106 @@ def _make_graph_score_mod_bwd(c_plus_1: int) -> Any:
     return _score_mod_bwd
 
 
+def _build_document_mask_aux(
+    *,
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return beta23 aux tensors for packed-document attention masking."""
+
+    if seqlen_q > seqlen_k:
+        raise ValueError(
+            f"FA4 document masking requires Sq <= Sk, got Sq={seqlen_q} Sk={seqlen_k}"
+        )
+
+    from cppmega.megatron.document_isolation import document_layout
+
+    document_ids, _spans, multiple_documents = document_layout(
+        batch_size=batch_size,
+        sequence_length=seqlen_k,
+        device=device,
+    )
+    if not multiple_documents:
+        return None
+    if document_ids is None:
+        raise RuntimeError("validated document layout did not return document_ids")
+
+    query_start = seqlen_k - seqlen_q
+    document_ids_k = document_ids.to(dtype=torch.int32).contiguous()
+    document_ids_q = document_ids_k[
+        :, query_start : query_start + seqlen_q
+    ].contiguous()
+    # Keep a singleton head axis so the decorated CuTe callback can use the
+    # official beta23 [batch, head, token] indexing pattern without copying
+    # the same document IDs for every attention head.
+    return document_ids_q[:, None, :], document_ids_k[:, None, :]
+
+
+def _make_document_causal_mask_mod(
+    document_ids_q_index: int,
+    document_ids_k_index: int,
+    *,
+    causal: bool,
+    window_size_left: int | None = None,
+    window_size_right: int | None = None,
+) -> Any:
+    """Create a beta23 ``mask_mod`` that keeps one causal document at a time."""
+
+    import cutlass
+    import cutlass.cute as cute
+    from flash_attn.cute import utils
+
+    # Do not use FA4's fast_sampling decorator here. Its five-point tile
+    # classifier is only sound for simple geometric masks; arbitrary packed
+    # document runs can contain valid pairs even when all sampled points miss.
+    @cute.jit
+    def _mask_mod(
+        batch_idx: Any,
+        head_idx: Any,
+        q_idx: Any,
+        kv_idx: Any,
+        seqlen_info: Any,
+        aux_tensors: list[Any],
+    ) -> Any:
+        document_ids_q = aux_tensors[document_ids_q_index]
+        document_ids_k = aux_tensors[document_ids_k_index]
+        q_read_idx = cutlass.min(q_idx[0], seqlen_info.seqlen_q - 1)
+        kv_read_idx = cutlass.min(kv_idx[0], seqlen_info.seqlen_k - 1)
+        q_document = utils.scalar_to_ssa(
+            document_ids_q[batch_idx[0], 0, q_read_idx], cutlass.Int32
+        )
+        kv_document = utils.scalar_to_ssa(
+            document_ids_k[batch_idx[0], 0, kv_read_idx], cutlass.Int32
+        )
+        query_start = utils.scalar_to_ssa(
+            seqlen_info.seqlen_k - seqlen_info.seqlen_q,
+            cutlass.Int32,
+        )
+        q_absolute = q_idx + query_start
+
+        # doc_id=0 is the trailing padding segment. Keeping 0 -> 0 causal
+        # attention avoids fully-masked softmax rows; its validated loss_mask
+        # is zero, and equality still isolates it from every real document.
+        keep = q_document == kv_document
+        if cutlass.const_expr(causal):
+            keep = keep & (kv_idx <= q_absolute)
+        if cutlass.const_expr(
+            window_size_left is not None and window_size_left >= 0
+        ):
+            window_left = utils.scalar_to_ssa(window_size_left, cutlass.Int32)
+            keep = keep & (kv_idx >= q_absolute - window_left)
+        if cutlass.const_expr(
+            window_size_right is not None and window_size_right >= 0
+        ):
+            window_right = utils.scalar_to_ssa(window_size_right, cutlass.Int32)
+            keep = keep & (kv_idx <= q_absolute + window_right)
+        return keep
+
+    return _mask_mod
+
+
 # ---------------------------------------------------------------------------
 # CppMegaFA4ScoreModAttention module
 # ---------------------------------------------------------------------------
@@ -1360,18 +1462,12 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
 
         batch_size, seqlen_q, num_heads, head_dim = q.shape
         _, seqlen_k, num_kv_heads, _ = k.shape
-        from cppmega.megatron.document_isolation import document_layout
-
-        _ids, _spans, multiple_documents = document_layout(
+        document_mask_aux = _build_document_mask_aux(
             batch_size=batch_size,
-            sequence_length=seqlen_q,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
             device=q.device,
         )
-        if multiple_documents:
-            raise RuntimeError(
-                "FA4 score_mod does not yet expose cppmega document mask_mod; "
-                "refusing a multi-document row"
-            )
 
         if num_heads % num_kv_heads != 0:
             raise ValueError(
@@ -1449,6 +1545,7 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
         score_mod_fn = None
         score_mod_bwd_fn = None
         aux_tensors_arg = None
+        mask_mod_fn = None
 
         if bias_state is not None:
             # Pack aux_tensors from ChunkNativeGraphBias.
@@ -1482,17 +1579,33 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                     "[cppmega] FA4 score_mod ABI: kwargs (b19/beta23 unified)"
                 )
 
+        if document_mask_aux is not None:
+            if aux_tensors_arg is None:
+                aux_tensors_arg = []
+            document_ids_q_index = len(aux_tensors_arg)
+            aux_tensors_arg.extend(document_mask_aux)
+            mask_mod_fn = _make_document_causal_mask_mod(
+                document_ids_q_index,
+                document_ids_q_index + 1,
+                causal=causal,
+            )
+
+        # In FA4 4.0.0b23's SM90 dispatch, the native causal/local branch does
+        # not apply mask_mod. For packed rows the callback therefore owns the
+        # complete document + causal predicate; single-document rows retain
+        # the native causal fast path.
+        native_causal = causal if mask_mod_fn is None else False
         out = flash_attn_func(
             q=q,
             k=k,
             v=v,
             softmax_scale=scale,
-            causal=causal,
+            causal=native_causal,
             score_mod=score_mod_fn,
             score_mod_bwd=score_mod_bwd_fn,
             aux_tensors=aux_tensors_arg,
             block_sparse_tensors=None,
-            mask_mod=None,
+            mask_mod=mask_mod_fn,
             return_lse=False,
         )
 

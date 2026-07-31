@@ -1,6 +1,20 @@
 # FA4 beta23 Image Upgrade Plan
 
-Status: planning only — no Dockerfile / STACK.lock changes in this commit.
+Status: **executed 2026-07-30/31** — the stack is pinned:
+`flash-attn-4[cu13]==4.0.0b23` and `apache-tvm-ffi==0.1.13.post5`
+(`STACK.lock:148,155`, `docker/Dockerfile`), with TileLang built from the
+`DatasunriseOU/tilelang` fork at `334266af` carrying vendored TVM/tvm-ffi
+fixes (`STACK.lock:100-118`). The §4 conflict was resolved via the fork
+(option 1 path: upstream `tile-ai/tilelang` still caps
+`apache-tvm-ffi<0.1.12`, so the fork is the clean path). **H200 update:** the
+production packed-document FA4 beta23 forward/backward and leakage gate passed
+4/4 on H200
+([Modal receipt](https://modal.com/apps/jewelmusic/main/ap-9SduRWlQgGXF3z4FArAUL5)).
+FA4 beta23 is hardware-proven for that path. The full §8 image-promotion gate
+remains open: the newer TileLang 0.1.9 / TVM-FFI 0.1.13 runtime SIGSEGVs on
+the Mamba TIR path, while the same current source passes 3/3 on the previously
+proven TileLang 0.1.8 / TVM-FFI 0.1.9 image. §2/§12 tables below describe the
+pre-upgrade pins and are kept as the historical record of what was changed.
 Owners: cppmega runtime / image
 Scope: `docker/Dockerfile`, `STACK.lock`, `.github/workflows/build-wheels.yml`,
 `.github/workflows/build-image.yml`, Nebius H200 image pin.
@@ -262,6 +276,9 @@ Run inside the candidate image, on H200 (SM90) at minimum; Blackwell
    import + step + loss sanity.
 
 Gate: do not promote the candidate to `latest` until 1–7 pass on H200.
+The packed-document FA4 subset is 4/4 green; the candidate as a whole is not
+promotion-ready until the TileLang/Mamba runtime regression is fixed or pinned
+and the remaining training smoke is green.
 
 ---
 

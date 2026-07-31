@@ -56,6 +56,46 @@ def _pipeline_worker(rank, init_file, results):
         torch.distributed.destroy_process_group()
 
 
+def _pipeline_rejection_worker(rank, init_file, failure_mode, results):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=5),
+    )
+    activation = torch.zeros(3 if rank == 1 and failure_mode == "shape" else 4, 1, 2)
+    communicator = SimpleNamespace(
+        next_rank=1,
+        prev_rank=0,
+        pp_group=torch.distributed.group.WORLD,
+    )
+    try:
+        if rank == 0:
+            if failure_mode == "shape":
+                structure_dataset_patch._set_current_structure_batch(
+                    {"document_ids": torch.tensor([[1, 1, 2, 2]])}
+                )
+            _exchange_pipeline_document_ids(
+                communicator,
+                tensor_send_next=activation,
+                tensor_recv_prev=None,
+            )
+        else:
+            _exchange_pipeline_document_ids(
+                communicator,
+                tensor_send_next=None,
+                tensor_recv_prev=activation,
+            )
+    except Exception as exc:
+        results.put((rank, type(exc).__name__, str(exc)))
+    else:
+        results.put((rank, "none", "document_ids rejection unexpectedly passed"))
+    finally:
+        structure_dataset_patch._set_current_structure_batch(None)
+        torch.distributed.destroy_process_group()
+
+
 def test_packed_documents_isolate_state_sparse_attention_and_mtp_loss():
     structure_dataset_patch._set_current_structure_batch(
         {"document_ids": torch.tensor([[1, 1, 2, 2]])}
@@ -399,3 +439,50 @@ def test_document_ids_cross_a_real_pipeline_process_group(tmp_path):
         process.join(25)
         assert process.exitcode == 0
     assert results.get(timeout=1) == [[1, 1, 2, 2]]
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_messages"),
+    (
+        (
+            "missing",
+            {
+                0: "pipeline activation send requires document_ids",
+                1: "upstream pipeline stage rejected its document_ids",
+            },
+        ),
+        (
+            "shape",
+            {
+                0: "downstream pipeline stage rejected document_ids metadata",
+                1: "is incompatible with activation",
+            },
+        ),
+    ),
+)
+def test_pipeline_document_id_rejection_is_coordinated(
+    tmp_path, failure_mode, expected_messages
+):
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    init_file = tmp_path / f"gloo-{failure_mode}-init"
+    processes = [
+        context.Process(
+            target=_pipeline_rejection_worker,
+            args=(rank, str(init_file), failure_mode, results),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+    messages = [results.get(timeout=1) for _ in range(2)]
+
+    assert all(process.exitcode == 0 for process in processes), messages
+    assert {rank for rank, _error_type, _message in messages} == {0, 1}
+    for rank, error_type, message in messages:
+        assert error_type in {"RuntimeError", "ValueError"}
+        assert expected_messages[rank] in message

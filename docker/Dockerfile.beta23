@@ -124,6 +124,10 @@ from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func; \
 import flash_attn.cute.block_sparsity as _fa4_block_sparsity; \
 import flash_attn_3; \
 import mamba_ssm, causal_conv1d, fast_hadamard_transform, tilelang, qoptim_cuda; \
+from mamba_ssm.modules import mamba3 as _mamba3_module; \
+from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd import mamba_mimo_bwd_combined as _mamba3_mimo_bwd; \
+from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd_varlen import mamba_mimo_bwd_combined_varlen as _mamba3_mimo_bwd_varlen; \
+assert _mamba3_module.mamba3_mimo_combined is not None; \
 import cutlass; import cutlass.cute as cute; \
 from cutlass.utils import LayoutEnum, SmemAllocator; \
 import quack; from quack import sm90_utils, copy_utils, layout_utils, mx_utils; \

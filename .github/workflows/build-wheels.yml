@@ -140,7 +140,8 @@ jobs:
             repo: state-spaces/mamba
             ref: 31f3d7baba69d0ccad1635ace1e477367899e408
             submodules: "false"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+            patch: upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch
+            extra_env: "MAMBA_FORCE_BUILD=TRUE MAX_JOBS=1 NVCC_THREADS=2"
           - name: causal_conv1d
             repo: Dao-AILab/causal-conv1d
             ref: c51519fb10d92ffa257c1982e1831d3243454b2f
@@ -639,6 +640,38 @@ jobs:
 
           print("torch", torch.__version__, torch.version.cuda)
           print("transformer_engine", transformer_engine.__version__)
+          PY
+
+      - name: Verify Mamba wheel contains the pinned GQA backward patch
+        if: success() && matrix.name == 'mamba_ssm'
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          from pathlib import Path
+          import zipfile
+
+          wheels = glob.glob("wheels/mamba_ssm-*.whl")
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one Mamba wheel, found {wheels!r}")
+          required = {
+              "mamba_ssm/modules/mamba3.py": (
+                  "F.softplus((dd_dt + self.dt_bias).to(torch.float32))"
+              ),
+              "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py": "elif H % G == 0:",
+              "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py": "elif H % G == 0:",
+          }
+          with zipfile.ZipFile(wheels[0]) as archive:
+              for path, marker in required.items():
+                  wheel_bytes = archive.read(path)
+                  text = wheel_bytes.decode()
+                  if marker not in text:
+                      raise SystemExit(f"{path} lacks pinned marker {marker!r}")
+                  source_bytes = (Path("src") / path).read_bytes()
+                  if wheel_bytes != source_bytes:
+                      raise SystemExit(
+                          f"{path} in wheel differs from patched checkout"
+                      )
           PY
 
       - name: Upload build log (always, even on failure/cancel)

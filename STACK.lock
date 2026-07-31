@@ -59,9 +59,10 @@ wheels:
   mamba_ssm:
     repo: state-spaces/mamba
     ref: 31f3d7baba69d0ccad1635ace1e477367899e408
+    patch: upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch
     version: 2.3.1
     build: |
-      MAX_JOBS=1 NVCC_THREADS=2 \
+      MAMBA_FORCE_BUILD=TRUE MAX_JOBS=1 NVCC_THREADS=2 \
         pip wheel . --no-build-isolation -w /wheels
     produces:
       - mamba_ssm-*.whl

@@ -239,6 +239,64 @@ def test_fa2_wheel_build_uses_upstream_arch_knob_and_exact_kernel_trim() -> None
     assert '[[ "$after" -ne 8 || -n "$unexpected" ]]' in workflow
 
 
+def test_mamba_wheel_build_applies_the_pinned_gqa_backward_patch() -> None:
+    patch = "upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch"
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
+    ).read_text(encoding="utf-8")
+    stack = (REPO_ROOT / "STACK.lock").read_text(encoding="utf-8")
+
+    stack_block = re.search(
+        r"(?ms)^  mamba_ssm:\n(?P<body>.*?)(?=^  \S[^:]*:\n|\Z)",
+        stack,
+    )
+    workflow_block = re.search(
+        r"(?ms)^          - name: mamba_ssm\n"
+        r"(?P<body>.*?)(?=^          - name:|\Z)",
+        workflow,
+    )
+
+    assert stack_block is not None
+    assert workflow_block is not None
+    for key in ("repo", "ref", "patch"):
+        stack_value = re.search(
+            rf"(?m)^    {key}: (?P<value>\S+)$",
+            stack_block.group("body"),
+        )
+        workflow_value = re.search(
+            rf"(?m)^            {key}: (?P<value>\S+)$",
+            workflow_block.group("body"),
+        )
+        assert stack_value is not None
+        assert workflow_value is not None
+        assert stack_value.group("value") == workflow_value.group("value")
+    assert f"    patch: {patch}" in stack_block.group("body")
+    assert f"            patch: {patch}" in workflow_block.group("body")
+    assert "MAMBA_FORCE_BUILD=TRUE" in stack_block.group("body")
+    assert "MAMBA_FORCE_BUILD=TRUE" in workflow_block.group("body")
+    assert (REPO_ROOT / patch).is_file()
+    assert 'if: matrix.patch' in workflow
+    assert 'git apply --check "$PATCH"' in workflow
+    assert "Verify Mamba wheel contains the pinned GQA backward patch" in workflow
+    assert "wheel_bytes != source_bytes" in workflow
+    assert "F.softplus((dd_dt + self.dt_bias).to(torch.float32))" in workflow
+    assert workflow.count('"elif H % G == 0:"') == 2
+
+
+def test_assembled_images_import_the_patched_mamba_runtime() -> None:
+    for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
+        dockerfile = (REPO_ROOT / path).read_text(encoding="utf-8")
+        assert (
+            "from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd import "
+            "mamba_mimo_bwd_combined"
+        ) in dockerfile
+        assert (
+            "from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo_bwd_varlen import "
+            "mamba_mimo_bwd_combined_varlen"
+        ) in dockerfile
+        assert "assert _mamba3_module.mamba3_mimo_combined is not None" in dockerfile
+
+
 def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
     transformer_engine_commit = "4220403e831d29e93868f7793693ea83f6b8b05b"
     workflow = (

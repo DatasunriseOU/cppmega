@@ -6,15 +6,37 @@ Promoted canonical packed `doc_ids` from graph-only metadata to a required
 model-wide sidecar. Logical documents are now isolated in FA3/TE and DSA
 attention, Mamba3 and M²RNN recurrent state, MTP label/loss rolling, checkpoint
 recomputation, and PP activation transport; the loader rejects non-zero loss at
-document transitions. Custom FA4 multi-document paths and sequence-sharded
-stateful paths fail closed until they have native boundary support.
+document transitions. The FA4 beta23 `score_mod` path now applies exact
+document equality plus causal masking, and stateful mixers support SP,
+Megatron zigzag CP, and combined SP+CP gather/map/scatter. PP sidecar
+transport uses a fixed header plus ACK/NACK before payload transfer so
+validation failures are symmetric instead of deadlocking a peer. The legacy
+FA4 CSR wrapper remains fail-closed for packed multi-document rows.
 
-Verification: 178 focused tests passed (12 CUDA/TileLang skips), including
-real two-process Gloo PP transport and checkpoint backward. The full local
-suite reached 2,472 passed / 164 skipped / 9 unrelated failures caused by
-missing MLX peer checkouts/parity environment, a missing MLX module, and an
-independent source-conveyor fixture omission. Live H200/TE/TileLang execution
-is still required before calling the production path proven.
+Verification:
+
+- Local focused gate: **143 passed / 18 skipped**, including real two-process
+  Gloo PP validation-failure regressions, checkpoint backward, FA4 masks,
+  SP/CP autograd, Mamba/M²RNN parity, wheel policy, and Docker smoke policy.
+- H200 FA4 beta23: **4/4 passed**, including forward/backward parity and zero
+  cross-document leakage
+  ([Modal receipt](https://modal.com/apps/jewelmusic/main/ap-9SduRWlQgGXF3z4FArAUL5)).
+- H200 two-GPU generic SP+CP plus actual M²RNN: **2/2 passed**
+  ([Modal receipt](https://modal.com/apps/jewelmusic/main/ap-AiHnkk7UE72AhNBqEU5nXm)).
+- H200 current Mamba isolation source on the previously proven runtime:
+  **3/3 passed**
+  ([Modal receipt](https://modal.com/apps/jewelmusic/main/ap-pTlgNp6p5LmQYwsUL5g9j7)).
+  The same gate, including byte-exact old source, SIGSEGVs on the newer
+  TileLang 0.1.9 / TVM-FFI 0.1.13 runtime. This isolates the remaining failure
+  to runtime-stack drift rather than the packed-document source changes.
+
+The repository-wide local run reached **2,287 passed / 194 skipped / 93 failed
+/ 98 errors**. All errors and most failures are missing optional test
+environment (`tokenizers`; additional failures require libclang, datasketch,
+explicit MLX/Megatron peer roots, or external fixtures). The scoped isolation
+gate above is green. Release promotion still requires a corrected/pinned
+TileLang runtime and a rebuilt Mamba wheel/image carrying the verified backward
+patches.
 
 ## 2026-07-31: Canonical live training-data inventory
 
@@ -31,6 +53,96 @@ store-local CI-unique tokens with zero eligible Parquet tokens. It also makes
 the DirectXTK receipt collision, mixed Python rows, incomplete source
 conveyor, cancelled PR export, and unfinished CI union/export explicit
 release blockers.
+
+## 2026-07-30: FA4 beta23 production stack pinned
+
+Landed the long-planned FA4 beta23 image move
+(`docs/fa4_beta23_upgrade_plan.md`): `flash-attn-4[cu13]==4.0.0b23` +
+`apache-tvm-ffi==0.1.13.post5` (`220fb10f`). The §4 TileLang/tvm-ffi conflict
+is resolved via the `DatasunriseOU/tilelang` fork at `334266af` — it carries
+tile-ai/tilelang#2071 (drops the `apache-tvm-ffi<0.1.10` cap), a vendored TVM
+bumped past apache/tvm#18938 (the `__slots__` fix for the
+`_NestedLoopCheckVisitor` import crash under tvm-ffi >=0.1.10), a complete
+lazy libcuda stub link, and vendored tvm-ffi `521efeb3` (v0.1.13.post5).
+Follow-ups pinned the tvm-ffi Optional/ObjectRef/GetRef compatibility stack,
+the exact TileLang Z3 build/runtime ABI, the TransformerEngine 2.16 source
+commit, and content-addressed wheel/image sources (`287f7893` → `6a417c4c`;
+PRs #79, #83, #84, #85). The packed-document FA4 beta23 H200 parity gate is
+now **4/4 green**; the full image-promotion gate remains open because the newer
+TileLang/TVM runtime regresses the Mamba kernel path.
+
+## 2026-07-27 – 2026-07-31: Data-pipeline hardening PRs #84–#91
+
+Final review-fix wave on the training-data pipeline: exact wheel-source
+receipts and full-SHA wheel-release binding (#84, #85), BOM-marked UTF-32
+domain ingestion (#86), commit-primary domain scoping (#87), reviewed CI
+parser transitions bound to frozen fetch receipts (#88), quarantine of the
+DirectX clang-crash fixture and the generated ThreadX module blob (#89, #90),
+and linear-time CI path matching (#91).
+
+## 2026-07-13 – 2026-07-29: Corpus/CI hardening wave (~410 commits)
+
+Sustained hardening across the data pipeline, CI, and model integration.
+Themes: fail-fast enforcement across data prep, structure side-channels, and
+scripts (07-10/07-11); domain-routed graph training (`e4b4e025`, 07-02);
+canonical v3 clang symbol identities and prompt-graph contracts (CASE1–CASE5);
+sealed Megatron bundles, immutable generation publication, and objective
+contracts bound to Parquet snapshots (07-13/07-14); fail-closed Nebius/H200
+training launchers and preflight receipts (CASE6); repository-owned
+self-hosted CI runners with fork-PR blocking (07-13/07-14); stable torch 2.13
+CUDA pin replacing the nightly (`0f907a52`, 07-17); lossless, exhaustive,
+receipt-gated GitHub Actions CI inventory with disjoint union support
+(07-26–07-29); resumable GraphQL PR ingestion bound to verified scans;
+five-bucket source preservation with exact quarantine; production FA4 beta23
+chunk-native score_mod adapter + Modal beta23 image (`25cc6f91`, `130f5644`,
+07-24).
+
+## 2026-06: GHCR image pipeline + dataset orchestration
+
+Migrated the image build to GHCR with required full sidecars, image built
+only after the wheel release, and fail-fast on missing wheel sources/assets
+(`fe500f64`, `5efe1e13`, `800fe9ec`, 06-26). Split the FA4 runtime out of the
+flash_attn wheel (`fd07ede1`) and moved to the latest tagged Megatron Core
+(`5280f7d9`). Data work: full dataset orchestration pipeline — corpus
+scanning, PR ingestion, validation (`1483b9e3`); GraphQL-primary PR fetch
+stream with token rotation and resumable cursors (`2cf48360`); canonical
+tokenizer-contract verifier (`d03c77eb`) and Phase-0 fail-closed
+audit/provenance/side-channel scripts with default `--side-channels` in the
+Megatron formatter (`c093e83d`); canonical vocab 65536 (`ad0cbb33`); dense-MLP
+route F profile and the gated `gb10_dense500m_cpp` pure-dense GQA profile
+with structure side-channels wired 1:1 with MLX (06-24), including the
+`document_index` permutation fix for truncated structure runs (`abb20550`).
+
+## 2026-05: MXFP8 acceptance waves + TileLang engine migration + wheel-build hardening
+
+MXFP8: `compact_direct_v1` validation tools, benchmarking, and acceptance
+lane (`a3567304`, `28d0ab8a`), vectorized MXFP8 A-columnwise smem production
+with acceptance suite (`27f8e1f7`), NAM56R-quarter profiling plus the
+`multi_cast_transpose` misaligned-pointer fix (`e39ba248`), MXFP8/BF16
+20-step acceptance runbook (`c4d3a961`), and the MXFP8 worktree audit with
+merge recommendations (`53041a55`). Salvaged bulk research artifacts from 35
+`worker/*` branches (mamba3 + m2rnn, `05ab5e62`). TileLang: unified
+`tilelang.engine.lower` path gated by `CPPMEGA_MLX_TILELANG_ENGINE`
+(`6395cbe8`) with phase-1–3 engine migrations and the integration-05/06
+regression waves (05-07). build-wheels: vendored gcc-15 toolchain (Launchpad
+PPA dropped), FA2 kernel matrix trimmed to bf16 hdim 64/128, FA3 sm_90-only +
+`DISABLE_SM80`, and `flash_attn.cute` (FA4) bundled into the flash_attn
+wheel. Data: token-aligned side-channel binary MMap streaming into Megatron-LM
+via dataset monkey-patching (`838fc102`, `8a3498f9`), Megatron Parquet dtype
+stamp fix (`b7735a8b`), and the TileLang Blackwell-optimized split-K indexer
+loss JIT kernel (`9758934f`).
+
+## 2026-04-15 – 2026-04-30: Bench3 stabilization + GHCR pipeline + MXFP8 exploration
+
+Reproducible per-config runner scripts, golden-smoke logging, and worktree
+NaN bisection infrastructure (04-15); nanochat-derived data preparation
+pipeline (`docs/data_preparation.md`, 04-15). First GHCR image-build pipeline
+(CUDA 13.2.1 + torch 2.13 + TE 2.16, `01485c05`, 04-25) with runner OOM/PIP
+fixes through 04-26. MXFP8 exploration opened: TE/SparseMLA fused prototypes,
+quantized Muon momentum kernels, CUTLASS MXFP8 GEMM with layout validation
+probes, and MXFP8 scaling transpose-cast (04-25–04-28). Mamba3 wave28/29/32
+H100/H200 stage2 harnesses and the H200 FA3 gate (04-30); FA3 (hopper) +
+patched FA4 fork added to the stack (`7e523e6f`).
 
 ## 2026-04-14: FP8 paths exploration + Mamba3 MIMO P1 + pipeline topology closures
 

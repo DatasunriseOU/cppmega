@@ -61,7 +61,12 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 
 from cppmega.features.mamba3 import build_author_mamba3_config
-from cppmega.megatron.document_isolation import map_sequence_by_document
+from cppmega.megatron.document_isolation import (
+    _validate_model_parallel_topology,
+    gather_context_parallel_sequence,
+    map_sequence_by_document,
+    scatter_context_parallel_sequence,
+)
 from cppmega.megatron.mamba_local_spec import build_cppmega_local_stack_spec
 from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combined
 
@@ -69,14 +74,6 @@ from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combin
 # ---------------------------------------------------------------------------
 # Small TP topology helpers (work with or without torch.distributed init)
 # ---------------------------------------------------------------------------
-
-def _group_world_size(group) -> int:
-    if group is None:
-        return 1
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return 1
-    return torch.distributed.get_world_size(group=group)
-
 
 def _group_rank(group) -> int:
     if group is None:
@@ -94,6 +91,18 @@ def _assert_divisible(name: str, value: int, tp_size: int) -> int:
             f"number of heads/groups"
         )
     return value // tp_size
+
+
+def _sum_gradient_across_tp(
+    gradient: torch.Tensor,
+    *,
+    tp_group,
+) -> torch.Tensor:
+    """Return the SUM of a replicated parameter's partial TP gradients."""
+
+    reduced = gradient.contiguous().clone()
+    torch.distributed.all_reduce(reduced, group=tp_group)
+    return reduced
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +147,22 @@ class CppmegaMamba3TPMixer(MegatronModule):
         self.layer_number = layer_number
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
-        self.tp_world_size = _group_world_size(self.tp_group)
-        self.tp_rank = _group_rank(self.tp_group)
-
-        cp_world_size = _group_world_size(getattr(pg_collection, "cp", None))
-        if cp_world_size != 1:
-            raise NotImplementedError(
-                "CppmegaMamba3TPMixer currently supports context-parallel-size=1 only"
+        self.cp_group = getattr(pg_collection, "cp", None)
+        (
+            self.tp_world_size,
+            self.cp_world_size,
+        ) = _validate_model_parallel_topology(
+            config,
+            tp_group=self.tp_group,
+            cp_group=self.cp_group,
+            component="CppmegaMamba3TPMixer",
+        )
+        if bool(getattr(config, "sequence_parallel", False)) and self.tp_group is None:
+            raise ValueError(
+                "CppmegaMamba3TPMixer requires pg_collection.tp when "
+                "sequence_parallel is enabled"
             )
+        self.tp_rank = _group_rank(self.tp_group)
 
         # ------------------------------------------------------------------
         # Mamba3 config -> structural dims
@@ -358,6 +375,8 @@ class CppmegaMamba3TPMixer(MegatronModule):
                 dtype=params_dtype,
             )
 
+        self._configure_replicated_tp_gradients()
+
         # ------------------------------------------------------------------
         # out_proj via build_module -- TE row-parallel linear (allreduce)
         # ------------------------------------------------------------------
@@ -374,6 +393,32 @@ class CppmegaMamba3TPMixer(MegatronModule):
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
         )
+
+    def _configure_replicated_tp_gradients(self) -> None:
+        """SUM replicated parameter gradients across TP in both SP modes."""
+
+        sequence_parallel = bool(
+            getattr(self.config, "sequence_parallel", False)
+        )
+        for parameter in (
+            self.angle_proj.weight,
+            getattr(self.B_norm, "weight", None),
+            getattr(self.C_norm, "weight", None),
+        ):
+            if parameter is None:
+                continue
+            setattr(parameter, "tensor_model_parallel", False)
+            setattr(parameter, "sequence_parallel", sequence_parallel)
+            if self.tp_world_size > 1 and not sequence_parallel:
+                parameter.register_hook(
+                    lambda gradient, group=self.tp_group: _sum_gradient_across_tp(
+                        gradient,
+                        tp_group=group,
+                    )
+                )
+
+        # ``self.norm`` (when is_outproj_norm=True) has d_inner_local_tp
+        # elements and is a real TP head shard, not a replicated parameter.
 
     # ------------------------------------------------------------------
     # angle_proj initialisation -- needs the same value on every rank
@@ -423,11 +468,7 @@ class CppmegaMamba3TPMixer(MegatronModule):
                 "CppmegaMamba3TPMixer expects hidden_states shaped [seq, batch, hidden]"
             )
 
-        return map_sequence_by_document(
-            hidden_states,
-            self._forward_unpacked,
-            pad_to=self.chunk_size,
-        ), None
+        return self._forward_unpacked(hidden_states), None
 
     def _forward_unpacked(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # ------------------------------------------------------------------
@@ -456,6 +497,28 @@ class CppmegaMamba3TPMixer(MegatronModule):
         #    first; output is already sharded along the head/group axis.
         # ------------------------------------------------------------------
         zxBCdt_packed, _ = self.in_proj(hidden_states)
+        if angles_raw.shape[:2] != zxBCdt_packed.shape[:2]:
+            raise RuntimeError(
+                "angle and packed projections disagree on sequence layout: "
+                f"{tuple(angles_raw.shape[:2])} != {tuple(zxBCdt_packed.shape[:2])}"
+            )
+
+        projected = torch.cat((angles_raw, zxBCdt_packed), dim=-1)
+        if self.cp_world_size > 1:
+            projected = gather_context_parallel_sequence(projected, self.cp_group)
+        y = map_sequence_by_document(
+            projected,
+            self._forward_projected,
+            pad_to=self.chunk_size,
+        )
+        if self.cp_world_size > 1:
+            y = scatter_context_parallel_sequence(y, self.cp_group)
+        out, _out_bias = self.out_proj(y.to(hidden_states.dtype))
+        return out
+
+    def _forward_projected(self, projected: torch.Tensor) -> torch.Tensor:
+        angles_raw = projected[..., : self.num_rope_angles]
+        zxBCdt_packed = projected[..., self.num_rope_angles :]
         # Scan kernels want batch-first: (L, B, D) -> (B, L, D)
         zxBCdt_packed = rearrange(zxBCdt_packed, "l b d -> b l d").contiguous()
 
@@ -555,13 +618,11 @@ class CppmegaMamba3TPMixer(MegatronModule):
             y = torch.einsum("blrhp,hrp->blhp", y, self.mimo_o)
 
         # ------------------------------------------------------------------
-        # 8) Repack to (L, B, d_inner_local) and run TE out_proj which
-        #    all-reduces across TP back to full d_model.
+        # 8) Repack to (L, B, d_inner_local). The caller restores CP layout
+        #    before TE out_proj performs TP all-reduce/reduce-scatter.
         # ------------------------------------------------------------------
         y = rearrange(y, "b l h p -> b l (h p)")
-        y = rearrange(y, "b l d -> l b d").contiguous()
-        out, _out_bias = self.out_proj(y.to(hidden_states.dtype))
-        return out
+        return rearrange(y, "b l d -> l b d").contiguous()
 
     # ------------------------------------------------------------------
     # Inference cache shapes -- not yet supported

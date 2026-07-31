@@ -16,7 +16,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.extensions.transformer_engine import TENorm as _NormClass
 
 from cppmega.features.m2rnn import build_cppmega_m2rnn_config
-from cppmega.megatron.document_isolation import map_sequence_by_document
+from cppmega.megatron.document_isolation import (
+    _validate_model_parallel_topology,
+    map_sharded_sequence_by_document,
+)
 from cppmega.megatron.mamba_local_spec import CppMegaLocalMambaStack
 
 # Fused Triton M²RNN kernel (replaces the pure-Python seq loop below).  When
@@ -113,7 +116,26 @@ class CppMegaM2RNNMixer(nn.Module):
         pp_layer_offset: int = 0,
     ) -> None:
         super().__init__()
-        del submodules, layer_number, pg_collection, pp_layer_offset
+        del submodules, layer_number, pp_layer_offset
+
+        sequence_parallel = bool(getattr(config, "sequence_parallel", False))
+        tp_group = getattr(pg_collection, "tp", None)
+        cp_group = getattr(pg_collection, "cp", None)
+        _tp_world_size, _cp_world_size = _validate_model_parallel_topology(
+            config,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            component="CppMegaM2RNNMixer",
+        )
+        if sequence_parallel and tp_group is None:
+            raise ValueError(
+                "CppMegaM2RNNMixer requires pg_collection.tp when "
+                "sequence_parallel is enabled"
+            )
+        self.sequence_parallel_group = (
+            tp_group if sequence_parallel else None
+        )
+        self.context_parallel_group = cp_group
 
         m2rnn = build_cppmega_m2rnn_config(config, d_model=d_model)
         self.hidden_size = d_model
@@ -218,6 +240,13 @@ class CppMegaM2RNNMixer(nn.Module):
             hidden_size=self.num_heads * self.v_head_dim,
             eps=config.layernorm_epsilon,
         )
+        if sequence_parallel:
+            # map_sharded_sequence_by_document gathers the full output
+            # gradient before this replicated module's backward, so every TP
+            # replica already owns the complete norm gradient. Megatron's
+            # usual sequence-parallel SUM would otherwise multiply it by TP.
+            for parameter in getattr(self.g_norm, "parameters")():
+                setattr(parameter, "sequence_parallel", False)
         self.output_projection = nn.Linear(
             self.g_dim,
             self.hidden_size,
@@ -242,7 +271,12 @@ class CppMegaM2RNNMixer(nn.Module):
         if hidden_states.ndim != 3:
             raise ValueError("CppMegaM2RNNMixer expects hidden_states shaped [seq, batch, hidden]")
 
-        return map_sequence_by_document(hidden_states, self._forward_unpacked), None
+        return map_sharded_sequence_by_document(
+            hidden_states,
+            self._forward_unpacked,
+            sequence_parallel_group=self.sequence_parallel_group,
+            context_parallel_group=self.context_parallel_group,
+        ), None
 
     def _forward_unpacked(self, hidden_states):
         x = hidden_states.transpose(0, 1).contiguous()

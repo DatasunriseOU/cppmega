@@ -216,10 +216,10 @@ def map_sequence_by_document(
         dim=1,
     )
     mapped = function(padded)
-    if mapped.shape != padded.shape:
+    if mapped.dim() != 3 or mapped.shape[:2] != padded.shape[:2]:
         raise RuntimeError(
             f"isolated sequence function returned {tuple(mapped.shape)} "
-            f"for input {tuple(padded.shape)}"
+            f"for input sequence/batch shape {tuple(padded.shape[:2])}"
         )
     cursor = 0
     rows = []
@@ -230,6 +230,260 @@ def map_sequence_by_document(
             cursor += 1
         rows.append(torch.cat(parts, dim=0))
     return torch.stack(rows, dim=1)
+
+
+def _group_size_rank(group: Any) -> tuple[int, int]:
+    if group is None:
+        return 1, 0
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("sequence sharding requires an initialized process group")
+    world_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank(group=group)
+    if rank < 0:
+        raise ValueError("the current rank is not a member of the process group")
+    return world_size, rank
+
+
+def _process_group_ranks(group: Any) -> tuple[int, ...]:
+    if group is None:
+        return ()
+    world_size, _rank = _group_size_rank(group)
+    get_ranks = getattr(torch.distributed, "get_process_group_ranks", None)
+    if get_ranks is not None:
+        return tuple(int(rank) for rank in get_ranks(group))
+    get_global_rank = getattr(torch.distributed, "get_global_rank", None)
+    if get_global_rank is None:
+        raise RuntimeError(
+            "this torch.distributed build cannot inspect process-group membership"
+        )
+    return tuple(int(get_global_rank(group, rank)) for rank in range(world_size))
+
+
+def _validate_model_parallel_topology(
+    config: Any,
+    *,
+    tp_group: Any,
+    cp_group: Any,
+    component: str,
+) -> tuple[int, int]:
+    """Validate that configured TP/CP axes match the initialized process mesh."""
+
+    configured_tp_size = int(
+        getattr(config, "tensor_model_parallel_size", 1)
+    )
+    configured_cp_size = int(getattr(config, "context_parallel_size", 1))
+    if configured_tp_size < 1 or configured_cp_size < 1:
+        raise ValueError(
+            f"{component} requires positive TP/CP sizes, got "
+            f"tp={configured_tp_size}, cp={configured_cp_size}"
+        )
+
+    actual_tp_size, _tp_rank = _group_size_rank(tp_group)
+    actual_cp_size, _cp_rank = _group_size_rank(cp_group)
+    if actual_tp_size != configured_tp_size:
+        raise ValueError(
+            f"{component} configured tensor_model_parallel_size="
+            f"{configured_tp_size}, but pg_collection.tp has world_size="
+            f"{actual_tp_size}"
+        )
+    if actual_cp_size != configured_cp_size:
+        raise ValueError(
+            f"{component} configured context_parallel_size="
+            f"{configured_cp_size}, but pg_collection.cp has world_size="
+            f"{actual_cp_size}"
+        )
+
+    if actual_tp_size > 1 and actual_cp_size > 1:
+        tp_ranks = _process_group_ranks(tp_group)
+        cp_ranks = _process_group_ranks(cp_group)
+        overlap = set(tp_ranks).intersection(cp_ranks)
+        current_global_rank = torch.distributed.get_rank()
+        if overlap != {current_global_rank}:
+            raise ValueError(
+                f"{component} requires distinct Cartesian TP/CP axes; "
+                f"tp ranks={tp_ranks} and cp ranks={cp_ranks} overlap at "
+                f"{tuple(sorted(overlap))}"
+            )
+    return actual_tp_size, actual_cp_size
+
+
+class _GatherSequence(torch.autograd.Function):
+    """Device-agnostic sequence gather with selectable backward semantics."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: Any, reduce_backward: bool):
+        world_size, rank = _group_size_rank(group)
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.rank = rank
+        ctx.local_length = tensor.shape[0]
+        ctx.reduce_backward = reduce_backward
+        if world_size == 1:
+            return tensor
+        parts = [torch.empty_like(tensor) for _ in range(world_size)]
+        torch.distributed.all_gather(parts, tensor.contiguous(), group=group)
+        return torch.cat(parts, dim=0)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: torch.Tensor):
+        (grad_output,) = grad_outputs
+        if ctx.world_size == 1:
+            return grad_output, None, None
+        if ctx.reduce_backward:
+            local = grad_output.new_empty(
+                (ctx.local_length, *grad_output.shape[1:])
+            )
+            if torch.distributed.get_backend(ctx.group) == "gloo":
+                # Gloo lacks reduce_scatter_tensor on supported macOS builds.
+                reduced = grad_output.contiguous().clone()
+                torch.distributed.all_reduce(reduced, group=ctx.group)
+                local.copy_(
+                    reduced.narrow(
+                        0, ctx.rank * ctx.local_length, ctx.local_length
+                    )
+                )
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    local, grad_output.contiguous(), group=ctx.group
+                )
+        else:
+            local = grad_output.narrow(
+                0, ctx.rank * ctx.local_length, ctx.local_length
+            ).contiguous()
+        return local, None, None
+
+
+class _ScatterSequence(torch.autograd.Function):
+    """Sequence scatter paired with either gathered or local-only backward."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: Any, gather_backward: bool):
+        world_size, rank = _group_size_rank(group)
+        if tensor.shape[0] % world_size:
+            raise ValueError(
+                f"sequence length {tensor.shape[0]} is not divisible by group size "
+                f"{world_size}"
+            )
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.rank = rank
+        ctx.gather_backward = gather_backward
+        ctx.global_shape = tuple(tensor.shape)
+        local_length = tensor.shape[0] // world_size
+        return tensor.narrow(0, rank * local_length, local_length).contiguous()
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: torch.Tensor):
+        (grad_output,) = grad_outputs
+        if ctx.world_size == 1:
+            return grad_output, None, None
+        if ctx.gather_backward:
+            parts = [torch.empty_like(grad_output) for _ in range(ctx.world_size)]
+            torch.distributed.all_gather(
+                parts, grad_output.contiguous(), group=ctx.group
+            )
+            full = torch.cat(parts, dim=0)
+        else:
+            full = grad_output.new_zeros(ctx.global_shape)
+            local_length = grad_output.shape[0]
+            full.narrow(
+                0, ctx.rank * local_length, local_length
+            ).copy_(grad_output)
+        return full, None, None
+
+
+def _context_parallel_reorder(
+    tensor: torch.Tensor, *, cp_size: int, restore_global_order: bool
+) -> torch.Tensor:
+    from megatron.core.ssm.mamba_context_parallel import (
+        _redo_attention_load_balancing,
+        _undo_attention_load_balancing,
+    )
+
+    reorder = (
+        _undo_attention_load_balancing
+        if restore_global_order
+        else _redo_attention_load_balancing
+    )
+    return reorder(tensor, cp_size, packed_seq_params=None)
+
+
+def gather_context_parallel_sequence(
+    tensor: torch.Tensor, cp_group: Any
+) -> torch.Tensor:
+    """Restore Megatron's CP-zigzag sequence with reduce-scatter backward."""
+
+    cp_size, _rank = _group_size_rank(cp_group)
+    if cp_size == 1:
+        return tensor
+    gathered = _GatherSequence.apply(tensor, cp_group, True)
+    if gathered.shape[0] % (2 * cp_size):
+        raise NotImplementedError(
+            "Megatron CP zigzag requires global sequence length divisible by "
+            f"2 * context_parallel_size ({2 * cp_size})"
+        )
+    return _context_parallel_reorder(
+        gathered, cp_size=cp_size, restore_global_order=True
+    )
+
+
+def scatter_context_parallel_sequence(
+    tensor: torch.Tensor, cp_group: Any
+) -> torch.Tensor:
+    """Return a global sequence to Megatron's CP-zigzag local layout."""
+
+    cp_size, _rank = _group_size_rank(cp_group)
+    if cp_size == 1:
+        return tensor
+    if tensor.shape[0] % (2 * cp_size):
+        raise NotImplementedError(
+            "Megatron CP zigzag requires global sequence length divisible by "
+            f"2 * context_parallel_size ({2 * cp_size})"
+        )
+    balanced = _context_parallel_reorder(
+        tensor, cp_size=cp_size, restore_global_order=False
+    )
+    return _ScatterSequence.apply(balanced, cp_group, False)
+
+
+def map_sharded_sequence_by_document(
+    hidden_states: torch.Tensor,
+    function: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    sequence_parallel_group: Any = None,
+    context_parallel_group: Any = None,
+    pad_to: int = 1,
+) -> torch.Tensor:
+    """Reassemble SP/CP input, isolate documents, then restore local layout."""
+
+    sp_size, _sp_rank = _group_size_rank(sequence_parallel_group)
+    cp_size, _cp_rank = _group_size_rank(context_parallel_group)
+    if sp_size > 1 and cp_size > 1:
+        sp_ranks = _process_group_ranks(sequence_parallel_group)
+        cp_ranks = _process_group_ranks(context_parallel_group)
+        overlap = set(sp_ranks).intersection(cp_ranks)
+        current_global_rank = torch.distributed.get_rank()
+        if overlap != {current_global_rank}:
+            raise ValueError(
+                "SP and CP must use distinct Cartesian process-group axes; "
+                f"SP ranks={sp_ranks}, CP ranks={cp_ranks}"
+            )
+
+    full = hidden_states
+    if sp_size > 1:
+        # The stateful module is replicated across TP ranks. Its output
+        # scatter gathers gradients so every replica receives the full loss.
+        full = _GatherSequence.apply(full, sequence_parallel_group, False)
+    if cp_size > 1:
+        full = gather_context_parallel_sequence(full, context_parallel_group)
+
+    mapped = map_sequence_by_document(full, function, pad_to=pad_to)
+
+    if cp_size > 1:
+        mapped = scatter_context_parallel_sequence(mapped, context_parallel_group)
+    if sp_size > 1:
+        mapped = _ScatterSequence.apply(mapped, sequence_parallel_group, True)
+    return mapped
 
 
 def roll_tensor_by_document(
@@ -631,30 +885,167 @@ def _exchange_pipeline_document_ids(
     tensor_recv_prev: torch.Tensor | None,
 ) -> None:
     send_ids = None
+    send_error: Exception | None = None
+    send_header = None
     if tensor_send_next is not None:
-        if tensor_send_next.dim() < 2:
-            raise ValueError("pipeline activation must have [S,B,...] dimensions")
-        sequence_length, batch_size = tensor_send_next.shape[:2]
-        send_ids, _spans, _multiple = document_layout(
-            batch_size=batch_size,
-            sequence_length=sequence_length,
+        try:
+            if tensor_send_next.dim() < 2:
+                raise ValueError(
+                    "pipeline activation must have [S,B,...] dimensions"
+                )
+            local_sequence_length, batch_size = tensor_send_next.shape[:2]
+            raw = _raw_document_ids()
+            if raw is not None and raw.dim() == 1:
+                raw = raw.unsqueeze(0)
+            if raw is None:
+                raise RuntimeError(
+                    "pipeline activation send requires document_ids"
+                )
+            if raw.shape[0] != batch_size:
+                raise ValueError(
+                    f"document_ids batch {raw.shape[0]} != activation batch "
+                    f"{batch_size}"
+                )
+            if raw.shape[1] % local_sequence_length:
+                raise ValueError(
+                    f"document_ids sequence {raw.shape[1]} is not divisible by "
+                    f"local activation sequence {local_sequence_length}"
+                )
+            send_ids, _spans, _multiple = document_layout(
+                batch_size=batch_size,
+                sequence_length=raw.shape[1],
+                device=tensor_send_next.device,
+            )
+            if send_ids is None:
+                raise RuntimeError(
+                    "validated document layout did not return document_ids"
+                )
+            header_values = (0, *send_ids.shape)
+        except Exception as exc:
+            send_error = exc
+            header_values = (1, 0, 0)
+        send_header = torch.tensor(
+            header_values,
+            dtype=torch.long,
             device=tensor_send_next.device,
         )
 
-    recv_ids = None
+    recv_header = None
+    recv_pre_error: Exception | None = None
     if tensor_recv_prev is not None:
         if tensor_recv_prev.dim() < 2:
-            raise ValueError("pipeline activation must have [S,B,...] dimensions")
-        sequence_length, batch_size = tensor_recv_prev.shape[:2]
-        recv_ids = torch.empty(
-            (batch_size, sequence_length),
+            recv_pre_error = ValueError(
+                "pipeline activation must have [S,B,...] dimensions"
+            )
+        recv_header = torch.empty(
+            3,
             dtype=torch.long,
             device=tensor_recv_prev.device,
         )
 
-    ops = []
-    if send_ids is not None:
-        ops.append(
+    header_ops = []
+    if send_header is not None:
+        header_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_header,
+                communicator.next_rank,
+                communicator.pp_group,
+            )
+        )
+    if recv_header is not None:
+        header_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_header,
+                communicator.prev_rank,
+                communicator.pp_group,
+            )
+        )
+    if header_ops:
+        for request in torch.distributed.batch_isend_irecv(header_ops):
+            request.wait()
+
+    recv_ids = None
+    recv_error: Exception | None = None
+    recv_ack = None
+    if recv_header is not None:
+        try:
+            status, recv_batch, recv_sequence = (
+                int(value) for value in recv_header.tolist()
+            )
+            if status != 0:
+                raise RuntimeError(
+                    "upstream pipeline stage rejected its document_ids"
+                )
+            if recv_pre_error is not None:
+                raise recv_pre_error
+            if tensor_recv_prev is None:
+                raise RuntimeError(
+                    "received document_ids shape without an activation"
+                )
+            local_sequence_length, activation_batch = tensor_recv_prev.shape[:2]
+            if (
+                recv_batch != activation_batch
+                or recv_sequence % local_sequence_length
+            ):
+                raise ValueError(
+                    "received document_ids shape "
+                    f"{(recv_batch, recv_sequence)} is incompatible with "
+                    f"activation {tuple(tensor_recv_prev.shape[:2])}"
+                )
+            recv_ids = torch.empty(
+                (recv_batch, recv_sequence),
+                dtype=torch.long,
+                device=tensor_recv_prev.device,
+            )
+            ack_value = 0
+        except Exception as exc:
+            recv_error = exc
+            ack_value = 1
+        recv_ack = torch.tensor(
+            [ack_value],
+            dtype=torch.long,
+            device=tensor_recv_prev.device,
+        )
+
+    send_ack = None
+    if send_header is not None:
+        send_ack = torch.empty(
+            1,
+            dtype=torch.long,
+            device=send_header.device,
+        )
+
+    ack_ops = []
+    if recv_ack is not None:
+        ack_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                recv_ack,
+                communicator.prev_rank,
+                communicator.pp_group,
+            )
+        )
+    if send_ack is not None:
+        ack_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                send_ack,
+                communicator.next_rank,
+                communicator.pp_group,
+            )
+        )
+    if ack_ops:
+        for request in torch.distributed.batch_isend_irecv(ack_ops):
+            request.wait()
+
+    data_ops = []
+    downstream_accepted = (
+        send_ack is not None and int(send_ack.item()) == 0
+    )
+    if send_ids is not None and downstream_accepted:
+        data_ops.append(
             torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_ids.contiguous(),
@@ -663,7 +1054,7 @@ def _exchange_pipeline_document_ids(
             )
         )
     if recv_ids is not None:
-        ops.append(
+        data_ops.append(
             torch.distributed.P2POp(
                 torch.distributed.irecv,
                 recv_ids,
@@ -671,11 +1062,19 @@ def _exchange_pipeline_document_ids(
                 communicator.pp_group,
             )
         )
-    if ops:
-        for request in torch.distributed.batch_isend_irecv(ops):
+    if data_ops:
+        for request in torch.distributed.batch_isend_irecv(data_ops):
             request.wait()
     if recv_ids is not None:
         _received_document_ids[id(tensor_recv_prev)] = recv_ids
+    if send_error is not None:
+        raise send_error
+    if send_header is not None and not downstream_accepted:
+        raise RuntimeError(
+            "downstream pipeline stage rejected document_ids metadata"
+        )
+    if recv_error is not None:
+        raise recv_error
 
 
 def _patch_pipeline_transport() -> None:
@@ -744,7 +1143,10 @@ __all__ = [
     "apply_document_isolation_patch",
     "bind_current_structure_batch",
     "document_layout",
+    "gather_context_parallel_sequence",
     "map_sequence_by_document",
+    "map_sharded_sequence_by_document",
     "mask_sparse_topk_by_document",
     "roll_tensor_by_document",
+    "scatter_context_parallel_sequence",
 ]

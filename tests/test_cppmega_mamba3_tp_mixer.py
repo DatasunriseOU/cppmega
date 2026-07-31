@@ -500,7 +500,12 @@ _SP_SEQLEN = 128
 _SP_BATCH = 2
 
 
-def _build_sp_config(world_size: int, sp_on: bool):
+def _build_sp_config(
+    world_size: int,
+    sp_on: bool,
+    *,
+    context_parallel_size: int = 1,
+):
     """Build the small TransformerConfig used by the SP parity workers."""
     import torch
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -513,6 +518,7 @@ def _build_sp_config(world_size: int, sp_on: bool):
         ffn_hidden_size=4 * _SP_D_MODEL,
         tensor_model_parallel_size=world_size,
         pipeline_model_parallel_size=1,
+        context_parallel_size=context_parallel_size,
         sequence_parallel=bool(sp_on and world_size > 1),
         params_dtype=torch.bfloat16,
         bf16=True,
@@ -649,7 +655,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
     torch.cuda.set_device(rank)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-    tag = "sp_on" if sp_on else "ref"
+    tag = "sp_on" if sp_on else ("tp_sp_off" if world_size > 1 else "ref")
 
     try:
         from megatron.core import parallel_state
@@ -773,9 +779,21 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
             dist.all_gather(gl, tensor.detach().contiguous())
             return torch.cat(gl, dim=1)
 
-        def _collect_replicated_sum(tensor: torch.Tensor) -> torch.Tensor:
+        def _collect_replicated_sum(
+            tensor: torch.Tensor,
+            *,
+            synchronized_by_mixer: bool = False,
+        ) -> torch.Tensor:
             if world_size == 1:
                 return tensor.detach()
+            if synchronized_by_mixer:
+                gathered = [
+                    torch.empty_like(tensor) for _ in range(world_size)
+                ]
+                dist.all_gather(gathered, tensor.detach().contiguous())
+                for other in gathered[1:]:
+                    torch.testing.assert_close(other, gathered[0])
+                return gathered[0]
             t = tensor.detach().clone()
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             return t
@@ -835,7 +853,10 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
         angle_grad = mixer.angle_proj.weight.grad
         if angle_grad is None:
             raise RuntimeError("angle_proj.weight.grad is None after backward()")
-        angle_grad_full = _collect_replicated_sum(angle_grad).float().cpu()
+        angle_grad_full = _collect_replicated_sum(
+            angle_grad,
+            synchronized_by_mixer=(world_size > 1 and not sp_on),
+        ).float().cpu()
         if rank == 0:
             return_dict[(tag, "grad.angle_proj.weight")] = angle_grad_full
 
@@ -843,7 +864,10 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
         for norm_name in ("B_norm", "C_norm"):
             norm = getattr(mixer, norm_name)
             if hasattr(norm, "weight") and norm.weight is not None and norm.weight.grad is not None:
-                g = _collect_replicated_sum(norm.weight.grad).float().cpu()
+                g = _collect_replicated_sum(
+                    norm.weight.grad,
+                    synchronized_by_mixer=(world_size > 1 and not sp_on),
+                ).float().cpu()
                 if rank == 0:
                     return_dict[(tag, f"grad.{norm_name}.weight")] = g
 
@@ -1029,6 +1053,287 @@ def test_tp2_sp_on_parity_vs_tp1():
             + f"max_abs={max_abs_fwd:.4e} max_rel={max_rel_fwd:.4e}"
         )
         raise AssertionError(msg)
+
+
+@pytest.mark.skipif(_runtime_skip_reason() is not None, reason=_runtime_skip_reason() or "")
+def test_tp2_sp_off_replicated_parameter_gradient_parity_vs_tp1():
+    """TP-only mode must SUM the three replicated Mamba3 parameter grads."""
+
+    import torch.multiprocessing as mp
+
+    manager = mp.Manager()
+    rd = manager.dict()
+    _spawn_world_sp(world_size=1, port=29513, sp_on=False, return_dict=rd)
+    _spawn_world_sp(world_size=2, port=29514, sp_on=False, return_dict=rd)
+
+    errors = [
+        (key, value)
+        for key, value in rd.items()
+        if isinstance(key, tuple) and key[0] == "error"
+    ]
+    assert not errors, f"TP/SP-off parity workers raised: {errors}"
+
+    targets = (
+        ("output", _SP_FWD_ATOL, _SP_FWD_RTOL),
+        ("grad.angle_proj.weight", _SP_BWD_ATOL, _SP_BWD_RTOL),
+        ("grad.B_norm.weight", _SP_BWD_ATOL, _SP_BWD_RTOL),
+        ("grad.C_norm.weight", _SP_BWD_ATOL, _SP_BWD_RTOL),
+    )
+    failures = []
+    for name, atol, rtol in targets:
+        ref_key = ("ref", name)
+        test_key = ("tp_sp_off", name)
+        assert ref_key in rd, f"reference world did not produce {name}"
+        assert test_key in rd, f"TP/SP-off world did not produce {name}"
+        passed, max_abs, max_rel = _compare(
+            rd[ref_key],
+            rd[test_key],
+            atol=atol,
+            rtol=rtol,
+        )
+        if not passed:
+            failures.append(
+                f"{name}: max_abs={max_abs:.4e} (tol={atol:.0e}), "
+                f"max_rel={max_rel:.4e} (tol={rtol:.0e})"
+            )
+    assert not failures, "TP=2/SP-off replicated-grad parity FAILED:\n" + "\n".join(
+        failures
+    )
+
+
+def _parity_worker_cp(
+    rank: int,
+    world_size: int,
+    master_port: int,
+    cp_on: bool,
+    return_dict,
+):
+    """Run actual Mamba3 with either CP=1 reference or CP=2 zigzag shards."""
+
+    import torch
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+        str(index) for index in range(world_size)
+    )
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    tag = "cp_on" if cp_on else "ref"
+
+    try:
+        from megatron.core import parallel_state
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.ssm.mamba_context_parallel import (
+            _redo_attention_load_balancing,
+            _undo_attention_load_balancing,
+        )
+        from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
+
+        from cppmega.megatron import structure_dataset_patch
+        from cppmega.megatron.cppmega_mamba3_tp_mixer import (
+            CppmegaMamba3TPMixer,
+        )
+
+        cp_size = world_size if cp_on else 1
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = _build_sp_config(
+            world_size=1,
+            sp_on=False,
+            context_parallel_size=cp_size,
+        )
+        submodules = MambaMixerSubmodules(
+            in_proj=TELayerNormColumnParallelLinear,
+            out_proj=TERowParallelLinear,
+        )
+        torch.manual_seed(20260412)
+        torch.cuda.manual_seed_all(20260412)
+        mixer = CppmegaMamba3TPMixer(
+            config=config,
+            d_model=config.hidden_size,
+            submodules=submodules,
+            layer_number=1,
+            pg_collection=pg_collection,
+            pp_layer_offset=0,
+        ).cuda()
+        _override_sp_mixer_weights(mixer, rank=0)
+
+        torch.manual_seed(0xBEEF)
+        hs_full = torch.randn(
+            _SP_SEQLEN,
+            _SP_BATCH,
+            _SP_D_MODEL,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        dist.broadcast(hs_full, src=0)
+        torch.manual_seed(0xC0FFEE)
+        g_full = torch.randn_like(hs_full)
+        dist.broadcast(g_full, src=0)
+        document_ids = torch.tensor(
+            [[1] * 32 + [2] * 48 + [3] * 48] * _SP_BATCH,
+            dtype=torch.long,
+            device="cuda",
+        )
+        structure_dataset_patch._set_current_structure_batch(
+            {"document_ids": document_ids}
+        )
+
+        if cp_on:
+            cp_group = pg_collection.cp
+            cp_rank = dist.get_rank(group=cp_group)
+            balanced_hs = _redo_attention_load_balancing(
+                hs_full,
+                cp_size,
+                packed_seq_params=None,
+            )
+            balanced_g = _redo_attention_load_balancing(
+                g_full,
+                cp_size,
+                packed_seq_params=None,
+            )
+            hs_local = balanced_hs.chunk(cp_size, dim=0)[cp_rank].contiguous()
+            g_local = balanced_g.chunk(cp_size, dim=0)[cp_rank].contiguous()
+        else:
+            cp_group = None
+            hs_local = hs_full
+            g_local = g_full
+
+        hs_local.requires_grad_(True)
+        out_local, _ = mixer(hs_local)
+        (out_local.float() * g_local.float()).sum().backward()
+        if hs_local.grad is None:
+            raise RuntimeError("Mamba3 CP input gradient is missing")
+
+        if cp_on:
+            output_parts = [
+                torch.empty_like(out_local) for _ in range(cp_size)
+            ]
+            input_grad_parts = [
+                torch.empty_like(hs_local.grad) for _ in range(cp_size)
+            ]
+            dist.all_gather(
+                output_parts,
+                out_local.detach().contiguous(),
+                group=cp_group,
+            )
+            dist.all_gather(
+                input_grad_parts,
+                hs_local.grad.detach().contiguous(),
+                group=cp_group,
+            )
+            out_full = _undo_attention_load_balancing(
+                torch.cat(output_parts, dim=0),
+                cp_size,
+                packed_seq_params=None,
+            )
+            input_grad_full = _undo_attention_load_balancing(
+                torch.cat(input_grad_parts, dim=0),
+                cp_size,
+                packed_seq_params=None,
+            )
+        else:
+            out_full = out_local.detach()
+            input_grad_full = hs_local.grad.detach()
+
+        parameter_grads = {}
+        for name, parameter in mixer.named_parameters():
+            if parameter.grad is None:
+                raise RuntimeError(f"Mamba3 CP parameter gradient missing: {name}")
+            gradient = parameter.grad.detach().clone()
+            if cp_on:
+                dist.all_reduce(gradient, group=cp_group)
+            parameter_grads[name] = gradient.float().cpu()
+
+        if rank == 0:
+            return_dict[(tag, "output")] = out_full.float().cpu()
+            return_dict[(tag, "input_grad")] = input_grad_full.float().cpu()
+            for name, gradient in parameter_grads.items():
+                return_dict[(tag, f"grad.{name}")] = gradient
+        dist.barrier()
+    except Exception as exc:
+        return_dict[("error", tag, rank)] = repr(exc)
+        raise
+    finally:
+        try:
+            from cppmega.megatron import structure_dataset_patch
+
+            structure_dataset_patch._set_current_structure_batch(None)
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+
+def _spawn_world_cp(
+    world_size: int,
+    port: int,
+    cp_on: bool,
+    return_dict,
+):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _parity_worker_cp,
+        args=(world_size, port, cp_on, return_dict),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(_runtime_skip_reason() is not None, reason=_runtime_skip_reason() or "")
+def test_cp2_actual_mamba3_forward_backward_parity_vs_cp1():
+    """Actual TileLang Mamba3 must preserve document isolation under CP=2."""
+
+    import torch.multiprocessing as mp
+
+    manager = mp.Manager()
+    rd = manager.dict()
+    _spawn_world_cp(world_size=1, port=29515, cp_on=False, return_dict=rd)
+    _spawn_world_cp(world_size=2, port=29516, cp_on=True, return_dict=rd)
+
+    errors = [
+        (key, value)
+        for key, value in rd.items()
+        if isinstance(key, tuple) and key[0] == "error"
+    ]
+    assert not errors, f"Mamba3 CP parity workers raised: {errors}"
+
+    ref_names = {
+        key[1] for key in rd if isinstance(key, tuple) and key[0] == "ref"
+    }
+    cp_names = {
+        key[1] for key in rd if isinstance(key, tuple) and key[0] == "cp_on"
+    }
+    assert ref_names == cp_names
+    failures = []
+    for name in sorted(ref_names):
+        passed, max_abs, max_rel = _compare(
+            rd[("ref", name)],
+            rd[("cp_on", name)],
+            atol=_SP_BWD_ATOL,
+            rtol=_SP_BWD_RTOL,
+        )
+        if not passed:
+            failures.append(
+                f"{name}: max_abs={max_abs:.4e}, max_rel={max_rel:.4e}"
+            )
+    assert not failures, "CP=1 vs CP=2 Mamba3 parity FAILED:\n" + "\n".join(
+        failures
+    )
 
 
 # ---------------------------------------------------------------------------

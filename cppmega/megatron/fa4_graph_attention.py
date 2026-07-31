@@ -708,8 +708,7 @@ def graph_score_mod(
     """
     row_offsets, col_idx, weight, _meta = aux_tensors
 
-    # q_idx is in local coordinates (query_start already accounted for by the
-    # caller via aux_scalars in the real FA4 path).
+    # q_idx is local to the query sequence; CSR rows use the same coordinates.
     q_local = q_idx
 
     lo = row_offsets[batch_idx, q_local]
@@ -914,13 +913,14 @@ class CppMegaFA4DotProductAttention(torch.nn.Module):
 
         _ids, _spans, multiple_documents = document_layout(
             batch_size=batch_size,
-            sequence_length=seqlen_q,
+            sequence_length=seqlen_k,
             device=query.device,
         )
         if multiple_documents:
             raise RuntimeError(
-                "FA4 graph attention does not yet expose cppmega document mask_mod; "
-                "refusing a multi-document row"
+                "legacy FA4 GraphEdgeCSR/FA4GraphRouteAux attention is not "
+                "beta23-compatible with packed-document mask aux; use "
+                "CppMegaFA4ScoreModAttention"
             )
 
         if num_heads % num_kv_heads != 0:
@@ -979,7 +979,6 @@ class CppMegaFA4DotProductAttention(torch.nn.Module):
         score_mod_fn = None
         score_mod_bwd_fn = None
         aux_tensors_arg = None
-        aux_scalars_arg = None
 
         if fa4_aux is not None:
             # FA4GraphRouteAux path: tensors are pre-built.
@@ -989,8 +988,6 @@ class CppMegaFA4DotProductAttention(torch.nn.Module):
                 fa4_aux.csr_weight,
                 fa4_aux.csr_meta,
             ]
-            query_start = int(fa4_aux.csr_meta[3].item())
-            aux_scalars_arg = (query_start,)
             score_mod_fn = graph_score_mod
             score_mod_bwd_fn = graph_score_mod_bwd
 
@@ -1009,13 +1006,12 @@ class CppMegaFA4DotProductAttention(torch.nn.Module):
                 csr.weights,
                 csr_meta,
             ]
-            aux_scalars_arg = (csr.query_start,)
             score_mod_fn = graph_score_mod
             score_mod_bwd_fn = graph_score_mod_bwd
 
         # Graph routes are an additive score_mod bias, not an attention
-        # mask.  Use the full causal tile schedule: block_sparse_tensors=None
-        # and mask_mod=None so no KV blocks are skipped.
+        # mask. Use the full causal tile schedule; packed-document rows were
+        # rejected above because this legacy callback cannot compose mask aux.
         out = flash_attn_func(
             q=query,
             k=key,
@@ -1027,7 +1023,7 @@ class CppMegaFA4DotProductAttention(torch.nn.Module):
             score_mod=score_mod_fn,
             score_mod_bwd=score_mod_bwd_fn,
             aux_tensors=aux_tensors_arg,
-            aux_scalars=aux_scalars_arg,
+            aux_scalars=None,
             block_sparse_tensors=None,
             mask_mod=None,
             return_lse=False,
