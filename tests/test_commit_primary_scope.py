@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import subprocess
 from pathlib import Path
 
@@ -155,3 +157,80 @@ def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> Non
     assert document["diff_text"] == diff
     assert document["commit_msg_text"].startswith("Track the build platform")
     assert any(document["change_mask_post"])
+
+
+@pytest.mark.native_toolchain
+def test_domain_commit_dedup_keeps_distinct_incremental_changes(
+    tmp_path: Path,
+) -> None:
+    from cppmega.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+    from tools.clang_indexer.dedup_store import DedupStore
+    from tools.clang_indexer.process_commits import process_jsonl_file
+
+    states = [
+        (
+            "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n"
+            "CREATE INDEX builds_status_idx ON builds(status);\n"
+        ),
+        (
+            "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+            "platform TEXT NOT NULL);\n"
+            "CREATE INDEX builds_status_idx ON builds(status);\n"
+        ),
+        (
+            "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+            "platform TEXT NOT NULL, runner TEXT NOT NULL);\n"
+            "CREATE INDEX builds_status_idx ON builds(status);\n"
+        ),
+    ]
+    records = []
+    for index, (old_content, new_content) in enumerate(zip(states, states[1:])):
+        diff = (
+            "diff --git a/schema.sql b/schema.sql\n"
+            "--- a/schema.sql\n"
+            "+++ b/schema.sql\n"
+            "@@ -1,2 +1,2 @@\n"
+            f"-{old_content.splitlines()[0]}\n"
+            f"+{new_content.splitlines()[0]}\n"
+            " CREATE INDEX builds_status_idx ON builds(status);\n"
+        )
+        records.append(
+            {
+                "repo": "tests/commit-domain",
+                "filepath": "schema.sql",
+                "commit_hash": f"{index + 1:040x}",
+                "subject": f"Change schema path {index}",
+                "old_content": old_content,
+                "new_content": new_content,
+                "diff": diff,
+            }
+        )
+    input_path = tmp_path / "domain-commits.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output = io.StringIO()
+    dedup_store = DedupStore(str(tmp_path / "dedup.sqlite"), near=True)
+
+    try:
+        stats = process_jsonl_file(
+            str(input_path),
+            output,
+            None,
+            str(tmp_path),
+            4096,
+            200_000,
+            "both",
+            5,
+            1.0,
+            dedup_store=dedup_store,
+            dedup_tokenizer=load_cppmega_tokenizer("cppmega/tokenizer"),
+            analysis_cache_entries=0,
+        )
+    finally:
+        dedup_store.close()
+
+    assert stats["documents_written"] == 2
+    assert stats["records_skipped"] == 0
+    assert len(output.getvalue().splitlines()) == 2

@@ -2960,10 +2960,27 @@ def process_record(
     return documents
 
 
+def _uses_typed_change_unit_dedup(document: dict) -> bool:
+    return bool(
+        document.get('doc_type') in {'build', 'shell', 'sql'}
+        and document.get('commit_hash')
+        and document.get('diff_text')
+    )
+
+
+def _commit_document_dedup_text(document: dict) -> str:
+    if _uses_typed_change_unit_dedup(document):
+        return (
+            f"COMMIT MESSAGE\n{document.get('commit_msg_text') or ''}\n\n"
+            f"UNIFIED DIFF\n{document['diff_text']}"
+        )
+    return str(document.get('text', ''))
+
+
 def process_jsonl_file(
     input_path: str,
     output_file,
-    clang_index: Index,
+    clang_index: Index | None,
     tmpdir: str,
     max_tokens: int,
     max_file_bytes: int,
@@ -2980,11 +2997,12 @@ def process_jsonl_file(
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output.
 
-    A commit is an ATOMIC change-unit: each commit DOC is deduped by the
-    tokenized hash of the WHOLE doc (drops identical commits, e.g. cherry-picks),
-    keeping route-by-fit downstream. When ``dedup_store`` is given the dedup is
-    GLOBAL + resumable + cross-stream (shared SQLite with the code stream). When
-    absent, a per-file in-RAM md5 set is used.
+    A commit is an ATOMIC change-unit. C/C++ rows dedup their rendered document;
+    domain rows exact-dedup the typed message plus unified diff and intentionally
+    skip lossy near-dedup so similar consecutive post-state files do not erase
+    distinct changes. When ``dedup_store`` is given the dedup is GLOBAL +
+    resumable + cross-stream (shared SQLite with the code stream). When absent,
+    a per-file in-RAM md5 set is used.
     """
     stats = {
         'records_read': 0,
@@ -3063,17 +3081,22 @@ def process_jsonl_file(
                 continue
 
             for doc in docs:
+                dedup_text = _commit_document_dedup_text(doc)
                 if dedup_store is not None:
-                    # CANONICAL: tokenized-hash dedup of the WHOLE commit doc.
-                    token_ids = dedup_tokenizer.encode(doc['text'])
+                    # CANONICAL: tokenized-hash dedup of the atomic change unit.
+                    token_ids = dedup_tokenizer.encode(dedup_text)
                     if dedup_store.seen_exact_tokens(token_ids):
                         stats['records_skipped'] += 1
                         continue
-                    if dedup_near and dedup_store.seen_near_tokens(token_ids):
+                    if (
+                        dedup_near
+                        and not _uses_typed_change_unit_dedup(doc)
+                        and dedup_store.seen_near_tokens(token_ids)
+                    ):
                         stats['records_skipped'] += 1
                         continue
                 else:
-                    doc_hash = hashlib.md5(doc['text'].encode()).hexdigest()
+                    doc_hash = hashlib.md5(dedup_text.encode()).hexdigest()
                     if doc_hash in seen_hashes:
                         stats['records_skipped'] += 1
                         continue
