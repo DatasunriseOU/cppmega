@@ -42,6 +42,8 @@ from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
     MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+    REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
     SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
     SOURCE_BINDING_PROJECTION_SCHEMA,
     target_parser_script_sha256,
@@ -2035,6 +2037,62 @@ def test_parser_binding_rollback_preserves_generation_evidence(
             require_current_parser_only=True,
         )
     assert not refused.exists()
+
+
+def test_reviewed_primary_equivalent_parser_transition_is_receipt_bound(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "clang++ -c src/current.cpp"
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, _provenance(text))],
+    )
+    upgrade = {
+        "binding_key": "parser_script_sha256",
+        "from_sha256": REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+        "to_sha256": target_parser_script_sha256(),
+        "reason": REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
+        "upgraded_at": "2026-07-30T13:38:03Z",
+    }
+    with sqlite3.connect(fetch_state) as connection:
+        connection.execute(
+            """
+            INSERT INTO binding_upgrades(
+              binding_key,from_sha256,to_sha256,reason,upgraded_at
+            ) VALUES (:binding_key,:from_sha256,:to_sha256,:reason,:upgraded_at)
+            """,
+            upgrade,
+        )
+        connection.commit()
+
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=tmp_path / "reviewed-primary-equivalent",
+    )
+
+    assert receipt["parser_generation_policy"] == {
+        "mode": "reviewed-primary-equivalent-transition",
+        "expected_current_parser_script_sha256": (
+            target_parser_script_sha256()
+        ),
+        "observed_parser_lineage": [
+            REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
+            target_parser_script_sha256(),
+        ],
+        "current_singleton": False,
+    }
+    assert receipt["input_fetch_state"]["summary"]["binding_upgrades"] == [
+        upgrade
+    ]
+    assert receipt["source_binding_projection"]["mode"] == (
+        "mixed_lineage_projection"
+    )
+    assert receipt["source_binding_projection"]["selection_counts"] == {}
 
 
 def test_parser_binding_history_disconnected_from_current_fails_closed(
