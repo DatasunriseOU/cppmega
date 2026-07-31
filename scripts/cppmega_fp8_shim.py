@@ -73,6 +73,12 @@ from cppmega.megatron.mxfp8_sidecar_refs import (
 )
 
 
+def _cppmega_flatten_lastdim_2d(tensor):
+    """Flatten matrix-like activations to the 2D contract used by TE GEMMs."""
+
+    return tensor.reshape(-1, tensor.shape[-1]) if tensor.dim() > 2 else tensor
+
+
 def _cppmega_te_version_matches(version: str) -> bool:
     if version in _SUPPORTED_TE_VERSIONS:
         return True
@@ -1071,6 +1077,14 @@ if (
                         file=_sys.stderr,
                     )
                 return _out
+            if _source.dim() > 2:
+                # TE may hand the original [sequence, batch, hidden] activation
+                # here (e.g. dense grad outputs; see
+                # _cppmega_attach_dense_grad_output_transpose).  Every sidecar
+                # consumer in this shim assumes the flattened-last-dim 2D
+                # contract (_cppmega_mxfp8_rowwise_2d_shape), so normalize the
+                # source before handing it to the TE transpose-emit op.
+                _source = _cppmega_flatten_lastdim_2d(_source)
             try:
                 with _torch.no_grad():
                     _fake_dtype = getattr(

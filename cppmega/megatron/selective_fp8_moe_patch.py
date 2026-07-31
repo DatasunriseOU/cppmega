@@ -135,7 +135,11 @@ def apply_selective_fp8_moe_patch(*, force: bool = False) -> bool:
                 flush=True,
             )
     except Exception:
-        pass
+        log.warning(
+            "DSA Patch 9 compatibility probe failed; selective FP8 MoE "
+            "continues without verifying the FP8 dispatch guard",
+            exc_info=True,
+        )
 
     def _selective_get_fp8_context(config, layer_no=-1, is_init=False):
         """Per-layer FP8 gate: FP8 for MoE, nullcontext for everything else."""

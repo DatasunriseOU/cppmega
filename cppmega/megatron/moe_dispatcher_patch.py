@@ -12,12 +12,15 @@ that contract.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import weakref
 
 import torch
 
 __all__ = ["apply_moe_dispatcher_identity_sort_patch", "is_identity_permutation"]
+
+log = logging.getLogger(__name__)
 
 _ENV_FLAG = "CPPMEGA_MOE_SKIP_IDENTITY_CHUNK_SORT"
 _PATCH_MARKER = "__cppmega_identity_chunk_sort_skip__"
@@ -88,6 +91,11 @@ def apply_moe_dispatcher_identity_sort_patch(*, force: bool = False) -> bool:
         from megatron.core.transformer.moe import moe_utils
         from megatron.core.transformer.moe import token_dispatcher
     except Exception:
+        log.warning(
+            "MoE identity-sort patch not installed: Megatron MoE modules "
+            "are not importable",
+            exc_info=True,
+        )
         return False
 
     original = getattr(moe_utils, "sort_chunks_by_idxs", None)

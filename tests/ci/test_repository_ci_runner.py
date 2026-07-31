@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import platform
@@ -744,3 +745,105 @@ def test_contract_lane_manifests_include_runner_regressions_and_cuda_probes() ->
     assert "tests/test_train_eval_graph_routes.py" in mlx_argv
     assert "tests/test_self_hosted_ci.py" in mlx_argv
     assert "tests/test_workflow_runner_policy.py" in mlx_argv
+
+
+def _run_lane_cli(lanes_path: Path, repo: Path, receipt_dir: Path, lane: str) -> int:
+    return ci.main(
+        [
+            "lane",
+            "--lanes-config",
+            str(lanes_path),
+            "--lane",
+            lane,
+            "--repo-root",
+            str(repo),
+            "--receipt-dir",
+            str(receipt_dir),
+            "--python",
+            sys.executable,
+        ]
+    )
+
+
+def test_lane_orchestrator_writes_failure_receipt_for_unknown_lane(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    lanes_path = _minimal_lane_config(tmp_path / "lanes.json")
+    receipt_dir = tmp_path / "lane-receipt"
+
+    exit_code = _run_lane_cli(lanes_path, repo, receipt_dir, "does-not-exist")
+    receipt = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))
+    log = (receipt_dir / "orchestrator-failure.log").read_text(encoding="utf-8")
+
+    assert exit_code == 2
+    assert receipt["schema_version"] == ci.SCHEMA_VERSION
+    assert receipt["status"] == "failed"
+    assert receipt["exit_code"] == exit_code
+    assert receipt["failure_stage"] == "orchestrator"
+    assert receipt["lane"] == "does-not-exist"
+    assert receipt["started_at"]
+    assert receipt["completed_at"]
+    assert "does-not-exist" in receipt["error"]
+    assert "Traceback" in log
+    assert "KeyError" in log
+
+
+def test_lane_orchestrator_writes_failure_receipt_for_missing_lane_config(
+    tmp_path: Path,
+) -> None:
+    receipt_dir = tmp_path / "lane-receipt"
+
+    exit_code = _run_lane_cli(
+        tmp_path / "missing.json", tmp_path, receipt_dir, "local-test"
+    )
+    receipt = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))
+    log = (receipt_dir / "orchestrator-failure.log").read_text(encoding="utf-8")
+
+    assert exit_code == 2
+    assert receipt["status"] == "failed"
+    assert receipt["exit_code"] == exit_code
+    assert receipt["failure_stage"] == "orchestrator"
+    assert "cannot read lane config" in receipt["error"]
+    assert "Traceback" in log
+
+
+def test_early_failure_receipt_does_not_clobber_an_existing_lane_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt_dir = tmp_path / "lane-receipt"
+    receipt_dir.mkdir()
+    existing = {"schema_version": ci.SCHEMA_VERSION, "kind": "lane", "status": "passed"}
+    (receipt_dir / "receipt.json").write_text(json.dumps(existing), encoding="utf-8")
+    args = argparse.Namespace(
+        command="lane",
+        receipt_dir=str(receipt_dir),
+        run_id="unit-early-failure",
+        lane="local-test",
+    )
+
+    ci._write_early_failure_receipt(args, RuntimeError("post-receipt crash"))
+    receipt = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))
+
+    assert receipt == existing
+    assert "post-receipt crash" in (
+        receipt_dir / "orchestrator-failure.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_early_failure_receipt_redacts_secrets(tmp_path: Path) -> None:
+    secret = "unit-test-orchestrator-secret-12345"
+    receipt_dir = tmp_path / "lane-receipt"
+    args = argparse.Namespace(
+        command="lane",
+        receipt_dir=str(receipt_dir),
+        run_id=None,
+        lane="local-test",
+    )
+
+    ci._write_early_failure_receipt(args, RuntimeError(f"token={secret} boom"))
+    receipt = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))
+
+    assert secret not in receipt["error"]
+    assert "<redacted>" in receipt["error"]

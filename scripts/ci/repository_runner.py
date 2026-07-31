@@ -21,6 +21,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -2024,6 +2025,59 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_early_failure_receipt(
+    args: argparse.Namespace, exc: BaseException
+) -> None:
+    """Best-effort minimal receipt when the lane orchestrator dies early.
+
+    The workflow uploads ``--receipt-dir`` with ``if-no-files-found: error``,
+    so a crash before ``run_lane`` writes its own receipt (unknown lane id,
+    unreadable lane config, unexpected exception) must still leave a
+    ``receipt.json`` plus a traceback log behind to preserve the root cause.
+    """
+
+    if getattr(args, "command", None) != "lane":
+        return
+    receipt_dir_value = getattr(args, "receipt_dir", None)
+    if not receipt_dir_value:
+        return
+    redactor = _Redactor()
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        receipt_dir = Path(str(receipt_dir_value)).resolve()
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        now = _utc_now()
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "lane",
+            "run_id": getattr(args, "run_id", None),
+            "lane": getattr(args, "lane", None),
+            "status": "failed",
+            "exit_code": 2,
+            "failure_stage": "orchestrator",
+            "error": redactor.text(f"orchestrator failed before lane completion: {exc}"),
+            "started_at": now,
+            "completed_at": now,
+            "host": {
+                "hostname": socket.gethostname(),
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+            },
+            "steps": [],
+        }
+        receipt_path = receipt_dir / "receipt.json"
+        if not receipt_path.is_file():
+            _write_json(receipt_path, receipt)
+        (receipt_dir / "orchestrator-failure.log").write_text(
+            redactor.text(detail), encoding="utf-8"
+        )
+        print(f"[repository-ci] failure receipt: {receipt_path}", flush=True)
+    except OSError:
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -2033,6 +2087,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.handler(args))
     except (OSError, RepositoryCIError, subprocess.SubprocessError) as exc:
         print(f"[repository-ci] fatal: {_Redactor().text(str(exc))}", file=sys.stderr)
+        _write_early_failure_receipt(args, exc)
+        return 2
+    except Exception as exc:
+        print(
+            f"[repository-ci] fatal: unexpected {type(exc).__name__}: "
+            f"{_Redactor().text(str(exc))}",
+            file=sys.stderr,
+        )
+        _write_early_failure_receipt(args, exc)
         return 2
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import threading
 import warnings
@@ -31,6 +32,8 @@ from cppmega.megatron.domain_route_contract import (
     is_accepted_case5_contract_hash_triple,
 )
 from cppmega.megatron.objective_contract import OBJECTIVE_IDS
+
+log = logging.getLogger(__name__)
 
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
 _local_storage = threading.local()
@@ -401,6 +404,7 @@ def _tp_backend_name(group: Any) -> str:
     try:
         return str(torch.distributed.get_backend(group))
     except Exception:
+        log.debug("could not query TP group backend; reporting 'unknown'", exc_info=True)
         return "unknown"
 
 

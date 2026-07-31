@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -57,6 +58,42 @@ def _pick_device() -> torch.device:
     if _HAS_MPS and tilelang_supports(torch.device("mps")):
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def test_mxfp8_transpose_emit_flattens_real_3d_tensor() -> None:
+    """The production shim normalizes TE's SBH activation to a 2D operand."""
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "0",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "te_tn_adapter",
+            "CPPMEGA_TE_VERSION_STRICT": "0",
+            "CPPMEGA_DSA_SPARSE_MODE": "gather_scatter",
+            "CPPMEGA_I_UNDERSTAND_DSA_GATHER_SCATTER_IS_DEPRECATED_AND_SLOW": "1",
+        }
+    )
+    env["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+    code = """
+import torch
+from scripts import cppmega_fp8_shim as shim
+
+source = torch.arange(24).reshape(2, 3, 4)
+flat = shim._cppmega_flatten_lastdim_2d(source)
+assert flat.shape == (6, 4)
+assert torch.equal(flat, source.reshape(6, 4))
+matrix = torch.arange(24).reshape(6, 4)
+assert shim._cppmega_flatten_lastdim_2d(matrix) is matrix
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
@@ -136,11 +173,14 @@ def test_fp8_pack_tilelang_bf16_clamp_roundtrip():
 
     # Dequantize the kernel output and compare against the reference quant
     # path; FP8 e4m3 has ~3 mantissa bits so we expect ~10% relative error.
-    deq = fp8_out.to(torch.float32) * scale
+    # torch MPS cannot cast to/from float8 on-device ("Undefined type
+    # Float8_e4m3fn"), so the fp8 round-trip runs on CPU tensors; the kernel
+    # output is produced on-device and only moved here for the comparison.
+    deq = fp8_out.cpu().to(torch.float32) * scale.cpu()
     ref_inv_scale = (1.0 / ref_scale.item()) if ref_scale.item() > 0 else 1.0
-    ref_q = (x_clamped.to(torch.float32) * ref_inv_scale).clamp(
+    ref_q = (x_clamped.cpu().to(torch.float32) * ref_inv_scale).clamp(
         -_FP8_E4M3_MAX, _FP8_E4M3_MAX
-    ).to(torch.float8_e4m3fn).to(torch.float32) * ref_scale
+    ).to(torch.float8_e4m3fn).to(torch.float32) * ref_scale.cpu()
     torch.testing.assert_close(deq, ref_q, rtol=0.15, atol=ref_scale.item() * 1.0)
 
 
@@ -252,11 +292,20 @@ def test_tilelang_supports_with_reason_returns_2tuple():
 
 @pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
 def test_fp8_pack_rejects_nonfinite_input():
-    """fp8_pack_tilelang must raise FloatingPointError on NaN/Inf, not
+    """fp8_pack_tilelang must raise FloatingPointError on Inf, not
     silently produce a degenerate (0 or NaN) scale that poisons downstream
     weights. Wave-3 self-audit: closes the silent-NaN-propagation hole
     in the host-side scale derivation.
+
+    NaN is the documented wave-11 exception: the pre-filter substitutes the
+    amax identity (0.0) for NaN before the cross-block reduction (CUDA
+    atomicMax is UB on NaN; the Metal CAS loop would spin forever), so a
+    NaN-poisoned input now yields the finite max over the real data instead
+    of raising. The NaN case below locks that trade-off in so a filter
+    regression (NaN leaking into the scale derivation) still fails loudly.
     """
+
+    import math
 
     device = _pick_device()
     if device.type == "cpu":
@@ -264,11 +313,20 @@ def test_fp8_pack_rejects_nonfinite_input():
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch.float8_e4m3fn not available in this build")
 
-    for poison in [float("nan"), float("inf"), float("-inf")]:
+    for poison in [float("inf"), float("-inf")]:
         x = torch.randn(32, 256, dtype=torch.float16, device=device)
         x[0, 0] = poison
         with pytest.raises(FloatingPointError, match=r"non-finite values"):
             fp8_pack_tilelang(x)
+
+    # Wave-11 NaN filter semantics: finite scale derived from the real data,
+    # no hang, no NaN scale.
+    x = torch.randn(32, 256, dtype=torch.float16, device=device)
+    x[0, 0] = float("nan")
+    _fp8_out, scale, _orig_dtype = fp8_pack_tilelang(x)
+    assert math.isfinite(scale.item()), (
+        "wave-11 NaN filter regressed: NaN leaked into the scale derivation"
+    )
 
 
 @pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
