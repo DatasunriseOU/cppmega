@@ -1,5 +1,55 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-01: Final dbfe runtime image receipts
+
+The final wheel release is bound to source
+`dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39`
+([build-wheels run 30683220700](https://github.com/DatasunriseOU/cppmega/actions/runs/30683220700);
+[build-image run 30684835398](https://github.com/DatasunriseOU/cppmega/actions/runs/30684835398)).
+The resulting immutable runtime is
+`ghcr.io/datasunriseou/cppmega@sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc`;
+`322bd9cf` pins that digest in the three Modal launchers and associated H200
+test.
+
+Release validation receipts:
+
+- FA4 beta23 document isolation is **4/4 green** on H200
+  ([Modal app `ap-XhbycAeXUQgF6fG5LFF1pb`](https://modal.com/apps/jewelmusic/main/ap-XhbycAeXUQgF6fG5LFF1pb)).
+  JUnit records 4 tests, 0 failures/errors/skips; all three document-isolation
+  cases report `leakage_max=0`. The downloaded `fa4_parity.json` receipt has
+  SHA256
+  `7117b4a04b40559fb5cd040a794847766d7c85953cadf62df7f58a2191a7c4d6`
+  and records the exact immutable `source_image_ref` above.
+- The exact Mamba H200:2 gate at `R=2`, `chunk=32`, `N=P=32` remains
+  **0/3** on the GQA-patched wheel
+  ([Modal app `ap-i5pmLkJiB16eaFdIWCf4pP`](https://modal.com/apps/jewelmusic/main/ap-i5pmLkJiB16eaFdIWCf4pP),
+  run `2620b7e2-fca7-44a0-aff1-9b6ad44db335`, receipt SHA256
+  `538420bba6a6ecbaaa37fdc6e081180c28b82aa8a36f46f28ca43809a55d5aba`).
+  All three failures are TileLang `LayoutInference` failures:
+  `layout_inference.cc:1373: no available layout found`.
+- An independent Stage2 force-nonTMA (`bf=1`, `bb=0`) plus GQA repeat first
+  dry-ran the existing patch against the exact installed source
+  (`980dadcec29cdd318c51c1660697d54b5a7d3311d2b681b4a68b31e7d21e64b9`
+  -> `e0d72c2e90ede0c903c3565f058d252f74d0f135d0b171e83dac7485899c08ba`)
+  and mutated **ephemeral Modal container source only**; it did not mutate
+  the production image or checked-in source. The same
+  `R=2/chunk=32/N=P=32` tests remained **0/3**
+  ([Modal app `ap-aQelxB9bc0zSq3OkV8KSpq`](https://modal.com/apps/jewelmusic/main/ap-aQelxB9bc0zSq3OkV8KSpq),
+  run `e41f9544-632e-4612-9c51-a297f23a69a9`, receipt SHA256
+  `ad88ea1929b090a1a9c5b058f4e5f2f68dd676a840e06f8a8bb8d2bea725f0e6`).
+  Stage2 advances past `LayoutInference`, but all three kernels fail in
+  `multi_version_buffer_rewriter.cc:129` with
+  `Cannot find role for stmt: tirx.Bind`.
+- A bounded production-factorization diagnostic changed only the ephemeral
+  test constants to `R=4/chunk=16` (`N=P=32`, all other sizes and semantics
+  unchanged) and reproduced the same **0/3** `tirx.Bind` failure
+  ([Modal app `ap-tb7wHpYI5uOVg4i4TaCTBG`](https://modal.com/apps/jewelmusic/main/ap-tb7wHpYI5uOVg4i4TaCTBG),
+  run `10427ae3-5f41-42e7-8aa0-d23ecdd753bf`, receipt SHA256
+  `41f1aa30801ca76200eb27ee5192e1c261ec5a61b7eefa4cc564ade7e3a57023`).
+  This excludes the checked-in test factorization as the sole cause. Stage2
+  is not promoted into the production wheel while this native TileLang
+  blocker remains red.
+
 ## 2026-08-01: Case-safe source artifact isolation
 
 Source archive names are now encoded into injective, case-insensitive-safe
