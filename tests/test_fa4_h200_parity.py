@@ -860,7 +860,7 @@ class TestFA4H200Parity:
                 rtol=BWD_RTOL,
             )
 
-    def test_multi_document_forward_backward_parity(self):
+    def test_graph_route_aux_multi_document_forward_backward_parity(self):
         """Native mask_mod isolates documents while score_mod keeps graph bias."""
         device = torch.device("cuda")
         document_ids = torch.tensor(
@@ -1068,7 +1068,7 @@ _GHCR_IMAGE_DIGEST = (
 )
 _DEFAULT_H200_TEST_FILTER = (
     "all_gradients_combined or "
-    "multi_document_forward_backward_parity or "
+    "graph_route_aux_multi_document_forward_backward_parity or "
     "document_mask_only_partial_tile_forward_backward_parity or "
     "document_mask_rectangular_unaligned_decode_forward_backward_parity"
 )
