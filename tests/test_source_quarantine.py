@@ -18,6 +18,9 @@ from tools.clang_indexer.source_quarantine import (
 PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
 RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
+RELATIVE_PARSER_CRASH_FIXTURE = (
+    "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
+)
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 
@@ -44,6 +47,32 @@ def _clang_crash_fixture_bytes() -> bytes:
         b"// CHECK: prag\\\n"
         b"// CHECK-NEXT: ma\n"
         b"\n"
+    )
+
+
+def _clang_parser_crash_fixture_bytes() -> bytes:
+    return (
+        b'// RUN: rm -rf "%t"\n'
+        b'// RUN: mkdir "%t"\n'
+        b'// RUN: not env TMPDIR="%t" TEMP="%t" TMP="%t" '
+        b'RC_DEBUG_OPTIONS=1 %clang -fsyntax-only "%s" 2>&1 | FileCheck "%s"\n'
+        b'// RUN: cat "%t/crash report spaces"-*.c | '
+        b'FileCheck --check-prefix=CHECKSRC "%s"\n'
+        b'// RUN: cat "%t/crash report spaces"-*.sh | '
+        b'FileCheck --check-prefix=CHECKSH "%s"\n'
+        b"// REQUIRES: crash-recovery\n"
+        b"\n"
+        b"// because of the glob (*.c, *.sh)\n"
+        b"// REQUIRES: shell\n"
+        b"\n"
+        b"#pragma clang __debug parser_crash\n"
+        b"// CHECK: Preprocessed source(s) and associated run script(s) are located at:\n"
+        b"// CHECK-NEXT: note: diagnostic msg: {{.*}}.c\n"
+        b"FOO\n"
+        b"// CHECKSRC: FOO\n"
+        b'// CHECKSH: "-cc1"\n'
+        b'// CHECKSH: "-main-file-name" "crash report spaces.c"\n'
+        b'// CHECKSH: "crash report spaces-{{[^ ]*}}.c"\n'
     )
 
 
@@ -232,6 +261,33 @@ def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
     )
 
 
+def test_exact_quarantine_filters_deliberate_clang_parser_crash_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_parser_crash_fixture_bytes()
+    candidate = tmp_path / RELATIVE_PARSER_CRASH_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_crash_fixture",
+        detected_format="clang_debug_parser_crash_pragma",
+        relative_path=RELATIVE_PARSER_CRASH_FIXTURE,
+        reason="fixture deliberately crashes the Clang parser",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["detected_format"] == (
+        "clang_debug_parser_crash_pragma"
+    )
+
+
 def test_exact_quarantine_filters_der_x509_certificate_pair(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +407,31 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
         assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
         assert entry["classification"] == "deliberate_compiler_crash_fixture"
         assert entry["detected_format"] == "clang_debug_crash_pragma"
+
+
+def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None:
+    payload = _clang_parser_crash_fixture_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "Stichting-MINIX-Research-Foundation/minix"
+    )
+
+    assert len(payload) == 700
+    assert hashlib.sha256(payload).hexdigest() == (
+        "e970a5aab931388aa671bf2589426acfcd2ebdcf60c70342cfd500086d697131"
+    )
+    assert entry["relative_path"] == RELATIVE_PARSER_CRASH_FIXTURE
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_crash_fixture"
+    assert entry["detected_format"] == "clang_debug_parser_crash_pragma"
 
 
 def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> None:

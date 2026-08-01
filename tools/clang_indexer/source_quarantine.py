@@ -36,6 +36,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_crash_fixture",
         "clang_debug_crash_pragma",
     ),
+    (
+        "deliberate_compiler_crash_fixture",
+        "clang_debug_parser_crash_pragma",
+    ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
@@ -229,6 +233,43 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
                 "but the deliberate crash signature is absent or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "clang_debug_parser_crash_pragma":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_debug_parser_crash_pragma "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        required_lines = {
+            "// REQUIRES: crash-recovery",
+            "#pragma clang __debug parser_crash",
+            "FOO",
+            "// CHECKSRC: FOO",
+            '// CHECKSH: "-cc1"',
+        }
+        crash_runs = [
+            line
+            for line in lines
+            if line.startswith("// RUN: not ")
+            and "%clang" in line
+            and "-fsyntax-only" in line
+            and "FileCheck" in line
+        ]
+        if (
+            not required_lines.issubset(lines)
+            or len(crash_runs) != 1
+            or lines.count("#pragma clang __debug parser_crash") != 1
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "clang_debug_parser_crash_pragma but the Clang parser-crash "
+                "test contract is incomplete or ambiguous"
             )
         return
 

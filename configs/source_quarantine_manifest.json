@@ -29,6 +29,15 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
     },
     {
+      "project_id": "Stichting-MINIX-Research-Foundation/minix",
+      "relative_path": "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c",
+      "size_bytes": 700,
+      "sha256": "e970a5aab931388aa671bf2589426acfcd2ebdcf60c70342cfd500086d697131",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_parser_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug parser_crash"
+    },
+    {
       "project_id": "eclipse-threadx/threadx",
       "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
       "size_bytes": 61551,
