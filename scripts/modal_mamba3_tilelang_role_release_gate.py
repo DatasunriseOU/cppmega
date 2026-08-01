@@ -16,7 +16,7 @@ Required local input:
     CPPMEGA_CANDIDATE_CPPMEGA_SHA=<40 lowercase hex> \
     CPPMEGA_CANDIDATE_IMAGE_DIGEST=sha256:<64 lowercase hex> \
     CPPMEGA_RELEASE_MANIFEST_SHA256=<64 lowercase hex> \
-    CPPMEGA_CANDIDATE_WHEELS_JSON='{"tilelang-...whl":"...","apache_tvm_ffi-...whl":"..."}' \
+    CPPMEGA_COMPLETE_WHEELS_JSON='<manifest complete_wheel_set JSON>' \
     CPPMEGA_H200_GATE_PHASE=one|r2|r4 \
       modal run scripts/modal_mamba3_tilelang_role_release_gate.py
 """
@@ -24,11 +24,13 @@ Required local input:
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
 import re
 import subprocess
+import tempfile
 from typing import Any
 
 import modal
@@ -42,6 +44,48 @@ def _required_env(name: str, pattern: str) -> str:
     if re.fullmatch(pattern, value) is None:
         raise RuntimeError(f"{name} does not match required pattern {pattern!r}")
     return value
+
+
+_INTEGRITY_HELPER_REL = "cppmega/megatron/release_gate_integrity.py"
+_LOCAL_INTEGRITY_HELPER_PATH = _LOCAL_ROOT / _INTEGRITY_HELPER_REL
+_REMOTE_INTEGRITY_HELPER_PATH = pathlib.Path(
+    "/opt/cppmega-gate/release-gate-integrity.py"
+)
+if modal.is_local():
+    _INTEGRITY_HELPER_PATH = _LOCAL_INTEGRITY_HELPER_PATH
+    _INTEGRITY_HELPER_SHA256 = hashlib.sha256(
+        _INTEGRITY_HELPER_PATH.read_bytes()
+    ).hexdigest()
+else:
+    _INTEGRITY_HELPER_PATH = _REMOTE_INTEGRITY_HELPER_PATH
+    _INTEGRITY_HELPER_SHA256 = _required_env(
+        "CPPMEGA_RELEASE_GATE_INTEGRITY_HELPER_SHA256",
+        r"[0-9a-f]{64}",
+    )
+if (
+    hashlib.sha256(_INTEGRITY_HELPER_PATH.read_bytes()).hexdigest()
+    != _INTEGRITY_HELPER_SHA256
+):
+    raise RuntimeError("release-gate integrity helper hash mismatch")
+_INTEGRITY_SPEC = importlib.util.spec_from_file_location(
+    "_cppmega_release_gate_integrity",
+    _INTEGRITY_HELPER_PATH,
+)
+if _INTEGRITY_SPEC is None or _INTEGRITY_SPEC.loader is None:
+    raise RuntimeError("cannot load the exact release-gate integrity helper")
+_INTEGRITY = importlib.util.module_from_spec(_INTEGRITY_SPEC)
+_INTEGRITY_SPEC.loader.exec_module(_INTEGRITY)
+canonical_sha256 = _INTEGRITY.canonical_sha256
+is_runtime_source_path = _INTEGRITY.is_runtime_source_path
+junit_counts = _INTEGRITY.junit_counts
+require_module_payload_bindings = _INTEGRITY.require_module_payload_bindings
+sha256_path = _INTEGRITY.sha256_path
+untracked_shadowable_files = _INTEGRITY.untracked_shadowable_files
+validate_complete_wheel_set = _INTEGRITY.validate_complete_wheel_set
+validate_exact_junit = _INTEGRITY.validate_exact_junit
+validate_source_manifest = _INTEGRITY.validate_source_manifest
+verify_wheel_record_payloads = _INTEGRITY.verify_wheel_record_payloads
+wheel_distribution_name = _INTEGRITY.wheel_distribution_name
 
 
 _CANDIDATE_CPPMEGA_SHA = _required_env(
@@ -62,34 +106,38 @@ _RELEASE_MANIFEST_URL = (
     "https://github.com/DatasunriseOU/cppmega/releases/download/"
     f"{_RELEASE_TAG}/CANDIDATE_MANIFEST.json"
 )
+_REQUIRED_WHEEL_PREFIXES = (
+    "transformer_engine",
+    "flash_attn",
+    "flash_attn_3",
+    "mamba_ssm",
+    "causal_conv1d",
+    "fast_hadamard_transform",
+    "apache_tvm_ffi",
+    "tilelang",
+    "qoptim_cuda",
+)
 try:
-    _CANDIDATE_WHEELS_VALUE = json.loads(
-        os.environ.get("CPPMEGA_CANDIDATE_WHEELS_JSON", "")
+    _COMPLETE_WHEELS_VALUE = json.loads(
+        os.environ.get("CPPMEGA_COMPLETE_WHEELS_JSON", "")
     )
 except json.JSONDecodeError as exc:
-    raise RuntimeError(
-        "CPPMEGA_CANDIDATE_WHEELS_JSON must be exact JSON"
-    ) from exc
-if not isinstance(_CANDIDATE_WHEELS_VALUE, dict):
-    raise TypeError("CPPMEGA_CANDIDATE_WHEELS_JSON must be a JSON object")
-_CANDIDATE_WHEELS = {
-    str(filename): str(digest)
-    for filename, digest in _CANDIDATE_WHEELS_VALUE.items()
+    raise RuntimeError("CPPMEGA_COMPLETE_WHEELS_JSON must be exact JSON") from exc
+if not isinstance(_COMPLETE_WHEELS_VALUE, dict):
+    raise TypeError("CPPMEGA_COMPLETE_WHEELS_JSON must be a JSON object")
+_COMPLETE_WHEELS = {
+    str(filename): str(digest) for filename, digest in _COMPLETE_WHEELS_VALUE.items()
 }
-if (
-    len(_CANDIDATE_WHEELS) != 2
-    or sum(name.startswith("tilelang-") for name in _CANDIDATE_WHEELS) != 1
-    or sum(name.startswith("apache_tvm_ffi-") for name in _CANDIDATE_WHEELS) != 1
-    or any(
-        re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", name) is None
-        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-        for name, digest in _CANDIDATE_WHEELS.items()
-    )
-):
-    raise RuntimeError(
-        "CPPMEGA_CANDIDATE_WHEELS_JSON must contain exactly one pinned "
-        "TileLang wheel and one pinned apache-tvm-ffi wheel"
-    )
+validate_complete_wheel_set(
+    _COMPLETE_WHEELS,
+    _COMPLETE_WHEELS,
+    _REQUIRED_WHEEL_PREFIXES,
+)
+_CANDIDATE_WHEELS = {
+    filename: digest
+    for filename, digest in _COMPLETE_WHEELS.items()
+    if filename.startswith(("tilelang-", "apache_tvm_ffi-"))
+}
 _IMAGE_DIGEST = _required_env(
     "CPPMEGA_CANDIDATE_IMAGE_DIGEST",
     r"sha256:[0-9a-f]{64}",
@@ -142,8 +190,7 @@ _PREREQUISITE_PHASE = _CONFIG["prerequisite_phase"]
 
 def _result_stem(phase: str) -> str:
     return (
-        f"mamba3-tilelang-bind-release-"
-        f"{_CANDIDATE_CPPMEGA_SHA[:8]}-{phase}-{_ATTEMPT}"
+        f"mamba3-tilelang-bind-release-{_CANDIDATE_CPPMEGA_SHA[:8]}-{phase}-{_ATTEMPT}"
     )
 
 
@@ -157,14 +204,6 @@ _GPU_SPEC = "H200:2"
 _STAGE2_PATCH_REL = (
     "upstream_prs/examples/13_tilelang_floormod_dbz/"
     "mamba3_bwd_stage2_force_nontma.patch"
-)
-_SOURCE_RELATIVE_PATHS = (
-    "cppmega/megatron/document_isolation.py",
-    "cppmega/megatron/cppmega_mamba3_tp_mixer.py",
-    "cppmega/megatron/upstream_patches/apply_mamba3_gqa_bwd_patches.py",
-    "cppmega/megatron/upstream_patches/apply_mamba3_stage2_force_nontma_patches.py",
-    "tests/test_cppmega_mamba3_tp_mixer.py",
-    _STAGE2_PATCH_REL,
 )
 _EXPECTED_MAMBA_INITIAL_SHA256 = {
     "mamba3_mimo_bwd.py": (
@@ -182,10 +221,10 @@ _EXPECTED_MAMBA_AFTER_SHA256 = {
         "mamba3_mimo_bwd_varlen.py"
     ],
 }
-
-
-def _sha256_path(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+_REMOTE_SOURCE_MANIFEST_PATH = pathlib.Path(
+    "/opt/cppmega-gate/expected-runtime-source-sha256.json"
+)
+_LOCAL_SOURCE_MANIFEST_PATH: pathlib.Path | None = None
 
 
 if modal.is_local():
@@ -221,42 +260,115 @@ if modal.is_local():
         text=True,
         check=False,
     )
+    source_tree = subprocess.run(
+        ["git", "-C", str(_LOCAL_ROOT), "rev-parse", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    tracked_paths_result = subprocess.run(
+        ["git", "-C", str(_LOCAL_ROOT), "ls-files", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    tracked_paths = {
+        value.decode() for value in tracked_paths_result.stdout.split(b"\0") if value
+    }
+    shadowable_extras = untracked_shadowable_files(_LOCAL_ROOT, tracked_paths)
     if (
         revision.returncode != 0
         or revision.stdout.strip() != _CANDIDATE_CPPMEGA_SHA
         or status.returncode != 0
         or status.stdout
         or tracked_script.returncode != 0
+        or source_tree.returncode != 0
+        or tracked_paths_result.returncode != 0
+        or shadowable_extras
     ):
         raise RuntimeError(
             "release gate requires the clean, tracked candidate checkout: "
             f"revision={revision.stdout.strip()!r}, "
             f"expected={_CANDIDATE_CPPMEGA_SHA!r}, "
-            f"status={status.stdout!r}, tracked_script={tracked_script.returncode}"
+            f"status={status.stdout!r}, tracked_script={tracked_script.returncode}, "
+            f"shadowable_extras={shadowable_extras!r}"
         )
-    _EXPECTED_SOURCE_SHA256 = {
-        relative: _sha256_path(_LOCAL_ROOT / relative)
-        for relative in _SOURCE_RELATIVE_PATHS
+    _FULL_TRACKED_SOURCE_SHA256 = {
+        relative: sha256_path(_LOCAL_ROOT / relative)
+        for relative in sorted(tracked_paths)
     }
-    _SCRIPT_SHA256 = _sha256_path(_SCRIPT_PATH)
-else:
-    try:
-        _EXPECTED_SOURCE_SHA256 = json.loads(
-            os.environ["CPPMEGA_EXPECTED_SOURCE_SHA256_JSON"]
+    _EXPECTED_SOURCE_SHA256 = {
+        relative: digest
+        for relative, digest in _FULL_TRACKED_SOURCE_SHA256.items()
+        if is_runtime_source_path(relative)
+    }
+    _SOURCE_TREE = source_tree.stdout.strip()
+    _FULL_SOURCE_MANIFEST_SHA256 = canonical_sha256(_FULL_TRACKED_SOURCE_SHA256)
+    _FULL_SOURCE_MANIFEST_FILE_COUNT = len(_FULL_TRACKED_SOURCE_SHA256)
+    _RUNTIME_SOURCE_MANIFEST_SHA256 = canonical_sha256(_EXPECTED_SOURCE_SHA256)
+    _RUNTIME_SOURCE_MANIFEST_FILE_COUNT = len(_EXPECTED_SOURCE_SHA256)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="cppmega-runtime-source-",
+        suffix=".json",
+        delete=False,
+    ) as source_manifest_file:
+        json.dump(
+            _EXPECTED_SOURCE_SHA256,
+            source_manifest_file,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-    except (KeyError, json.JSONDecodeError) as exc:
+        _LOCAL_SOURCE_MANIFEST_PATH = pathlib.Path(source_manifest_file.name)
+    _SCRIPT_SHA256 = sha256_path(_SCRIPT_PATH)
+else:
+    _RUNTIME_SOURCE_MANIFEST_SHA256 = _required_env(
+        "CPPMEGA_RUNTIME_SOURCE_MANIFEST_SHA256",
+        r"[0-9a-f]{64}",
+    )
+    _RUNTIME_SOURCE_MANIFEST_FILE_COUNT = int(
+        _required_env(
+            "CPPMEGA_RUNTIME_SOURCE_MANIFEST_FILE_COUNT",
+            r"[1-9][0-9]*",
+        )
+    )
+    try:
+        _EXPECTED_SOURCE_SHA256 = json.loads(_REMOTE_SOURCE_MANIFEST_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
-            "remote gate lacks CPPMEGA_EXPECTED_SOURCE_SHA256_JSON"
+            "remote gate lacks its exact runtime-source manifest"
         ) from exc
+    if (
+        not isinstance(_EXPECTED_SOURCE_SHA256, dict)
+        or canonical_sha256(_EXPECTED_SOURCE_SHA256) != _RUNTIME_SOURCE_MANIFEST_SHA256
+        or len(_EXPECTED_SOURCE_SHA256) != _RUNTIME_SOURCE_MANIFEST_FILE_COUNT
+    ):
+        raise RuntimeError("remote runtime-source manifest identity mismatch")
     _SCRIPT_SHA256 = _required_env(
         "CPPMEGA_RELEASE_GATE_SCRIPT_SHA256",
         r"[0-9a-f]{64}",
+    )
+    _SOURCE_TREE = _required_env(
+        "CPPMEGA_SOURCE_TREE",
+        r"[0-9a-f]{40}",
+    )
+    _FULL_SOURCE_MANIFEST_SHA256 = _required_env(
+        "CPPMEGA_FULL_SOURCE_MANIFEST_SHA256",
+        r"[0-9a-f]{64}",
+    )
+    _FULL_SOURCE_MANIFEST_FILE_COUNT = int(
+        _required_env(
+            "CPPMEGA_FULL_SOURCE_MANIFEST_FILE_COUNT",
+            r"[1-9][0-9]*",
+        )
     )
 
 _EXPECTED_STAGE2_PATCH_SHA256 = _EXPECTED_SOURCE_SHA256[_STAGE2_PATCH_REL]
 
 
 def _image() -> modal.Image:
+    if _LOCAL_SOURCE_MANIFEST_PATH is None:
+        raise RuntimeError("release image assembly requires its local source manifest")
     wheel_downloads = " ".join(
         (
             "curl --fail --location --retry 3 --retry-delay 2 "
@@ -266,7 +378,7 @@ def _image() -> modal.Image:
             f"echo '{digest}  "
             f"/opt/cppmega-gate/release-wheels/{filename}' | sha256sum -c -;"
         )
-        for filename, digest in sorted(_CANDIDATE_WHEELS.items())
+        for filename, digest in sorted(_COMPLETE_WHEELS.items())
     )
     image: Any = modal.Image.from_registry(
         _IMAGE_REF,
@@ -279,13 +391,15 @@ def _image() -> modal.Image:
                 "CPPMEGA_CANDIDATE_CPPMEGA_SHA": _CANDIDATE_CPPMEGA_SHA,
                 "CPPMEGA_CANDIDATE_IMAGE_DIGEST": _IMAGE_DIGEST,
                 "CPPMEGA_CANDIDATE_TILELANG_SHA": _CANDIDATE_TILELANG_SHA,
-                "CPPMEGA_CANDIDATE_WHEELS_JSON": json.dumps(
-                    _CANDIDATE_WHEELS,
+                "CPPMEGA_COMPLETE_WHEELS_JSON": json.dumps(
+                    _COMPLETE_WHEELS,
                     sort_keys=True,
                 ),
-                "CPPMEGA_EXPECTED_SOURCE_SHA256_JSON": json.dumps(
-                    _EXPECTED_SOURCE_SHA256,
-                    sort_keys=True,
+                "CPPMEGA_RUNTIME_SOURCE_MANIFEST_SHA256": (
+                    _RUNTIME_SOURCE_MANIFEST_SHA256
+                ),
+                "CPPMEGA_RUNTIME_SOURCE_MANIFEST_FILE_COUNT": str(
+                    _RUNTIME_SOURCE_MANIFEST_FILE_COUNT
                 ),
                 "CPPMEGA_H200_GATE_ATTEMPT": _ATTEMPT,
                 "CPPMEGA_H200_GATE_PHASE": _PHASE,
@@ -293,8 +407,16 @@ def _image() -> modal.Image:
                 "CPPMEGA_MAMBA3_TEST_MIMO_RANK": str(_MIMO_RANK),
                 "CPPMEGA_MEGATRON_COMMIT": _MEGATRON_COMMIT,
                 "CPPMEGA_RELEASE_GATE_SCRIPT_SHA256": _SCRIPT_SHA256,
+                "CPPMEGA_RELEASE_GATE_INTEGRITY_HELPER_SHA256": (
+                    _INTEGRITY_HELPER_SHA256
+                ),
                 "CPPMEGA_RELEASE_MANIFEST_SHA256": _RELEASE_MANIFEST_SHA256,
                 "CPPMEGA_RELEASE_TAG": _RELEASE_TAG,
+                "CPPMEGA_SOURCE_TREE": _SOURCE_TREE,
+                "CPPMEGA_FULL_SOURCE_MANIFEST_SHA256": (_FULL_SOURCE_MANIFEST_SHA256),
+                "CPPMEGA_FULL_SOURCE_MANIFEST_FILE_COUNT": str(
+                    _FULL_SOURCE_MANIFEST_FILE_COUNT
+                ),
                 "CUDA_LAUNCH_BLOCKING": "1",
                 "MEGATRON_LM_REPO": "/opt/megatron-lm",
                 "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
@@ -305,6 +427,16 @@ def _image() -> modal.Image:
         .add_local_file(
             str(_SCRIPT_PATH),
             remote_path="/opt/cppmega-gate/release-gate.py",
+            copy=True,
+        )
+        .add_local_file(
+            str(_LOCAL_SOURCE_MANIFEST_PATH),
+            remote_path=str(_REMOTE_SOURCE_MANIFEST_PATH),
+            copy=True,
+        )
+        .add_local_file(
+            str(_LOCAL_INTEGRITY_HELPER_PATH),
+            remote_path=str(_REMOTE_INTEGRITY_HELPER_PATH),
             copy=True,
         )
         .run_commands(
@@ -357,25 +489,7 @@ def run_release_gate() -> dict[str, Any]:
     import time
     import traceback
     import uuid
-    import xml.etree.ElementTree as ET
     from importlib import metadata
-
-    import torch
-
-    from cppmega.megatron.upstream_patches import (
-        apply_mamba3_gqa_bwd_patches as gqa,
-    )
-    from cppmega.megatron.upstream_patches import (
-        apply_mamba3_stage2_force_nontma_patches as stage2,
-    )
-
-    def sha256_path(path: pathlib.Path) -> str:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-
-    def canonical_sha256(value: Any) -> str:
-        return hashlib.sha256(
-            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
 
     def write_receipt(receipt: dict[str, Any]) -> None:
         path = pathlib.Path(_RESULT_PATH)
@@ -433,15 +547,41 @@ def run_release_gate() -> dict[str, Any]:
             "files": inventory,
         }
 
-    def source_hashes() -> dict[str, str]:
-        hashes = {
-            relative: sha256_path(pathlib.Path("/opt/cppmega") / relative)
-            for relative in _EXPECTED_SOURCE_SHA256
+    def image_source_binding() -> dict[str, Any]:
+        path = pathlib.Path("/opt/cppmega-image-source.json")
+        observed = json.loads(path.read_text())
+        expected = {
+            "cppmega_sha": _CANDIDATE_CPPMEGA_SHA,
+            "source_tree": _SOURCE_TREE,
+            "source_manifest_sha256": _FULL_SOURCE_MANIFEST_SHA256,
+            "source_manifest_file_count": _FULL_SOURCE_MANIFEST_FILE_COUNT,
         }
-        if hashes != _EXPECTED_SOURCE_SHA256:
+        if observed != expected:
             raise RuntimeError(
-                "release-image source hashes do not match candidate commit: "
-                f"observed={hashes!r} expected={_EXPECTED_SOURCE_SHA256!r}"
+                "immutable image source receipt mismatch: "
+                f"observed={observed!r}, expected={expected!r}"
+            )
+        return {
+            "path": str(path),
+            "content": observed,
+            "metadata_only": True,
+            "runtime_bytes_verified_separately": True,
+        }
+
+    def source_hashes() -> dict[str, Any]:
+        source_identity = validate_source_manifest(
+            pathlib.Path("/opt/cppmega"),
+            _EXPECTED_SOURCE_SHA256,
+        )
+        expected_runtime_identity = {
+            "file_count": _RUNTIME_SOURCE_MANIFEST_FILE_COUNT,
+            "manifest_sha256": _RUNTIME_SOURCE_MANIFEST_SHA256,
+        }
+        if source_identity != expected_runtime_identity:
+            raise RuntimeError(
+                "verified runtime/build-context source identity mismatch: "
+                f"observed={source_identity!r}, "
+                f"expected={expected_runtime_identity!r}"
             )
         copied_script_hash = sha256_path(
             pathlib.Path("/opt/cppmega-gate/release-gate.py")
@@ -450,17 +590,20 @@ def run_release_gate() -> dict[str, Any]:
             pathlib.Path("/opt/cppmega")
             / "scripts/modal_mamba3_tilelang_role_release_gate.py"
         )
-        if (
-            copied_script_hash != _SCRIPT_SHA256
-            or image_script_hash != _SCRIPT_SHA256
-        ):
+        if copied_script_hash != _SCRIPT_SHA256 or image_script_hash != _SCRIPT_SHA256:
             raise RuntimeError(
                 "candidate-image/local gate script mismatch: "
                 f"image={image_script_hash}, copied={copied_script_hash}, "
                 f"expected={_SCRIPT_SHA256}"
             )
         return {
-            **hashes,
+            "verified_runtime_build_context": source_identity,
+            "candidate_commit_metadata": {
+                "source_tree": _SOURCE_TREE,
+                "full_tracked_manifest_sha256": (_FULL_SOURCE_MANIFEST_SHA256),
+                "full_tracked_manifest_file_count": (_FULL_SOURCE_MANIFEST_FILE_COUNT),
+                "metadata_only_for_dockerignored_paths": True,
+            },
             "scripts/modal_mamba3_tilelang_role_release_gate.py": image_script_hash,
             "scripts/release-gate.py": copied_script_hash,
         }
@@ -503,15 +646,11 @@ def run_release_gate() -> dict[str, Any]:
                 f"observed={manifest.get('base_release')!r} "
                 f"expected={expected_base!r}"
             )
-        complete_wheels = manifest.get("complete_wheel_set")
-        if not isinstance(complete_wheels, dict) or any(
-            complete_wheels.get(filename) != digest
-            for filename, digest in _CANDIDATE_WHEELS.items()
-        ):
-            raise RuntimeError(
-                "complete wheel set does not contain the pinned candidate pair: "
-                f"{complete_wheels!r}"
-            )
+        validate_complete_wheel_set(
+            manifest.get("complete_wheel_set"),
+            _COMPLETE_WHEELS,
+            _REQUIRED_WHEEL_PREFIXES,
+        )
         github_run = manifest.get("github_run", {})
         if (
             not str(github_run.get("id", "")).isdigit()
@@ -529,108 +668,52 @@ def run_release_gate() -> dict[str, Any]:
             "content": manifest,
         }
 
-    def installed_wheel_identity() -> dict[str, Any]:
-        import base64
-        import csv
-        import io
-        import zipfile
-
+    def installed_wheel_identity() -> tuple[
+        dict[str, Any],
+        dict[str, dict[str, str]],
+    ]:
         wheel_dir = pathlib.Path("/opt/cppmega-gate/release-wheels")
-        distribution_names = {
-            "tilelang": "tilelang",
-            "apache_tvm_ffi": "apache-tvm-ffi",
-        }
         identities: dict[str, Any] = {}
-        for wheel_prefix, distribution_name in distribution_names.items():
-            filenames = [
-                filename
-                for filename in _CANDIDATE_WHEELS
-                if filename.startswith(f"{wheel_prefix}-")
-            ]
-            if len(filenames) != 1:
-                raise RuntimeError(
-                    f"expected one pinned {wheel_prefix} wheel: {filenames!r}"
-                )
-            filename = filenames[0]
+        verified_absolute_paths: dict[str, dict[str, str]] = {}
+        for filename, expected_wheel_sha256 in sorted(_COMPLETE_WHEELS.items()):
             wheel_path = wheel_dir / filename
-            wheel_sha256 = sha256_path(wheel_path)
-            expected_wheel_sha256 = _CANDIDATE_WHEELS[filename]
-            if wheel_sha256 != expected_wheel_sha256:
-                raise RuntimeError(
-                    f"downloaded release wheel mismatch for {filename}: "
-                    f"observed={wheel_sha256}, expected={expected_wheel_sha256}"
-                )
-
+            distribution_name = wheel_distribution_name(wheel_path)
             distribution = metadata.distribution(distribution_name)
-            verified_payload: dict[str, dict[str, Any]] = {}
-            native_payload: dict[str, str] = {}
-            with zipfile.ZipFile(wheel_path) as archive:
-                record_names = [
-                    name
-                    for name in archive.namelist()
-                    if name.endswith(".dist-info/RECORD")
-                ]
-                if len(record_names) != 1:
-                    raise RuntimeError(
-                        f"{filename} must contain exactly one RECORD: "
-                        f"{record_names!r}"
-                    )
-                record_bytes = archive.read(record_names[0])
-                rows = csv.reader(io.StringIO(record_bytes.decode()))
-                for row in rows:
-                    if len(row) < 2 or not row[1]:
-                        continue
-                    relative_path, encoded_hash = row[:2]
-                    algorithm, separator, digest_text = encoded_hash.partition("=")
-                    if separator != "=" or algorithm != "sha256" or not digest_text:
-                        raise RuntimeError(
-                            f"{filename} has unsupported RECORD hash: {row!r}"
-                        )
-                    expected_digest = base64.urlsafe_b64decode(
-                        digest_text + "=" * (-len(digest_text) % 4)
-                    ).hex()
-                    archive_bytes = archive.read(relative_path)
-                    archive_digest = hashlib.sha256(archive_bytes).hexdigest()
-                    installed_path = pathlib.Path(
-                        str(distribution.locate_file(relative_path))
-                    ).resolve(strict=True)
-                    installed_digest = sha256_path(installed_path)
-                    if (
-                        archive_digest != expected_digest
-                        or installed_digest != expected_digest
-                    ):
-                        raise RuntimeError(
-                            "installed payload differs from exact release wheel: "
-                            f"wheel={filename}, path={relative_path}, "
-                            f"record={expected_digest}, archive={archive_digest}, "
-                            f"installed={installed_digest}"
-                        )
-                    verified_payload[relative_path] = {
-                        "sha256": installed_digest,
-                        "size_bytes": installed_path.stat().st_size,
-                    }
-                    if pathlib.PurePosixPath(relative_path).suffix in {
-                        ".so",
-                        ".dylib",
-                        ".pyd",
-                    }:
-                        native_payload[relative_path] = installed_digest
-            if not verified_payload or not native_payload:
+            installed_root = pathlib.Path(str(distribution.locate_file("")))
+            transformations: dict[str, dict[str, str]] = {}
+            if distribution_name == "mamba_ssm":
+                stage2_relative = "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+                stage2_path = pathlib.Path(
+                    str(distribution.locate_file(stage2_relative))
+                ).resolve(strict=True)
+                transformations[stage2_relative] = {
+                    "kind": "cppmega-stage2-build-time-patch",
+                    "backup_path": str(stage2._backup_path(stage2_path)),
+                    "installed_sha256": _EXPECTED_MAMBA_AFTER_SHA256[
+                        "mamba3_mimo_bwd.py"
+                    ],
+                }
+            identity = verify_wheel_record_payloads(
+                wheel_path,
+                expected_wheel_sha256=expected_wheel_sha256,
+                expected_distribution_name=distribution_name,
+                installed_root=installed_root,
+                verified_absolute_paths=verified_absolute_paths,
+                allowed_transformations=transformations,
+            )
+            if distribution_name in identities:
                 raise RuntimeError(
-                    f"{filename} lacks verified payload/native identity: "
-                    f"payloads={len(verified_payload)}, natives={native_payload!r}"
+                    "release wheels contain duplicate distribution identity: "
+                    f"{distribution_name}"
                 )
-            identities[distribution_name] = {
-                "wheel_path": str(wheel_path),
-                "wheel_sha256": wheel_sha256,
-                "record_sha256": hashlib.sha256(record_bytes).hexdigest(),
-                "verified_payload_count": len(verified_payload),
-                "verified_payload_identity_sha256": canonical_sha256(
-                    verified_payload
-                ),
-                "native_payload": native_payload,
-            }
-        return identities
+            identities[distribution_name] = identity
+        if len(identities) != len(_COMPLETE_WHEELS):
+            raise RuntimeError(
+                "installed release distributions are not one-to-one with wheels: "
+                f"identities={identities.keys()!r}, "
+                f"wheels={_COMPLETE_WHEELS.keys()!r}"
+            )
+        return identities, verified_absolute_paths
 
     def stack_provenance() -> dict[str, Any]:
         megatron_revision = subprocess.run(
@@ -726,9 +809,10 @@ def run_release_gate() -> dict[str, Any]:
         }
 
     def runtime_fingerprints(
-        source_sha256: dict[str, str],
+        source_sha256: dict[str, Any],
         mamba_state: dict[str, Any],
         installed_wheels: dict[str, Any],
+        verified_payload_paths: dict[str, dict[str, str]],
     ) -> dict[str, Any]:
         def fingerprint_file(path: pathlib.Path) -> dict[str, Any]:
             try:
@@ -787,7 +871,18 @@ def run_release_gate() -> dict[str, Any]:
                 )
 
         module_provenance: dict[str, dict[str, Any]] = {}
-        for module_name in ("tilelang", "tvm", "tvm_ffi"):
+        for module_name in (
+            "tilelang",
+            "tvm",
+            "tvm_ffi",
+            "mamba_ssm",
+            "transformer_engine",
+            "flash_attn",
+            "flash_attn_3",
+            "causal_conv1d",
+            "fast_hadamard_transform",
+            "qoptim_cuda",
+        ):
             module = __import__(module_name)
             module_path = getattr(module, "__file__", None)
             if not module_path:
@@ -800,6 +895,10 @@ def run_release_gate() -> dict[str, Any]:
                     f"module provenance failed: "
                     f"{module_name}={module_provenance[module_name]!r}"
                 )
+        require_module_payload_bindings(
+            module_provenance,
+            verified_payload_paths,
+        )
 
         runtime_matches = [
             artifact
@@ -842,6 +941,7 @@ def run_release_gate() -> dict[str, Any]:
             "release_tag": _RELEASE_TAG,
             "release_manifest_sha256": _RELEASE_MANIFEST_SHA256,
             "candidate_wheels": _CANDIDATE_WHEELS,
+            "complete_wheels": _COMPLETE_WHEELS,
             "installed_release_wheels": installed_wheels,
             "source_sha256": source_sha256,
             "mamba_installed_sha256": mamba_state["installed_sha256"],
@@ -865,6 +965,7 @@ def run_release_gate() -> dict[str, Any]:
         )
         return {
             "candidate_wheels": _CANDIDATE_WHEELS,
+            "complete_wheels": _COMPLETE_WHEELS,
             "installed_release_wheels": installed_wheels,
             "module_provenance": module_provenance,
             "native_artifacts": native_artifacts,
@@ -907,6 +1008,23 @@ def run_release_gate() -> dict[str, Any]:
                     f"phase={phase}, receipt={path}, junit={junit_path}"
                 )
             prior = json.loads(path.read_text())
+            junit_artifact = prior.get("junit_artifact")
+            if (
+                not isinstance(junit_artifact, dict)
+                or junit_artifact.get("present") is not True
+                or junit_artifact.get("durable_path") != str(junit_path)
+            ):
+                raise RuntimeError(
+                    "prior phase durable JUnit artifact contract mismatch: "
+                    f"phase={phase}, artifact={junit_artifact!r}"
+                )
+            validated_junit = validate_exact_junit(
+                junit_path,
+                expected_test_count=expected_test_count,
+                expected_sha256=str(junit_artifact.get("sha256", "")),
+            )
+            actual_junit = validated_junit["counts"]
+            actual_junit_sha = validated_junit["sha256"]
             expected = {
                 "status": "passed",
                 "gate_kind": "release-image",
@@ -916,19 +1034,14 @@ def run_release_gate() -> dict[str, Any]:
                 "release_tag": _RELEASE_TAG,
                 "manifest_sha256": _RELEASE_MANIFEST_SHA256,
                 "candidate_wheels": _CANDIDATE_WHEELS,
+                "complete_wheels": _COMPLETE_WHEELS,
                 "image_digest": _IMAGE_DIGEST,
                 "script_sha256": _SCRIPT_SHA256,
                 "selected_tests": expected_tests,
                 "expected_test_count": expected_test_count,
                 "mimo_rank": int(config["mimo_rank"]),
                 "chunk_size": int(config["chunk_size"]),
-                "junit": {
-                    "present": True,
-                    "tests": expected_test_count,
-                    "failures": 0,
-                    "errors": 0,
-                    "skipped": 0,
-                },
+                "junit": actual_junit,
             }
             observed = {
                 "status": prior.get("status"),
@@ -937,22 +1050,15 @@ def run_release_gate() -> dict[str, Any]:
                 "cppmega_sha": prior.get("candidate", {}).get("cppmega_sha"),
                 "tilelang_sha": prior.get("candidate", {}).get("tilelang_sha"),
                 "release_tag": prior.get("release", {}).get("tag"),
-                "manifest_sha256": prior.get("release", {}).get(
-                    "manifest_sha256"
-                ),
-                "candidate_wheels": prior.get("release", {}).get(
-                    "candidate_wheels"
-                ),
+                "manifest_sha256": prior.get("release", {}).get("manifest_sha256"),
+                "candidate_wheels": prior.get("release", {}).get("candidate_wheels"),
+                "complete_wheels": prior.get("release", {}).get("complete_wheels"),
                 "image_digest": prior.get("image", {}).get("digest"),
                 "script_sha256": prior.get("script_sha256"),
                 "selected_tests": prior.get("selected_tests"),
                 "expected_test_count": prior.get("expected_test_count"),
-                "mimo_rank": prior.get("test_factorization", {}).get(
-                    "R_mimo_rank"
-                ),
-                "chunk_size": prior.get("test_factorization", {}).get(
-                    "chunk_size"
-                ),
+                "mimo_rank": prior.get("test_factorization", {}).get("R_mimo_rank"),
+                "chunk_size": prior.get("test_factorization", {}).get("chunk_size"),
                 "junit": prior.get("junit"),
             }
             if observed != expected:
@@ -961,18 +1067,6 @@ def run_release_gate() -> dict[str, Any]:
                     f"phase={phase}, observed={observed!r}, expected={expected!r}"
                 )
 
-            junit_artifact = prior.get("junit_artifact", {})
-            actual_junit_sha = sha256_path(junit_path)
-            if (
-                junit_artifact.get("present") is not True
-                or junit_artifact.get("durable_path") != str(junit_path)
-                or junit_artifact.get("sha256") != actual_junit_sha
-            ):
-                raise RuntimeError(
-                    "prior phase durable JUnit identity mismatch: "
-                    f"phase={phase}, artifact={junit_artifact!r}, "
-                    f"actual_sha256={actual_junit_sha}"
-                )
             prior_identity = prior.get("runtime_fingerprints", {}).get(
                 "artifact_identity"
             )
@@ -1021,6 +1115,7 @@ def run_release_gate() -> dict[str, Any]:
                 "release_tag": _RELEASE_TAG,
                 "manifest_sha256": _RELEASE_MANIFEST_SHA256,
                 "candidate_wheels": _CANDIDATE_WHEELS,
+                "complete_wheels": _COMPLETE_WHEELS,
                 "image_digest": _IMAGE_DIGEST,
                 "script_sha256": _SCRIPT_SHA256,
                 "selected_tests": expected_tests,
@@ -1034,32 +1129,6 @@ def run_release_gate() -> dict[str, Any]:
             }
 
         return verify_phase_artifact(str(_PREREQUISITE_PHASE))
-
-    def junit_counts() -> dict[str, int | bool]:
-        path = pathlib.Path(_JUNIT_PATH)
-        if not path.is_file():
-            return {
-                "present": False,
-                "tests": 0,
-                "failures": 0,
-                "errors": 0,
-                "skipped": 0,
-            }
-        root = ET.parse(path).getroot()
-        if root.tag.rsplit("}", 1)[-1] == "testsuite":
-            suites = [root]
-        else:
-            suites = [
-                child for child in root if child.tag.rsplit("}", 1)[-1] == "testsuite"
-            ]
-        if not suites:
-            raise RuntimeError(f"{_JUNIT_PATH} contains no testsuite elements")
-        counts: dict[str, int | bool] = {
-            name: sum(int(suite.attrib.get(name, "0")) for suite in suites)
-            for name in ("tests", "failures", "errors", "skipped")
-        }
-        counts["present"] = True
-        return counts
 
     started = time.time()
     existing_outputs = [
@@ -1077,7 +1146,7 @@ def run_release_gate() -> dict[str, Any]:
             f"new CPPMEGA_H200_GATE_ATTEMPT: {existing_outputs!r}"
         )
     receipt: dict[str, Any] = {
-        "schema_version": 6,
+        "schema_version": 7,
         "run_id": str(uuid.uuid4()),
         "attempt": f"release-{_CANDIDATE_CPPMEGA_SHA[:8]}-{_PHASE}-{_ATTEMPT}",
         "gate_kind": "release-image",
@@ -1100,6 +1169,7 @@ def run_release_gate() -> dict[str, Any]:
             "manifest_url": _RELEASE_MANIFEST_URL,
             "manifest_sha256": _RELEASE_MANIFEST_SHA256,
             "candidate_wheels": _CANDIDATE_WHEELS,
+            "complete_wheels": _COMPLETE_WHEELS,
         },
         "image": {
             "ref": _IMAGE_REF,
@@ -1169,11 +1239,25 @@ def run_release_gate() -> dict[str, Any]:
                 f"runtime mutation gates must be unset: {mutation_env!r}"
             )
         receipt["runtime_mutation_environment"] = mutation_env
-        receipt["prerequisite"] = verify_prerequisite()
-        receipt["release_manifest"] = release_manifest()
-        receipt["installed_release_wheels"] = installed_wheel_identity()
-        receipt["stack_provenance"] = stack_provenance()
         receipt["source_sha256_before_test"] = source_hashes()
+        receipt["prerequisite"] = verify_prerequisite()
+        receipt["image_source_binding"] = image_source_binding()
+        receipt["release_manifest"] = release_manifest()
+
+        import torch
+
+        from cppmega.megatron.upstream_patches import (
+            apply_mamba3_gqa_bwd_patches as gqa,
+        )
+        from cppmega.megatron.upstream_patches import (
+            apply_mamba3_stage2_force_nontma_patches as stage2,
+        )
+
+        (
+            receipt["installed_release_wheels"],
+            verified_payload_paths,
+        ) = installed_wheel_identity()
+        receipt["stack_provenance"] = stack_provenance()
         receipt["mamba_overlay_before_test"] = mamba_overlay_state()
 
         import tilelang  # noqa: F401  # Registers the wheel's vendored TVM.
@@ -1202,6 +1286,7 @@ def run_release_gate() -> dict[str, Any]:
             receipt["source_sha256_before_test"],
             receipt["mamba_overlay_before_test"],
             receipt["installed_release_wheels"],
+            verified_payload_paths,
         )
         if receipt["prerequisite"] is not None:
             prior_identity = receipt["prerequisite"]["artifact_identity"]
@@ -1277,7 +1362,7 @@ def run_release_gate() -> dict[str, Any]:
 
         receipt["tvm_debug_artifact"] = persist_tvm_debug_artifacts()
         receipt["junit_artifact"] = persist_junit()
-        counts = junit_counts()
+        counts = junit_counts(pathlib.Path(_JUNIT_PATH))
         receipt["junit"] = counts
         exact_pass = (
             process.returncode == 0
