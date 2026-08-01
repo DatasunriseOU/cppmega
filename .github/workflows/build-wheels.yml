@@ -1,14 +1,11 @@
 name: build-wheels
 
-# Build all custom CUDA wheels (TE 2.16.0, flash-attn, mamba_ssm,
-# causal_conv1d, fast_hadamard, tilelang, qoptim_cuda) on the repository's
-# persistent self-hosted Linux x86_64 runner.
+# Candidate-only workflow on candidate/tilelang-role-3dff66ef.
 #
-# Each matrix entry caches its own ~/.ccache between runs, keyed on source
-# git commit. Wheels are uploaded as `wheels-<full triggering commit SHA>`.
-#
-# Trigger manually after bumping STACK.lock; or on push to STACK.lock /
-# upstream_prs/*.patch.
+# Build exactly the TileLang/tvm-ffi pair from the native role-classification
+# fix, then overlay it onto the immutable production wheel release. The
+# resulting complete prerelease remains bound to this candidate cppmega
+# commit and must not be promoted to main/STACK.lock before the H200 gates.
 
 on:
   workflow_dispatch:
@@ -60,98 +57,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: transformer_engine
-            repo: NVIDIA/TransformerEngine
-            ref: 4220403e831d29e93868f7793693ea83f6b8b05b
-            submodules: "true"
-            # MAX_JOBS=1 NVCC_THREADS=2 — without these, ninja saturates the
-            # 4-core / 7 GB runner and the job gets cancelled at ~1h30m with
-            # nothing useful in the logs. TE core CMake ignores
-            # TORCH_CUDA_ARCH_LIST; v2.16 reads NVTE_CUDA_ARCHS instead.
-            extra_env: "NVTE_FRAMEWORK=pytorch MAX_JOBS=1 NVCC_THREADS=2 NVTE_CUDA_ARCHS='90;100;120'"
-          - name: flash_attn
-            # Public upstream builds the FA2 cuda kernels + FA4 cute python
-            # module in one wheel. cppmega-specific build trimming stays below
-            # in this workflow so the build recipe is owned by DatasunriseOU/cppmega.
-            #
-            # MAX_JOBS=1 NVCC_THREADS=1 is the only RAM-stable combo on the
-            # 7-GB runner. NVCC_THREADS=2 OOM-killed at 58 min (single nvcc
-            # peaked >6 GB). MAX_JOBS=2 NVCC_THREADS=1 also OOM-killed at
-            # 13 min (two parallel nvccs went over the cap). Wall time at
-            # MAX_JOBS=1/THREADS=1 is the constraint; we keep it under
-            # 350 min by trimming the kernel matrix to 8 files (drop splitkv,
-            # patch dispatcher in trim step to avoid undefined references).
-            #
-            # arch_override is sm_120 only. cppmega architecture priority:
-            #   - H100/H200: covered by flash_attn_3 (FA3 hopper)
-            #   - B200:      primary path is FA4 cute python (same wheel,
-            #                JIT-compiled at runtime — no arch list needed)
-            # FA2 is therefore only the legacy fallback; sm_120 is enough for
-            # this wheel build. GB10-specific sm_120f/121 fixes must live as
-            # local patches in this repo if we re-enable that path.
-            repo: Dao-AILab/flash-attention
-            ref: c75d019dea9d910312974417bc28f190dfdda6d9
-            submodules: "false"
-            patch: upstream_prs/flash_attn_setup_sm120f.patch
-            arch_override: "12.1"
-            # Upstream FA2 ignores TORCH_CUDA_ARCH_LIST and reads this knob.
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=1 FLASH_ATTN_CUDA_ARCHS=120"
-          - name: flash_attn_3
-            # Hopper FA3 path from upstream flash-attention (subdir hopper/). Trimmed to
-            # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
-            # Drop fp16, hdim 96/192/256, paged/append KV (inference), local,
-            # softcap, packgqa, cluster, hdimdiff64/192. Even at sm_90 + MAX_JOBS=1
-            # the full kernel matrix runs ~6h+ on free runners — cancelled at
-            # 5h51m on previous runs. The trimmed set fits in <1h.
-            #
-            # DISABLE_SM80=TRUE is critical: even though we set arch_override=9.0,
-            # leaving SM8x enabled pulls sm_80 .cu sources AND causes setup.py to
-            # instantiate \`run_mha_fwd_constexpr<Arch=80, ..., PackGQA=true, ...>\`.
-            # That template's e4m3 dispatch branch hardcodes \`<90, e4m3, ...>\` in
-            # the run_mha_fwd_<> call — so the compiler emits an undefined
-            # reference to \`run_mha_fwd_<90, e4m3, 64, 64, ..., PackGQA=true>\`
-            # even though we built with DISABLE_PACKGQA. Result: \`_C.abi3.so\`
-            # ImportError on \`undefined symbol\` at smoke test time. Locking
-            # ARCH_SWITCH to 90 (via DISABLE_SM8x → defined when SM80=TRUE)
-            # prevents the sm80 instantiation entirely, and PackGQA collapses to
-            # false everywhere for arch=90.
-            repo: Dao-AILab/flash-attention
-            ref: c75d019dea9d910312974417bc28f190dfdda6d9
-            submodules: "false"
-            subdir: hopper
-            arch_override: "9.0"
-            extra_env: >-
-              MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE
-              FLASH_ATTENTION_DISABLE_SM80=TRUE
-              FLASH_ATTENTION_DISABLE_FP16=TRUE
-              FLASH_ATTENTION_DISABLE_HDIM96=TRUE
-              FLASH_ATTENTION_DISABLE_HDIM192=TRUE
-              FLASH_ATTENTION_DISABLE_HDIM256=TRUE
-              FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE
-              FLASH_ATTENTION_DISABLE_APPENDKV=TRUE
-              FLASH_ATTENTION_DISABLE_LOCAL=TRUE
-              FLASH_ATTENTION_DISABLE_SOFTCAP=TRUE
-              FLASH_ATTENTION_DISABLE_PACKGQA=TRUE
-              FLASH_ATTENTION_DISABLE_CLUSTER=TRUE
-              FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE
-              FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE
-              FLASH_ATTENTION_DISABLE_SPLIT=TRUE
-          - name: mamba_ssm
-            repo: state-spaces/mamba
-            ref: 31f3d7baba69d0ccad1635ace1e477367899e408
-            submodules: "false"
-            patch: upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch
-            extra_env: "MAMBA_FORCE_BUILD=TRUE MAX_JOBS=1 NVCC_THREADS=2"
-          - name: causal_conv1d
-            repo: Dao-AILab/causal-conv1d
-            ref: c51519fb10d92ffa257c1982e1831d3243454b2f
-            submodules: "false"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
-          - name: fast_hadamard_transform
-            repo: Dao-AILab/fast-hadamard-transform
-            ref: e7706faf8d1c3b9f241e36860640ad1dac644ede
-            submodules: "false"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
             #   - 11848a44 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
@@ -174,17 +79,12 @@ jobs:
             #     AllocBuffer nodes (WGMMA descriptors and local.var scalars).
             #   - upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12,
             #     incompatible with FA4 beta23's >=0.1.12 floor.
-            # Must match STACK.lock wheels.tilelang.ref.
+            # Candidate-only override. Do not copy to STACK.lock before H200
+            # stage2+GQA and the exact three Mamba tests pass.
             repo: DatasunriseOU/tilelang
-            ref: 11848a444a7578afe17e9261bd41fe10ac1723c7
+            ref: 3dff66efd068369a859646f259910cac5a508236
             submodules: "true"
             extra_env: ""
-          - name: qoptim_cuda
-            repo: NVlabs/COAT
-            ref: 80ec99f47aaa09231b07ace1fd04c30a1e30ec18
-            submodules: "false"
-            subdir: coat/optimizer/kernels
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
 
     steps:
       - name: Checkout cppmega (for patches)
@@ -709,19 +609,74 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheel-*
-          merge-multiple: true
-          path: wheels
-
-      - name: List collected wheels
-        run: ls -lh wheels/
-
-      - name: Verify required wheels
+      - name: Download and verify immutable production wheel set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_WHEEL_TAG: wheels-dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
+          BASE_SOURCE_SHA: dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
         run: |
           set -euo pipefail
+          rm -rf wheels candidate-wheels
+          mkdir -p wheels
+          read -r tag_type tag_sha < <(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${BASE_WHEEL_TAG}" \
+              --jq '.object.type + " " + .object.sha'
+          )
+          if [[ "$tag_type" != "commit" || "$tag_sha" != "$BASE_SOURCE_SHA" ]]; then
+            echo "::error::base wheel tag $BASE_WHEEL_TAG is not bound to $BASE_SOURCE_SHA"
+            exit 1
+          fi
+          gh release download "$BASE_WHEEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir wheels \
+            --pattern '*.whl' \
+            --pattern SHA256SUMS
+          (
+            cd wheels
+            sha256sum -c SHA256SUMS
+            diff -u \
+              <(awk '{print $2}' SHA256SUMS | LC_ALL=C sort) \
+              <(printf '%s\n' *.whl | LC_ALL=C sort)
+          )
+
+      - name: Download candidate TileLang pair
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-tilelang
+          merge-multiple: true
+          path: candidate-wheels
+
+      - name: Overlay exact candidate pair
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          candidate_all=(candidate-wheels/*.whl)
+          candidate_tilelang=(candidate-wheels/tilelang-*.whl)
+          candidate_ffi=(candidate-wheels/apache_tvm_ffi-*.whl)
+          base_tilelang=(wheels/tilelang-*.whl)
+          base_ffi=(wheels/apache_tvm_ffi-*.whl)
+          if (( ${#candidate_all[@]} != 2 ||
+                ${#candidate_tilelang[@]} != 1 ||
+                ${#candidate_ffi[@]} != 1 )); then
+            echo "::error::candidate artifact must contain exactly one TileLang wheel and one tvm-ffi wheel"
+            find candidate-wheels -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+          if (( ${#base_tilelang[@]} != 1 || ${#base_ffi[@]} != 1 )); then
+            echo "::error::immutable base must contain exactly one TileLang wheel and one tvm-ffi wheel"
+            find wheels -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+          rm -- wheels/SHA256SUMS "${base_tilelang[0]}" "${base_ffi[0]}"
+          install -m 0644 "${candidate_tilelang[0]}" "${candidate_ffi[0]}" wheels/
+
+      - name: List complete candidate wheel set
+        run: ls -lh wheels/
+
+      - name: Verify complete candidate wheel set
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
           required=(
             'transformer_engine-*.whl'
             'flash_attn-*.whl'
@@ -735,18 +690,86 @@ jobs:
           )
           for pattern in "${required[@]}"; do
             matches=(wheels/$pattern)
-            if [[ ! -e "${matches[0]}" ]]; then
-              echo "::error::missing required wheel asset: $pattern"
+            if (( ${#matches[@]} != 1 )); then
+              echo "::error::expected exactly one required wheel asset for $pattern, found ${#matches[@]}"
               ls -lh wheels/ || true
               exit 1
             fi
           done
+          all_wheels=(wheels/*.whl)
+          if (( ${#all_wheels[@]} != ${#required[@]} )); then
+            echo "::error::candidate release contains unexpected wheel assets"
+            printf '%s\n' "${all_wheels[@]}"
+            exit 1
+          fi
 
       - name: Write wheel checksums
         run: |
           set -euo pipefail
-          (cd wheels && sha256sum *.whl > SHA256SUMS)
+          (cd wheels && sha256sum *.whl | LC_ALL=C sort -k2 > SHA256SUMS)
           (cd wheels && sha256sum -c SHA256SUMS)
+
+      - name: Write branch-bound candidate manifest
+        env:
+          BASE_WHEEL_TAG: wheels-dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
+          BASE_SOURCE_SHA: dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
+          CANDIDATE_CPPMEGA_SHA: ${{ github.sha }}
+          CANDIDATE_TILELANG_SHA: 3dff66efd068369a859646f259910cac5a508236
+          CANDIDATE_TVM_SHA: e25ca6ae50beee0e907b1e5ed32949879caddde1
+          CANDIDATE_TVM_FFI_SHA: 521efeb30bfd9e4946b248b3d76e6391028233a3
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          wheel_dir = Path("wheels")
+          checksums = {}
+          for line in (wheel_dir / "SHA256SUMS").read_text().splitlines():
+              digest, filename = line.split(maxsplit=1)
+              checksums[filename] = digest
+          tilelang = [name for name in checksums if name.startswith("tilelang-")]
+          tvm_ffi = [name for name in checksums if name.startswith("apache_tvm_ffi-")]
+          if len(tilelang) != 1 or len(tvm_ffi) != 1:
+              raise SystemExit(
+                  f"candidate manifest expected one TileLang/tvm-ffi pair: "
+                  f"tilelang={tilelang!r} tvm_ffi={tvm_ffi!r}"
+              )
+          manifest = {
+              "schema_version": 1,
+              "candidate": {
+                  "cppmega_ref": os.environ["GITHUB_REF_NAME"],
+                  "cppmega_sha": os.environ["CANDIDATE_CPPMEGA_SHA"],
+                  "tilelang_sha": os.environ["CANDIDATE_TILELANG_SHA"],
+                  "tvm_sha": os.environ["CANDIDATE_TVM_SHA"],
+                  "tvm_ffi_sha": os.environ["CANDIDATE_TVM_FFI_SHA"],
+              },
+              "base_release": {
+                  "tag": os.environ["BASE_WHEEL_TAG"],
+                  "source_sha": os.environ["BASE_SOURCE_SHA"],
+              },
+              "github_run": {
+                  "id": os.environ["GITHUB_RUN_ID"],
+                  "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                  "url": (
+                      f"{os.environ['GITHUB_SERVER_URL']}/"
+                      f"{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                      f"{os.environ['GITHUB_RUN_ID']}"
+                  ),
+              },
+              "candidate_wheels": {
+                  tilelang[0]: checksums[tilelang[0]],
+                  tvm_ffi[0]: checksums[tvm_ffi[0]],
+              },
+              "complete_wheel_set": checksums,
+          }
+          (wheel_dir / "CANDIDATE_MANIFEST.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+          python -m json.tool wheels/CANDIDATE_MANIFEST.json >/dev/null
+          sha256sum wheels/CANDIDATE_MANIFEST.json
 
       - name: Create / update Release
         env:
@@ -756,8 +779,8 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" \
               --target "${{ github.sha }}" \
-              --title "cppmega wheels ${{ needs.resolve.outputs.tag }}" \
-              --notes "Auto-built by build-wheels.yml from commit ${{ github.sha }}." \
+              --title "cppmega TileLang candidate wheels ${{ needs.resolve.outputs.tag }}" \
+              --notes "Candidate-only complete wheel set: immutable production wheels from dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39 overlaid with TileLang 3dff66efd068369a859646f259910cac5a508236 and its matched tvm-ffi. Do not promote before H200 stage2+GQA and exact 3/3 Mamba gates." \
               --prerelease
           read -r tag_type tag_sha < <(
             gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \
@@ -767,4 +790,8 @@ jobs:
             echo "::error::wheel release tag $TAG is not bound to ${{ github.sha }}"
             exit 1
           fi
-          gh release upload "$TAG" wheels/*.whl wheels/SHA256SUMS --clobber
+          gh release upload "$TAG" \
+            wheels/*.whl \
+            wheels/SHA256SUMS \
+            wheels/CANDIDATE_MANIFEST.json \
+            --clobber
