@@ -15,12 +15,13 @@ and executable SASS from the previously tested revisions were byte-identical
 across TileLang `3dff66ef`, `6c338795`, and the native Bind-role state,
 excluding the Bind-role change as the runtime cause. The current exact
 candidate `dafd3d9b2d2425a3c1298011b906b0127466ae31` retains that fix and
-adds fail-closed planning that requires the copy-write and dependent RMW
-regions to be provably identical; a partial-copy/full-RMW overlap remains
-rejected. It is not covered by the historical SASS comparison and therefore
-remains gated on a rebuilt immutable release and the ordered H200 run. The
-Stage2 validator and focused tests fail closed if either backward kernel
-re-enables TMA lowering or warp specialization.
+adds fail-closed planning that requires the dependent RMW read and write
+regions to be provably identical and the copy-write region to provably cover
+the full RMW region; a partial-copy/full-RMW overlap remains rejected. It is
+not covered by the historical SASS comparison and therefore remains gated on
+a rebuilt immutable release and the ordered H200 run. The Stage2 validator and
+focused tests fail closed if either backward kernel re-enables TMA lowering or
+warp specialization.
 
 The immutable candidate image now includes and applies the exact Stage2 patch
 during its Docker build. The ordered H200 release gate never overlays
