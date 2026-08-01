@@ -1,5 +1,6 @@
 import multiprocessing
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -420,6 +421,19 @@ def test_checkpoint_backward_recomputes_with_the_originating_documents():
         torch.testing.assert_close(hidden.grad.flatten(), expected)
     finally:
         structure_dataset_patch._set_current_structure_batch(None)
+
+
+def test_varlen_design_doc_is_referenced_from_map_sequence_source():
+    """The ponytail path must reference the varlen design decision."""
+    source = Path(
+        "cppmega/megatron/document_isolation.py"
+    ).read_text(encoding="utf-8")
+    assert "docs/document_isolation_varlen_design.md" in source
+    design = Path("docs/document_isolation_varlen_design.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## 5. Decision and next steps" in design
+    assert "cu_seqlens" in design
 
 
 def test_mamba_cp_signature_guard_accepts_pinned_api():

@@ -203,8 +203,9 @@ def map_sequence_by_document(
             "multi-document state isolation does not support sequence-sharded hidden states"
         )
 
-    # ponytail: batch padded document segments for exact state resets; switch to
-    # the TileLang varlen kernel once cppmega's custom autograd supports cu_seqlens.
+    # ponytail: batch padded document segments for exact state resets. A true
+    # varlen path is documented in docs/document_isolation_varlen_design.md;
+    # it is deferred until a cppmega custom autograd kernel accepts cu_seqlens.
     segments = [
         hidden_states[start:end, batch_index]
         for batch_index, spans in enumerate(row_spans)
