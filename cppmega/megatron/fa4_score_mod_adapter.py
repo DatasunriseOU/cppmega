@@ -1369,10 +1369,12 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 "CppMegaFA4ScoreModAttention is causal-only (POC constraint)"
             )
         from cppmega.megatron.document_isolation import (
+            _require_packed_attention_cp1,
             _normalize_window_size,
             _window_size_from_config,
         )
 
+        _require_packed_attention_cp1(config, backend="FA4")
         self.config = config
         self.layer_number = layer_number
         self.num_attention_heads = num_attention_heads
@@ -1502,18 +1504,12 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 "materialization."
             )
 
-        # Sequence parallel / context parallel guard.
+        # Sequence parallel guard. Context parallelism is rejected at init.
         if self.config is not None:
             if getattr(self.config, "sequence_parallel", False):
                 raise RuntimeError(
                     "FA4 chunk-native score_mod does not support "
                     "sequence_parallel"
-                )
-            if int(getattr(self.config, "context_parallel_size", 1)) != 1:
-                raise RuntimeError(
-                    "FA4 chunk-native score_mod does not yet support "
-                    "context_parallel_size > 1; see "
-                    "docs/document_isolation_cp128k_design.md"
                 )
 
         self._log_first_use()

@@ -720,6 +720,15 @@ def _window_size_from_config(
     return _normalize_window_size(window_size)
 
 
+def _require_packed_attention_cp1(config: Any, *, backend: str) -> None:
+    """Reject packed attention until its document-aware CP path is implemented."""
+    if int(getattr(config, "context_parallel_size", 1)) != 1:
+        raise NotImplementedError(
+            f"packed-document {backend} attention does not yet support context "
+            "parallelism; see docs/document_isolation_cp128k_design.md"
+        )
+
+
 def _document_attention_mask(
     ids: torch.Tensor,
     *,
@@ -805,11 +814,7 @@ def _patch_te_attention() -> None:
             raise RuntimeError(
                 "document_ids isolation cannot be combined with upstream packed_seq_params"
             )
-        if int(getattr(self.config, "context_parallel_size", 1)) != 1:
-            raise NotImplementedError(
-                "packed-document TE attention does not yet support context "
-                "parallelism; see docs/document_isolation_cp128k_design.md"
-            )
+        _require_packed_attention_cp1(getattr(self, "config", None), backend="TE")
 
         attention_bias = bound.arguments["attention_bias"]
         if attention_bias is None:
@@ -916,11 +921,7 @@ def _patch_torch_attention() -> None:
             return installed(*bound.args, **bound.kwargs)
         if ids is None:
             raise RuntimeError("validated document layout did not return document_ids")
-        if int(getattr(self.config, "context_parallel_size", 1)) != 1:
-            raise NotImplementedError(
-                "packed-document torch attention does not yet support context "
-                "parallelism; see docs/document_isolation_cp128k_design.md"
-            )
+        _require_packed_attention_cp1(getattr(self, "config", None), backend="torch")
         window_size = _window_size_from_config(
             getattr(self, "config", None),
             layer_number=getattr(self, "layer_number", None),
@@ -961,11 +962,7 @@ def _patch_dsa_attention() -> None:
             raise RuntimeError("validated document layout did not return document_ids")
         if bound.arguments["packed_seq_params"] is not None:
             raise RuntimeError("DSA document isolation owns packed boundaries")
-        if int(getattr(self.config, "context_parallel_size", 1)) != 1:
-            raise NotImplementedError(
-                "packed-document DSA attention does not yet support context "
-                "parallelism; see docs/document_isolation_cp128k_design.md"
-            )
+        _require_packed_attention_cp1(getattr(self, "config", None), backend="DSA")
         backend = dsa_mod.unfused_dsa_fn
         if not getattr(backend, "__cppmega_document_isolation__", False):
             raise RuntimeError(
@@ -1290,6 +1287,8 @@ def apply_document_isolation_patch() -> bool:
       - `docs/document_isolation_varlen_design.md` — varlen/cu_seqlens path.
       - `docs/document_isolation_swa_design.md` — sliding-window `window_size`
         plumbing for packed-document attention.
+      - `docs/document_isolation_cp128k_design.md` — open CP implementation
+        contract and H200 parity gates.
     """
 
     _assert_mamba_cp_signatures()

@@ -1311,16 +1311,13 @@ class TestFA4WindowSizePlumbing:
             context_parallel_size = 2
             attention_dropout = 0.0
 
-        attn = CppMegaFA4ScoreModAttention(
-            config=FakeConfig(),
-            num_attention_heads=4,
-            head_dim=32,
-            causal=True,
-        )
-        S, B, H, D = 8, 1, 4, 32
-        q = torch.randn(S, B, H, D)
-        with pytest.raises(RuntimeError, match="document_isolation_cp128k"):
-            attn.forward(q, q, q)
+        with pytest.raises(NotImplementedError, match="document_isolation_cp128k"):
+            CppMegaFA4ScoreModAttention(
+                config=FakeConfig(),
+                num_attention_heads=4,
+                head_dim=32,
+                causal=True,
+            )
 
 
 # ---------------------------------------------------------------------------
