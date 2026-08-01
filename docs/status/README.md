@@ -37,6 +37,7 @@ Use one of these labels in new docs and in index rows:
 | Upstream bugs | [../upstream_bugs.md](../upstream_bugs.md) | Known upstream issues and local workarounds. |
 | Data preparation | [../data_preparation.md](../data_preparation.md) | Dataset/tokenizer pipeline. |
 | Training-data inventory | [training_data_inventory.md](training_data_inventory.md) | Live token counts, versions, sidecars, Parquet paths, eligibility, and changelog. |
+| Data release checklist | [../data_release_checklist.md](../data_release_checklist.md) | Reproducible gate commands for the five inventory blockers. |
 | Long-context roadmap | [../long_context_roadmap.md](../long_context_roadmap.md) | Context-length thresholds and deferred work. |
 | Document isolation — varlen design | [../document_isolation_varlen_design.md](../document_isolation_varlen_design.md) | cu_seqlens vs mask path trade-offs. |
 | Document isolation — SWA | [../document_isolation_swa_design.md](../document_isolation_swa_design.md) | `window_size` plumbing for packed documents. |
