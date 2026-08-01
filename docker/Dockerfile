@@ -84,7 +84,25 @@ RUN set -eu; \
     python -m pip install -e . --no-build-isolation --no-deps
 
 # --- cppmega itself (source of cppmega.megatron.* runtime patches) ----------
+ARG CPPMEGA_SOURCE_SHA
+ARG CPPMEGA_SOURCE_TREE
+ARG CPPMEGA_SOURCE_MANIFEST_SHA256
+ARG CPPMEGA_SOURCE_MANIFEST_FILE_COUNT
 COPY . /opt/cppmega
+RUN set -eu; \
+    printf '%s' "${CPPMEGA_SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; \
+    printf '%s' "${CPPMEGA_SOURCE_TREE}" | grep -Eq '^[0-9a-f]{40}$'; \
+    printf '%s' "${CPPMEGA_SOURCE_MANIFEST_SHA256}" | grep -Eq '^[0-9a-f]{64}$'; \
+    printf '%s' "${CPPMEGA_SOURCE_MANIFEST_FILE_COUNT}" | grep -Eq '^[1-9][0-9]*$'; \
+    printf '{"cppmega_sha":"%s","source_tree":"%s","source_manifest_sha256":"%s","source_manifest_file_count":%s}\n' \
+      "${CPPMEGA_SOURCE_SHA}" \
+      "${CPPMEGA_SOURCE_TREE}" \
+      "${CPPMEGA_SOURCE_MANIFEST_SHA256}" \
+      "${CPPMEGA_SOURCE_MANIFEST_FILE_COUNT}" \
+      > /opt/cppmega-image-source.json
+LABEL org.opencontainers.image.revision="${CPPMEGA_SOURCE_SHA}" \
+      io.cppmega.source-tree="${CPPMEGA_SOURCE_TREE}" \
+      io.cppmega.source-manifest-sha256="${CPPMEGA_SOURCE_MANIFEST_SHA256}"
 RUN python -m pip install -e /opt/cppmega --no-build-isolation --no-deps
 
 # Apply the repository-bound Mamba3 Stage2 safety patch while building the

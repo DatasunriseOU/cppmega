@@ -1,7 +1,4 @@
 .git
-.github
-docs/sessions
-docs/status
 **/__pycache__
 **/*.pyc
 **/.pytest_cache
@@ -10,6 +7,7 @@ docs/status
 *.egg-info
 build/
 dist/
+outputs/
 !wheels/
 !docker/
 .venv
@@ -18,7 +16,3 @@ venv
 .vscode
 *.log
 *.bak
-upstream_prs/examples/*
-!upstream_prs/examples/13_tilelang_floormod_dbz/
-upstream_prs/examples/13_tilelang_floormod_dbz/*
-!upstream_prs/examples/13_tilelang_floormod_dbz/mamba3_bwd_stage2_force_nontma.patch
