@@ -359,14 +359,16 @@ def test_step_timeout_kills_process_group(tmp_path: Path) -> None:
 
 
 def test_sanitized_environment_disables_user_site_and_unsafe_path(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("PYTHONNOUSERSITE", "0")
-    monkeypatch.setenv("PYTHONSAFEPATH", "0")
-    monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted")
-
-    environment = ci._sanitized_environment(tmp_path)
+    environment = ci._sanitized_environment(
+        tmp_path,
+        base_environment={
+            "PYTHONNOUSERSITE": "0",
+            "PYTHONSAFEPATH": "0",
+            "PYTHONPATH": "/tmp/untrusted",
+        },
+    )
 
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert environment["PYTHONSAFEPATH"] == "1"
@@ -965,12 +967,7 @@ _MODAL_TOKEN_ID = "ak-unitTEST0123456789abcdef"
 _MODAL_TOKEN_SECRET = "as-unitTEST0123456789abcdef"
 
 
-def test_step_logs_redact_project_token_formats(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("NEBIUS_API_KEY", _NEBIUS_API_KEY)
-    monkeypatch.setenv("MODAL_TOKEN_ID", _MODAL_TOKEN_ID)
-    monkeypatch.setenv("MODAL_TOKEN_SECRET", _MODAL_TOKEN_SECRET)
+def test_step_logs_redact_project_token_formats(tmp_path: Path) -> None:
     code = (
         f"print('pat={_GITHUB_CLASSIC_PAT}'); "
         f"print('fine={_GITHUB_FINE_GRAINED_PAT}'); "
@@ -983,6 +980,11 @@ def test_step_logs_redact_project_token_formats(
         cwd=tmp_path,
         log_path=tmp_path / "redaction.log",
         timeout_seconds=5,
+        environment_overrides={
+            "NEBIUS_API_KEY": _NEBIUS_API_KEY,
+            "MODAL_TOKEN_ID": _MODAL_TOKEN_ID,
+            "MODAL_TOKEN_SECRET": _MODAL_TOKEN_SECRET,
+        },
     )
     log = (tmp_path / "redaction.log").read_text(encoding="utf-8")
 
@@ -1001,10 +1003,8 @@ def test_step_logs_redact_project_token_formats(
 
 
 def test_run_early_failure_receipt_redacts_project_token_formats(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("NEBIUS_API_KEY", _NEBIUS_API_KEY)
-    monkeypatch.setenv("MODAL_TOKEN_SECRET", _MODAL_TOKEN_SECRET)
     receipt_base = tmp_path / "receipts"
     args = argparse.Namespace(
         command="run",
@@ -1015,7 +1015,7 @@ def test_run_early_failure_receipt_redacts_project_token_formats(
     )
     failure = RuntimeError(
         f"auth failed for {_GITHUB_CLASSIC_PAT} and {_GITHUB_FINE_GRAINED_PAT}; "
-        f"token={_NEBIUS_API_KEY}; modal {_MODAL_TOKEN_SECRET}"
+        f"token={_NEBIUS_API_KEY}; secret={_MODAL_TOKEN_SECRET}"
     )
 
     ci._write_early_failure_receipt(args, failure)

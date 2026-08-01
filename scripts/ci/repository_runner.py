@@ -23,7 +23,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -494,11 +494,12 @@ def provenance_unchanged(
 
 
 class _Redactor:
-    def __init__(self) -> None:
+    def __init__(self, environment: Mapping[str, str] | None = None) -> None:
+        source_environment = os.environ if environment is None else environment
         self._known_values = sorted(
             {
                 value
-                for name, value in os.environ.items()
+                for name, value in source_environment.items()
                 if _SECRET_ENV_NAME.search(name) and len(value) >= 8
             },
             key=len,
@@ -529,10 +530,16 @@ class _Redactor:
 def _sanitized_environment(
     repo_root: Path,
     *,
+    base_environment: Mapping[str, str] | None = None,
     environment_overrides: dict[str, str | None] | None = None,
 ) -> dict[str, str]:
+    source_environment = (
+        os.environ if base_environment is None else base_environment
+    )
     environment = {
-        key: value for key, value in os.environ.items() if key in _PASSTHROUGH_ENV
+        key: value
+        for key, value in source_environment.items()
+        if key in _PASSTHROUGH_ENV
     }
     environment.update(
         {
@@ -605,9 +612,14 @@ def run_step(
         raise RepositoryCIError(f"step {name!r} has no time remaining")
     if not command:
         raise RepositoryCIError(f"step {name!r} has no command")
-    redactor = _Redactor()
+    environment = _sanitized_environment(
+        cwd, environment_overrides=environment_overrides
+    )
+    redactor = _Redactor(environment)
     shown = tuple(display_command or command)
-    rendered = _Redactor().text(shlex.join(str(part) for part in shown))
+    rendered = _Redactor(environment).text(
+        shlex.join(str(part) for part in shown)
+    )
     print(f"[repository-ci] start {name}: {rendered}", flush=True)
     started_at = _utc_now()
     started = time.monotonic()
@@ -618,9 +630,7 @@ def run_step(
         process = subprocess.Popen(
             tuple(str(part) for part in command),
             cwd=cwd,
-            env=_sanitized_environment(
-                cwd, environment_overrides=environment_overrides
-            ),
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -662,7 +672,7 @@ def run_step(
             print(f"[repository-ci] {name} log tail:\n{tail}", file=sys.stderr)
     return {
         "name": name,
-        "command": [_Redactor().text(str(part)) for part in shown],
+        "command": [_Redactor(environment).text(str(part)) for part in shown],
         "status": status,
         "exit_code": exit_code,
         "timed_out": timed_out,
