@@ -267,12 +267,17 @@ P3 — стратегическое/отложенное.
   - Exact self-hosted run `30704454462` на `3ad84ca4` завершил обе lanes
     успешно; наведённое live-падение preamble ещё не выполнялось.
 
-## [P017] Job summary с receipt.json при падении lane
+## [P017] Job summary с receipt.json при падении lane — PARTIAL
 - Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P016
-- **Где:** `.github/workflows/ci-self-hosted.yml`.
-- **Что делать:** шаг `if: failure()`: cat receipt.json в `$GITHUB_STEP_SUMMARY`.
-- **Проверка:** наведённое падение → в Summary виден JSON причины без скачивания
-  artifact.
+- **Где:** `.github/workflows/ci-self-hosted.yml:82-97` (macOS) и `:152-167` (Linux).
+- **Что сделано:** добавлены шаги `Surface macOS/Linux lane failure receipt in job summary`
+  с `if: failure()`, которые пишут `receipt.json` в `$GITHUB_STEP_SUMMARY`.
+- **Что осталось:** выполнить наведённое падение и сохранить ссылку на run,
+  где JSON действительно виден в GitHub Summary. Зелёный run этот failure-path
+  не доказывает.
+- **Проверка:**
+  - `grep -n "Surface.*lane failure receipt" .github/workflows/ci-self-hosted.yml` → 2 строки.
+  - Live failure receipt/summary — ещё нет.
 
 ## [P018] Свежие CI-диагностики: outputs/ci_diagnostics устарели — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: chore | Зависит от: —
@@ -321,23 +326,28 @@ P3 — стратегическое/отложенное.
     `1317 passed, 4 skipped`; Linux portable
     `946 passed, 18 skipped`.
 
-## [P021] CUDA-покрытие isolation-тестов в linux-cuda lane
+## [P021] CUDA-покрытие isolation-тестов в linux-cuda lane — PARTIAL
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P020
-- **Где:** `configs/ci/lanes.json`, lane `linux-cuda` (сейчас только
-  `test_m2rnn_pararnn_tiled_cuda.py` и `test_noconv_f2_gpu.py`).
-- **Что делать:** добавить NCCL-кейсы `test_document_isolation_cp.py`
-  (2 GPU) и GPU-тесты FA4 — либо в `linux-cuda`, либо в новый H200 lane.
-- **Проверка:** CI run на CUDA-runner показывает эти тесты не skipped.
+- **Где:** `configs/ci/lanes.json`, lane `linux-cuda` (`commands.cuda-contracts.argv`).
+- **Что сделано:** в lane `linux-cuda` добавлены `tests/test_document_isolation_cp.py`
+  (NCCL / 2-GPU кейсы) и `tests/test_fa4_h200_parity.py` (GPU FA4 parity).
+- **Что осталось:** live CUDA-runner receipt, доказывающий, что оба файла
+  выполнялись на GPU и не были skipped. Наличие argv в конфиге этого не
+  доказывает.
+- **Проверка:**
+  - `grep -n "test_document_isolation_cp\|test_fa4_h200_parity" configs/ci/lanes.json` → строки в `linux-cuda`.
+  - CUDA-runner receipt — ещё нет.
 
-## [P022] Policy-тест verify-шага: убрать хрупкий string-count
+## [P022] Policy-тест verify-шага: убрать хрупкий string-count — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P073
-  (`test_workflow_runner_policy.py` в активном фронте)
-- **Где:** `tests/test_workflow_runner_policy.py`
-  (`workflow.count('"elif H % G == 0:"') == 2`).
-- **Что делать:** заменить подсчёт строк на структурную проверку (regex по
-  секции verify-шага или парсинг YAML).
-- **Проверка:** тест зелёный; переформатирование workflow без смены смысла
-  не ломает тест.
+- **Где:** `tests/test_workflow_runner_policy.py:349-364`
+  (`test_mamba_wheel_build_applies_the_pinned_gqa_backward_patch`).
+- **Что сделано:** вместо хрупкого `workflow.count(...)` используется парсинг
+  verify-шага через `re.search` и проверка маркеров `mamba3_mimo_bwd.py` /
+  `mamba3_mimo_bwd_varlen.py` в теле шага.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega && .venv/bin/python -m pytest tests/test_workflow_runner_policy.py::test_mamba_wheel_build_applies_the_pinned_gqa_backward_patch -q` → 1 passed.
+  - Переформатирование YAML в verify-шаге без смены смысла не ломает тест.
 
 ## [P023] Failure-receipt: секреты-редакция под тестом на реальных паттернах — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P015
@@ -373,17 +383,29 @@ P3 — стратегическое/отложенное.
 Живые артефакты: `mlx/outputs/training_data_status/current.json` + `changelog.jsonl`
 (watcher `scripts/report_training_data_status.py` уже бежит).
 
-## [P025] DirectXTK case-fold double-count (-453k токенов)
+## [P025] DirectXTK case-fold double-count (-453k токенов) — DONE
 - Репо: mlx | Приоритет: P1 | Тип: bug | Зависит от: —
-- **Где:** `cppmega_mlx/data/` (source routing/receipts; receipt завышает на
-  453,368 токенов и 215 строк из-за коллизии `DirectXTK::code`/`directxtk::code`,
-  см. `docs/status/training_data_inventory.md:75-77`).
-- **Что делать:** найти место, где source-unit ключуется по пути/имени домена;
-  ввести case-insensitive канонизацию ключа (NFC + casefold) с явным логом
-  слияния. Добавить регрессионный тест на пару путей, различающихся регистром.
-- **Проверка:** новый тест зелёный; пересчитанный receipt для DirectXTK на
-  453,368 токенов и 215 строк меньше прежнего; `pytest tests/ -k "quarantine
-  or routes or publication" -q` зелёный.
+- **Где:** `scripts/streaming_conveyor.py:2819-2889`
+  (`claim_code_project_identity`, `claim_code_repo_for_submission`),
+  `tests/test_streaming_conveyor_progress.py`.
+- **Что сделано:**
+  - Bare-name aliases сначала разрешаются через frozen repo-list в канонический
+    `project_identity`, затем один project может быть принят только один раз;
+    остальные aliases получают явный receipt/event
+    `duplicate_project_identity_skipped`.
+  - В repo-list v14 `DirectXTK` и `directxtk` оба связаны с
+    `microsoft/DirectXTK`. `filesystem_repo_key` намеренно сохраняет раздельные
+    collision-safe пути: casefold имени файла здесь создал бы риск
+    перезаписи commit/code outputs вместо канонической дедупликации.
+  - Кодовый фикс существует с `cppmega.mlx@500932ae`; текущий source conveyor
+    на revision `73372dcc` его содержит.
+- **Что осталось:** P026 — дождаться физического нового receipt и доказать
+  ожидаемое уменьшение на 453,368 токенов / 215 строк. Это не часть code-fix
+  P025 и ещё не завершено.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_streaming_conveyor_progress.py -q` → 59 passed.
+  - `jq -r '.by_bare_name.DirectXTK, .by_bare_name.directxtk' repo_list_v14...`
+    → две одинаковые строки `microsoft/DirectXTK`.
 
 ## [P026] Пересчёт receipt'ов затронутых доменов после P025
 - Репо: mlx | Приоритет: P1 | Тип: task | Зависит от: P025
