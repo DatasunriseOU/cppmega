@@ -118,21 +118,53 @@ jobs:
         run: python -m pip install --disable-pip-version-check pytest numpy pyarrow tokenizers boto3 zstandard
       - name: Run repository-owned Linux lane
         run: |
-          set -euo pipefail
+          set -eEuo pipefail
+          receipt_dir="${RUNNER_TEMP}/cppmega-repository-ci-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          pre_python_step="preamble start"
+          on_pre_python_error() {
+            local exit_code="$?"
+            trap - ERR
+            mkdir -p "${receipt_dir}"
+            printf '{"schema_version": "cppmega.repository-ci.v1", "kind": "lane", "run_id": "%s", "run_attempt": "%s", "lane": "linux-contracts", "status": "failed", "exit_code": %d, "failure_stage": "workflow-preamble", "error": "pre-python preamble failed at step: %s", "steps": []}\n' \
+              "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${exit_code}" "${pre_python_step}" \
+              > "${receipt_dir}/receipt.json"
+            exit "${exit_code}"
+          }
+          trap 'on_pre_python_error' ERR
+          pre_python_step="checkout matches GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          pre_python_step="resolve expected source tree"
           expected_tree="$(git rev-parse HEAD^{tree})"
+          pre_python_step="verify tokenizer contract"
           python "${GITHUB_WORKSPACE}/scripts/data/verify_tokenizer_contract.py" \
             --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
             --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
             --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"
+          trap - ERR
           python scripts/ci/run_repository_ci.py lane \
             --lanes-config "${GITHUB_WORKSPACE}/configs/ci/lanes.json" \
             --lane linux-contracts \
             --repo-root "${GITHUB_WORKSPACE}" \
-            --receipt-dir "${RUNNER_TEMP}/cppmega-repository-ci-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --receipt-dir "${receipt_dir}" \
             --python python \
             --expected-source-commit "${GITHUB_SHA}" \
             --expected-source-tree "${expected_tree}"
+      - name: Surface Linux lane failure receipt in job summary
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/cppmega-repository-ci-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/receipt.json"
+          if [[ -f "${receipt}" ]]; then
+            {
+              echo "### Linux lane failure receipt"
+              echo '```json'
+              cat "${receipt}"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Linux lane failed before a receipt.json was written." >> "${GITHUB_STEP_SUMMARY}"
+          fi
       - name: Upload Linux lane receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -179,6 +179,39 @@ def test_macos_lane_writes_a_pre_python_failure_receipt() -> None:
     assert 'cat "${receipt}"' in summary_body
 
 
+def test_linux_lane_writes_a_pre_python_failure_receipt() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
+        encoding="utf-8"
+    )
+    jobs = {
+        match.group("name"): match.group("body")
+        for match in JOB_BLOCK.finditer(workflow.partition("\njobs:\n")[2])
+    }
+    linux = jobs["linux-portable"]
+
+    assert "set -eEuo pipefail" in linux
+    assert "trap 'on_pre_python_error' ERR" in linux
+    assert '"schema_version": "cppmega.repository-ci.v1"' in linux
+    assert '"failure_stage": "workflow-preamble"' in linux
+    assert 'pre_python_step="checkout matches GITHUB_SHA"' in linux
+    assert 'pre_python_step="verify tokenizer contract"' in linux
+    # the trap is disarmed before the orchestrator writes its own receipts
+    assert linux.rindex("trap - ERR") < linux.index(
+        "scripts/ci/run_repository_ci.py lane"
+    )
+
+    summary_step = re.search(
+        r"(?ms)^      - name: Surface Linux lane failure receipt in job summary\n"
+        r"(?P<body>.*?)(?=^      - name:|\Z)",
+        linux,
+    )
+    assert summary_step is not None
+    summary_body = summary_step.group("body")
+    assert "if: failure()" in summary_body
+    assert "GITHUB_STEP_SUMMARY" in summary_body
+    assert 'cat "${receipt}"' in summary_body
+
+
 def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
         encoding="utf-8"

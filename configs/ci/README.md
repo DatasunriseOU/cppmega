@@ -128,14 +128,15 @@ keep the root cause visible when something fails before the lane finishes:
    config, unexpected exception) is caught by `_write_early_failure_receipt`
    in `scripts/ci/repository_runner.py`, which writes a minimal
    `orchestrator`-stage receipt and exits `2`.
-2. The macOS workflow job wraps its pre-python preamble (interpreter check,
-   checkout identity, tokenizer contract) in a bash `ERR` trap that writes a
-   minimal `workflow-preamble` receipt into the same directory before
-   exiting, so a broken interpreter or checkout no longer surfaces as a bare
-   artifact-upload error (incident: run 30638778832). The trap is disarmed
-   right before the orchestrator runs so it never overwrites lane receipts.
-3. A dedicated `if: failure()` step appends `receipt.json` to
-   `$GITHUB_STEP_SUMMARY`, so the failure reason is readable in the job
+2. The macOS interpreter check and both jobs' shell preambles (checkout
+   identity and tokenizer contract) run under a bash `ERR` trap that writes a
+   minimal `workflow-preamble` receipt into the same directory before exiting.
+   The trap is disarmed right before the orchestrator runs so it never
+   overwrites lane receipts. Linux checkout, `actions/setup-python`, and
+   dependency-install failures occur before that shell block; GitHub surfaces
+   those steps directly and the summary reports that no receipt was written.
+3. Dedicated `if: failure()` steps append `receipt.json` to
+   `$GITHUB_STEP_SUMMARY`, so the failure reason is readable in each job
    summary without downloading the artifact.
 
 ## Adding a test to a lane
