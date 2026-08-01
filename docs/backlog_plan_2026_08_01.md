@@ -1148,14 +1148,21 @@ P3 — стратегическое/отложенное.
 - **Проверка:** либо bench в пределах 2× от torch, либо summary.md с вердиктом
   «closed as dead end» и ссылкой на замену.
 
-## [P091] GHCR-образ: добавить fa3/fa4
+## [P091] GHCR-образ: добавить fa3/fa4 — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073 (образ собирается
   из дерева с beta23-пинами)
 - **Где:** `docker/Dockerfile*`, `artifacts/mamba3_wave32_h200_20step_gate/backend_probe.json`
   (`fa3_usable: false`, `fa4_usable: false`; только flash_attn 2.8.3).
-- **Что делать:** собрать образ с fa3/fa4, probe-шаг в CI/сборке.
-- **Проверка:** backend_probe в новом образе: `fa3_usable: true`,
-  `fa4_usable: true`.
+- **Что сделано:** образ `ghcr.io/datasunriseou/cppmega:459a574` (build-image
+  run 30718915774 из wheel release `wheels-459a5741` с `flash_attn_3-3.0.0`)
+  проверен на Modal H200:2 (`backend_preflight_20260801T223952Z`):
+  `fa3_usable: true` (flash_attn_interface + flash_attn_3 3.0.0),
+  `fa4_usable: true` (flash_attn.cute.interface, flash-attn-4 4.0.0b23),
+  policy hopper/FA3 production_usable: true. Эвристика probe обновлена под
+  namespace `flash_attn.cute` (FA4 из flash-attn-4 PyPI), а image_ref в
+  receipt передаётся через `CPPMEGA_GHCR_REF` (cppmega@688386dd).
+- **Проверка:** `artifacts/mamba3_wave32_h200_20step_gate/backend_preflight_20260801T223952Z/backend_probe.json`:
+  `fa3_usable: true`, `fa4_usable: true`, `image_ref: ghcr.io/datasunriseou/cppmega:459a574`.
 
 ## [P092] wave32 20-step gate: перепрогон
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P091
