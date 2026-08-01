@@ -91,6 +91,9 @@ def _image() -> modal.Image:
             {
                 "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
                 "TILELANG_EXECUTION_BACKEND": "cython",
+                # Remote module re-import sees no GHCR_TAG; carry the locally
+                # selected ref so receipts name the image that actually ran.
+                "CPPMEGA_GHCR_REF": GHCR_REF,
             }
         )
         .add_local_dir(str(_REPO_ROOT / "cppmega"), remote_path="/opt/cppmega/cppmega")
@@ -371,6 +374,10 @@ def _backend_probe() -> dict[str, Any]:
     flash_attn_pkg_interface = _module_probe("flash_attn.flash_attn_interface")
     flash_attn_3 = _module_probe("flash_attn_3")
     flash_attn_4 = _module_probe("flash_attn_4")
+    # FA4 from the flash-attn-4 PyPI distribution lives in the flash_attn.cute
+    # namespace (see docker/Dockerfile smoke import), not in a flash_attn_4
+    # module; probe it explicitly.
+    flash_attn_cute = _module_probe("flash_attn.cute.interface")
 
     # FA3's Hopper beta installs a top-level flash_attn_interface module.
     fa3_usable = bool(
@@ -395,6 +402,11 @@ def _backend_probe() -> dict[str, Any]:
         (fa4_source and pathlib.Path(fa4_source).exists())
         or fa4_paths
         or (flash_attn_4.get("installed") and not flash_attn_4.get("error"))
+        or (
+            flash_attn_cute.get("installed")
+            and not flash_attn_cute.get("error")
+            and flash_attn_cute.get("has_flash_attn_func")
+        )
     )
     probe: dict[str, Any] = {
         "device_count": device_count,
@@ -413,6 +425,7 @@ def _backend_probe() -> dict[str, Any]:
         "flash_attn_package_interface_module": flash_attn_pkg_interface,
         "flash_attn_3_module": flash_attn_3,
         "flash_attn_4_module": flash_attn_4,
+        "flash_attn_cute_module": flash_attn_cute,
         "fa3_usable": fa3_usable,
         "fa4_usable": fa4_usable,
         "fa4_source_root": fa4_source,
@@ -1093,7 +1106,7 @@ def backend_preflight(run_id: str = "") -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "run_id": run_id,
-        "image_ref": GHCR_REF,
+        "image_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
         "gpu_spec": GPU_SPEC,
         "backend_probe": _backend_probe(),
     }
@@ -1134,7 +1147,7 @@ def preflight(run_id: str = "") -> dict[str, Any]:
     grouped_head_final_rollback = _grouped_head_applier("rollback", env)
     result = {
         "run_id": run_id,
-        "image_ref": GHCR_REF,
+        "image_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
         "gpu_spec": GPU_SPEC,
         "backend_probe": _backend_probe(),
         "device_count": torch.cuda.device_count(),
@@ -1192,7 +1205,7 @@ def gate(
     if case.get("production_throughput") and not backend_probe.get("policy", {}).get("production_usable"):
         result: dict[str, Any] = {
             "run_id": run_id,
-            "image_ref": GHCR_REF,
+            "image_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
             "gpu_spec": GPU_SPEC,
             "requested_train_iters": train_iters,
             "case_label": case_label,
@@ -1223,7 +1236,7 @@ def gate(
 
     result: dict[str, Any] = {
         "run_id": run_id,
-        "image_ref": GHCR_REF,
+        "image_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
         "gpu_spec": GPU_SPEC,
         "requested_train_iters": train_iters,
         "dataset": dataset,
@@ -1338,7 +1351,7 @@ def debug_sweep(
 
     result: dict[str, Any] = {
         "run_id": run_id,
-        "image_ref": GHCR_REF,
+        "image_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
         "gpu_spec": GPU_SPEC,
         "requested_train_iters": train_iters,
         "dataset": dataset,
