@@ -1203,11 +1203,12 @@ def test_macro_registry_compacts_shared_definitions_without_losing_root_views(
         encoding="utf-8",
     )
     roots = []
-    for stem in ("alpha", "beta"):
+    for index, stem in enumerate(("alpha", "beta")):
         root = tmp_path / f"{stem}.cpp"
         root.write_text(
-            '#include "shared.h"\n'
-            f"int {stem}() {{ return VALUE; }}\n",
+            ("// beta prefix one\n// beta prefix two\n" if index else "")
+            + '#include "shared.h"\n'
+            + f"int {stem}() {{ return VALUE; }}\n",
             encoding="utf-8",
         )
         roots.append(str(root))
@@ -1220,14 +1221,20 @@ def test_macro_registry_compacts_shared_definitions_without_losing_root_views(
         project_id="fixture/shared-macro-views",
         macro_usage_texts_by_file={
             "alpha.cpp": [("VALUE", 2)],
-            "beta.cpp": [("VALUE", 2)],
+            "beta.cpp": [("VALUE", 4)],
         },
         max_retained_macros=2,
     )
 
+    assert stats["registered_macros"] == 4
     assert stats["canonical_macro_definitions"] == 2
     assert stats["macro_visibility_records"] == 4
     assert stats["compacted_macro_occurrences"] == 2
+    assert 0 < stats["macro_visibility_bytes"]
+    assert (
+        stats["macro_visibility_bytes"]
+        <= stats["macro_visibility_byte_limit"]
+    )
     assert len(index.macro_definitions) == 2
 
     alpha = index_project._select_visible_macro(
@@ -1240,13 +1247,15 @@ def test_macro_registry_compacts_shared_definitions_without_losing_root_views(
         index,
         "VALUE",
         target_file="beta.cpp",
-        max_line=2,
+        max_line=4,
     )
     assert alpha is not None
     assert beta is not None
     assert alpha.text == beta.text == "#undef VALUE\n#define VALUE 2\n"
     assert alpha.visible_in_file == "alpha.cpp"
     assert beta.visible_in_file == "beta.cpp"
+    assert alpha.visible_line == 1
+    assert beta.visible_line == 3
     assert alpha.sequence == 1
     assert beta.sequence == 3
     assert alpha.previous is not None
@@ -1260,9 +1269,9 @@ def test_macro_registry_compacts_shared_definitions_without_losing_root_views(
         (macro.visible_in_file, macro.sequence)
         for macro in index_project._used_macro_defs(
             index,
-            [("return VALUE;", 2)],
+            [("return VALUE;", 4)],
             target_file="beta.cpp",
-            max_line=2,
+            max_line=4,
         )
     ] == [("beta.cpp", 2), ("beta.cpp", 3)]
 
@@ -1300,6 +1309,33 @@ def test_macro_registry_bound_counts_distinct_source_definitions(
                 "two.cpp": [("VALUE", 2)],
             },
             max_retained_macros=1,
+        )
+
+
+def test_macro_registry_visibility_byte_bound_fails_loud(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    root = tmp_path / "root.cpp"
+    root.write_text(
+        "#define VALUE 1\n"
+        "int root() { return VALUE; }\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        MemoryError,
+        match=r"root visibility byte bound: .*limit=1",
+    ):
+        index_project.register_header_macros(
+            index_project.ProjectIndex(),
+            [str(root)],
+            project_dir=str(tmp_path),
+            project_id="fixture/macro-visibility-byte-bound",
+            macro_usage_texts_by_file={"root.cpp": [("VALUE", 2)]},
+            max_retained_macros=2,
+            max_macro_visibility_bytes=1,
         )
 
 

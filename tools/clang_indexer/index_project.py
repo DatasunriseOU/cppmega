@@ -2068,6 +2068,23 @@ class _MacroVisibilityRecord:
         self.previous = previous
 
 
+# Preserve the old registry's fail-closed memory envelope in bytes rather than
+# silently turning its 250k MacroDef cap into an unbounded number of root views.
+# This is the measured shallow allocation of one first retained MacroDef slot:
+# object + three owned lists + occurrence tuple/set + name-history list +
+# macro/name dictionaries. String/symbol payloads are deliberately omitted, so
+# the process-wide RSS guard below remains the authoritative total-memory cap.
+_LEGACY_MACRO_OCCURRENCE_KEY_FIXTURE = (None,) * 5
+LEGACY_MACRO_RETAINED_SHALLOW_BYTES = (
+    sys.getsizeof(MacroDef.__new__(MacroDef))
+    + 3 * sys.getsizeof([])
+    + sys.getsizeof(_LEGACY_MACRO_OCCURRENCE_KEY_FIXTURE)
+    + sys.getsizeof({_LEGACY_MACRO_OCCURRENCE_KEY_FIXTURE})
+    + sys.getsizeof([None])
+    + 2 * sys.getsizeof({"macro": None})
+)
+
+
 def _macro_definition_key(macro: MacroDef) -> tuple[object, ...]:
     """Identity of source definition content, excluding root visibility."""
 
@@ -2121,6 +2138,7 @@ class ProjectIndex:
             dict[str, list[_MacroVisibilityRecord]],
         ] = {}
         self.macro_visibility_record_count = 0
+        self.macro_visibility_bytes = 0
         self.symbol_id_registry = SymbolIdentityRegistry()
         self.symbol_id_keys = self.symbol_id_registry.keys_by_id
 
@@ -2182,7 +2200,7 @@ class ProjectIndex:
         self,
         target_file: str,
         macros: Sequence[MacroDef],
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """Compact one root's retained macros into canonical defs + views."""
 
         if target_file in self.macro_visibility_by_file:
@@ -2192,6 +2210,7 @@ class ProjectIndex:
         environment: dict[str, list[_MacroVisibilityRecord]] = defaultdict(list)
         records_by_occurrence: dict[int, _MacroVisibilityRecord] = {}
         canonical_before = len(self.macro_definitions)
+        top_level_bytes_before = sys.getsizeof(self.macro_visibility_by_file)
         visibility_count = 0
         for macro in sorted(macros, key=lambda item: item.sequence):
             definition_key = _macro_definition_key(macro)
@@ -2231,9 +2250,30 @@ class ProjectIndex:
             environment[macro.name].append(record)
             visibility_count += 1
 
-        self.macro_visibility_by_file[target_file] = dict(environment)
+        stored_environment = dict(environment)
+        environment_bytes = (
+            sys.getsizeof(stored_environment)
+            + sys.getsizeof(target_file)
+            + sum(
+                sys.getsizeof(name)
+                + sys.getsizeof(records)
+                + sum(sys.getsizeof(record) for record in records)
+                for name, records in stored_environment.items()
+            )
+        )
+        self.macro_visibility_by_file[target_file] = stored_environment
+        environment_bytes += max(
+            0,
+            sys.getsizeof(self.macro_visibility_by_file)
+            - top_level_bytes_before,
+        )
         self.macro_visibility_record_count += visibility_count
-        return len(self.macro_definitions) - canonical_before, visibility_count
+        self.macro_visibility_bytes += environment_bytes
+        return (
+            len(self.macro_definitions) - canonical_before,
+            visibility_count,
+            environment_bytes,
+        )
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
@@ -8359,6 +8399,7 @@ def register_header_macros(
     resolve_cache_entries: int | None = None,
     max_macro_candidates_per_root: int | None = None,
     max_retained_macros: int | None = None,
+    max_macro_visibility_bytes: int | None = None,
 ) -> dict[str, int]:
     stable_project_id = require_project_identity(
         project_id,
@@ -8401,6 +8442,20 @@ def register_header_macros(
         if max_retained_macros is None
         else int(max_retained_macros)
     )
+    if max_macro_visibility_bytes is None:
+        configured_visibility_bytes = os.environ.get(
+            "CPPMEGA_MAX_MACRO_VISIBILITY_BYTES"
+        )
+        max_macro_visibility_bytes = (
+            int(configured_visibility_bytes)
+            if configured_visibility_bytes is not None
+            else (
+                max_retained_macros
+                * LEGACY_MACRO_RETAINED_SHALLOW_BYTES
+            )
+        )
+    else:
+        max_macro_visibility_bytes = int(max_macro_visibility_bytes)
     if max_include_depth < 0:
         raise ValueError(f"max_include_depth must be >= 0, got {max_include_depth}")
     if max_include_files_per_root < 0:
@@ -8424,6 +8479,12 @@ def register_header_macros(
         raise ValueError(
             f"max_retained_macros must be > 0, got {max_retained_macros}"
         )
+    if max_macro_visibility_bytes <= 0:
+        raise ValueError(
+            "max_macro_visibility_bytes must be > 0, got "
+            f"{max_macro_visibility_bytes}"
+        )
+    stats["macro_visibility_byte_limit"] = max_macro_visibility_bytes
 
     def _check_memory() -> None:
         if memory_limit_gb is not None and memory_limit_gb > 0:
@@ -8608,7 +8669,9 @@ def register_header_macros(
                 "  Macro scan heartbeat: "
                 f"roots={stats['roots']} scanned_files={stats['scanned_files']} "
                 f"discovered={stats['discovered_macro_occurrences']} "
-                f"retained={stats['registered_macros']} "
+                f"retained_views={stats['retained_macro_occurrences']} "
+                f"canonical={stats['canonical_macro_definitions']} "
+                f"visibility_bytes={index.macro_visibility_bytes} "
                 f"resolve_cache_hits={stats['include_resolve_cache_hits']}",
                 file=sys.stderr,
                 flush=True,
@@ -9047,11 +9110,12 @@ def register_header_macros(
                 "Raise CPPMEGA_MAX_RETAINED_MACROS only after inspecting macro "
                 "retention telemetry."
             )
-        registered, visibility_count = index.add_macro_environment(
+        registered, visibility_count, visibility_bytes = index.add_macro_environment(
             root_rel,
             retained,
         )
-        stats["registered_macros"] += registered
+        stats["registered_macros"] += visibility_count
+        stats["registered_canonical_macros"] += registered
         stats["retained_macro_occurrences"] += visibility_count
         stats["compacted_macro_occurrences"] += (
             visibility_count - registered
@@ -9062,6 +9126,21 @@ def register_header_macros(
         stats["canonical_macro_definitions"] = len(
             index.macro_definitions
         )
+        stats["macro_visibility_bytes"] = index.macro_visibility_bytes
+        stats["last_root_macro_visibility_bytes"] = visibility_bytes
+        if index.macro_visibility_bytes > max_macro_visibility_bytes:
+            raise MemoryError(
+                "macro scan exceeded the root visibility byte bound: "
+                f"root={root_rel} "
+                f"visibility_records={index.macro_visibility_record_count} "
+                f"visibility_bytes={index.macro_visibility_bytes} "
+                f"limit={max_macro_visibility_bytes}. "
+                "The default preserves the prior MacroDef registry's measured "
+                "minimum shallow-memory envelope; raise "
+                "CPPMEGA_MAX_MACRO_VISIBILITY_BYTES only with retained-view "
+                "telemetry."
+            )
+        _check_memory()
 
     seen_roots: set[str] = set()
     for path in header_files:
@@ -9886,7 +9965,10 @@ def build_training_documents(
             f"resolve_cache_hits={macro_stats.get('include_resolve_cache_hits', 0)} "
             f"discovered={macro_stats.get('discovered_macro_occurrences', 0)} "
             f"materialized_peak={macro_stats.get('peak_root_macro_candidates', 0)} "
-            f"retained={macro_stats.get('registered_macros', 0)} "
+            f"retained_views={macro_stats.get('retained_macro_occurrences', 0)} "
+            f"canonical={macro_stats.get('canonical_macro_definitions', 0)} "
+            f"visibility_bytes={macro_stats.get('macro_visibility_bytes', 0)} "
+            f"visibility_byte_limit={macro_stats.get('macro_visibility_byte_limit', 0)} "
             f"pruned={macro_stats.get('pruned_macro_occurrences', 0)} "
             f"directive_cache_peak={macro_stats.get('directive_cache_peak_entries', 0)} "
             f"resolve_cache_peak={macro_stats.get('resolve_cache_peak_entries', 0)} "
