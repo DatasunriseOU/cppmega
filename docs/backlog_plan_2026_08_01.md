@@ -53,28 +53,35 @@ P3 — стратегическое/отложенное.
   убедиться, что `cppmega.mlx/.venv` по-прежнему резолвится в `.venvs/cppmega.mlx`
   (`readlink cppmega.mlx/.venv`), а не в music-jax-mps.
 
-## [P002] Верификация wheel-сборки после починки packaging-бага
+## [P002] Верификация wheel-сборки после починки packaging-бага — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: —
-- **Где:** `cppmega/pyproject.toml:31-33`, новые `cppmega/features/{mhc,mod,structure}/__init__.py`.
-- **Что делать:** собрать wheel (`cd /Volumes/external/sources/cppmega && .venv/bin/python -m build`
-  или `uv build`), распаковать, проверить наличие `cppmega/features/mhc/`,
-  `mod/`, `structure/` внутри. Установить wheel во временный venv и импортировать
-  `cppmega.recipes.nam56r_megatron` и `cppmega.megatron.custom_embedding`.
-- **Проверка:** `unzip -l dist/*.whl | grep -c "features/\(mhc\|mod\|structure\)/"`
-  ≥ 6; импорты во временном venv без `ModuleNotFoundError`. Заодно убедиться,
-  что `SOURCES.txt`/`PKG-INFO` перегенерированы без `dsa_sparse_absorbed.py`
-  и `mamba3_te_out_proj.py`.
+- **Где:** `cppmega/pyproject.toml:31-33`, новые
+  `cppmega/features/{mhc,mod,structure}/__init__.py`.
+- **Что сделано:** packaging fix `include = ["cppmega", "cppmega.*"]` оставлен;
+  локально собран и изолированно проверен wheel
+  `cppmega-0.1.0-py3-none-any.whl`
+  (`sha256:2f0895a921d7fd015ff3daa344c5440c83e1ef8288e42c2f9c4df02dc5a9824d`);
+  внутри присутствуют `cppmega/features/{mhc,mod,structure}/` (7 файлов).
+  Deprecated-модули сохранены: верификация packaging не требует удаления
+  runtime-кода.
+- **Проверка:**
+  - `PYTHONPATH= .venv/bin/python3 -m build --wheel --no-isolation`
+  - `unzip -l dist/*.whl | grep -c "features/\(mhc\|mod\|structure\)/"` → 7
+  - wheel распакован во временный каталог; оба импорта
+    `cppmega.recipes.nam56r_megatron` и
+    `cppmega.megatron.custom_embedding` разрешились именно из распакованного
+    wheel, не из source tree.
 
 ## [P003] Почистить исторические ссылки на удалённые модули
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: P002
 - **Где:** `README.md:460`, `docs/changelog.md:938`,
   `docs/dsa_ep2_tilelang_sweep_2026_04_12.md`,
   `docs/nam56r_mtp_optimization_plan_2026_04_11_ru.md`, `reports/review_20260713/`.
-- **Что делать:** рядом с каждым упоминанием `dsa_sparse_absorbed` /
-  `mamba3_te_out_proj` добавить пометку «(removed 2026-08-01, see git history)»;
-  тексты не переписывать.
-- **Проверка:** `rg -n "dsa_sparse_absorbed|mamba3_te_out_proj" README.md docs reports`
-  — все совпадения имеют пометку; `rg` по `cppmega/ scripts/ tests/ tools/` — пусто.
+- **Что делать:** не менять, пока runtime-модули сохранены. Исторические ссылки
+  остаются корректными; cleanup нужен только после отдельного доказанного
+  решения об удалении.
+- **Проверка:** оба файла существуют и остаются покрыты текущими тестами/import
+  checks; исторические docs не заявляют ложное удаление.
 
 ## [P004] Логирование вместо молчаливого except: hybrid_schedule_plan.py — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
@@ -599,19 +606,21 @@ P3 — стратегическое/отложенное.
 - **Проверка:** два receipt с совпадающей конфигурацией; числовой diff
   зафиксирован (входит в P095).
 
-## [P059] Wave-Next 4: checkpoint sharding для больших моделей — DONE
+## [P059] Wave-Next 4: checkpoint sharding для больших моделей — WIP ISOLATED
 - Репо: mlx | Приоритет: P3 | Тип: feature | Зависит от: —
 - **Где:** `cppmega_mlx/training/checkpoint.py`, `tests/test_checkpoint.py`.
-- **Что сделано:** шардирование safetensors-чекпоинтов реализовано и влито в
-  `cppmega.mlx@647b8036`. `save_checkpoint` принимает `max_file_size_gb` и
-  разбивает веса модели на `model-XXXXX-of-YYYYY.safetensors` с
-  `model.safetensors.index.json` (`weight_map`); оптимизатор и
-  gradient-accumulator сохраняются в отдельных нешардированных файлах.
-  `load_checkpoint` читает индекс и собирает тензоры обратно. Покрыто тестами
-  roundtrip, очисткой stale-файлов и метаданными.
+- **Что сделано:** точный прототип сохранён и pushed в
+  `wip/checkpoint-sharding-20260801@647b8036`; из `main` удалён обратимым
+  `cppmega.mlx@64d47925`.
+- **Почему не DONE:** переключение sharded↔single не транзакционно, shard index
+  принимает небезопасные относительные пути, а очистка может удалить index
+  раньше stale-shard’ов. Нужны fail-closed проверки и проверка отказа записи,
+  прежде чем менять production checkpoint format.
 - **Проверка:**
-  - `cd /Volumes/external/sources/cppmega.mlx && source ../.venvs/cppmega.mlx/bin/activate && python3 -m pytest tests/test_checkpoint.py -q` → 90 passed.
-  - Commit: `cppmega.mlx@647b8036` (`wip/checkpoint-sharding-20260801` → main ff-merge).
+  - Прототип: `pytest tests/test_checkpoint.py -q` → 90 passed, но перечисленные
+    trust-boundary/data-loss сценарии тестами не закрыты.
+  - Canonical `main`: tree после revert совпадает с проверенным
+    `cppmega.mlx@cdbdacd4`.
 
 ## [P060] Полный mlx suite baseline (~7900 тестов)
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: P052
