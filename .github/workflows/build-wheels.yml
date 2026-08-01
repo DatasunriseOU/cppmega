@@ -666,18 +666,26 @@ jobs:
           if len(wheels) != 1:
               raise SystemExit(f"expected one Mamba wheel, found {wheels!r}")
           required = {
-              "mamba_ssm/modules/mamba3.py": (
-                  "F.softplus((dd_dt + self.dt_bias).to(torch.float32))"
-              ),
-              "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py": "elif H % G == 0:",
-              "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py": "elif H % G == 0:",
+              "mamba_ssm/modules/mamba3.py": [
+                  "_A = -F.softplus(dd_A.to(torch.float32))",
+                  "DT = F.softplus((dd_dt + self.dt_bias).to(torch.float32)) # (B, L, N) -- fp32 for TileLang kernel",
+                  "_A = -F.softplus(A_proj.to(torch.float32))",
+                  "DT = F.softplus((dd_dt + self.dt_bias).to(torch.float32))  # fp32 for TileLang kernel",
+              ],
+              "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py": [
+                  "elif H % G == 0:",
+              ],
+              "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py": [
+                  "elif H % G == 0:",
+              ],
           }
           with zipfile.ZipFile(wheels[0]) as archive:
-              for path, marker in required.items():
+              for path, markers in required.items():
                   wheel_bytes = archive.read(path)
                   text = wheel_bytes.decode()
-                  if marker not in text:
-                      raise SystemExit(f"{path} lacks pinned marker {marker!r}")
+                  for marker in markers:
+                      if marker not in text:
+                          raise SystemExit(f"{path} lacks pinned marker {marker!r}")
                   source_bytes = (Path("src") / path).read_bytes()
                   if wheel_bytes != source_bytes:
                       raise SystemExit(
