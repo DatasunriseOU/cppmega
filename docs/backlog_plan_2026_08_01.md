@@ -43,15 +43,17 @@ P3 — стратегическое/отложенное.
 
 # Фаза A. cppmega — код и гигиена, без железа (P001–P014)
 
-## [P001] Восстановить окружение nanochat после инцидента uv sync
+## [P001] Восстановить окружение nanochat после инцидента uv sync — DONE
 - Репо: external | Приоритет: P1 | Тип: chore | Зависит от: —
-- **Где:** `/Volumes/external/sources/nanochat` (окружение `.venvs/music-jax-mps`
-  было пересинкано под чужой uv.lock 2026-07-31, удалены jax и ~46 пакетов).
-- **Что делать:** `cd /Volumes/external/sources/nanochat && uv sync`.
+- **Где:** `/Volumes/external/sources/nanochat/pyproject.toml`, `uv.lock`,
+  `.venvs/music-jax-mps`.
+- **Что сделано:** `jax[cpu]>=0.4.30` возвращён в зависимости nanochat,
+  `uv.lock` пересобран (`uv sync`).
   Конфликта с cppmega/cppmega.mlx больше нет — они переключены на выделенный venv.
-- **Проверка:** `/Volumes/external/sources/.venvs/music-jax-mps/bin/python -c "import jax; print(jax.__version__)"`;
-  убедиться, что `cppmega.mlx/.venv` по-прежнему резолвится в `.venvs/cppmega.mlx`
-  (`readlink cppmega.mlx/.venv`), а не в music-jax-mps.
+- **Проверка:**
+  - `/Volumes/external/sources/.venvs/music-jax-mps/bin/python -c "import jax; print(jax.__version__)"` → `0.11.0`.
+  - `readlink cppmega.mlx/.venv` → `../.venvs/cppmega.mlx`.
+  - nanochat commit `42803d87` запушен в `origin/main`.
 
 ## [P002] Верификация wheel-сборки после починки packaging-бага — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: —
