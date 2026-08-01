@@ -20,7 +20,7 @@ from cppmega.megatron.release_gate_integrity import (
 
 _ROOT = Path(__file__).resolve().parents[1]
 _HARNESS = _ROOT / "scripts/modal_mamba3_tilelang_role_release_gate.py"
-_CANDIDATE_TILELANG_SHA = "a951e3c8a4e2e1092579939d6bc31631ee1a4d8f"
+_CANDIDATE_TILELANG_SHA = "dafd3d9b2d2425a3c1298011b906b0127466ae31"
 
 
 def _record_hash(payload: bytes) -> str:
