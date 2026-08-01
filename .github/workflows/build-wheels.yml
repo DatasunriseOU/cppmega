@@ -82,7 +82,7 @@ jobs:
             # Candidate-only override. Do not copy to STACK.lock before H200
             # stage2+GQA and the exact three Mamba tests pass.
             repo: DatasunriseOU/tilelang
-            ref: 546e9f5fdd6e31dc034c41f3d6df3d4cc021955f
+            ref: 6c338795c92d26eb931e3a626911093f22c0fd49
             submodules: "true"
             extra_env: ""
 
@@ -714,7 +714,7 @@ jobs:
           BASE_WHEEL_TAG: wheels-dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
           BASE_SOURCE_SHA: dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
           CANDIDATE_CPPMEGA_SHA: ${{ github.sha }}
-          CANDIDATE_TILELANG_SHA: 546e9f5fdd6e31dc034c41f3d6df3d4cc021955f
+          CANDIDATE_TILELANG_SHA: 6c338795c92d26eb931e3a626911093f22c0fd49
           CANDIDATE_TVM_SHA: e25ca6ae50beee0e907b1e5ed32949879caddde1
           CANDIDATE_TVM_FFI_SHA: 521efeb30bfd9e4946b248b3d76e6391028233a3
         run: |
@@ -780,7 +780,7 @@ jobs:
             gh release create "$TAG" \
               --target "${{ github.sha }}" \
               --title "cppmega TileLang candidate wheels ${{ needs.resolve.outputs.tag }}" \
-              --notes "Candidate-only complete wheel set: immutable production wheels from dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39 overlaid with TileLang 546e9f5fdd6e31dc034c41f3d6df3d4cc021955f and its matched tvm-ffi. Do not promote before H200 stage2+GQA and exact 3/3 Mamba gates." \
+              --notes "Candidate-only complete wheel set: immutable production wheels from dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39 overlaid with TileLang 6c338795c92d26eb931e3a626911093f22c0fd49 and its matched tvm-ffi. Do not promote before H200 stage2+GQA and exact 3/3 Mamba gates." \
               --prerelease
           read -r tag_type tag_sha < <(
             gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \
