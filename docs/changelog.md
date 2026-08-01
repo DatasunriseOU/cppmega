@@ -1,5 +1,36 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-01: Source-conveyor terminal failure closure
+
+Classified all 42 terminal source-conveyor failures: 34 deterministic defects
+(10 C/C++ NUL fixtures, 5 typed-domain NUL fixtures, 7 fixed-bucket
+overflows, 7 translation-unit parse failures, 3 encoding fixtures, 1
+domain-edge token gap, and 1 macro-registry cap) plus 8 resource/scheduling
+failures (4 timeouts, 2 `BrokenProcessPool` exits, 1 memory guard, and 1 exit
+137). Deterministic fixes preserve colliding archive paths, byte-oriented
+fixtures, and language modes; quarantine only SHA-bound proven non-source
+archives/crash fixtures; and compact shared macro definitions while retaining
+independent root-local visibility under a separate byte gate.
+
+The exact full Zephyr archive replay passed: 13,243/13,243 files, 64,146
+functions, 8,785 macro roots, 277,064 visibility views / 65,396 canonical
+definitions, 227,550 JSONL documents, full JSON-object validation, and both
+dedup SQLite integrity checks. The durable replay receipt is
+`/Volumes/external/cppmega_data/receipts/source-conveyor-terminal-failures-20260801/replay_receipt.json`
+(SHA256
+`9990f824399b721df6db57e0fc483b587013a4bbe284f609b41bd2422b18b7f2`);
+the 6,045,108,177-byte temporary JSONL was verified at SHA256
+`3e554490ad9058286701031afda7ce394800f5ebfd213d4cdd6ffaf11e42e685`
+and then removed with its reconstructible `/tmp` replay trees.
+
+Added a repo-native fail-closed supervisor with dynamic 501-repository
+inventory coverage, SHA/stat/revision/input revalidation, serial 16 GiB
+resource defaults, immutable same-input resume, isolated signal handling, and
+atomic bounded completion receipts. It adds no hardcoded corpus cap, source
+cache, or `jq` dependency. Verification after the whole 13-commit branch was
+merged into `main`: 237 focused cppmega tests and 35 MLX sibling regressions
+passed; the independent review also passed.
+
 ## 2026-08-01: Final dbfe runtime image receipts
 
 The final wheel release is bound to source
