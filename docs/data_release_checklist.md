@@ -1,159 +1,122 @@
 # Data Release Checklist
 
-Reproducible status gate for the live training-data release. Each item maps to
-one of the five blockers listed in
-[`docs/status/training_data_inventory.md`](status/training_data_inventory.md).
+This checklist evaluates the canonical live ledger. It never infers readiness
+from directory names or adds overlapping datasets.
 
-Run the commands in order; any non-green result means the release is **not**
-ready.
-
-## 1. DirectXTK case-fold collision is resolved
-
-**Blocker:** live source receipt double-counts `DirectXTK::code` /
-`directxtk::code` (453,368 valid tokens / 215 rows).
+Set the paths once:
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python scripts/report_training_data_status.py \
-  --config configs/training_data_status.json --jobs 4
-.venv/bin/python - <<'PY'
-import json
-d = json.load(open('outputs/training_data_status/current.json'))
-assert d.get('casefold_collisions') == [], d['casefold_collisions']
-print('casefold_collisions: ok')
-PY
+CPPMEGA_REPO=/Volumes/external/sources/cppmega
+CPPMEGA_STATUS=/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.json
 ```
 
-**Pass criterion:** `casefold_collisions` is empty and the live source valid
- token count matches the physical Parquet sum.
-
-## 2. Source conveyor has no unhandled failed units
-
-**Blocker:** source conveyor is incomplete and still has failed units.
+The LaunchAgent refreshes the ledger every five minutes. To force one atomic
+refresh:
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python - <<'PY'
-import json
-d = json.load(open('outputs/training_data_status/current.json'))
-failed = d['datasets']['live_source'].get('failed_units', [])
-assert failed == [], f"failed_units: {len(failed)}"
-print('live_source failed_units: 0')
-PY
+/Volumes/external/sources/.venvs/cppmega.source/bin/python \
+  "$CPPMEGA_REPO/scripts/report_training_data_status.py" \
+  --config "$CPPMEGA_REPO/configs/training_data_status.json" \
+  --jobs 4
 ```
 
-**Pass criterion:** `failed_units` is empty, or every remaining unit has a
-quarantine receipt with a reason.
+Every command below must exit zero. A non-zero result means that the release is
+not ready.
 
-## 3. Python auxiliary documents are separated from the primary stream
-
-**Blocker:** Python auxiliary documents share physical packed rows with the
-C/C++/SQL/build/test primary stream.
+## 1. Physical source Parquet matches its receipt
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python - <<'PY'
-import json
-d = json.load(open('outputs/training_data_status/current.json'))
-blockers = d['datasets']['live_source'].get('blockers', [])
-assert "Python auxiliary documents are still mixed into main rows" not in blockers
-print('python auxiliary stream: ok')
-PY
+jq -e '
+  (.freshness.stale == []) and
+  (.datasets.live_source.casefold_collisions == []) and
+  ([.datasets.live_source.receipt_minus_physical[]] | all(. == 0))
+' "$CPPMEGA_STATUS"
 ```
 
-**Pass criterion:** the mixed-row blocker is gone from `live_source.blockers`.
+This catches stale inputs, case-fold collisions, and any row/token difference
+between the conveyor receipt and the published Parquet files.
 
-## 4. PR/MR store is materialized to eligible Parquet
-
-**Blocker:** PR store verified but primary five-bucket materialization was
-cancelled before producing eligible Parquet.
+## 2. Source conveyor is terminal
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python - <<'PY'
-import json
-d = json.load(open('outputs/training_data_status/current.json'))
-pr = d['datasets'].get('pr_mr', {})
-eligible = pr.get('eligible', False)
-print(f'pr_mr eligible: {eligible}')
-assert eligible, "PR/MR dataset is not eligible"
-PY
+jq -e '
+  (.datasets.live_source.conveyor.failed == 0) and
+  (.datasets.live_source.conveyor.not_terminal == 0)
+' "$CPPMEGA_STATUS"
 ```
 
-**Pass criterion:** `datasets.pr_mr.eligible` is `true` and the configured
-Parquet path exists.
-
-## 5. CI acquisition, dedup, and five-bucket export are complete
-
-**Blocker:** CI acquisition is non-exhaustive; canonical union/global dedup,
-primary-scope routing, five-bucket ZSTD Parquet export, and audit have not
-completed.
+## 3. Auxiliary languages are physically isolated
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python - <<'PY'
-import json
-d = json.load(open('outputs/training_data_status/current.json'))
-ci = d['datasets'].get('ci', {})
-blockers = ci.get('blockers', [])
-assert blockers == [], f"ci blockers: {blockers}"
-assert ci.get('eligible') is True, "CI dataset is not eligible"
-print('ci dataset: ok')
-PY
+jq -e '
+  .datasets.live_source.strict_primary_is_separate_parquet == true
+' "$CPPMEGA_STATUS"
 ```
 
-**Pass criterion:** `datasets.ci.blockers` is empty and `datasets.ci.eligible`
-is `true`.
+The primary C/C++/SQL/build/test stream must not share physical rows with the
+Python auxiliary stream.
 
-## 6. Sealed bundle v2 is pinned (final gate)
-
-**Blocker:** live source Parquet is unsealed; no reproducible sealed bundle v2
-exists.
+## 4. PR/MR data is materialized
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python - <<'PY'
-import json
-d = json.load(open('outputs/training_data_status/current.json'))
-sealed = d['datasets'].get('sealed_megatron', {})
-assert sealed.get('eligible') is True, sealed
-print(f'sealed bundle: {sealed.get("manifest")}')
-PY
+jq -e '
+  (.datasets.pr_mr.release_ready == true) and
+  (.datasets.pr_mr.training_readable == true) and
+  (.datasets.pr_mr.blockers == []) and
+  (.datasets.pr_mr.eligible_parquet.files > 0)
+' "$CPPMEGA_STATUS"
 ```
 
-**Pass criterion:** `datasets.sealed_megatron.eligible` is `true` and the
-manifest path points to a valid `.bin/.idx` bundle audited for sidecar
-contract.
-
-## Quick combined command
+## 5. CI data is globally deduplicated and exported
 
 ```bash
-cd /Volumes/external/sources/cppmega.mlx
-.venv/bin/python scripts/report_training_data_status.py \
-  --config configs/training_data_status.json --jobs 4 && \
-.venv/bin/python - <<'PY'
-import json, sys
-d = json.load(open('outputs/training_data_status/current.json'))
-errors = []
-if d.get('casefold_collisions'):
-    errors.append(f"casefold_collisions: {d['casefold_collisions']}")
-ls = d['datasets']['live_source']
-if ls.get('failed_units'):
-    errors.append(f"live_source failed_units: {len(ls['failed_units'])}")
-if "Python auxiliary documents are still mixed into main rows" in ls.get('blockers', []):
-    errors.append("python aux still mixed")
-pr = d['datasets'].get('pr_mr', {})
-if not pr.get('eligible'):
-    errors.append(f"pr_mr not eligible: {pr.get('blockers')}")
-ci = d['datasets'].get('ci', {})
-if ci.get('blockers') or not ci.get('eligible'):
-    errors.append(f"ci not ready: {ci.get('blockers')}")
-sealed = d['datasets'].get('sealed_megatron', {})
-if not sealed.get('eligible'):
-    errors.append(f"sealed bundle not ready")
-if errors:
-    print('\n'.join(errors))
-    sys.exit(1)
-print('release-ready checks passed')
-PY
+jq -e '
+  (.datasets.ci.release_ready == true) and
+  (.datasets.ci.training_readable == true) and
+  (.datasets.ci.blockers == []) and
+  (.datasets.ci.token_accounting.ready_trained_tokens > 0)
+' "$CPPMEGA_STATUS"
 ```
+
+Store-local CAS token counters are not accepted by this gate.
+
+## Final sealed-bundle gate
+
+```bash
+jq -e '
+  (.datasets.sealed_megatron.release_ready == true) and
+  (.datasets.sealed_megatron.training_readable == true) and
+  (.datasets.sealed_megatron.blockers == [])
+' "$CPPMEGA_STATUS"
+CPPMEGA_MANIFEST=$(jq -er '.datasets.sealed_megatron.manifest' "$CPPMEGA_STATUS")
+test -s "$CPPMEGA_MANIFEST"
+```
+
+## Combined gate
+
+```bash
+jq -e '
+  (.freshness.stale == []) and
+  (.datasets.live_source.casefold_collisions == []) and
+  ([.datasets.live_source.receipt_minus_physical[]] | all(. == 0)) and
+  (.datasets.live_source.conveyor.failed == 0) and
+  (.datasets.live_source.conveyor.not_terminal == 0) and
+  (.datasets.live_source.strict_primary_is_separate_parquet == true) and
+  (.datasets.pr_mr.release_ready == true) and
+  (.datasets.pr_mr.training_readable == true) and
+  (.datasets.pr_mr.blockers == []) and
+  (.datasets.pr_mr.eligible_parquet.files > 0) and
+  (.datasets.ci.release_ready == true) and
+  (.datasets.ci.training_readable == true) and
+  (.datasets.ci.blockers == []) and
+  (.datasets.ci.token_accounting.ready_trained_tokens > 0) and
+  (.datasets.sealed_megatron.release_ready == true) and
+  (.datasets.sealed_megatron.training_readable == true) and
+  (.datasets.sealed_megatron.blockers == [])
+' "$CPPMEGA_STATUS"
+CPPMEGA_MANIFEST=$(jq -er '.datasets.sealed_megatron.manifest' "$CPPMEGA_STATUS")
+test -s "$CPPMEGA_MANIFEST"
+```
+
+At the time this checklist was introduced, gates 1-5 correctly failed and the
+existing sealed-bundle gate passed. Re-run the commands for current truth.

@@ -2,6 +2,8 @@
 
 Status: canonical
 
+Release gate: [data release checklist](../data_release_checklist.md)
+
 Live artifact:
 `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.json`
 
