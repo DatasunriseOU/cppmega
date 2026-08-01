@@ -1,3 +1,4 @@
+import ast
 import base64
 import hashlib
 import zipfile
@@ -302,3 +303,26 @@ def test_release_gate_keeps_ordered_read_only_h200_contract():
     assert 'receipt["gpu_health_before_test"]' in harness
     assert "isinstance(exc, subprocess.TimeoutExpired)" in harness
     assert ".add_local_file(\n            str(_LOCAL_STAGE2_PATCH)" not in harness
+
+
+def test_release_gate_remote_hydration_never_assembles_local_image():
+    tree = ast.parse(_HARNESS.read_text())
+    run_release_gate = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_release_gate"
+    )
+    function_decorator = next(
+        decorator
+        for decorator in run_release_gate.decorator_list
+        if isinstance(decorator, ast.Call)
+        and ast.unparse(decorator.func) == "app.function"
+    )
+    image_keyword = next(
+        keyword for keyword in function_decorator.keywords if keyword.arg == "image"
+    )
+
+    assert ast.unparse(image_keyword.value) == (
+        "_image() if modal.is_local() else modal.Image.debian_slim()"
+    )

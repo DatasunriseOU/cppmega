@@ -477,7 +477,7 @@ results = modal.Volume.from_name("cppmega-test-results", create_if_missing=True)
 
 
 @app.function(
-    image=_image(),
+    image=_image() if modal.is_local() else modal.Image.debian_slim(),
     gpu=_GPU_SPEC,
     timeout=3600,
     volumes={"/results": results},
