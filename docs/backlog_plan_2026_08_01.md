@@ -76,42 +76,47 @@ P3 — стратегическое/отложенное.
 - **Проверка:** `rg -n "dsa_sparse_absorbed|mamba3_te_out_proj" README.md docs reports`
   — все совпадения имеют пометку; `rg` по `cppmega/ scripts/ tests/ tools/` — пусто.
 
-## [P004] Логирование вместо молчаливого except: hybrid_schedule_plan.py
+## [P004] Логирование вместо молчаливого except: hybrid_schedule_plan.py — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `cppmega/megatron/hybrid_schedule_plan.py:~644`.
-- **Что делать:** как в `moe_dispatcher_patch.py` (образец уже в tree):
-  модульный `log = logging.getLogger(__name__)`, `log.warning/debug(..., exc_info=True)`,
-  поведение не менять.
+- **Где:** `cppmega/megatron/hybrid_schedule_plan.py:647`.
+- **Что сделано:** единственный `except Exception` уже логируется через
+  `log.warning(..., exc_info=True)`; поведение не изменено.
 - **Проверка:** `rg -n "except Exception" cppmega/megatron/hybrid_schedule_plan.py`
-  — у каждого есть log; прогнать `pytest tests/ -k hybrid_schedule -q`.
+  — у handler есть log; `pytest tests/ -k hybrid_schedule -q`.
 
-## [P005] Логирование вместо молчаливого except: memory_debug.py
+## [P005] Логирование вместо молчаливого except: memory_debug.py — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `cppmega/megatron/memory_debug.py:42,203,228,297`.
-- **Что делать:** то же, что P004; уровень debug (диагностический модуль).
+- **Где:** `cppmega/megatron/memory_debug.py:45,49,208,233,304,305`.
+- **Что сделано:** все `except Exception`/`except Exception as e` уже логируются
+  (`log.debug(..., exc_info=True)` или `print` + `traceback.print_exc()`);
+  поведение не изменено.
 - **Проверка:** `pytest tests/ -k memory_debug -q`; ручной вызов с
   `logging.basicConfig(level=DEBUG)` — сообщения видны.
 
-## [P006] Логирование вместо молчаливого except: grouped_mxfp8_gemm.py
+## [P006] Логирование вместо молчаливого except: grouped_mxfp8_gemm.py — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `cppmega/megatron/grouped_mxfp8_gemm.py:~594`.
-- **Что делать:** то же, что P004.
+- **Где:** `cppmega/megatron/grouped_mxfp8_gemm.py:597,600,639`.
+- **Что сделано:** `except Exception` в reshape-пути уже логируется через
+  `log.debug(..., exc_info=True)`; build-failure handler сохраняет ошибку и
+  re-raise; поведение не изменено.
 - **Проверка:** `pytest tests/test_grouped_mxfp8_direct_routing.py -q`.
 
-## [P007] Логирование вместо молчаливого except: mxfp8_sidecar_refs.py
+## [P007] Логирование вместо молчаливого except: mxfp8_sidecar_refs.py — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `cppmega/megatron/mxfp8_sidecar_refs.py:30-34`.
-- **Что делать:** то же, что P004.
+- **Где:** `cppmega/megatron/mxfp8_sidecar_refs.py:34,38`.
+- **Что сделано:** оба `except Exception` в очистке sidecar-ссылок уже
+  логируются через `log.debug(..., exc_info=True)`; поведение не изменено.
 - **Проверка:** `pytest tests/test_mxfp8_sidecar_lifecycle.py -q`.
 
-## [P008] Логирование в upstream_patches/apply_*.py (цепочки return False)
+## [P008] Логирование в upstream_patches/apply_*.py (цепочки return False) — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `cppmega/megatron/upstream_patches/apply_*.py` — серия молчаливых
-  `return False` при неприменимости патча.
-- **Что делать:** при явно запрошенном патче (env-флаг/force) — `log.warning`
-  с причиной; при авто-детекте — `log.debug`. Поведение не менять.
-- **Проверка:** `pytest tests/ -k upstream_patch -q`; grep — ни одного
-  «голого» `return False` в ветке явного запроса.
+- **Где:** `cppmega/megatron/upstream_patches/apply_mamba3_mimo_p1_patches.py:398`.
+- **Что сделано:** последний «глухой» `except OSError: pass` заменён на
+  `log.debug(..., exc_info=True)` при чтении lockfile в ожидании sentinel;
+  остальные `except` в apply_* уже логировались. Поведение не изменено.
+- **Проверка:** `pytest tests/test_mamba3_mimo_p1_patches.py -q` → 3 passed;
+  `rg -n "except.*:\\s*pass" cppmega/megatron/upstream_patches/apply_*.py` —
+  пусто.
 
 ## [P009] Deprecation-заголовок для mamba3_author_spec.py
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: — (НЕ трогать

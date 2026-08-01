@@ -396,7 +396,11 @@ def apply_all() -> None:
                     finally:
                         fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
-                pass
+                log.debug(
+                    "mamba3_p1 lockfile read failed for %s; retrying",
+                    lock_path,
+                    exc_info=True,
+                )
         time.sleep(0.1)
     raise RuntimeError(
         f"[mamba3_p1] local_rank={local_rank}: timed out waiting 120s for "
