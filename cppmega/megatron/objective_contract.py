@@ -1002,7 +1002,7 @@ def load_objective_materialization_artifact(
         raise ValueError("objective_contract.file_sha256 does not match")
     with contract_path.open(encoding="utf-8") as handle:
         contract_raw = json.load(handle)
-    contract = validate_objective_contract(
+    contract = validate_production_objective_contract(
         _mapping(contract_raw, where="objective contract")
     )
     if contract_ref.get("sha256") != contract.sha256:

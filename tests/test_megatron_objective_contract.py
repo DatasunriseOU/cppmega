@@ -215,8 +215,10 @@ def _valid_contract() -> dict[str, object]:
     }
 
 
-def _write_materialization_artifact(tmp_path: Path) -> Path:
-    contract = _valid_contract()
+def _write_materialization_artifact(
+    tmp_path: Path, *, contract: dict[str, object] | None = None
+) -> Path:
+    contract = _valid_contract() if contract is None else contract
     contract_path = tmp_path / "objective_contract.json"
     contract_path.write_text(json.dumps(contract), encoding="utf-8")
     shard = tmp_path / "objectives_00000.parquet"
@@ -445,6 +447,18 @@ def test_objective_materialization_artifact_opens_exact_bound_inputs(
         (tmp_path / "objectives_00000.parquet").resolve(),
     )
     assert artifact.contract.sha256 == artifact.payload["objective_contract"]["sha256"]
+
+
+def test_objective_materialization_artifact_rejects_missing_schedule(
+    tmp_path: Path,
+) -> None:
+    contract = _valid_contract()
+    contract.pop("source_selection")
+
+    with pytest.raises(ValueError, match="canonical.*schedule receipt"):
+        load_objective_materialization_artifact(
+            _write_materialization_artifact(tmp_path, contract=contract)
+        )
 
 
 def test_objective_materialization_artifact_rejects_shard_byte_drift(

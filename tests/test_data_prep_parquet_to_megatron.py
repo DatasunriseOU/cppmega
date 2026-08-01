@@ -134,6 +134,8 @@ def _stamp_v3_identity_table(pa, table, converter):
 
 
 def _objective_contract() -> dict[str, object]:
+    from tests.test_megatron_objective_contract import _source_selection_receipt
+
     tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
     return {
         "schema": OBJECTIVE_CONTRACT_SCHEMA,
@@ -196,6 +198,7 @@ def _objective_contract() -> dict[str, object]:
             "document_id_column": "doc_ids",
             "source_document_id_column": "token_source_doc_ids",
         },
+        "source_selection": _source_selection_receipt(),
     }
 
 
