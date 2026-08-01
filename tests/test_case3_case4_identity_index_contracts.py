@@ -16,7 +16,31 @@ from tools.clang_indexer import index_project as indexer
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MLX_ROOT = ROOT.parent / "cppmega_mlx_pr_integration_20260718"
+
+
+def _mlx_root() -> Path:
+    configured = os.environ.get("CPPMEGA_MLX_REFERENCE_ROOT")
+    expected_commit = os.environ.get("CPPMEGA_MLX_REFERENCE_COMMIT")
+    if not configured or not expected_commit:
+        pytest.fail(
+            "cross-repository identity checks require explicit "
+            "CPPMEGA_MLX_REFERENCE_ROOT and CPPMEGA_MLX_REFERENCE_COMMIT"
+        )
+    root = Path(configured).expanduser().resolve()
+    if not root.is_dir():
+        pytest.fail(f"MLX reference checkout is unavailable: {root}")
+    actual_commit = subprocess.run(
+        ("git", "-C", str(root), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if actual_commit != expected_commit:
+        pytest.fail(
+            "MLX reference checkout commit mismatch: "
+            f"expected={expected_commit} actual={actual_commit}"
+        )
+    return root
 
 
 def _cursor(path: Path, *, usr: str, displayname: str = "move(int)") -> SimpleNamespace:
@@ -102,16 +126,17 @@ def test_semantic_whitespace_in_conversion_operator_usr_is_preserved(
 
 
 def test_mlx_emits_the_shared_integrity_version() -> None:
+    mlx_root = _mlx_root()
     probe = (
         "from cppmega_mlx.data import prompt_graph_index as m; "
         "from cppmega_mlx.data import prompt_graph_provenance as p; "
         "assert m.INDEX_INTEGRITY_VERSION == p.INDEX_INTEGRITY_VERSION == '1'"
     )
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(MLX_ROOT)
+    env["PYTHONPATH"] = str(mlx_root)
     result = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=MLX_ROOT,
+        cwd=mlx_root,
         env=env,
         text=True,
         capture_output=True,
@@ -510,7 +535,7 @@ def test_root_rejects_foreign_indexer_checkout(
     module: object,
     tmp_path: Path,
 ) -> None:
-    foreign_root = MLX_ROOT
+    foreign_root = _mlx_root()
     with pytest.raises(ValueError, match="same checkout|Cross-checkout"):
         module._load_indexer(foreign_root)
     foreign_link = tmp_path / "foreign-link"

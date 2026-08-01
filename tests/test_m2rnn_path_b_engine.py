@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 from pathlib import Path
 
 import pytest
@@ -108,21 +109,27 @@ def test_wave6_deferral_marker_survives(_m2rnn_source, kernel_block):
 
 
 @pytest.mark.parametrize("mode", _ENGINE_MODES)
-def test_engine_mode_does_not_break_module_import(monkeypatch, mode):
+def test_engine_mode_does_not_break_module_import(_m2rnn_module, mode):
     """Setting CPPMEGA_MLX_TILELANG_ENGINE must not break m2rnn import.
 
     The wave-6 deferral path stays on raw MSL irrespective of mode; we
     just need the module to keep loading and exposing its surface.
     """
 
-    monkeypatch.setenv("CPPMEGA_MLX_TILELANG_ENGINE", mode)
-    mod = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn")
-    importlib.reload(mod)
-    for entry in _PUBLIC_ENTRY_POINTS:
-        assert callable(getattr(mod, entry, None)), (
-            f"entry point {entry} not callable under "
-            f"CPPMEGA_MLX_TILELANG_ENGINE={mode}"
-        )
+    previous = os.environ.get("CPPMEGA_MLX_TILELANG_ENGINE")
+    try:
+        os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = mode
+        mod = importlib.reload(_m2rnn_module)
+        for entry in _PUBLIC_ENTRY_POINTS:
+            assert callable(getattr(mod, entry, None)), (
+                f"entry point {entry} not callable under "
+                f"CPPMEGA_MLX_TILELANG_ENGINE={mode}"
+            )
+    finally:
+        if previous is None:
+            os.environ.pop("CPPMEGA_MLX_TILELANG_ENGINE", None)
+        else:
+            os.environ["CPPMEGA_MLX_TILELANG_ENGINE"] = previous
 
 
 def test_m2rnn_fwd_metal_launches_when_metal_available(_m2rnn_module):
