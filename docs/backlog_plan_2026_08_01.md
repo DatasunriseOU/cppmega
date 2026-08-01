@@ -1046,14 +1046,6 @@ P3 — стратегическое/отложенное.
   - `grep -n "V9 scope decision" cppmega.mlx/VisualBuilderPlan-v9.md` → строка 253.
   - `grep -n "U01\|U02" cppmega.mlx/VisualBuilderPlan-v9.md | head -10` — U01/U02 в
     scope, U03–U10 в deferral-таблице.
-- Репо: mlx | Приоритет: P1 | Тип: task | Зависит от: —
-- **Где:** `VisualBuilderPlan-v9.md` (статус «planned 2026-05-24», 2+ месяца без
-  движения), `vbgui/STYLE.md:161-165`; существующие эпики `cppmega-mlx-zozw` (V9),
-  `cppmega-mlx-a7vl` (U01).
-- **Что делать:** решение: запускать U01/U02 (P2-эпики, самые ценные для
-  оператора) или формально перенести в V10 с явной записью в плане и STYLE.md.
-- **Проверка:** статус в VisualBuilderPlan-v9.md не «planned» а «in progress»
-  (с датой старта) или «deferred to V10» с причиной; bd-эпики соответствуют.
 
 ## [P098] NAM56R full readiness в mlx: оценка разрыва
 - Репо: mlx | Приоритет: P3 | Тип: task | Зависит от: P060
