@@ -220,20 +220,22 @@ P3 — стратегическое/отложенное.
 - **Проверка:** свежие jsonl в `outputs/ci_diagnostics/` с датой прогона;
   `domain-routed-codegen.json` не единственный свежий файл.
 
-## [P019] Контрольная сборка mamba_ssm wheel с verify-шагом — IN PROGRESS
+## [P019] Контрольная сборка mamba_ssm wheel с verify-шагом — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073 (build-wheels.yml
   в активном фронте)
 - **Где:** `.github/workflows/build-wheels.yml` (matrix.patch +
   «Verify Mamba wheel contains the pinned GQA backward patch»).
 - **Что сделано:** verify-шаг расширен до 6 маркеров (`cppmega@45763efa`);
-  workflow `build-wheels` запущен (run ID `30698977374`) и находится в очереди.
-- **Что осталось:** дождаться завершения run, скачать артефакт `wheel-mamba_ssm`,
-  распаковать whl и убедиться, что все 6 маркеры на месте; закрыть шаг.
+  job `91366705130` run `30698977374` собрал `mamba_ssm` и прошёл встроенный
+  verify. Артефакт скачан; все 6 маркеров независимо найдены ровно по одному.
+  Ненужный хвост full-matrix run отменён после сохранения артефакта.
 - **Проверка:**
-  - `gh run view 30698977374 --json status,conclusion,jobs`
-  - `gh run download 30698977374 -n wheel-mamba_ssm -D /tmp/mamba_wheel`
-  - локальная verify: `python -c "import zipfile; ..."` на
-    `/tmp/mamba_wheel/wheels/mamba_ssm-*.whl`.
+  - wheel SHA256:
+    `3fade64fc70c08a6f0a7fdad822f90666f579cfe16e8c027d2d8121ff35dbbac`;
+  - receipt:
+    `/Volumes/external/cppmega_data/receipts/github-ci/mamba-45763efa-run-30698977374/binding.json`
+    (SHA256
+    `f885ae806c174bc772d07e1405c86d45e02acb0d6f4af2e01dd52f024c17aead`).
 
 ## [P020] Новые isolation-тесты в CI lanes
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073
@@ -522,7 +524,7 @@ P3 — стратегическое/отложенное.
 - **Что делать:** обновить на новый API (по тексту deprecation).
 - **Проверка:** `pytest tests/v4 -q` без Starlette deprecation в summary.
 
-## [P053] Paged attention compatibility path в serving (фича) — DONE
+## [P053] Paged attention compatibility path в serving (фича) — PARTIAL
 - Репо: mlx | Приоритет: P2 | Тип: feature | Зависит от: —
 - **Где:**
   - `cppmega_mlx/inference/serving.py:525-748` — `gather_paged_kv`,
@@ -531,13 +533,16 @@ P3 — стратегическое/отложенное.
   - `cppmega_mlx/nn/attention.py:1076-1220` — `CausalSelfAttention.__call__`
     принимает `paged_kv_manager`, `paged_block_table`, `paged_seq_lengths`,
     `paged_layer_idx` и вызывает `_apply_paged_kv_compatibility_path`.
-- **Что сделано:** реализован scatter/gather paged KV → contiguous K/V через
-  `mx.put_along_axis` / `mx.take` / `mx.slice_update`, интегрирован в
-  `CausalSelfAttention` для prefill-only GQA/MLA/full режимов (DSA пока не
-  поддерживается). Данные проходят через пул, чтобы scheduler мог выделять и
-  preempt'ить блоки; attention пока reused `mx.fast.scaled_dot_product_attention`.
+- **Что сделано:** реализован correctness-first scatter/gather paged KV →
+  contiguous K/V через `mx.take` / per-block `mx.slice_update`, интегрирован в
+  `CausalSelfAttention` для prefill-only GQA/MLA/full режимов. Follow-up
+  `cppmega.mlx@cdbdacd4` сохраняет KV последовательностей вне текущего batch,
+  маскирует mixed-length rows независимо и валидирует длины fail-closed.
+- **Что осталось:** decode с per-sequence RoPE offsets, DSA/Sparse-MLA,
+  нативный paged-attention/scatter kernel и memory/throughput receipts. До них
+  это совместимый prefill path, а не завершённый production paged attention.
 - **Проверка:**
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 52 passed.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 54 passed.
   - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 72 passed (регрессия).
   - `pytest tests/test_inference_serving.py::test_paged_attention_model_integration_is_deprecated_warning -q` — warning, не ошибка.
   - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_matches_contiguous_baseline -q` — parity с contiguous baseline.
