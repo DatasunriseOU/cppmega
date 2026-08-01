@@ -691,14 +691,21 @@ P3 — стратегическое/отложенное.
   `CausalSelfAttention` для prefill-only GQA/MLA/full режимов. Follow-up
   `cppmega.mlx@cdbdacd4` сохраняет KV последовательностей вне текущего batch,
   маскирует mixed-length rows независимо и валидирует длины fail-closed.
-- **Что осталось:** decode с per-sequence RoPE offsets, DSA/Sparse-MLA,
-  нативный paged-attention/scatter kernel и memory/throughput receipts. До них
-  это совместимый prefill path, а не завершённый production paged attention.
+  Decode закрыт в `cppmega.mlx@0286d667`: `scatter_paged_kv_offsets` пишет
+  новые токены по абсолютным per-sequence offsets, `_project_qkv` получил
+  per-sequence RoPE offsets (`rope_offsets`), paged-путь принимает
+  `paged_seq_lengths` как тоталы после шага и строит per-row decode mask;
+  смешанные batch (prefill+decode в одном forward) поддерживаются. Follow-up
+  `cppmega.mlx@62a3e269` до любой записи fail-closed проверяет отсутствующие и
+  aliased physical blocks во всём live prefix.
+- **Что осталось:** DSA/Sparse-MLA в paged-пути, нативный
+  paged-attention/scatter kernel и memory/throughput receipts. До них это
+  совместимый prefill+decode path, а не завершённый production paged attention.
 - **Проверка:**
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 54 passed.
-  - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 72 passed (регрессия).
-  - `pytest tests/test_inference_serving.py::test_paged_attention_model_integration_is_deprecated_warning -q` — warning, не ошибка.
-  - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_matches_contiguous_baseline -q` — parity с contiguous baseline.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 62 passed.
+  - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 76 passed (регрессия).
+  - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_decode_matches_contiguous_cache tests/test_attention.py::test_paged_kv_compatibility_path_decode_mixed_batch -q` — parity с contiguous cache decode.
+  - `pytest tests/test_inference_serving.py -k scatter_paged_kv_offsets -q` — offsets-scatter round-trip + fail-closed кейсы.
 
 ## [P054] DenseCppLM rope_only режим — DONE
 - Репо: mlx | Приоритет: P1 | Тип: feature | Зависит от: —
