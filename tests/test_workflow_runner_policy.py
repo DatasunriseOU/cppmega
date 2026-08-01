@@ -324,7 +324,7 @@ def test_mamba_wheel_build_applies_the_pinned_gqa_backward_patch() -> None:
         marker = re.compile(
             r'"mamba_ssm/ops/tilelang/mamba3/'
             + re.escape(module)
-            + r'":\s*"elif H % G == 0:"'
+            + r'":\s*\[\s*"elif H % G == 0:",?\s*\]'
         )
         assert marker.search(verify_body), (
             f"verify step must pin the GQA marker for {module}"
