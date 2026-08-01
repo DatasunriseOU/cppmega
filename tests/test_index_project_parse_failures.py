@@ -960,12 +960,12 @@ def test_mixed_case_cpp_suffix_forces_cpp_language(
     )
 
     adapted = index_project._adapt_args_for_file(
-        ["-x", "c", "-std=c11", "-Wno-everything"],
+        ["-std=c++17", "-Wno-everything"],
         str(source),
     )
 
     assert adapted[:2] == ["-x", "c++"]
-    assert "-std=c11" not in adapted
+    assert "-std=c++17" in adapted
     translation_unit = index_project.Index.create().parse(
         str(source),
         args=adapted,
@@ -975,6 +975,36 @@ def test_mixed_case_cpp_suffix_forces_cpp_language(
         for diagnostic in translation_unit.diagnostics
         if int(diagnostic.severity) >= 3
     ]
+
+
+def test_mixed_case_cpp_suffix_preserves_explicit_language(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "kernel.Cpp"
+    explicit_args = ["-x", "cuda", "--cuda-host-only"]
+
+    assert index_project._adapt_args_for_file(
+        explicit_args,
+        str(source),
+    ) == explicit_args
+    assert index_project._adapt_args_for_file(
+        ["-xdefinitely-invalid"],
+        str(source),
+    ) == ["-xdefinitely-invalid"]
+
+
+def test_lowercase_cpp_suffix_does_not_rewrite_explicit_language(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "kernel.cpp"
+    explicit_args = ["-x", "objective-c++", "-fobjc-arc"]
+
+    assert index_project._adapt_args_for_file(
+        explicit_args,
+        str(source),
+    ) == explicit_args
 
 
 def test_valgrind_fallback_status_is_emitted_in_source_sidecars(

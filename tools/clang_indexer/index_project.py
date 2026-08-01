@@ -5300,6 +5300,23 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
             adapted.append(arg)
         header_language = 'c-header' if is_c_header else 'c++-header'
         return ['-x', header_language] + adapted
+    mixed_case_cpp_source = (
+        raw_ext == '.C'
+        or (
+            ext in (CPP_EXTENSIONS - C_EXTENSIONS)
+            and raw_ext != ext
+        )
+    )
+    if mixed_case_cpp_source:
+        has_explicit_language = any(
+            arg == '-x' or (arg.startswith('-x') and arg != '-x')
+            for arg in args
+        )
+        if has_explicit_language:
+            return args
+        # Libclang does not reliably infer mixed-case suffixes such as .Cpp.
+        # Preserve all caller-owned flags and add only the missing language.
+        return ['-x', 'c++'] + args
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
@@ -5336,36 +5353,6 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
         if not has_c_standard:
             prefix.append('-std=c11')
         return prefix + adapted
-    if raw_ext == '.C' or ext in (CPP_EXTENSIONS - C_EXTENSIONS):
-        adapted = []
-        skip_next = False
-        for arg in args:
-            if skip_next:
-                skip_next = False
-                continue
-            if arg == '-x':
-                skip_next = True
-                continue
-            if arg.startswith('-x') and arg != '-x':
-                continue
-
-            standard_context = (
-                _standard_flag_context(arg)
-                if any(
-                    arg.startswith(prefix)
-                    for prefix in _STANDARD_FLAG_PREFIXES
-                )
-                else None
-            )
-            if standard_context is not None:
-                if standard_context[1] == 'c++':
-                    adapted.append(arg)
-                # A C standard cannot describe the C++ translation unit.
-                continue
-            adapted.append(arg)
-        # Mixed-case suffixes such as Outgoing.Cpp are not inferred reliably
-        # by libclang, so every known C++ source suffix gets an explicit mode.
-        return ['-x', 'c++'] + adapted
     return args
 
 
