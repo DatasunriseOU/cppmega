@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@ab7160de into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@3a495bb5 into the active
 # (or given) venv.
 #
 # Primary path: download the prebuilt x86_64 TileLang/tvm-ffi wheel pair.
@@ -10,7 +10,8 @@
 # L2-cache-flush header, and removes the apache-tvm-ffi<0.1.10 cap (upstream
 # PR #2071), so it imports cleanly under tvm-ffi >=0.1.12 as required by FA4
 # beta23. Its lazy driver stub also exports cuFuncGetAttribute required by the
-# CUDA 13.2 TVM runtime, and its matching tvm-ffi wheel is v0.1.13.post5.
+# CUDA 13.2 TVM runtime, its matching tvm-ffi wheel is v0.1.13.post5, and its
+# CUDA codegen emits scalar TIRx AllocBuffer special scopes correctly.
 # Must match STACK.lock.
 #
 # Usage:
@@ -27,7 +28,7 @@ set -euo pipefail
 
 WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
 TVM_FFI_WHEEL_URL="${TVM_FFI_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-ab7160de46be9e94ca6af8c7005113ee2c27200c}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-3a495bb573bbdf3a263d728a50ace59239bc5159}"
 TVM_COMMIT="${TILELANG_TVM_COMMIT:-e25ca6ae50beee0e907b1e5ed32949879caddde1}"
 TVM_FFI_COMMIT="${TILELANG_TVM_FFI_COMMIT:-521efeb30bfd9e4946b248b3d76e6391028233a3}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"

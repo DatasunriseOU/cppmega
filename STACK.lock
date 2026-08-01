@@ -96,7 +96,7 @@ wheels:
       - apache_tvm_ffi-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at ab7160de carries:
+    # DatasunriseOU/tilelang fork at 3a495bb5 carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
     #   - vendored TVM submodule bumped to DatasunriseOU/tvm@e25ca6ae, which includes
@@ -109,6 +109,8 @@ wheels:
     #     production import does not require the test-only pytest package.
     #   - preserves AttrStmt(node=None) instead of casting it to a null
     #     PrimExpr, preventing Mamba T.use_swizzle TIR purity-analysis SIGSEGVs.
+    #   - restores special-scope CUDA declarations for TIRx AllocBuffer nodes,
+    #     including WGMMA descriptors and local.var scalars.
     #   - adapts AdjustMatmulOrder's ND axes to this fork's boxed-Integer
     #     permute_dims API (the upstream int64_t form does not compile here).
     #   - links TVM CUDA driver calls through TileLang's lazy libcuda_stub,
@@ -120,7 +122,7 @@ wheels:
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: ab7160de46be9e94ca6af8c7005113ee2c27200c
+    ref: 3a495bb573bbdf3a263d728a50ace59239bc5159
     version: 0.1.9
     submodules: true
     build: |

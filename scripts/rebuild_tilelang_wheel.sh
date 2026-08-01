@@ -9,7 +9,7 @@
 #   (_ObjectSlotsMeta), but TileLang's vendored TVM (882a774) lacks the fix
 #   from apache/tvm#18938 (TVMDerivedObject.__slots__ = ("__dict__","__weakref__")).
 #   Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12, so it is
-#   NOT usable. The DatasunriseOU/tilelang fork at ab7160de is the clean path:
+#   NOT usable. The DatasunriseOU/tilelang fork at 3a495bb5 is the clean path:
 #     - carries upstream tile-ai/tilelang#2071 (removes the <0.1.10 cap)
 #     - vendored TVM submodule = DatasunriseOU/tvm@e25ca6ae, which includes
 #       apache/tvm#18938 (the __slots__ fix) and restores the nvbench CUDA
@@ -18,6 +18,8 @@
 #       (v0.1.13.post5), exactly matching the linked TVM runtime ABI
 #     - adapts AdjustMatmulOrder to the fork's boxed-Integer permute_dims API
 #     - completes the lazy CUDA driver stub for CUDA 13.2 TVM
+#     - restores TIRx AllocBuffer CUDA declarations for WGMMA descriptors and
+#       local.var scalars
 #   This script clones that fork commit, ensures the TVM submodule is checked
 #   out at the fixed commit, builds the wheel, and drops it in wheels/.
 #
@@ -31,7 +33,7 @@
 #
 # Env overrides:
 #   TILELANG_REPO    fork repo URL   (default: DatasunriseOU/tilelang)
-#   TILELANG_REF     fork commit     (default: ab7160de...)
+#   TILELANG_REF     fork commit     (default: 3a495bb5...)
 #   TILELANG_TVM_REF vendored TVM commit (default: e25ca6ae...)
 #   TILELANG_TVM_FFI_REF vendored tvm-ffi commit (default: 521efeb3...)
 #   TILELANG_SRC_DIR clone dir        (default: $HOME/tilelang-build)
@@ -40,7 +42,7 @@
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-ab7160de46be9e94ca6af8c7005113ee2c27200c}"
+TILELANG_REF="${TILELANG_REF:-3a495bb573bbdf3a263d728a50ace59239bc5159}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.

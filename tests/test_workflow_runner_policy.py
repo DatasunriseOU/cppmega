@@ -447,7 +447,7 @@ def test_image_build_binds_triggering_source_and_wheel_release() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "ab7160de46be9e94ca6af8c7005113ee2c27200c"
+    tilelang_commit = "3a495bb573bbdf3a263d728a50ace59239bc5159"
     tvm_commit = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
     tvm_ffi_commit = "521efeb30bfd9e4946b248b3d76e6391028233a3"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
