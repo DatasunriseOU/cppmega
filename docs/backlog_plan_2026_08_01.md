@@ -148,15 +148,25 @@ P3 — стратегическое/отложенное.
 - **Проверка:** `pytest tests/test_mamba3_psiv_cache.py -q` зелёный в обоих
   исходах; в дизайн-доке обновлён статус.
 
-## [P011] Triage 22 warnings последнего локального прогона
+## [P011] Triage 22 warnings последнего локального прогона — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: —
 - **Где:** вывод `pytest tests/test_document_isolation_cp.py
-  tests/test_fa4_document_isolation.py tests/test_mxfp8_transpose_emit_shapes.py`
+  tests/test_fa4_document_isolation.py tests/test_mxfp8_transpose_emit_ext.py`
   (22 warnings).
-- **Что делать:** классифицировать (Deprecation/User/от зависимостей);
-  починить свои, чужие зафиксировать в `docs/upstream_bugs.md`.
-- **Проверка:** повторный прогон с `-W error::DeprecationWarning` проходит
-  либо список чужих warnings задокументирован.
+- **Что сделано:** классифицированы:
+  - 2 `DeprecationWarning` — чужие (torch.jit._script, megatron.core.inference.contexts);
+  - остальные `UserWarning` — Megatron об отсутствии optional deps (TE, Apex, absl-py).
+  Ни один warning не исходит из cppmega. Задокументировано в
+  `docs/upstream_bugs.md` (раздел «Local pytest DeprecationWarning triage»).
+- **Проверка:**
+  ```bash
+  .venv/bin/python3 -m pytest tests/test_document_isolation_cp.py \
+    tests/test_fa4_document_isolation.py tests/test_mxfp8_transpose_emit_ext.py -q \
+    -W error::DeprecationWarning \
+    -W "ignore::DeprecationWarning:torch.jit._script" \
+    -W "ignore::DeprecationWarning:megatron.core.inference.contexts"
+  ```
+  → 10 passed, 6 skipped, 7 оставшихся UserWarning (все от зависимостей).
 
 ## [P012] Линт и типы для файлов, изменённых аудитом 2026-07-31/08-01
 - Репо: cppmega | Приоритет: P2 | Тип: chore | Зависит от: P004–P008
