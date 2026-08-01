@@ -1,5 +1,10 @@
 # Long-context roadmap for NAM56R
 
+**Last updated**: 2026-08-01  
+**Status**: thresholds and switching policy stable; SWA plumbing landed (P083);
+CP 128k design landed (P084); beta23 H200 gate (P075) blocks runtime parity
+verification.
+
 Strategy for scaling NAM56R training beyond 4k context without a model
 redesign. Defines thresholds, switches, and the migration plan from the
 current 4k baseline (289 TFLOP/s europe, 253 bench3) toward 128k.
@@ -31,13 +36,13 @@ sub-quadratic (O(seq × 256)). Mamba3 SSM is linear in seq.
 
 Recommended runtime config per seq_len range:
 
-| seq_len range | MLA config | SW window | Notes |
+| seq_len range | MLA config | SW window | Status / Notes |
 |---|---|---|---|
-| ≤ 8k | full attention | — | SWA would be a no-op; keep full for numerical behavior |
-| 8k – 16k | full attention | — | still tractable (~4 GiB/sample, 4 layers × 16 GiB total) |
-| 16k – 64k | **SWA on** | 8192 | each MLA token attends to last 8k tokens |
-| 64k – 128k | **SWA on** | 8192 | + context extension fine-tune phase (see below) |
-| > 128k | **SWA on** | 8192 or 16384 | + CP reopened (see memory `reference_cp_blocked_by_custom_mixers.md` — condition c triggered) |
+| ≤ 8k | full attention | — | Stable; SWA would be a no-op. |
+| 8k – 16k | full attention | — | Stable; still tractable. |
+| 16k – 64k | **SWA on** | 8192 | Plumbing landed in P083; parity verification waits for P075 (H200). |
+| 64k – 128k | **SWA on** | 8192 | + context extension fine-tune phase (see below). |
+| > 128k | **SWA on** | 8192 or 16384 | + CP reopened; design landed in P084, implementation waits for 128k phase. |
 
 Window=8192 chosen because: (a) covers typical local structure in code /
 natural language, (b) at 4k seq it is a no-op (seq ≤ window), (c) at 16k+
@@ -106,6 +111,14 @@ to memory-BW dominance (KV cache, per-token activation saves). Still
 profitable because extension is a small tail (< 2% of total training
 compute).
 
+## Current blockers and owners
+
+| Item | Owner | Blocker | Next action |
+|---|---|---|---|
+| SWA parity at 16k–64k | attention/runtime | P075 (beta23 H200 gate) | Run FA4 + packed-document mask parity on H200 after P075 closes. |
+| CP implementation at 128k | document isolation / runtime | 128k extension phase not started | Implement Option B gather/scatter in `CppMegaFA4ScoreModAttention` when hardware is allocated. |
+| MLA `window_size` spec param | spec builders | Recipe not yet at seq > 8k | Pass `config.window_size` into MLA `ModuleSpec` params when the first 16k recipe is cut. |
+
 ## What this means for cppmega optimization priorities
 
 - 4k training optimizations (P1/P2/P3 SSM kernel work, fp8-param-gather,
@@ -114,8 +127,8 @@ compute).
 - Any optimization specifically targeting 128k activations (CP port,
   full recompute, CPU offload optimizer states) — **defer** until
   context extension phase is scoped. Premature now.
-- `--attention-window-size 8192` plumbing in MLA — **add when we hit
-  seq > 8k the first time**. One-liner.
+- `--attention-window-size 8192` plumbing — **landed in P083**; spec-level
+  wiring happens when the first 16k recipe is configured.
 
 ## Reopening CP
 
@@ -137,7 +150,8 @@ TL;DR: reopen CP investigation AT 128k, not before.
 
 ## References
 
-- `reference_cp_blocked_by_custom_mixers.md` — why CP is closed at 4k
+- `docs/document_isolation_cp128k_design.md` — CP design for packed documents at 128k
+- `docs/document_isolation_swa_design.md` — SWA `window_size` plumbing design
 - `project_mamba3_tp_is_net_loss.md` — TP=2 Mamba3 MIMO 3.2× slower
   (same overhead pattern as CP=2 head-parallel)
 - `reference_mamba_ssm_optimization_plan.md` — P1/P2/P3 4k-scale
