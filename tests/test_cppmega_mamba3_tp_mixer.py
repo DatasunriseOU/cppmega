@@ -16,6 +16,7 @@ There are two test layers:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import importlib
 import os
 import pathlib
@@ -494,8 +495,34 @@ _SP_NHEADS = 8
 _SP_HEADDIM = 32
 _SP_NGROUPS = 4
 _SP_DSTATE = 32
-_SP_MIMO_RANK = 2
-_SP_CHUNK = 32
+_SP_TEST_FACTORIZATIONS = {(2, 32), (4, 16)}
+
+
+def _resolve_sp_test_factorization(env: Mapping[str, str]) -> tuple[int, int]:
+    factorization = (
+        int(env.get("CPPMEGA_MAMBA3_TEST_MIMO_RANK", "2")),
+        int(env.get("CPPMEGA_MAMBA3_TEST_CHUNK_SIZE", "32")),
+    )
+    if factorization not in _SP_TEST_FACTORIZATIONS:
+        raise ValueError(
+            "unsupported Mamba3 parity factorization: "
+            f"mimo_rank={factorization[0]}, chunk_size={factorization[1]}; "
+            f"expected one of {sorted(_SP_TEST_FACTORIZATIONS)}"
+        )
+    return factorization
+
+
+_SP_MIMO_RANK, _SP_CHUNK = _resolve_sp_test_factorization(os.environ)
+
+
+def test_sp_factorization_allowlist_rejects_invalid_pair():
+    with pytest.raises(ValueError, match="unsupported Mamba3 parity factorization"):
+        _resolve_sp_test_factorization(
+            {
+                "CPPMEGA_MAMBA3_TEST_MIMO_RANK": "4",
+                "CPPMEGA_MAMBA3_TEST_CHUNK_SIZE": "32",
+            }
+        )
 _SP_SEQLEN = 128
 _SP_BATCH = 2
 
