@@ -768,14 +768,18 @@ P3 — стратегическое/отложенное.
 - **Проверка:** сводный отчёт «старые веса vs новые» в `outputs/reports/`;
   расхождения объяснены.
 
-## [P068] Канонизация tokenizer.json (1-байтное расхождение)
+## [P068] Канонизация tokenizer.json (1-байтное расхождение) — DONE
 - Репо: both | Приоритет: P2 | Тип: chore | Зависит от: —
-- **Где:** канон `cppmega/data/tokenizer_v2/tokenizer.json` vs vendored
-  `mlx/cppmega_mlx/tokenizer/tokenizer.json` (различаются на 1 байт;
-  контракт-тест `mlx/tests/test_tokenizer_contract.py:314` сравнивает SHA-256).
-- **Что делать:** выяснить природу 1-байтного diff; скопировать канонический
-  файл в vendored (или наоборот обновить канон); зафиксировать процедуру синка.
-- **Проверка:** SHA-256 совпадают; контракт-тест зелёный в обоих репо.
+- **Где:** `cppmega/data/tokenizer_v2/tokenizer.json` (канон) и
+  `mlx/cppmega_mlx/tokenizer/tokenizer.json` (vendored copy).
+- **Что сделано:** файлы байт-идентичны; SHA-256
+  `e6a8ad2d2cc74af05c75ed4338b6649a301122d942683e0a8cf44393a185296a`.
+  Процедура синка задокументирована в
+  `mlx/tests/test_tokenizer_contract.py:314-318`: канон — в `cppmega`,
+  при drift перекопировать канон в `cppmega.mlx`.
+- **Проверка:**
+  - `sha256sum cppmega/data/tokenizer_v2/tokenizer.json cppmega.mlx/cppmega_mlx/tokenizer/tokenizer.json` — совпадают.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_tokenizer_contract.py::test_cppmega_tokenizer_v2_matches_vendored_artifact_when_available -q` → 1 passed.
 
 ## [P069] Обновление outputs/megatron_ready под sealed bundle v2
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P032
