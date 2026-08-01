@@ -1055,13 +1055,19 @@ P3 — стратегическое/отложенное.
   - `grep -n "U01\|U02" cppmega.mlx/VisualBuilderPlan-v9.md | head -10` — U01/U02 в
     scope, U03–U10 в deferral-таблице.
 
-## [P098] NAM56R full readiness в mlx: оценка разрыва
+## [P098] NAM56R full readiness в mlx: оценка разрыва — DONE
 - Репо: mlx | Приоритет: P3 | Тип: task | Зависит от: P060
-- **Где:** `docs/porting_plan.md:484-544` (non-goals: full NAM56R, distributed,
-  production-scale ingress не доказаны).
-- **Что делать:** gap-лист «что до full NAM56R» с оценкой трудоёмкости;
-  решение о приоритете.
-- **Проверка:** gap-док в `docs/status/`; bd-issues на признанные пункты.
+- **Где:** `cppmega.mlx/docs/nam56r_readiness_assessment.md`,
+  `cppmega.mlx/tests/test_nam56r_readiness_assessment.py`,
+  `docs/porting_plan.md:484-544`.
+- **Что сделано:** assessment зафиксирован: pattern/routing/config — landed;
+  attention, mamba3, m2rnn, MoE, checkpoint conversion, training — partial;
+  FP8/CP/distributed — missing. Вердикт: NAM56R в `cppmega_mlx` ещё не
+  полностью ready. bd issue `cppmega-mlx-d5so` closed.
+- **Проверка:**
+  - `ls cppmega.mlx/docs/nam56r_readiness_assessment.md` — файл существует.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_nam56r_readiness_assessment.py -q` — зелёный.
+  - `grep '"title":"\[P098\]' cppmega.mlx/.beads/issues.jsonl` — status `closed`.
 
 ## [P099] Обновить long_context_roadmap.md
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: P075
