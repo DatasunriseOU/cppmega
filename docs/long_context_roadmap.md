@@ -119,9 +119,9 @@ compute).
 
 ## Reopening CP
 
-When extension phase becomes real (seq > 64k), CP reopens from the
-closed direction per condition (c) of `reference_cp_blocked_by_custom_mixers.md`:
-*"compute mix shifts dramatically"*. At 128k the MLA/DSA activation
+When extension phase becomes real (seq > 64k), CP reopens.  The design for
+packing documents under CP is in
+`docs/document_isolation_cp128k_design.md`.  At 128k the MLA/DSA activation
 cost dominates and TP=2 for Mamba3 becomes viable because:
 
 - Per-rank activation savings from seq/2 exceed the Mamba3 head-parallel

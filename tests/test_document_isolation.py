@@ -15,6 +15,7 @@ from cppmega.megatron.document_isolation import (
     _patch_dsa_attention,
     _patch_model_input_transport,
     _patch_te_attention,
+    _patch_torch_attention,
     _received_document_ids,
     _window_size_from_config,
     bind_current_structure_batch,
@@ -299,6 +300,9 @@ def test_dsa_indexer_receives_document_causal_mask(monkeypatch):
     calls = []
 
     class FakeDSAttention:
+        def __init__(self):
+            self.config = SimpleNamespace(context_parallel_size=1)
+
         def forward(
             self,
             query,
@@ -342,6 +346,126 @@ def test_dsa_indexer_receives_document_causal_mask(monkeypatch):
         assert mask[0, 0, 2, 0]
         assert not mask[0, 0, 2, 2]
         assert mask[0, 0, 2, 3]
+    finally:
+        structure_dataset_patch._set_current_structure_batch(None)
+
+
+def test_torch_attention_rejects_context_parallelism(monkeypatch):
+    from megatron.core.transformer import dot_product_attention as dpa_module
+    from megatron.core.transformer.enums import AttnMaskType
+
+    calls = []
+
+    class FakeDotProductAttention:
+        def __init__(self):
+            self.config = SimpleNamespace(context_parallel_size=2)
+
+        def forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=None,
+            attention_bias=None,
+            packed_seq_params=None,
+        ):
+            calls.append((attention_mask, attn_mask_type))
+            return query
+
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    # Replace the class before patching so _patch_torch_attention wraps the fake.
+    monkeypatch.setattr(dpa_module, "DotProductAttention", FakeDotProductAttention)
+    _patch_torch_attention()
+    structure_dataset_patch._set_current_structure_batch(
+        {"document_ids": torch.tensor([[1, 1, 2, 2]])}
+    )
+    try:
+        query = torch.ones(4, 1, 1, 2)
+        with pytest.raises(NotImplementedError, match="document_isolation_cp128k"):
+            FakeDotProductAttention().forward(
+                query, query, query, None, AttnMaskType.causal
+            )
+        assert not calls
+    finally:
+        structure_dataset_patch._set_current_structure_batch(None)
+
+
+def test_dsa_attention_rejects_context_parallelism(monkeypatch):
+    from megatron.core.transformer.experimental_attention_variant import (
+        dsa as dsa_module,
+    )
+    from megatron.core.transformer.enums import AttnMaskType
+
+    class FakeDSAttention:
+        def __init__(self):
+            self.config = SimpleNamespace(context_parallel_size=2)
+
+        def forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            x,
+            qr,
+            attn_mask_type=None,
+            attention_bias=None,
+            packed_seq_params=None,
+        ):
+            return query
+
+    def sparse_backend(*_args):
+        raise AssertionError("fake DSAttention should not call the backend")
+
+    setattr(sparse_backend, "__cppmega_document_isolation__", True)
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.setattr(dsa_module, "DSAttention", FakeDSAttention)
+    monkeypatch.setattr(dsa_module, "unfused_dsa_fn", sparse_backend)
+    _patch_dsa_attention()
+    structure_dataset_patch._set_current_structure_batch(
+        {"document_ids": torch.tensor([[1, 1, 2, 2]])}
+    )
+    try:
+        query = torch.ones(4, 1, 1, 2)
+        with pytest.raises(NotImplementedError, match="document_isolation_cp128k"):
+            FakeDSAttention().forward(
+                query, query, query, None, query.reshape(4, 1, 2), query.reshape(4, 1, 2)
+            )
+    finally:
+        structure_dataset_patch._set_current_structure_batch(None)
+
+
+def test_te_attention_rejects_context_parallelism(monkeypatch):
+    from megatron.core.extensions import transformer_engine as te_module
+    from megatron.core.transformer.enums import AttnMaskType
+
+    class FakeTEAttention:
+        def __init__(self):
+            self.config = SimpleNamespace(context_parallel_size=2)
+
+        def forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=None,
+            packed_seq_params=None,
+        ):
+            return query
+
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.setattr(te_module, "TEDotProductAttention", FakeTEAttention)
+    _patch_te_attention()
+    structure_dataset_patch._set_current_structure_batch(
+        {"document_ids": torch.tensor([[1, 1, 2, 2]])}
+    )
+    try:
+        query = torch.arange(8.0).view(4, 1, 1, 2)
+        with pytest.raises(NotImplementedError, match="document_isolation_cp128k"):
+            FakeTEAttention().forward(query, query, query, None, AttnMaskType.causal)
     finally:
         structure_dataset_patch._set_current_structure_batch(None)
 
@@ -449,6 +573,19 @@ def test_swa_design_doc_is_referenced_from_isolation_source():
     )
     assert "## 5. Risks and open questions" in design
     assert "window_size" in design
+
+
+def test_cp128k_design_doc_is_referenced_from_isolation_source():
+    """The CP path must reference its design decision."""
+    source = Path(
+        "cppmega/megatron/document_isolation.py"
+    ).read_text(encoding="utf-8")
+    assert "docs/document_isolation_cp128k_design.md" in source
+    design = Path("docs/document_isolation_cp128k_design.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## 8. Decision and next steps" in design
+    assert "128 k" in design
 
 
 def test_document_attention_mask_ignores_window_when_unset():

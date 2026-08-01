@@ -1285,6 +1285,7 @@ class TestFA4WindowSizePlumbing:
         assert attn.window_size == (None, None)
 
     def test_fa4_attention_reads_active_window_from_transformer_config(self):
+        """window_size may be skipped for some layers via config."""
         from cppmega.megatron.fa4_score_mod_adapter import (
             CppMegaFA4ScoreModAttention,
         )
@@ -1299,6 +1300,27 @@ class TestFA4WindowSizePlumbing:
 
         assert active.window_size == (8192, 0)
         assert skipped.window_size == (None, None)
+
+    def test_fa4_attention_rejects_context_parallelism(self):
+        """CP is rejected with a pointer to the 128k CP design doc."""
+        from cppmega.megatron.fa4_score_mod_adapter import (
+            CppMegaFA4ScoreModAttention,
+        )
+
+        class FakeConfig:
+            context_parallel_size = 2
+            attention_dropout = 0.0
+
+        attn = CppMegaFA4ScoreModAttention(
+            config=FakeConfig(),
+            num_attention_heads=4,
+            head_dim=32,
+            causal=True,
+        )
+        S, B, H, D = 8, 1, 4, 32
+        q = torch.randn(S, B, H, D)
+        with pytest.raises(RuntimeError, match="document_isolation_cp128k"):
+            attn.forward(q, q, q)
 
 
 # ---------------------------------------------------------------------------

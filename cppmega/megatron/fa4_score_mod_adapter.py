@@ -1511,8 +1511,9 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 )
             if int(getattr(self.config, "context_parallel_size", 1)) != 1:
                 raise RuntimeError(
-                    "FA4 chunk-native score_mod does not support "
-                    "context_parallel_size > 1"
+                    "FA4 chunk-native score_mod does not yet support "
+                    "context_parallel_size > 1; see "
+                    "docs/document_isolation_cp128k_design.md"
                 )
 
         self._log_first_use()

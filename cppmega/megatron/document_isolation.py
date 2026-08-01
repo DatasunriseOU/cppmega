@@ -807,7 +807,8 @@ def _patch_te_attention() -> None:
             )
         if int(getattr(self.config, "context_parallel_size", 1)) != 1:
             raise NotImplementedError(
-                "packed-document TE attention does not support context parallelism"
+                "packed-document TE attention does not yet support context "
+                "parallelism; see docs/document_isolation_cp128k_design.md"
             )
 
         attention_bias = bound.arguments["attention_bias"]
@@ -915,6 +916,11 @@ def _patch_torch_attention() -> None:
             return installed(*bound.args, **bound.kwargs)
         if ids is None:
             raise RuntimeError("validated document layout did not return document_ids")
+        if int(getattr(self.config, "context_parallel_size", 1)) != 1:
+            raise NotImplementedError(
+                "packed-document torch attention does not yet support context "
+                "parallelism; see docs/document_isolation_cp128k_design.md"
+            )
         window_size = _window_size_from_config(
             getattr(self, "config", None),
             layer_number=getattr(self, "layer_number", None),
@@ -955,6 +961,11 @@ def _patch_dsa_attention() -> None:
             raise RuntimeError("validated document layout did not return document_ids")
         if bound.arguments["packed_seq_params"] is not None:
             raise RuntimeError("DSA document isolation owns packed boundaries")
+        if int(getattr(self.config, "context_parallel_size", 1)) != 1:
+            raise NotImplementedError(
+                "packed-document DSA attention does not yet support context "
+                "parallelism; see docs/document_isolation_cp128k_design.md"
+            )
         backend = dsa_mod.unfused_dsa_fn
         if not getattr(backend, "__cppmega_document_isolation__", False):
             raise RuntimeError(
