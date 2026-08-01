@@ -265,3 +265,33 @@ Before investing kernel-work time, confirm these **are not** blockers:
 ## 14. If Phase A shows no gain — archive
 
 If the Python-level materialisation shows no measurable TFLOP/s improvement (within 0.5% noise), then the TileLang compiler is already handling PsiV optimally and this work should be **archived**. Update this doc with a "superseded / not pursued" addendum and point future agents at the Phase A measurement as the reason.
+
+## 15. Archive addendum
+
+**Date**: 2026-08-01  
+**Decision**: archive the PsiV cache scaffolding without running Phase A.
+
+During the 2026-08-01 backlog sweep, available local and hardware time was
+prioritised for release-blocking work: packed-document isolation (CP/SP/PP),
+FA4 beta23 image promotion, and the canonical training-data release pipeline.
+The PsiV cache was a speculative +1.5–2.3 % TFLOP/s optimisation with a
+multi-day kernel-edit tail (Phases B/C) and no committed GPU slot for the
+Phase A go/no-go measurement.
+
+Rather than leave the scaffold (`cppmega/megatron/mamba3_psiv_cache.py`,
+`cppmega/megatron/upstream_patches/apply_mamba3_p2_psiv_patches.py`, and the
+associated Modal dry-run scripts) in tree as a misleading "almost done"
+skeleton, the code was deleted.  The design reasoning in §1–§13 is preserved
+for reference; a future session that has a free H200/H100 slot should start
+from scratch with a clean Phase A prototype and treat this doc as historical
+context, not a source of reusable code.
+
+Files removed:
+- `cppmega/megatron/mamba3_psiv_cache.py`
+- `cppmega/megatron/upstream_patches/apply_mamba3_p2_psiv_patches.py`
+- `scripts/modal_mamba3_psiv_dryrun.py`
+- `scripts/modal_mamba3_psiv_hopper_ab.py`
+- `scripts/modal_mamba3_b200_paths.py`
+
+`tests/test_mamba3_psiv_cache.py` was converted into an archive guard that
+fails if any of the removed files reappear without an explicit revival plan.
