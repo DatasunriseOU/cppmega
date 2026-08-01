@@ -12,6 +12,17 @@ import torch
 
 _PATCH_MARKER = "__cppmega_document_isolation_patched__"
 _layout_cache: dict[str, Any] = {"key": None, "value": None}
+
+# Maps the Python object identity (``id(tensor_recv_prev)``) of a received
+# pipeline activation to the document_ids tensor that accompanied it.
+#
+# IMPORTANT CONTRACT: the key is the exact tensor object identity seen by
+# ``_exchange_pipeline_document_ids`` when it performs the irecv. Any call
+# that creates a new tensor object---``.contiguous()`` on a non-contiguous
+# buffer, a slicing op that returns a new tensor, or an explicit ``.clone()``
+# or ``.detach()``---changes ``id()`` and breaks the lookup in
+# ``_patch_model_input_transport``. Keep the activation reference stable
+# between the P2P receive and ``set_input_tensor``.
 _received_document_ids: dict[int, torch.Tensor] = {}
 
 
@@ -390,6 +401,80 @@ class _ScatterSequence(torch.autograd.Function):
                 0, ctx.rank * local_length, local_length
             ).copy_(grad_output)
         return full, None, None
+
+
+def _assert_mamba_cp_signatures() -> None:
+    """Fail fast if Megatron's private CP helpers change their contract.
+
+    ``document_isolation`` calls ``_redo_attention_load_balancing`` and
+    ``_undo_attention_load_balancing`` from
+    ``megatron.core.ssm.mamba_context_parallel`` with positional arguments
+    ``(tensor, cp_size, packed_seq_params=None)``.  Megatron treats these as
+    private helpers and may change their signatures without notice; a silent
+    mismatch would corrupt the context-parallel zigzag restore path.  This
+    guard checks the current signature at patch time and raises a descriptive
+    error instead of allowing downstream shape corruption.
+    """
+    from megatron.core.ssm.mamba_context_parallel import (
+        _redo_attention_load_balancing,
+        _undo_attention_load_balancing,
+    )
+
+    def _check(name: str, function: Callable[..., Any]) -> None:
+        try:
+            signature = inspect.signature(function)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"cannot inspect Megatron mamba_context_parallel.{name} signature"
+            ) from exc
+
+        parameters = list(signature.parameters.values())
+        if len(parameters) != 3:
+            raise RuntimeError(
+                f"Megatron mamba_context_parallel.{name} signature changed: "
+                f"expected 3 parameters, got {len(parameters)} ({signature}). "
+                "Update document_isolation before using this Megatron commit."
+            )
+
+        input_param, cp_param, packed_param = parameters
+        input_name = input_param.name
+        input_annotation = str(input_param.annotation)
+        cp_annotation = str(cp_param.annotation)
+        packed_annotation = str(packed_param.annotation)
+
+        if input_name not in ("input", "input_") or "Tensor" not in input_annotation:
+            raise RuntimeError(
+                f"Megatron mamba_context_parallel.{name} first parameter changed: "
+                f"expected Tensor input, got {input_name}: {input_annotation} "
+                f"({signature})"
+            )
+        if cp_param.name != "cp_size" or cp_annotation != "<class 'int'>":
+            raise RuntimeError(
+                f"Megatron mamba_context_parallel.{name} second parameter changed: "
+                f"expected int cp_size, got {cp_param.name}: {cp_annotation} "
+                f"({signature})"
+            )
+        if (
+            packed_param.name != "packed_seq_params"
+            or "PackedSeqParams" not in packed_annotation
+        ):
+            raise RuntimeError(
+                f"Megatron mamba_context_parallel.{name} third parameter changed: "
+                f"expected Optional[PackedSeqParams] packed_seq_params, got "
+                f"{packed_param.name}: {packed_annotation} ({signature})"
+            )
+
+        return_annotation = signature.return_annotation
+        if return_annotation is not inspect.Signature.empty:
+            return_name = str(return_annotation)
+            if "Tensor" not in return_name:
+                raise RuntimeError(
+                    f"Megatron mamba_context_parallel.{name} return annotation changed: "
+                    f"expected Tensor, got {return_name} ({signature})"
+                )
+
+    _check("_redo_attention_load_balancing", _redo_attention_load_balancing)
+    _check("_undo_attention_load_balancing", _undo_attention_load_balancing)
 
 
 def _context_parallel_reorder(
@@ -1108,6 +1193,11 @@ def _patch_model_input_transport(model_class: type) -> None:
     def isolated_set_input_tensor(self, input_tensor):
         tensor = input_tensor[0] if isinstance(input_tensor, list) else input_tensor
         if _structure_enabled() and isinstance(tensor, torch.Tensor):
+            # Look up by the exact tensor object identity populated during the
+            # P2P receive in ``_exchange_pipeline_document_ids``. Any rewrite of
+            # ``tensor`` into a different object (``.clone()``, ``.detach()``,
+            # or a non-contiguous ``.contiguous()`` copy) changes ``id()`` and
+            # breaks this lookup. Keep the activation reference stable.
             document_ids = _received_document_ids.pop(id(tensor), None)
             if document_ids is None:
                 raise RuntimeError(
@@ -1123,6 +1213,7 @@ def _patch_model_input_transport(model_class: type) -> None:
 def apply_document_isolation_patch() -> bool:
     """Install all pinned Megatron seams used by packed cppmega training."""
 
+    _assert_mamba_cp_signatures()
     _patch_mtp_roll()
     _patch_te_attention()
     _patch_torch_attention()

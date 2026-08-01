@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from cppmega.megatron import structure_dataset_patch
 from cppmega.megatron.document_isolation import (
+    _assert_mamba_cp_signatures,
     _exchange_pipeline_document_ids,
     _patch_dsa_attention,
     _patch_model_input_transport,
@@ -419,6 +420,39 @@ def test_checkpoint_backward_recomputes_with_the_originating_documents():
         torch.testing.assert_close(hidden.grad.flatten(), expected)
     finally:
         structure_dataset_patch._set_current_structure_batch(None)
+
+
+def test_mamba_cp_signature_guard_accepts_pinned_api():
+    """The pinned Megatron commit must expose the expected private API."""
+    _assert_mamba_cp_signatures()
+
+
+def test_mamba_cp_signature_guard_rejects_changed_signature(monkeypatch):
+    from megatron.core.ssm import mamba_context_parallel
+
+    def bad_redo(_a, _b, _c, _d):
+        pass
+
+    monkeypatch.setattr(
+        mamba_context_parallel, "_redo_attention_load_balancing", bad_redo
+    )
+    with pytest.raises(RuntimeError, match="_redo_attention_load_balancing.*signature changed"):
+        _assert_mamba_cp_signatures()
+
+
+def test_received_document_ids_uses_exact_tensor_identity():
+    """Only the exact tensor object seen during P2P receive resolves document_ids."""
+    activation = torch.zeros(4, 1, 2)
+    document_ids = torch.tensor([[1, 1, 2, 2]])
+    _received_document_ids[id(activation)] = document_ids
+    try:
+        assert _received_document_ids.get(id(activation)) is document_ids
+        clone = activation.clone()
+        assert _received_document_ids.get(id(clone)) is None
+        detached = activation.detach()
+        assert _received_document_ids.get(id(detached)) is None
+    finally:
+        _received_document_ids.pop(id(activation), None)
 
 
 def test_document_ids_cross_a_real_pipeline_process_group(tmp_path):
