@@ -168,16 +168,22 @@ P3 — стратегическое/отложенное.
   ```
   → 10 passed, 6 skipped, 7 оставшихся UserWarning (все от зависимостей).
 
-## [P012] Линт и типы для файлов, изменённых аудитом 2026-07-31/08-01
+## [P012] Линт и типы для файлов, изменённых аудитом 2026-07-31/08-01 — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: chore | Зависит от: P004–P008
 - **Где:** `cppmega/features/{mhc,mod,structure}/__init__.py`,
   `scripts/ci/repository_runner.py`, `cppmega/megatron/{structure_dataset_patch,
   moe_dispatcher_patch,selective_fp8_moe_patch}.py`, `scripts/cppmega_fp8_shim.py`,
-  `tests/test_mxfp8_transpose_emit_shapes.py`.
-- **Что делать:** прогнать `ruff check` и `mypy` (конфиги репо) по этим файлам;
-  починить замечания.
-- **Проверка:** `ruff check <paths>` и `mypy <paths>` — чисто; кэши
-  `.ruff_cache`/`.mypy_cache` существуют — конфиги на месте.
+  `tests/test_mxfp8_transpose_emit_ext.py`.
+- **Что сделано:**
+  - `ruff check <paths>` — чисто (4 E402 в `cppmega_fp8_shim.py` убраны путём
+    переноса module-level imports в начало файла).
+  - `mypy --ignore-missing-imports <paths>` — чисто по target-файлам; исправлены
+    типовые замечания в `structure_dataset_patch.py`, `moe_dispatcher_patch.py`,
+    `flashinfer_mxfp8_gemm.py` и `cppmega_fp8_shim.py`.
+- **Проверка:**
+  - `ruff check cppmega/features/mhc/__init__.py cppmega/features/mod/__init__.py cppmega/features/structure/__init__.py scripts/ci/repository_runner.py cppmega/megatron/structure_dataset_patch.py cppmega/megatron/moe_dispatcher_patch.py cppmega/megatron/selective_fp8_moe_patch.py scripts/cppmega_fp8_shim.py tests/test_mxfp8_transpose_emit_ext.py`
+  - `mypy --ignore-missing-imports <same paths>`
+  - `pytest tests/test_mxfp8_transpose_emit_ext.py tests/test_moe_dispatcher_patch.py tests/test_structure_dataset_patch_source.py tests/test_structure_dataset_patch_bridge.py -q` → 29 passed, 5 skipped.
 
 ## [P013] Полный локальный прогон cppmega suite в общем venv (baseline)
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P012

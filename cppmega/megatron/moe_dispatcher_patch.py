@@ -28,6 +28,16 @@ _IDENTITY_CACHE: dict[
     int, tuple[weakref.ReferenceType[torch.Tensor], int, bool]
 ] = {}
 
+
+def _identity_cache_finalizer(
+    current: weakref.ReferenceType[torch.Tensor], key: int
+) -> None:
+    """Remove ``current`` from the identity cache if it is still the holder."""
+    cached = _IDENTITY_CACHE.get(key)
+    if cached is not None and cached[0]() is current():
+        _IDENTITY_CACHE.pop(key, None)
+
+
 def is_identity_permutation(sorted_idxs: torch.Tensor) -> bool:
     """Return True when ``sorted_idxs`` is ``[0, 1, ..., n - 1]``.
 
@@ -56,11 +66,7 @@ def is_identity_permutation(sorted_idxs: torch.Tensor) -> bool:
     if sorted_idxs.is_cuda:
         reference = weakref.ref(
             sorted_idxs,
-            lambda current, key=cache_key: (
-                _IDENTITY_CACHE.pop(key, None)
-                if _IDENTITY_CACHE.get(key, (None,))[0] is current
-                else None
-            ),
+            functools.partial(_identity_cache_finalizer, key=cache_key),
         )
         _IDENTITY_CACHE[cache_key] = (reference, version, result)
     return result

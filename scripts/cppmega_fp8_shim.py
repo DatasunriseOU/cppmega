@@ -53,6 +53,7 @@ import os
 import sys as _sys
 import warnings
 import weakref as _weakref
+from typing import Any, Callable
 
 from cppmega.megatron.deprecated_paths import (
     require_deprecated_ack as _cppmega_require_deprecated_ack,
@@ -583,7 +584,10 @@ if (
                 "_make_rowwise_transpose_for_backward. Use the patched TE source "
                 "tree or disable dense saved operands."
             )
-        _cppmega_mxfp8_tn_sidecar_registry = {}
+        _cppmega_mxfp8_tn_sidecar_registry: dict[
+            tuple[int, int, tuple[int, ...], tuple[int, ...], str],
+            tuple[Any, bool, int, Any],
+        ] = {}
         # Forward can create hundreds of MXFP8 transpose sidecars before the
         # matching backward GEMM consumes the earliest ones. Keep enough entries
         # for the full local NAM56R-quarter graph; entries are still one-shot
@@ -1177,7 +1181,11 @@ if (
                 _out = _orig_mxfp8_quantize(self, tensor, *args, **kwargs)
                 return _cppmega_attach_mxfp8_rowwise_transpose(_out, self, tensor)
 
-            _mxfp8_quantize_with_rowwise_transpose._cppmega_transpose_emit = True
+            setattr(
+                _mxfp8_quantize_with_rowwise_transpose,
+                "_cppmega_transpose_emit",
+                True,
+            )
             _TE_MXFP8Quantizer.quantize = _mxfp8_quantize_with_rowwise_transpose
 
         assert hasattr(_TE_MXFP8Quantizer, "update_quantized"), (
@@ -1207,7 +1215,11 @@ if (
                     _out = dst
                 return _cppmega_attach_mxfp8_rowwise_transpose(_out, self, src)
 
-            _mxfp8_update_quantized_with_rowwise_transpose._cppmega_transpose_emit = True
+            setattr(
+                _mxfp8_update_quantized_with_rowwise_transpose,
+                "_cppmega_transpose_emit",
+                True,
+            )
             _TE_MXFP8Quantizer.update_quantized = (
                 _mxfp8_update_quantized_with_rowwise_transpose
             )
@@ -1377,7 +1389,11 @@ if (
                     _start += _size
                 return _outputs
 
-            _split_quantize_with_rowwise_transpose._cppmega_transpose_emit = True
+            setattr(
+                _split_quantize_with_rowwise_transpose,
+                "_cppmega_transpose_emit",
+                True,
+            )
             _tex.split_quantize = _split_quantize_with_rowwise_transpose
 
         def _cppmega_has_comm_overlap(_kwargs):
@@ -2311,7 +2327,11 @@ if (
                     _new_A, _new_B, out, *args, **_new_kwargs
                 )
 
-            _general_grouped_gemm._cppmega_blockscaled_bwd = True
+            setattr(
+                _general_grouped_gemm,
+                "_cppmega_blockscaled_bwd",
+                True,
+            )
             _module.general_grouped_gemm = _general_grouped_gemm
             return True
 
@@ -2476,7 +2496,11 @@ if (
 
                 return _orig_general_gemm(*_args, **_kwargs)
 
-            _general_gemm._cppmega_blockscaled_bwd = True
+            setattr(
+                _general_gemm,
+                "_cppmega_blockscaled_bwd",
+                True,
+            )
             _module.general_gemm = _general_gemm
             return True
 
@@ -2637,7 +2661,11 @@ if (
                     return grad_output, None
                 return _orig_grad_output_preprocess(ctx, grad_output, row_parallel_mode, quantizer)
 
-            _grad_output_preprocess._cppmega_blockscaled_bwd = True
+            setattr(
+                _grad_output_preprocess,
+                "_cppmega_blockscaled_bwd",
+                True,
+            )
             _te_module_base.TransformerEngineBaseModule.grad_output_preprocess = staticmethod(
                 _grad_output_preprocess
             )
@@ -2873,7 +2901,11 @@ if (
                     )
                 return _weightmat, _new_workspace
 
-            _quantize_weight_with_rowwise_transpose._cppmega_transpose_emit = True
+            setattr(
+                _quantize_weight_with_rowwise_transpose,
+                "_cppmega_transpose_emit",
+                True,
+            )
             _module.quantize_weight = _quantize_weight_with_rowwise_transpose
             return True
 
@@ -2950,7 +2982,11 @@ if (
                     zero_centered_gamma,
                 )
 
-            _apply_normalization_with_sidecar._cppmega_transpose_emit = True
+            setattr(
+                _apply_normalization_with_sidecar,
+                "_cppmega_transpose_emit",
+                True,
+            )
             _module.apply_normalization = _apply_normalization_with_sidecar
             return True
 
@@ -3286,6 +3322,9 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
             sparse_mla_fp8_as_unfused_dsa as _sparse_mla_fp8_fn,
         )
 
+        _sparse_mla_fn: Callable[..., Any]
+        _sparse_mla_cls: type[Any]
+        _sparse_mla_name: str
         if _dsa_fp8_attention:
             _sparse_mla_fn = _sparse_mla_fp8_fn
             _sparse_mla_cls = _cppmega_sparse_mla_fp8_cls
@@ -3298,7 +3337,7 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
         if _existing_unfused is not None and not getattr(
             _existing_unfused, "__cppmega_sparse_dsa_patched__", False
         ):
-            _sparse_mla_fn.__cppmega_sparse_dsa_patched__ = True
+            setattr(_sparse_mla_fn, "__cppmega_sparse_dsa_patched__", True)
             _dsa_mod.unfused_dsa_fn = _sparse_mla_fn
             print(
                 "[cppmega_fp8_shim] TileLang SparseMLA applied "
@@ -3327,7 +3366,7 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
             sparse_dsa_fn as _sparse_dsa_fn,
         )
 
-        _sparse_dsa_fn.__cppmega_sparse_dsa_patched__ = True
+        setattr(_sparse_dsa_fn, "__cppmega_sparse_dsa_patched__", True)
         _dsa_mod.unfused_dsa_fn = _sparse_dsa_fn
         print("[cppmega_fp8_shim] DEPRECATED fallback: gather_scatter sparse_dsa_fn applied")
 else:
@@ -3349,7 +3388,7 @@ else:
         if _existing_unfused is not None and not getattr(
             _existing_unfused, "__cppmega_sparse_dsa_patched__", False
         ):
-            _sparse_dsa_fn.__cppmega_sparse_dsa_patched__ = True
+            setattr(_sparse_dsa_fn, "__cppmega_sparse_dsa_patched__", True)
             _dsa_mod.unfused_dsa_fn = _sparse_dsa_fn
             print(
                 "[cppmega_fp8_shim] gather_scatter sparse_dsa_fn applied "

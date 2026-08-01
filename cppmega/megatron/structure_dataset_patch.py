@@ -13,10 +13,10 @@ import logging
 import os
 import threading
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import wraps
 from math import prod
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch  # type: ignore[import-not-found]
@@ -1565,10 +1565,9 @@ def _build_graph_route_tensors(
         # call/type pairs are chunk-index routes, not token offsets. Remap the
         # document-local chunk ids through the chunks that overlap this sample;
         # the attention/indexer layer expands them to token-span blocks.
-        for source_name, sink in (
-            ("token_call_edges", call_edges),
-            ("token_type_edges", type_edges),
-        ):
+        def _append_call_type_edges(
+            source_name: str, sink: list[tuple[int, int]]
+        ) -> None:
             rows = _slice_graph_doc(graph_sidecars[source_name], real_doc)
             for src, dst in rows:
                 src_i = int(src)
@@ -1589,13 +1588,16 @@ def _build_graph_route_tensors(
                         (doc_chunk_to_sample[src_i], doc_chunk_to_sample[dst_i])
                     )
 
+        _append_call_type_edges("token_call_edges", call_edges)
+        _append_call_type_edges("token_type_edges", type_edges)
+
     if len(chunk_starts) > max_chunks:
         raise ValueError(
             "[cppmega-patch] graph route chunk capacity exceeded: "
             f"required={len(chunk_starts)} configured={max_chunks}; increase "
             "CPPMEGA_GRAPH_MAX_CHUNKS rather than truncating routes"
         )
-    edge_families = {
+    edge_families: dict[str, Sequence[tuple[int, ...]]] = {
         "call": call_edges,
         "type": type_edges,
         "domain": domain_edges,
