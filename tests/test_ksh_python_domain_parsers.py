@@ -303,6 +303,114 @@ def test_windows_1252_sql_is_decoded_without_replacement(tmp_path: Path) -> None
     assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
 
 
+def test_rowbinary_sql_literal_preserves_every_source_byte(tmp_path: Path) -> None:
+    from cppmega.data.domain_ingestion import (
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    encoded = (
+        b"-- This query throw high-level exception instead of low-level "
+        b'"too large size passed to allocator":\n\n'
+        b"SELECT * FROM format(RowBinary,\n"
+        b"'payload String',\n"
+        b"'head\x00\x81\xff\x02tail'); -- { serverError TOO_LARGE_ARRAY_SIZE }\n"
+    )
+    path = tmp_path / "rowbinary.sql"
+    path.write_bytes(encoded)
+
+    discovered = discover_project_domain_files(tmp_path)
+    assert [item.path for item in discovered] == [path]
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=32))
+
+    assert {chunk.source_encoding for chunk in chunks} == {"iso-8859-1"}
+    assert b"".join(
+        chunk.text.encode("latin-1", errors="strict") for chunk in chunks
+    ) == encoded
+    assert sum(chunk.text.count("\0") for chunk in chunks) == 1
+    assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
+
+
+def test_rowbinary_policy_rejects_structural_nul(tmp_path: Path) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / "rowbinary.sql"
+    path.write_bytes(
+        b"SELECT * FROM format(RowBinary, 'safe');\x00DROP TABLE audit;\n"
+    )
+
+    with pytest.raises(ValueError, match="binary domain input contains NUL byte"):
+        list(iter_domain_file_chunks(path))
+
+
+def test_rowbinary_marker_does_not_authorize_unrelated_binary_literal(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / "rowbinary.sql"
+    path.write_bytes(
+        b"-- format(RowBinary, 'not executable SQL')\n"
+        b"SELECT 'unrelated\x00literal';\n"
+    )
+
+    with pytest.raises(ValueError, match="binary domain input contains NUL byte"):
+        list(iter_domain_file_chunks(path))
+
+
+def test_posix_invalid_byte_fixture_preserves_every_source_byte(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    encoded = (
+        b"#!/bin/sh\n"
+        b"# valid UTF-8 before the raw-byte cases\n"
+        b'test_ps "E=\xc3\xb1" "LC_CTYPE=C"\n'
+        b"# invalid 8-bit bytes\n"
+        b'test_ps "E=x\xffx" ""\n'
+        b'test_ps "E=x\x81x" ""\n'
+    )
+    path = tmp_path / "command.sh"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=40))
+
+    assert {chunk.source_encoding for chunk in chunks} == {"iso-8859-1"}
+    assert b"".join(
+        chunk.text.encode("latin-1", errors="strict") for chunk in chunks
+    ) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 40 for chunk in chunks)
+
+
+def test_invalid_shell_bytes_without_fixture_contract_still_fail(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / "command.sh"
+    path.write_bytes(b'#!/bin/sh\nprintf "x\x81x"\n')
+
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
+        list(iter_domain_file_chunks(path))
+
+
+def test_shell_byte_fixture_marker_does_not_authorize_arbitrary_invalid_bytes(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / "command.sh"
+    path.write_bytes(
+        b"#!/bin/sh\n"
+        b"# invalid 8-bit bytes\n"
+        b'printf "unrelated \x81 byte"\n'
+    )
+
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
+        list(iter_domain_file_chunks(path))
+
+
 @pytest.mark.parametrize(
     ("filename", "codec", "source_encoding", "text"),
     [

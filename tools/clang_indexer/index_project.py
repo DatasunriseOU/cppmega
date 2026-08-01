@@ -2049,6 +2049,58 @@ class MacroDef:
         self.symbol_id = _compute_symbol_id(self.symbol_key)
 
 
+class _MacroVisibilityRecord:
+    """Compact root-specific view of one canonical macro definition."""
+
+    __slots__ = ["definition", "visible_line", "sequence", "previous"]
+
+    def __init__(
+        self,
+        definition: MacroDef,
+        *,
+        visible_line: int,
+        sequence: int,
+        previous: "_MacroVisibilityRecord | None",
+    ):
+        self.definition = definition
+        self.visible_line = int(visible_line)
+        self.sequence = int(sequence)
+        self.previous = previous
+
+
+# Preserve the old registry's fail-closed memory envelope in bytes rather than
+# silently turning its 250k MacroDef cap into an unbounded number of root views.
+# This is the measured shallow allocation of one first retained MacroDef slot:
+# object + three owned lists + occurrence tuple/set + name-history list +
+# macro/name dictionaries. String/symbol payloads are deliberately omitted, so
+# the process-wide RSS guard below remains the authoritative total-memory cap.
+_LEGACY_MACRO_OCCURRENCE_KEY_FIXTURE = (None,) * 5
+LEGACY_MACRO_RETAINED_SHALLOW_BYTES = (
+    sys.getsizeof(MacroDef.__new__(MacroDef))
+    + 3 * sys.getsizeof([])
+    + sys.getsizeof(_LEGACY_MACRO_OCCURRENCE_KEY_FIXTURE)
+    + sys.getsizeof({_LEGACY_MACRO_OCCURRENCE_KEY_FIXTURE})
+    + sys.getsizeof([None])
+    + 2 * sys.getsizeof({"macro": None})
+)
+
+
+def _macro_definition_key(macro: MacroDef) -> tuple[object, ...]:
+    """Identity of source definition content, excluding root visibility."""
+
+    return (
+        macro.name,
+        macro.file,
+        macro.line,
+        macro.text,
+        tuple(macro.params),
+        tuple(macro.condition_names),
+        tuple(macro.condition_lines),
+        macro.undef_text,
+        macro.project_id,
+    )
+
+
 class ProjectIndex:
     """Cross-file function index for a single project."""
 
@@ -2077,6 +2129,16 @@ class ProjectIndex:
         self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
         self.macro_definitions: list[MacroDef] = []
         self._macro_occurrence_keys: set[tuple[str, str, str, int, int]] = set()
+        self._macro_definition_by_key: dict[
+            tuple[object, ...],
+            MacroDef,
+        ] = {}
+        self.macro_visibility_by_file: dict[
+            str,
+            dict[str, list[_MacroVisibilityRecord]],
+        ] = {}
+        self.macro_visibility_record_count = 0
+        self.macro_visibility_bytes = 0
         self.symbol_id_registry = SymbolIdentityRegistry()
         self.symbol_id_keys = self.symbol_id_registry.keys_by_id
 
@@ -2126,6 +2188,92 @@ class ProjectIndex:
         self.macros_by_name[macro.name].append(macro)
         self.macro_definitions.append(macro)
         self.macros[macro.name] = macro
+
+    def new_canonical_macro_definition_count(
+        self,
+        macros: Sequence[MacroDef],
+    ) -> int:
+        keys = {_macro_definition_key(macro) for macro in macros}
+        return sum(key not in self._macro_definition_by_key for key in keys)
+
+    def add_macro_environment(
+        self,
+        target_file: str,
+        macros: Sequence[MacroDef],
+    ) -> tuple[int, int, int]:
+        """Compact one root's retained macros into canonical defs + views."""
+
+        if target_file in self.macro_visibility_by_file:
+            raise ValueError(
+                f"macro visibility environment already exists for {target_file}"
+            )
+        environment: dict[str, list[_MacroVisibilityRecord]] = defaultdict(list)
+        records_by_occurrence: dict[int, _MacroVisibilityRecord] = {}
+        canonical_before = len(self.macro_definitions)
+        top_level_bytes_before = sys.getsizeof(self.macro_visibility_by_file)
+        visibility_count = 0
+        for macro in sorted(macros, key=lambda item: item.sequence):
+            definition_key = _macro_definition_key(macro)
+            canonical = self._macro_definition_by_key.get(definition_key)
+            if canonical is None:
+                canonical = MacroDef(
+                    name=macro.name,
+                    file=macro.file,
+                    line=macro.line,
+                    text=macro.text,
+                    params=macro.params,
+                    project_id=macro.project_id,
+                    visible_in_file=macro.file,
+                    visible_line=macro.line,
+                    sequence=len(self.macro_definitions),
+                    condition_names=macro.condition_names,
+                    condition_lines=macro.condition_lines,
+                    undef_text=macro.undef_text,
+                )
+                self._macro_definition_by_key[definition_key] = canonical
+                self.add_macro(canonical)
+            previous = None
+            if macro.previous is not None:
+                previous = records_by_occurrence.get(id(macro.previous))
+                if previous is None:
+                    raise ValueError(
+                        "retained macro environment omitted a previous "
+                        f"definition: root={target_file} macro={macro.name}"
+                    )
+            record = _MacroVisibilityRecord(
+                canonical,
+                visible_line=macro.visible_line,
+                sequence=macro.sequence,
+                previous=previous,
+            )
+            records_by_occurrence[id(macro)] = record
+            environment[macro.name].append(record)
+            visibility_count += 1
+
+        stored_environment = dict(environment)
+        environment_bytes = (
+            sys.getsizeof(stored_environment)
+            + sys.getsizeof(target_file)
+            + sum(
+                sys.getsizeof(name)
+                + sys.getsizeof(records)
+                + sum(sys.getsizeof(record) for record in records)
+                for name, records in stored_environment.items()
+            )
+        )
+        self.macro_visibility_by_file[target_file] = stored_environment
+        environment_bytes += max(
+            0,
+            sys.getsizeof(self.macro_visibility_by_file)
+            - top_level_bytes_before,
+        )
+        self.macro_visibility_record_count += visibility_count
+        self.macro_visibility_bytes += environment_bytes
+        return (
+            len(self.macro_definitions) - canonical_before,
+            visibility_count,
+            environment_bytes,
+        )
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
@@ -3356,15 +3504,19 @@ def find_shell_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
     invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
+    excluded_paths: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Find shell sources, including extensionless files with a shell shebang."""
 
     skip_dirs = {'.git'} | (extra_exclude_dirs or set())
+    excluded = {os.path.abspath(path) for path in (excluded_paths or set())}
     files: list[tuple[str, str]] = []
     for root, dirs, filenames in os.walk(project_dir):
         dirs[:] = [directory for directory in dirs if directory not in skip_dirs]
         for fname in filenames:
             filepath = os.path.join(root, fname)
+            if os.path.abspath(filepath) in excluded:
+                continue
             try:
                 shell_kind = _classify_shell_file(filepath, fname)
             except ValueError as exc:
@@ -5258,7 +5410,8 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     """Adapt compile args based on file extension — .c files need C mode, not C++,
     and headers need an explicit header language (otherwise libclang can infer
     the wrong mode for a standalone .h/.hpp translation unit)."""
-    ext = os.path.splitext(filepath)[1].lower()
+    raw_ext = os.path.splitext(filepath)[1]
+    ext = raw_ext.lower()
     if ext in HEADER_EXTENSIONS:
         explicit_language: str | None = None
         for arg_index, arg in enumerate(args):
@@ -5295,6 +5448,23 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
             adapted.append(arg)
         header_language = 'c-header' if is_c_header else 'c++-header'
         return ['-x', header_language] + adapted
+    mixed_case_cpp_source = (
+        raw_ext == '.C'
+        or (
+            ext in (CPP_EXTENSIONS - C_EXTENSIONS)
+            and raw_ext != ext
+        )
+    )
+    if mixed_case_cpp_source:
+        has_explicit_language = any(
+            arg == '-x' or (arg.startswith('-x') and arg != '-x')
+            for arg in args
+        )
+        if has_explicit_language:
+            return args
+        # Libclang does not reliably infer mixed-case suffixes such as .Cpp.
+        # Preserve all caller-owned flags and add only the missing language.
+        return ['-x', 'c++'] + args
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
@@ -8229,6 +8399,7 @@ def register_header_macros(
     resolve_cache_entries: int | None = None,
     max_macro_candidates_per_root: int | None = None,
     max_retained_macros: int | None = None,
+    max_macro_visibility_bytes: int | None = None,
 ) -> dict[str, int]:
     stable_project_id = require_project_identity(
         project_id,
@@ -8271,6 +8442,20 @@ def register_header_macros(
         if max_retained_macros is None
         else int(max_retained_macros)
     )
+    if max_macro_visibility_bytes is None:
+        configured_visibility_bytes = os.environ.get(
+            "CPPMEGA_MAX_MACRO_VISIBILITY_BYTES"
+        )
+        max_macro_visibility_bytes = (
+            int(configured_visibility_bytes)
+            if configured_visibility_bytes is not None
+            else (
+                max_retained_macros
+                * LEGACY_MACRO_RETAINED_SHALLOW_BYTES
+            )
+        )
+    else:
+        max_macro_visibility_bytes = int(max_macro_visibility_bytes)
     if max_include_depth < 0:
         raise ValueError(f"max_include_depth must be >= 0, got {max_include_depth}")
     if max_include_files_per_root < 0:
@@ -8294,6 +8479,12 @@ def register_header_macros(
         raise ValueError(
             f"max_retained_macros must be > 0, got {max_retained_macros}"
         )
+    if max_macro_visibility_bytes <= 0:
+        raise ValueError(
+            "max_macro_visibility_bytes must be > 0, got "
+            f"{max_macro_visibility_bytes}"
+        )
+    stats["macro_visibility_byte_limit"] = max_macro_visibility_bytes
 
     def _check_memory() -> None:
         if memory_limit_gb is not None and memory_limit_gb > 0:
@@ -8478,7 +8669,9 @@ def register_header_macros(
                 "  Macro scan heartbeat: "
                 f"roots={stats['roots']} scanned_files={stats['scanned_files']} "
                 f"discovered={stats['discovered_macro_occurrences']} "
-                f"retained={stats['registered_macros']} "
+                f"retained_views={stats['retained_macro_occurrences']} "
+                f"canonical={stats['canonical_macro_definitions']} "
+                f"visibility_bytes={index.macro_visibility_bytes} "
                 f"resolve_cache_hits={stats['include_resolve_cache_hits']}",
                 file=sys.stderr,
                 flush=True,
@@ -8901,20 +9094,53 @@ def register_header_macros(
             0,
             root_discovered_macros - len(retained_candidate_ids),
         )
-        if len(index.macro_definitions) + len(retained) > max_retained_macros:
+        incoming_canonical = index.new_canonical_macro_definition_count(
+            retained
+        )
+        if (
+            len(index.macro_definitions) + incoming_canonical
+            > max_retained_macros
+        ):
             raise MemoryError(
-                "macro scan exceeded the retained registry bound: "
-                f"root={root_rel} retained={len(index.macro_definitions)} "
-                f"incoming={len(retained)} limit={max_retained_macros}. "
+                "macro scan exceeded the canonical definition registry bound: "
+                f"root={root_rel} canonical={len(index.macro_definitions)} "
+                f"incoming_canonical={incoming_canonical} "
+                f"visibility_records={index.macro_visibility_record_count} "
+                f"limit={max_retained_macros}. "
                 "Raise CPPMEGA_MAX_RETAINED_MACROS only after inspecting macro "
                 "retention telemetry."
             )
-        before = len(index.macro_definitions)
-        for macro in retained:
-            index.add_macro(macro)
-        registered = len(index.macro_definitions) - before
-        stats["registered_macros"] += registered
-        stats["retained_macro_occurrences"] += registered
+        registered, visibility_count, visibility_bytes = index.add_macro_environment(
+            root_rel,
+            retained,
+        )
+        stats["registered_macros"] += visibility_count
+        stats["registered_canonical_macros"] += registered
+        stats["retained_macro_occurrences"] += visibility_count
+        stats["compacted_macro_occurrences"] += (
+            visibility_count - registered
+        )
+        stats["macro_visibility_records"] = (
+            index.macro_visibility_record_count
+        )
+        stats["canonical_macro_definitions"] = len(
+            index.macro_definitions
+        )
+        stats["macro_visibility_bytes"] = index.macro_visibility_bytes
+        stats["last_root_macro_visibility_bytes"] = visibility_bytes
+        if index.macro_visibility_bytes > max_macro_visibility_bytes:
+            raise MemoryError(
+                "macro scan exceeded the root visibility byte bound: "
+                f"root={root_rel} "
+                f"visibility_records={index.macro_visibility_record_count} "
+                f"visibility_bytes={index.macro_visibility_bytes} "
+                f"limit={max_macro_visibility_bytes}. "
+                "The default preserves the prior MacroDef registry's measured "
+                "minimum shallow-memory envelope; raise "
+                "CPPMEGA_MAX_MACRO_VISIBILITY_BYTES only with retained-view "
+                "telemetry."
+            )
+        _check_memory()
 
     seen_roots: set[str] = set()
     for path in header_files:
@@ -8994,6 +9220,57 @@ def _select_visible_macro(
     max_line: int | None,
     before_sequence: int | None = None,
 ) -> MacroDef | None:
+    if (
+        target_file is not None
+        and target_file in index.macro_visibility_by_file
+    ):
+        records = index.macro_visibility_by_file[target_file].get(name, [])
+        scoped_records = [
+            record
+            for record in records
+            if (max_line is None or record.visible_line <= max_line)
+            and (
+                before_sequence is None
+                or record.sequence < before_sequence
+            )
+        ]
+        if not scoped_records:
+            return None
+        selected = max(
+            scoped_records,
+            key=lambda record: (record.visible_line, record.sequence),
+        )
+        materialized: dict[int, MacroDef] = {}
+
+        def materialize(record: _MacroVisibilityRecord) -> MacroDef:
+            cached = materialized.get(id(record))
+            if cached is not None:
+                return cached
+            definition = record.definition
+            view = MacroDef(
+                name=definition.name,
+                file=definition.file,
+                line=definition.line,
+                text=definition.text,
+                params=definition.params,
+                project_id=definition.project_id,
+                visible_in_file=target_file,
+                visible_line=record.visible_line,
+                sequence=record.sequence,
+                condition_names=definition.condition_names,
+                condition_lines=definition.condition_lines,
+                undef_text=definition.undef_text,
+                previous=(
+                    materialize(record.previous)
+                    if record.previous is not None
+                    else None
+                ),
+            )
+            materialized[id(record)] = view
+            return view
+
+        return materialize(selected)
+
     candidates = list(index.macros_by_name.get(name, []))
     if not candidates:
         return None
@@ -9497,11 +9774,12 @@ def emit_build_documents(
     function dedup continues in ``dedup_root_functions``.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
-    with invalid text RAISES. NUL-bearing or malformed supported-encoding
+    with invalid text RAISES. Structural NULs and malformed supported-encoding
     explicit domain inputs also raise before any chunk is emitted. UTF-8,
-    BOM-marked UTF-16/32, filename-declared legacy SQL encodings, and strict
-    Windows-1252 are decoded without replacement. Only zero-length inputs are
-    skipped; whitespace is source content and remains losslessly represented.
+    BOM-marked UTF-16/32, filename-declared legacy SQL encodings, strict
+    Windows-1252, and narrowly verified byte-oriented fixture contracts are
+    decoded without replacement. Only zero-length inputs are skipped;
+    whitespace is source content and remains losslessly represented.
     """
     docs: list[dict] = []
     if not build_files:
@@ -9687,7 +9965,10 @@ def build_training_documents(
             f"resolve_cache_hits={macro_stats.get('include_resolve_cache_hits', 0)} "
             f"discovered={macro_stats.get('discovered_macro_occurrences', 0)} "
             f"materialized_peak={macro_stats.get('peak_root_macro_candidates', 0)} "
-            f"retained={macro_stats.get('registered_macros', 0)} "
+            f"retained_views={macro_stats.get('retained_macro_occurrences', 0)} "
+            f"canonical={macro_stats.get('canonical_macro_definitions', 0)} "
+            f"visibility_bytes={macro_stats.get('macro_visibility_bytes', 0)} "
+            f"visibility_byte_limit={macro_stats.get('macro_visibility_byte_limit', 0)} "
             f"pruned={macro_stats.get('pruned_macro_occurrences', 0)} "
             f"directive_cache_peak={macro_stats.get('directive_cache_peak_entries', 0)} "
             f"resolve_cache_peak={macro_stats.get('resolve_cache_peak_entries', 0)} "
@@ -10344,6 +10625,7 @@ def process_project(
         else None
     )
     quarantine_receipt: dict[str, object] | None = None
+    quarantined_paths: set[str] = set()
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
 
@@ -10358,10 +10640,31 @@ def process_project(
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     if source_quarantine is not None:
-        cpp_files, quarantine_receipt = source_quarantine.filter_candidates(
+        quarantine_candidates = list(cpp_files)
+        candidate_identities = {
+            os.path.abspath(candidate) for candidate in quarantine_candidates
+        }
+        for relative_path in source_quarantine.entries_by_path:
+            candidate = os.path.abspath(os.path.join(project_dir, relative_path))
+            if candidate not in candidate_identities:
+                quarantine_candidates.append(candidate)
+                candidate_identities.add(candidate)
+        kept_candidates, quarantine_receipt = source_quarantine.filter_candidates(
             project_dir,
-            cpp_files,
+            quarantine_candidates,
         )
+        kept_candidate_identities = {
+            os.path.abspath(candidate) for candidate in kept_candidates
+        }
+        quarantined_paths = {
+            os.path.abspath(os.path.join(project_dir, relative_path))
+            for relative_path in source_quarantine.entries_by_path
+        }
+        cpp_files = [
+            candidate
+            for candidate in cpp_files
+            if os.path.abspath(candidate) in kept_candidate_identities
+        ]
         assert source_quarantine_receipt is not None
         _write_source_quarantine_receipt(
             source_quarantine_receipt,
@@ -10384,6 +10687,7 @@ def process_project(
         project_dir,
         extra_exclude_dirs=extra_exclude_dirs,
         invalid_input_handler=invalid_handler,
+        excluded_paths=quarantined_paths,
     )
     print(f"  Found {len(shell_files)} project shell files", file=sys.stderr)
     from cppmega.data.domain_ingestion import discover_project_domain_files
@@ -10393,6 +10697,7 @@ def process_project(
         extra_exclude_dirs=extra_exclude_dirs,
         include_cpp=False,
         invalid_input_handler=invalid_handler,
+        excluded_paths=quarantined_paths,
     )
     domain_files_by_path = {
         os.path.abspath(filepath): (os.path.abspath(filepath), build_kind)

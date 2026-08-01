@@ -22,6 +22,22 @@ def test_source_stream_read_error_is_only_suppressed_after_checkpoint_signal() -
     conveyor._handle_source_stream_read_error(error, interrupted=True)
 
 
+def test_source_archive_argument_configures_both_streaming_producers(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "source.tar.zst"
+    original_source_archive = conveyor.sr.TARBALL
+    original_commit_archive = conveyor.src.TARBALL
+    try:
+        args = conveyor.parse_args(["--source-archive", str(archive)])
+        conveyor.configure_runtime_paths_from_args(args)
+        assert conveyor.sr.TARBALL == archive
+        assert conveyor.src.TARBALL == archive
+    finally:
+        conveyor.sr.TARBALL = original_source_archive
+        conveyor.src.TARBALL = original_commit_archive
+
+
 @pytest.mark.parametrize("dedup_near", (True, False))
 def test_adaptive_code_retry_preserves_configured_dedup_policy(
     tmp_path: Path,
@@ -730,6 +746,53 @@ def test_manifest_source_repo_list_binding_is_resume_bound(
         match="source repo-list mismatch",
     ):
         reloaded.bind_source_repo_list(changed)
+
+
+def test_source_completion_receipt_is_bounded_and_binds_manifest_bytes(
+    source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    source_repo_list = tmp_path / "source.json"
+    _write_repo_list(
+        source_repo_list,
+        [_github_row(), _local_row()],
+    )
+    source_binding = conveyor.build_source_repo_list_binding(
+        conveyor.load_repo_list_snapshot(source_repo_list, role="source")
+    )
+    manifest_path = tmp_path / "conveyor" / "_done.json"
+    manifest = conveyor.ConcurrentManifest.load(manifest_path)
+    revision = conveyor.capture_code_revision(source_repo)
+    manifest.bind_code_revision(revision)
+    manifest.bind_source_repo_list(source_binding)
+    manifest.mark_done("local-source::code", {"rows": 1})
+    manifest.mark_done("project::code", {"rows": 2})
+
+    receipt_path = tmp_path / "conveyor" / "completion_receipt.json"
+    receipt = conveyor.write_source_completion_receipt(
+        receipt_path,
+        manifest=manifest,
+        streams="code",
+        source_repo_list_reverified_at_finish=True,
+        interrupted=False,
+    )
+
+    assert receipt["schema"] == conveyor.SOURCE_COMPLETION_SCHEMA
+    assert receipt["status"] == "success"
+    assert receipt["code_repositories"] == ["local-source", "project"]
+    assert receipt["code_repository_names_sha256"] == (
+        _canonical_json_sha256(["local-source", "project"])
+    )
+    assert receipt["failed_unit_count"] == 0
+    assert receipt["non_code_done_unit_count"] == 0
+    assert receipt["code_revision"] == revision
+    assert receipt["source_repo_list"] == source_binding
+    assert receipt["manifest"] == {
+        "path": str(manifest_path.resolve()),
+        "size_bytes": manifest_path.stat().st_size,
+        "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    }
+    assert receipt_path.stat().st_size < 4 * 1024 * 1024
 
 
 def test_manifest_rejects_legacy_work_without_source_repo_binding(

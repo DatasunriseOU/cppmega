@@ -128,6 +128,7 @@ DEFAULT_RESERVATION_FILE = CONVEYOR_ROOT / "_reservations.json"
 DEFAULT_RANGE_SUBMIT_WINDOW_MULTIPLIER = 2
 DEFAULT_MEMORY_BUDGET_FRACTION = 0.55
 DEFAULT_MEMORY_BUDGET_FALLBACK_GB = 48.0
+SOURCE_COMPLETION_SCHEMA = "cppmega.source_conveyor_completion_v1"
 DEFAULT_MIN_RETRY_RANGE_SIZE = 25
 DEFAULT_RANGE_TARGET_BYTES = 32 * 1024 * 1024
 DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
@@ -294,6 +295,14 @@ def validate_source_repo_list_snapshot(
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _bounded_git_output(
@@ -704,6 +713,31 @@ def _write_atomic_text(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
+def _write_atomic_json_receipt(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def install_code_revision_child_guard(
     guard: CodeRevisionGuard,
     conveyor_root: Path,
@@ -862,6 +896,9 @@ def configure_runtime_paths_from_args(args: argparse.Namespace) -> None:
         conveyor_root=args.conveyor_root,
         extract_cache_root=args.extract_cache_root,
     )
+    source_archive = Path(args.source_archive).expanduser()
+    sr.TARBALL = source_archive
+    src.TARBALL = source_archive
 
     if Path(args.progress_jsonl) == old_defaults["progress_jsonl"]:
         args.progress_jsonl = str(DEFAULT_PROGRESS_JSONL)
@@ -2351,6 +2388,73 @@ class ConcurrentManifest(Manifest):
             "cross-process merge under flock); a blind save() would re-introduce "
             "the lost-update clobber this class exists to prevent."
         )
+
+
+def write_source_completion_receipt(
+    path: Path,
+    *,
+    manifest: ConcurrentManifest,
+    streams: str,
+    source_repo_list_reverified_at_finish: bool,
+    interrupted: bool,
+) -> dict:
+    """Write a bounded terminal projection bound to the full manifest bytes."""
+    manifest._lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest._thread_lock:
+        lock_stream = manifest._lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_SH)
+            state = manifest._read_disk()
+            manifest_stat = manifest.path.stat()
+            manifest_sha256 = _sha256_file(manifest.path)
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            lock_stream.close()
+
+    done_units = sorted(state["done"])
+    code_repositories = sorted(
+        unit[: -len("::code")]
+        for unit in done_units
+        if unit.endswith("::code")
+    )
+    non_code_done_unit_count = len(done_units) - len(code_repositories)
+    failed_unit_count = len(state["failed"])
+    status = (
+        "interrupted"
+        if interrupted
+        else ("failed" if failed_unit_count else "success")
+    )
+    receipt = {
+        "schema": SOURCE_COMPLETION_SCHEMA,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": status,
+        "streams": streams,
+        "interrupted": interrupted,
+        "manifest": {
+            "path": str(manifest.path.resolve()),
+            "size_bytes": manifest_stat.st_size,
+            "sha256": manifest_sha256,
+        },
+        "total_done_unit_count": len(done_units),
+        "failed_unit_count": failed_unit_count,
+        "non_code_done_unit_count": non_code_done_unit_count,
+        "code_repositories": code_repositories,
+        "code_repository_names_sha256": _sha256_bytes(
+            json.dumps(
+                code_repositories,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("ascii")
+        ),
+        "code_revision": state["code_revision"],
+        "source_repo_list": state["source_repo_list"],
+        "source_repo_list_reverified_at_finish": (
+            source_repo_list_reverified_at_finish
+        ),
+    }
+    _write_atomic_json_receipt(path, receipt)
+    return receipt
 
 
 class ProgressWriter:
@@ -4380,6 +4484,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--streams", choices=("both", "code", "commits"), default="both",
                    help="Which streams to emit. 'code' uses the source-only tar "
                         "stream and does not extract .git / run PR/commit stages.")
+    p.add_argument(
+        "--source-archive",
+        default=str(sr.TARBALL),
+        help="Explicit .tar.zst source archive consumed by the streaming producer. "
+             f"Default {sr.TARBALL}.",
+    )
     p.add_argument("--max-repos", type=int, default=None,
                    help="Process at most N repos this run (after resume filtering).")
     p.add_argument("--token-budget", type=int, default=None,
@@ -4537,6 +4647,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--progress-jsonl", default=str(DEFAULT_PROGRESS_JSONL),
                    help="Append unit-level progress events here for live "
                         "throughput monitoring. Use empty string to disable.")
+    p.add_argument(
+        "--completion-receipt",
+        default=None,
+        help="Optional bounded terminal projection, atomically bound to the full "
+             "manifest bytes. Intended for fail-closed external supervision.",
+    )
     p.add_argument("--dedup-checkpoint-tokens", type=int,
                    default=DEFAULT_DEDUP_CHECKPOINT_TOKENS,
                    help="Run a SQLite WAL checkpoint on --dedup-db after each "
@@ -4587,6 +4703,11 @@ def main(argv: list[str]) -> int:
     pr_completion_receipt_path = (
         Path(args.pr_completion_receipt).expanduser().resolve()
         if args.pr_completion_receipt
+        else None
+    )
+    completion_receipt_path = (
+        Path(args.completion_receipt).expanduser().resolve()
+        if args.completion_receipt
         else None
     )
     source_repo_snapshot: RepoListSnapshot | None = None
@@ -4906,6 +5027,7 @@ def main(argv: list[str]) -> int:
         pr_completion=pr_completion_binding,
         code_revision_child_guard=str(child_guard_path),
         streams=args.streams,
+        source_archive=str(sr.TARBALL),
         workers=workers,
         repo_workers=repo_workers,
         max_active_repos=max_active_repos,
@@ -5043,6 +5165,7 @@ def main(argv: list[str]) -> int:
                 "parse_workers": parse_workers,
                 "memory_plan": memory_plan,
                 "streams": args.streams,
+                "source_archive": str(sr.TARBALL),
                 "source_cache_populate_only": True,
                 "source_cache_report": report,
                 "manifest": str(CONVEYOR_MANIFEST),
@@ -5383,6 +5506,7 @@ def main(argv: list[str]) -> int:
         "parse_workers": parse_workers,
         "memory_plan": memory_plan,
         "streams": args.streams,
+        "source_archive": str(sr.TARBALL),
         "range_size": args.range_size,
         "target_lengths_code": list(lengths_code),
         "target_lengths_commits": list(lengths_commits),
@@ -5407,6 +5531,22 @@ def main(argv: list[str]) -> int:
         "extract_cache_metrics": progress.extract_cache_metrics(),
         "interrupted": interrupted,
     }
+    if completion_receipt_path is not None:
+        revision_guard.verify("source completion receipt")
+        completion_receipt = write_source_completion_receipt(
+            completion_receipt_path,
+            manifest=manifest,
+            streams=args.streams,
+            source_repo_list_reverified_at_finish=(
+                source_repo_list_reverified_at_finish
+            ),
+            interrupted=interrupted,
+        )
+        summary["completion_receipt"] = {
+            "path": str(completion_receipt_path),
+            "sha256": _sha256_file(completion_receipt_path),
+            "status": completion_receipt["status"],
+        }
     progress.emit("run_finished", **summary)
     print(json.dumps(summary, indent=2))
     if interrupted:

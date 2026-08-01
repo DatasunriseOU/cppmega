@@ -29,6 +29,15 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
     },
     {
+      "project_id": "Stichting-MINIX-Research-Foundation/minix",
+      "relative_path": "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c",
+      "size_bytes": 700,
+      "sha256": "e970a5aab931388aa671bf2589426acfcd2ebdcf60c70342cfd500086d697131",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_parser_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug parser_crash"
+    },
+    {
       "project_id": "eclipse-threadx/threadx",
       "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
       "size_bytes": 61551,
@@ -45,6 +54,24 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "asn1_der_x509_certificate_pair",
       "reason": "DER X.509 CertificatePair test vector stored under a .cp suffix"
+    },
+    {
+      "project_id": "python/cpython",
+      "relative_path": "Lib/test/archivetestdata/exe_with_z64",
+      "size_bytes": 978,
+      "sha256": "b1a8382acacce4022b02daa25b293ddfc1dc6ce6a3ddb8b3d95b517592c5a428",
+      "classification": "generated_executable_archive",
+      "detected_format": "posix_shell_appended_zip",
+      "reason": "CPython executable ZIP64 test fixture with a UTF-8 Bash prefix and appended archive"
+    },
+    {
+      "project_id": "questdb/questdb",
+      "relative_path": "core/src/main/bin/linux-x86-64/jfrconv",
+      "size_bytes": 125326,
+      "sha256": "1806e97395e39bd37386eb3ef4ad0a2e83fe9a70b6a05e6779d542684342def4",
+      "classification": "generated_executable_archive",
+      "detected_format": "posix_shell_appended_zip",
+      "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
     }
   ]
 }

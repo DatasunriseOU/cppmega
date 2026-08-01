@@ -118,6 +118,7 @@ class _ValidatedDomainText:
     bom: bytes
     signature_text: str
     trailing_nul_bytes: int
+    allow_embedded_nul: bool = False
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,10 @@ class _JsonObjectLexState:
 
 
 _SQL_DOLLAR_QUOTE_RE = re.compile(rb"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_SQL_ROWBINARY_LITERAL_RE = re.compile(
+    rb"\bformat\s*\(\s*RowBinary\s*,\s*",
+    re.IGNORECASE,
+)
 
 
 def _scan_domain_stream(
@@ -424,6 +429,178 @@ def _validate_euc_tw_stream(
         bom=b"",
         signature_text=text[:DOMAIN_SIGNATURE_READ_BYTES],
         trailing_nul_bytes=trailing_nul_bytes,
+    )
+
+
+def _sql_rowbinary_literal_is_byte_preserving(payload: bytes) -> bool:
+    """Accept binary bytes only inside a complete RowBinary SQL literal."""
+
+    def single_quote_end(quote_start: int) -> int | None:
+        index = quote_start + 1
+        while index < len(payload):
+            byte = payload[index]
+            following = payload[index + 1] if index + 1 < len(payload) else None
+            if byte == 0x5C and following is not None:
+                index += 2
+                continue
+            if byte == 0x27:
+                if following == 0x27:
+                    index += 2
+                    continue
+                return index
+            index += 1
+        return None
+
+    def skip_space(index: int) -> int:
+        while index < len(payload) and payload[index] in b" \t\r\n":
+            index += 1
+        return index
+
+    literal_spans: list[tuple[int, int]] = []
+    for match in _SQL_ROWBINARY_LITERAL_RE.finditer(payload):
+        if len(literal_spans) >= 64:
+            return False
+        prefix = bytearray(payload[: match.start()])
+        _statement_cut, _lexical_cut, state = _scan_sql_chunk_prefix(
+            prefix,
+            limit=len(prefix),
+            initial_state=_SqlLexState(),
+        )
+        if state.mode != "normal":
+            continue
+        structure_start = skip_space(match.end())
+        if structure_start >= len(payload) or payload[structure_start] != 0x27:
+            continue
+        structure_end = single_quote_end(structure_start)
+        if structure_end is None:
+            continue
+        comma = skip_space(structure_end + 1)
+        if comma >= len(payload) or payload[comma] != 0x2C:
+            continue
+        data_start = skip_space(comma + 1)
+        if data_start >= len(payload) or payload[data_start] != 0x27:
+            continue
+        data_end = single_quote_end(data_start)
+        if data_end is None:
+            continue
+        closing_paren = skip_space(data_end + 1)
+        if closing_paren >= len(payload) or payload[closing_paren] != 0x29:
+            continue
+        literal_spans.append((data_start + 1, data_end))
+    if not literal_spans:
+        return False
+
+    found_embedded_nul = False
+    for index, byte in enumerate(payload):
+        unsafe = (
+            byte == 0
+            or byte >= 0x80
+            or (byte < 0x20 and byte not in b"\t\n\r")
+        )
+        if not unsafe:
+            continue
+        if not any(start <= index < end for start, end in literal_spans):
+            return False
+        found_embedded_nul = found_embedded_nul or byte == 0
+    return found_embedded_nul
+
+
+def _posix_shell_invalid_byte_test_is_byte_preserving(payload: bytes) -> bool:
+    """Recognize a POSIX shell fixture that deliberately exercises raw bytes."""
+
+    marker = b"# invalid 8-bit bytes\n"
+    marker_end = payload.find(marker)
+    if (
+        not payload.startswith(b"#!/bin/sh\n")
+        or marker_end < 0
+        or b"\0" in payload
+    ):
+        return False
+    marker_end += len(marker)
+    try:
+        payload[:marker_end].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    found_invalid_fixture = False
+    for line in payload[marker_end:].splitlines(keepends=True):
+        try:
+            line.decode("utf-8", errors="strict")
+            continue
+        except UnicodeDecodeError:
+            pass
+        prefix = b'test_ps "'
+        if not line.startswith(prefix):
+            return False
+        quote_start = len(prefix) - 1
+        index = quote_start + 1
+        quote_end: int | None = None
+        while index < len(line):
+            if line[index] == 0x5C and index + 1 < len(line):
+                index += 2
+                continue
+            if line[index] == 0x22:
+                quote_end = index
+                break
+            index += 1
+        if quote_end is None:
+            return False
+        try:
+            line[: quote_start + 1].decode("utf-8", errors="strict")
+            line[quote_end:].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        try:
+            line[quote_start + 1 : quote_end].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            found_invalid_fixture = True
+            continue
+        return False
+    return found_invalid_fixture
+
+
+def _validate_byte_preserving_domain_stream(
+    stream: BinaryIO,
+    *,
+    path: Path,
+    expected_size: int,
+    trailing_nul_bytes: int,
+) -> _ValidatedDomainText | None:
+    """Return a narrow one-byte codec contract for proven byte-oriented text."""
+
+    if expected_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+        return None
+    stream.seek(0)
+    raw = stream.read(expected_size + 1)
+    if len(raw) != expected_size:
+        raise OSError(
+            f"domain input changed size while reading {path}: "
+            f"expected {expected_size}, read {len(raw)}"
+        )
+    payload = raw[: expected_size - trailing_nul_bytes]
+    suffix = path.suffix.casefold()
+    allow_embedded_nul = (
+        suffix == ".sql"
+        and _sql_rowbinary_literal_is_byte_preserving(payload)
+    )
+    if allow_embedded_nul:
+        accepted = True
+    else:
+        accepted = (
+            suffix == ".sh"
+            and _posix_shell_invalid_byte_test_is_byte_preserving(payload)
+        )
+    if not accepted:
+        return None
+    text = payload.decode("latin-1", errors="strict")
+    if text.encode("latin-1", errors="strict") != payload:
+        raise ValueError(f"byte-preserving domain input did not round-trip: {path}")
+    return _ValidatedDomainText(
+        codec="latin-1",
+        source_encoding="iso-8859-1",
+        bom=b"",
+        signature_text=text[:DOMAIN_SIGNATURE_READ_BYTES],
+        trailing_nul_bytes=trailing_nul_bytes,
+        allow_embedded_nul=allow_embedded_nul,
     )
 
 
@@ -583,10 +760,28 @@ def _validate_domain_stream(
                 trailing_nul_bytes=trailing_nul_bytes,
             )
         except UnicodeDecodeError as cp1252_exc:
+            byte_preserving = _validate_byte_preserving_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+            if byte_preserving is not None:
+                return byte_preserving
             raise ValueError(
                 f"invalid UTF-8 or Windows-1252 domain input {path}: "
                 f"utf-8={utf8_exc}; windows-1252={cp1252_exc}"
             ) from cp1252_exc
+    except ValueError:
+        byte_preserving = _validate_byte_preserving_domain_stream(
+            stream,
+            path=path,
+            expected_size=expected_size,
+            trailing_nul_bytes=trailing_nul_bytes,
+        )
+        if byte_preserving is not None:
+            return byte_preserving
+        raise
 
 
 def _validate_domain_path(
@@ -622,7 +817,7 @@ def _decode_domain_bytes(
         "utf-16-be",
         "utf-32-le",
         "utf-32-be",
-    } and b"\0" in payload:
+    } and b"\0" in payload and not selected.allow_embedded_nul:
         raise ValueError(f"binary domain input contains NUL byte: {path}")
     if selected.codec == _ICONV_EUC_TW_CODEC:
         return _decode_euc_tw(payload, path=path)
@@ -632,7 +827,7 @@ def _decode_domain_bytes(
         raise ValueError(
             f"invalid {selected.source_encoding} domain input {path}: {exc}"
         ) from exc
-    if "\0" in text:
+    if "\0" in text and not selected.allow_embedded_nul:
         raise ValueError(f"decoded domain input contains NUL character: {path}")
     return text
 
@@ -871,7 +1066,7 @@ def _decodable_prefix_at_or_before(
     cut = min(int(limit), len(data))
     if codec == "utf-8":
         return _utf8_boundary_at_or_before(data, cut)
-    if codec == "cp1252":
+    if codec in {"cp1252", "latin-1"}:
         return cut
     if codec not in {
         "utf-16-le",
@@ -1066,10 +1261,13 @@ def iter_domain_file_chunks(
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
     UTF-8, BOM-marked UTF-16/32, filename-declared legacy SQL encodings, and
-    strict Windows-1252 are decoded without replacement. SQL prefers statement
-    boundaries; build, shell, and diagnostic text prefers line boundaries.
-    Every emitted chunk has an explicit hard byte cap and exact byte/character
-    provenance into the original encoded file.
+    strict Windows-1252 are decoded without replacement. Syntax-confined
+    RowBinary SQL literals and explicit POSIX invalid-byte test sections use a
+    one-byte ISO-8859-1 round trip; structural NULs and unmarked invalid shell
+    bytes still fail closed. SQL prefers statement boundaries; build, shell,
+    and diagnostic text prefers line boundaries. Every emitted chunk has an
+    explicit hard byte cap and exact byte/character provenance into the
+    original encoded file.
     """
 
     if not 4 <= max_chunk_bytes <= DOMAIN_INPUT_SIZE_LIMIT_BYTES:
@@ -1205,7 +1403,7 @@ def iter_domain_file_chunks(
 
             raw = bytes(buffer)
             text = raw.decode(validated.codec, errors="strict")
-            if "\0" in text:
+            if "\0" in text and not validated.allow_embedded_nul:
                 raise ValueError(
                     f"decoded domain input contains NUL character: {path_obj}"
                 )
@@ -1867,11 +2065,13 @@ def discover_project_domain_files(
     extra_exclude_dirs: set[str] | None = None,
     include_cpp: bool = True,
     invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
+    excluded_paths: set[str] | None = None,
 ) -> list[DiscoveredDomainFile]:
     """Discover typed text inputs without opening unrelated binary assets."""
 
     root_path = Path(root)
     skip_dirs = {".git"} | (extra_exclude_dirs or set())
+    excluded = {os.path.abspath(path) for path in (excluded_paths or set())}
     discovered: list[DiscoveredDomainFile] = []
 
     def candidate_paths() -> Iterator[Path]:
@@ -1881,6 +2081,8 @@ def discover_project_domain_files(
                 yield Path(directory) / name
 
     for path in candidate_paths():
+        if os.path.abspath(path) in excluded:
+            continue
         explicit_candidate = _is_explicit_domain_path(path, include_cpp=include_cpp)
         signature_candidate = _allows_domain_content_signatures(path)
         if not explicit_candidate and not signature_candidate:

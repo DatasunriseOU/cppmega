@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 from typing import Iterable
+import zipfile
 
 
 MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v1"
@@ -36,7 +37,12 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_crash_fixture",
         "clang_debug_crash_pragma",
     ),
+    (
+        "deliberate_compiler_crash_fixture",
+        "clang_debug_parser_crash_pragma",
+    ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
+    ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
 }
@@ -232,6 +238,43 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             )
         return
 
+    if entry.detected_format == "clang_debug_parser_crash_pragma":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_debug_parser_crash_pragma "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        required_lines = {
+            "// REQUIRES: crash-recovery",
+            "#pragma clang __debug parser_crash",
+            "FOO",
+            "// CHECKSRC: FOO",
+            '// CHECKSH: "-cc1"',
+        }
+        crash_runs = [
+            line
+            for line in lines
+            if line.startswith("// RUN: not ")
+            and "%clang" in line
+            and "-fsyntax-only" in line
+            and "FileCheck" in line
+        ]
+        if (
+            not required_lines.issubset(lines)
+            or len(crash_runs) != 1
+            or lines.count("#pragma clang __debug parser_crash") != 1
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "clang_debug_parser_crash_pragma but the Clang parser-crash "
+                "test contract is incomplete or ambiguous"
+            )
+        return
+
     if entry.detected_format == "mixed_utf8_utf16le_c_array":
         payload = path.read_bytes()
         marker = "/* \n\n   Input ELF file:".encode("utf-16le")
@@ -273,6 +316,53 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
                 "but the generated binary-array contract is incomplete"
+            )
+        return
+
+    if entry.detected_format == "posix_shell_appended_zip":
+        payload = path.read_bytes()
+        archive_start = payload.find(b"PK\x03\x04")
+        if archive_start <= 0:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                "but an appended ZIP local header is absent"
+            )
+        try:
+            shell_prefix = payload[:archive_start].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                f"but the shell prefix is not UTF-8: {exc}"
+            ) from exc
+        first_line = shell_prefix.splitlines()[0] if shell_prefix else ""
+        if (
+            first_line not in {"#!/bin/sh", "#!/bin/bash"}
+            or '"$0"' not in shell_prefix
+            or "\x00" in shell_prefix
+            or not shell_prefix.endswith("\n")
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                "but the self-executing shell contract is incomplete"
+            )
+        try:
+            with zipfile.ZipFile(path) as archive:
+                members = archive.infolist()
+                first_bad_member = archive.testzip()
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                f"but the appended ZIP is invalid: {exc}"
+            ) from exc
+        if not members or not any(not member.is_dir() for member in members):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                "but the appended ZIP has no file members"
+            )
+        if first_bad_member is not None:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                f"but ZIP CRC validation failed for {first_bad_member!r}"
             )
         return
 
@@ -425,7 +515,7 @@ class ProjectSourceQuarantine:
         missing = sorted(set(self.entries_by_path) - set(consumed))
         if missing:
             raise SourceQuarantineError(
-                f"{self.project_id}: manifest entries were not discovered as C/C++ "
+                f"{self.project_id}: manifest entries were not discovered as source "
                 f"candidates: {missing}"
             )
         quarantined_entries = [

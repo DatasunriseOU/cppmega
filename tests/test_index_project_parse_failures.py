@@ -944,6 +944,69 @@ def test_valgrind_style_header_loads_with_sane_fallback_args(
     }
 
 
+def test_mixed_case_cpp_suffix_forces_cpp_language(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "Outgoing.Cpp"
+    source.write_text(
+        "namespace tapi {\n"
+        "class Outgoing {\n"
+        "public:\n"
+        "    int call() const { return 3; }\n"
+        "};\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-std=c++17", "-Wno-everything"],
+        str(source),
+    )
+
+    assert adapted[:2] == ["-x", "c++"]
+    assert "-std=c++17" in adapted
+    translation_unit = index_project.Index.create().parse(
+        str(source),
+        args=adapted,
+    )
+    assert not [
+        diagnostic
+        for diagnostic in translation_unit.diagnostics
+        if int(diagnostic.severity) >= 3
+    ]
+
+
+def test_mixed_case_cpp_suffix_preserves_explicit_language(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "kernel.Cpp"
+    explicit_args = ["-x", "cuda", "--cuda-host-only"]
+
+    assert index_project._adapt_args_for_file(
+        explicit_args,
+        str(source),
+    ) == explicit_args
+    assert index_project._adapt_args_for_file(
+        ["-xdefinitely-invalid"],
+        str(source),
+    ) == ["-xdefinitely-invalid"]
+
+
+def test_lowercase_cpp_suffix_does_not_rewrite_explicit_language(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "kernel.cpp"
+    explicit_args = ["-x", "objective-c++", "-fobjc-arc"]
+
+    assert index_project._adapt_args_for_file(
+        explicit_args,
+        str(source),
+    ) == explicit_args
+
+
 def test_valgrind_fallback_status_is_emitted_in_source_sidecars(
     tmp_path: Path,
 ) -> None:
@@ -1126,6 +1189,154 @@ def test_header_macro_emission_preserves_mixed_legacy_bytes(
     assert len(docs) == 1
     assert docs[0]["text"].encode("latin-1") == raw
     assert "\ufffd" not in docs[0]["text"]
+
+
+def test_macro_registry_compacts_shared_definitions_without_losing_root_views(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    (tmp_path / "shared.h").write_text(
+        "#define VALUE 1\n"
+        "#undef VALUE\n"
+        "#define VALUE 2\n",
+        encoding="utf-8",
+    )
+    roots = []
+    for index, stem in enumerate(("alpha", "beta")):
+        root = tmp_path / f"{stem}.cpp"
+        root.write_text(
+            ("// beta prefix one\n// beta prefix two\n" if index else "")
+            + '#include "shared.h"\n'
+            + f"int {stem}() {{ return VALUE; }}\n",
+            encoding="utf-8",
+        )
+        roots.append(str(root))
+
+    index = index_project.ProjectIndex()
+    stats = index_project.register_header_macros(
+        index,
+        roots,
+        project_dir=str(tmp_path),
+        project_id="fixture/shared-macro-views",
+        macro_usage_texts_by_file={
+            "alpha.cpp": [("VALUE", 2)],
+            "beta.cpp": [("VALUE", 4)],
+        },
+        max_retained_macros=2,
+    )
+
+    assert stats["registered_macros"] == 4
+    assert stats["canonical_macro_definitions"] == 2
+    assert stats["macro_visibility_records"] == 4
+    assert stats["compacted_macro_occurrences"] == 2
+    assert 0 < stats["macro_visibility_bytes"]
+    assert (
+        stats["macro_visibility_bytes"]
+        <= stats["macro_visibility_byte_limit"]
+    )
+    assert len(index.macro_definitions) == 2
+
+    alpha = index_project._select_visible_macro(
+        index,
+        "VALUE",
+        target_file="alpha.cpp",
+        max_line=2,
+    )
+    beta = index_project._select_visible_macro(
+        index,
+        "VALUE",
+        target_file="beta.cpp",
+        max_line=4,
+    )
+    assert alpha is not None
+    assert beta is not None
+    assert alpha.text == beta.text == "#undef VALUE\n#define VALUE 2\n"
+    assert alpha.visible_in_file == "alpha.cpp"
+    assert beta.visible_in_file == "beta.cpp"
+    assert alpha.visible_line == 1
+    assert beta.visible_line == 3
+    assert alpha.sequence == 1
+    assert beta.sequence == 3
+    assert alpha.previous is not None
+    assert beta.previous is not None
+    assert alpha.previous.text == beta.previous.text == "#define VALUE 1\n"
+    assert alpha.previous.visible_in_file == "alpha.cpp"
+    assert beta.previous.visible_in_file == "beta.cpp"
+    assert alpha.previous.sequence == 0
+    assert beta.previous.sequence == 2
+    assert [
+        (macro.visible_in_file, macro.sequence)
+        for macro in index_project._used_macro_defs(
+            index,
+            [("return VALUE;", 4)],
+            target_file="beta.cpp",
+            max_line=4,
+        )
+    ] == [("beta.cpp", 2), ("beta.cpp", 3)]
+
+
+def test_macro_registry_bound_counts_distinct_source_definitions(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    roots = []
+    for stem in ("one", "two"):
+        (tmp_path / f"{stem}.h").write_text(
+            "#define VALUE 1\n",
+            encoding="utf-8",
+        )
+        root = tmp_path / f"{stem}.cpp"
+        root.write_text(
+            f'#include "{stem}.h"\n'
+            f"int {stem}() {{ return VALUE; }}\n",
+            encoding="utf-8",
+        )
+        roots.append(str(root))
+
+    with pytest.raises(
+        MemoryError,
+        match=r"canonical definition registry bound: .*limit=1",
+    ):
+        index_project.register_header_macros(
+            index_project.ProjectIndex(),
+            roots,
+            project_dir=str(tmp_path),
+            project_id="fixture/distinct-macro-definitions",
+            macro_usage_texts_by_file={
+                "one.cpp": [("VALUE", 2)],
+                "two.cpp": [("VALUE", 2)],
+            },
+            max_retained_macros=1,
+        )
+
+
+def test_macro_registry_visibility_byte_bound_fails_loud(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    root = tmp_path / "root.cpp"
+    root.write_text(
+        "#define VALUE 1\n"
+        "int root() { return VALUE; }\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        MemoryError,
+        match=r"root visibility byte bound: .*limit=1",
+    ):
+        index_project.register_header_macros(
+            index_project.ProjectIndex(),
+            [str(root)],
+            project_dir=str(tmp_path),
+            project_id="fixture/macro-visibility-byte-bound",
+            macro_usage_texts_by_file={"root.cpp": [("VALUE", 2)]},
+            max_retained_macros=2,
+            max_macro_visibility_bytes=1,
+        )
 
 
 def test_parse_pool_emits_heartbeat_while_a_batch_is_still_running(

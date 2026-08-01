@@ -516,27 +516,20 @@ def _remap_char_edge_triples_to_tokens(
     if source_length is None:
         source_length = max((int(end) for _start, end in token_spans), default=0)
     for src_char, dst_char, kind in triples:
-        if src_char == dst_char:
-            src = dst = _char_point_to_token_index(
-                token_spans,
-                src_char,
-                source_length=source_length,
-            )
-        else:
-            src = _char_position_to_token_index(
-                token_spans,
-                src_char,
-                source_length=source_length,
-            )
-            dst = _char_position_to_token_index(
-                token_spans,
-                dst_char,
-                source_length=source_length,
-            )
+        src = _char_point_to_token_index(
+            token_spans,
+            src_char,
+            source_length=source_length,
+        )
+        dst = _char_point_to_token_index(
+            token_spans,
+            dst_char,
+            source_length=source_length,
+        )
         if src is None or dst is None:
             raise ValueError(
-                f"domain edge {src_char}->{dst_char} endpoint is not contained "
-                "in a nonempty token span"
+                f"domain edge {src_char}->{dst_char} could not be mapped "
+                "to a nonempty token span"
             )
         remapped.append({"from": int(src), "to": int(dst), "kind": int(kind)})
     return remapped

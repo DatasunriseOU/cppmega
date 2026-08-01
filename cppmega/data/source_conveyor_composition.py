@@ -826,6 +826,15 @@ def _load_run(
         archive,
         run_id=run_id,
     )
+    if "--source-archive" in command:
+        command_archive = Path(
+            _single_option(command, "--source-archive")
+        ).expanduser().resolve()
+        receipt_archive = Path(
+            str(archive_fields["resolved_path"])
+        ).expanduser().resolve()
+        if command_archive != receipt_archive:
+            raise ValueError(f"{run_id} source archive command path drifted")
     input_artifacts: dict[str, tuple[dict[str, Any], Path]] = {
         name: _validate_input_artifact(
             inputs,
@@ -902,22 +911,21 @@ def _load_run(
         inventory.get("canonical_repo_list"),
         where=f"{run_id} inventory canonical repo list",
     )
+    for label, binding in (
+        ("archive SHA-256 receipt", inventory_archive_receipt),
+        ("canonical repo list", inventory_repo_list),
+    ):
+        recorded_path = binding.get("path")
+        if not isinstance(recorded_path, str) or not recorded_path:
+            raise ValueError(
+                f"{run_id} inventory {label} path provenance is invalid"
+            )
     if (
-        _resolve_bound_path(
-            inventory_archive_receipt.get("path"),
-            where=f"{run_id} inventory archive SHA-256 receipt",
-        )
-        != archive_receipt_path
-        or _require_sha256(
+        _require_sha256(
             inventory_archive_receipt.get("sha256"),
             where=f"{run_id} inventory archive SHA-256 receipt.sha256",
         )
         != input_binding_hashes["archive_sha256_receipt"]
-        or _resolve_bound_path(
-            inventory_repo_list.get("path"),
-            where=f"{run_id} inventory canonical repo list",
-        )
-        != input_artifacts["repo_list"][1]
         or _require_sha256(
             inventory_repo_list.get("sha256"),
             where=f"{run_id} inventory canonical repo list.sha256",
