@@ -16,7 +16,7 @@ import warnings
 from collections.abc import Mapping, Sequence
 from functools import wraps
 from math import prod
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch  # type: ignore[import-not-found]
@@ -1155,7 +1155,7 @@ def _lazy_init_graph_sidecars(dataset: Any) -> dict[str, dict[str, Any]]:
 
         offset_dtype = np.dtype(entry.get("offset_dtype", "int64"))
         dtype = np.dtype(entry.get("dtype", "int32"))
-        offsets = np.memmap(
+        offsets: np.memmap = np.memmap(
             offsets_path, mode="r", dtype=offset_dtype, shape=(document_count + 1,)
         )
         if int(offsets[0]) != 0:

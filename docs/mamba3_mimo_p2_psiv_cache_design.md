@@ -265,3 +265,18 @@ Before investing kernel-work time, confirm these **are not** blockers:
 ## 14. If Phase A shows no gain — archive
 
 If the Python-level materialisation shows no measurable TFLOP/s improvement (within 0.5% noise), then the TileLang compiler is already handling PsiV optimally and this work should be **archived**. Update this doc with a "superseded / not pursued" addendum and point future agents at the Phase A measurement as the reason.
+
+### Addendum: archived 2026-08-01
+
+Phase A requires a real GPU run to measure the Python-level `psi_v = v * psi`
+materialisation vs the baseline kernel recompute. No local GPU was available on
+2026-08-01, and the work was not in the active hardware queue. Rather than keep
+the scaffold in a perpetual "not started" state, this P2 item is **archived**:
+
+- `cppmega/megatron/mamba3_psiv_cache.py` and
+  `cppmega/megatron/upstream_patches/apply_mamba3_p2_psiv_patches.py` remain as
+  deprecated scaffolding (gate `CPPMEGA_MAMBA3_P2_PSIV_CACHE` stays **OFF**).
+- All entrypoints continue to raise `NotImplementedError` if the gate is enabled.
+- To resurrect, rerun Phase A on H200/GB10 with `modal_mamba3_psiv_dryrun.py` or
+  a dedicated kernel micro-benchmark; only a ≥0.5% TFLOP/s win justifies moving
+  to Phases B/C.

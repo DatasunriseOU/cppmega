@@ -1,5 +1,9 @@
+import gc
+import weakref
+
 import torch
 
+from cppmega.megatron import moe_dispatcher_patch
 from cppmega.megatron.moe_dispatcher_patch import (
     apply_moe_dispatcher_identity_sort_patch,
     is_identity_permutation,
@@ -9,6 +13,23 @@ from cppmega.megatron.moe_dispatcher_patch import (
 def test_identity_permutation_detection():
     assert is_identity_permutation(torch.arange(4))
     assert not is_identity_permutation(torch.tensor([0, 2, 1, 3]))
+
+
+def test_identity_cache_finalizer_keeps_a_replacement_reference():
+    original = torch.tensor([0])
+    replacement = torch.tensor([1])
+    original_ref = weakref.ref(original)
+    replacement_ref = weakref.ref(replacement)
+    key = id(original)
+    moe_dispatcher_patch._IDENTITY_CACHE[key] = (replacement_ref, 0, False)
+
+    del original, replacement
+    gc.collect()
+    assert original_ref() is None and replacement_ref() is None
+
+    moe_dispatcher_patch._identity_cache_finalizer(original_ref, key)
+    assert moe_dispatcher_patch._IDENTITY_CACHE[key][0] is replacement_ref
+    moe_dispatcher_patch._IDENTITY_CACHE.pop(key)
 
 
 def test_identity_chunk_sort_patch_skips_noop_sort():

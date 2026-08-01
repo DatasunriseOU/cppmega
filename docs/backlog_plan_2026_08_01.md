@@ -136,17 +136,19 @@ P3 — стратегическое/отложенное.
 - **Проверка:** `pytest tests/ -k deprecated_paths -q` → 1 passed, 18 skipped;
   `head -20 cppmega/megatron/mamba3_author_spec.py` содержит пометку.
 
-## [P010] Решение по PsiV cache scaffold (Phase A замер или архив)
+## [P010] Решение по PsiV cache scaffold (Phase A замер или архив) — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: —
-- **Где:** `cppmega/megatron/mamba3_psiv_cache.py` (все entrypoints
-  `NotImplementedError`, строки 63–218), `docs/mamba3_mimo_p2_psiv_cache_design.md:251`,
+- **Где:** `docs/mamba3_mimo_p2_psiv_cache_design.md` §14 + addendum,
+  `cppmega/megatron/mamba3_psiv_cache.py` (остаётся как deprecated scaffold),
   `tests/test_mamba3_psiv_cache.py`.
-- **Что делать:** по §14 дизайн-дока: либо сделать Phase A замер (~1 день,
-  потребуется GPU — тогда перенести в фазу G), либо заархивировать модуль:
-  удалить код, оставить addendum в дизайн-доке «not pursued, reason». Решение
-  зафиксировать в дизайн-доке.
-- **Проверка:** `pytest tests/test_mamba3_psiv_cache.py -q` зелёный в обоих
-  исходах; в дизайн-доке обновлён статус.
+- **Что сделано:** принято решение об архивации: Phase A требует GPU-замера,
+  локального GPU нет, работа не в активной hardware-очереди. В дизайн-док
+  добавлен addendum «archived 2026-08-01» с условиями воскрешения
+  (≥0.5% TFLOP/s win на H200/GB10). Модуль оставлен как deprecated scaffolding
+  с gate `CPPMEGA_MAMBA3_P2_PSIV_CACHE` OFF; entrypoints по-прежнему
+  `NotImplementedError` при включении gate.
+- **Проверка:** `pytest tests/test_mamba3_psiv_cache.py -q` → 3 passed, 4 skipped;
+  дизайн-док содержит addendum с обоснованием archived-статуса.
 
 ## [P011] Triage 22 warnings последнего локального прогона — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: —

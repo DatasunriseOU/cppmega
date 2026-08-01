@@ -19,7 +19,6 @@ from torch.utils.cpp_extension import load_inline
 _SUPPORTED_OUT_DTYPES = (torch.bfloat16, torch.float16)
 _RUNNER_ENV = "CPPMEGA_FLASHINFER_MXFP8_RUNNER"
 _TACTIC_ENV = "CPPMEGA_FLASHINFER_MXFP8_TACTIC"
-_DEFAULT_RUNNER_MODE: RunnerMode = "mm_mxfp8"
 
 RunnerMode = Literal["mm_mxfp8", "direct_tactic"]
 CompactColumnwiseOp = Literal["dgrad_nn", "wgrad_nt"]
@@ -39,6 +38,7 @@ CompactColumnwiseReason = Literal[
     "flashinfer_mm_mxfp8_no_compact_columnwise",
 ]
 
+_DEFAULT_RUNNER_MODE: RunnerMode = "mm_mxfp8"
 _COMPACT_COLUMNWISE_BACKEND = "cutlass_native_compact_direct"
 _PURE_FLASHINFER_COMPACT_REASON: CompactColumnwiseReason = (
     "flashinfer_mm_mxfp8_no_compact_columnwise"

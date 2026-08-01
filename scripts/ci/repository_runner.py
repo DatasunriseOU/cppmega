@@ -25,7 +25,7 @@ import traceback
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 SCHEMA_VERSION = "cppmega.repository-ci.v1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -638,11 +638,12 @@ def run_step(
             bufsize=1,
             start_new_session=True,
         )
-        assert process.stdout is not None
+        process_stdout = process.stdout
+        assert process_stdout is not None
 
         def consume_output() -> None:
             try:
-                for line in process.stdout:
+                for line in process_stdout:
                     log_handle.write(redactor.line(line))
                     log_handle.flush()
             except (OSError, ValueError) as exc:
@@ -657,7 +658,7 @@ def run_step(
             _terminate_process_group(process)
             exit_code = 124
         reader.join(timeout=5)
-        process.stdout.close()
+        process_stdout.close()
     duration = round(time.monotonic() - started, 3)
     if reader_errors and exit_code == 0:
         exit_code = 1
@@ -777,16 +778,19 @@ def _lane_probe_status(
     machines_match = str(observed.get("machine", "")).lower() in {
         str(machine).lower() for machine in lane["machines"]
     }
-    modules = (
-        observed.get("modules") if isinstance(observed.get("modules"), dict) else {}
+    observed_modules = observed.get("modules")
+    modules: dict[str, Any] = (
+        observed_modules if isinstance(observed_modules, dict) else {}
     )
-    tools = observed.get("tools") if isinstance(observed.get("tools"), dict) else {}
+    observed_tools = observed.get("tools")
+    tools: dict[str, Any] = observed_tools if isinstance(observed_tools, dict) else {}
     missing_modules = [
         module for module in lane["required_modules"] if modules.get(module) is not True
     ]
     missing_tools = [name for name, present in tools.items() if present is not True]
-    cuda_payload = (
-        observed.get("cuda") if isinstance(observed.get("cuda"), dict) else {}
+    observed_cuda = observed.get("cuda")
+    cuda_payload: dict[str, Any] = (
+        observed_cuda if isinstance(observed_cuda, dict) else {}
     )
     cuda_available = cuda_payload.get("available")
     cuda_ok = not lane.get("requires_cuda") or cuda_available is True
@@ -1314,7 +1318,12 @@ def run_lane(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def _safe_extract(archive_path: Path, destination: Path, *, mode: str = "r:") -> None:
+def _safe_extract(
+    archive_path: Path,
+    destination: Path,
+    *,
+    mode: Literal["r:", "r:gz"] = "r:",
+) -> None:
     with tarfile.open(archive_path, mode=mode) as archive:
         members = archive.getmembers()
         for member in members:
@@ -2067,7 +2076,7 @@ def _write_early_failure_receipt(
             receipt_name = "orchestration.json"
         receipt_dir.mkdir(parents=True, exist_ok=True)
         now = _utc_now()
-        receipt = {
+        receipt: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "kind": "orchestration" if command == "run" else "lane",
             "run_id": run_id,

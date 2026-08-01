@@ -34,7 +34,7 @@ def _identity_cache_finalizer(
 ) -> None:
     """Remove ``current`` from the identity cache if it is still the holder."""
     cached = _IDENTITY_CACHE.get(key)
-    if cached is not None and cached[0]() is current():
+    if cached is not None and cached[0] is current:
         _IDENTITY_CACHE.pop(key, None)
 
 
