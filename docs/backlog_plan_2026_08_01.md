@@ -694,15 +694,23 @@ P3 — стратегическое/отложенное.
   - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_dense_cpp_lm.py tests/test_convert_megatron_dense500m_torchdist_to_mlx.py -q` → зелёный.
   - `rg "rope_only" cppmega_mlx/models/dense_cpp_lm.py scripts/convert_megatron_dense500m_torchdist_to_mlx.py` — флаг проброшен.
 
-## [P055] Совместимость generic generation API с DenseCppLM
+## [P055] Совместимость generic generation API с DenseCppLM — DONE
 - Репо: mlx | Приоритет: P2 | Тип: bug | Зависит от: P054
-- **Где:** `cppmega_mlx/models/dense_cpp_lm.py:573` (tuple output) vs
-  `cppmega_mlx/inference/generation.py:765`; обходной путь в
-  `cppmega_mlx/eval/cpp_jsonl_generation_compile_eval.py:403`.
-- **Что делать:** унифицировать контракт (адаптер на одной стороне), удалить
-  обходной путь из eval-скрипта.
-- **Проверка:** eval работает через generic API; тест на DenseCppLM через
-  `inference/generation.py` зелёный.
+- **Где:** `cppmega_mlx/models/dense_cpp_lm.py:1056` (tuple output `(logits, None)`)
+  vs `cppmega_mlx/inference/generation.py:105-113`/`804-827` (`next_token_logits` /
+  `_standard_generation_logits` адаптер); обходной путь `logits, _loss = model(...)`
+  в `scripts/cpp_jsonl_generation_compile_eval.py:1340`.
+- **Что сделано:**
+  - Адаптер в `generation.py` разворачивает `(logits, None)`; проверено, что
+    `generate_tokens(DenseCppLM, ...)` работает.
+  - Обходной путь в eval-скрипте заменён на вызов адаптера:
+    `next_token_logits(model(...), input_ids)`; `_sample_next` теперь получает
+    `(B, V)` logits напрямую.
+  - Добавлен regression-тест `test_dense_cpp_lm_works_with_generic_generation_api`
+    в `tests/test_dense_cpp_lm.py`.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_dense_cpp_lm.py::test_dense_cpp_lm_works_with_generic_generation_api -q` → 1 passed.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_dense_cpp_lm.py tests/test_inference_generation.py tests/test_cpp_jsonl_generation_compile_eval.py -q` → 147 passed.
 
 ## [P056] Wave-Next 1: side-channel preservation в Megatron-конвертере — DONE
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: —
