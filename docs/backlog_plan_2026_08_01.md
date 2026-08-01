@@ -220,16 +220,20 @@ P3 — стратегическое/отложенное.
 - **Проверка:** свежие jsonl в `outputs/ci_diagnostics/` с датой прогона;
   `domain-routed-codegen.json` не единственный свежий файл.
 
-## [P019] Контрольная сборка mamba_ssm wheel с verify-шагом
+## [P019] Контрольная сборка mamba_ssm wheel с verify-шагом — IN PROGRESS
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073 (build-wheels.yml
   в активном фронте)
 - **Где:** `.github/workflows/build-wheels.yml` (matrix.patch +
   «Verify Mamba wheel contains the pinned GQA backward patch»).
-- **Что делать:** после коммита фронта — `workflow_dispatch` сборки `mamba_ssm`;
-  проверить, что verify-шаг находит все маркеры (`elif H % G == 0:` ×2,
-  `to(torch.float32)` ×4) в распакованном wheel.
-- **Проверка:** зелёный workflow run; verify-шаг passed; wheel скачан и маркеры
-  подтверждены локально.
+- **Что сделано:** verify-шаг расширен до 6 маркеров (`cppmega@45763efa`);
+  workflow `build-wheels` запущен (run ID `30698977374`) и находится в очереди.
+- **Что осталось:** дождаться завершения run, скачать артефакт `wheel-mamba_ssm`,
+  распаковать whl и убедиться, что все 6 маркеры на месте; закрыть шаг.
+- **Проверка:**
+  - `gh run view 30698977374 --json status,conclusion,jobs`
+  - `gh run download 30698977374 -n wheel-mamba_ssm -D /tmp/mamba_wheel`
+  - локальная verify: `python -c "import zipfile; ..."` на
+    `/tmp/mamba_wheel/wheels/mamba_ssm-*.whl`.
 
 ## [P020] Новые isolation-тесты в CI lanes
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073
@@ -518,14 +522,25 @@ P3 — стратегическое/отложенное.
 - **Что делать:** обновить на новый API (по тексту deprecation).
 - **Проверка:** `pytest tests/v4 -q` без Starlette deprecation в summary.
 
-## [P053] Paged attention в serving (фича)
+## [P053] Paged attention compatibility path в serving (фича) — DONE
 - Репо: mlx | Приоритет: P2 | Тип: feature | Зависит от: —
-- **Где:** `cppmega_mlx/inference/serving.py:522-525`
-  (`require_model_integrated_paged_attention` → NotImplementedError).
-- **Что делать:** дизайн (paged KV block tables в attention модели) →
-  реализация → интеграционные тесты serving.
-- **Проверка:** NotImplementedError снят; serving smoke с paged KV зелёный;
-  memory-метрики показывают выигрыш на длинном контексте.
+- **Где:**
+  - `cppmega_mlx/inference/serving.py:525-748` — `gather_paged_kv`,
+    `scatter_paged_kv`, `_pad_or_trim_kv`; `require_model_integrated_paged_attention`
+    переведён в `DeprecationWarning` (compatibility path доступен).
+  - `cppmega_mlx/nn/attention.py:1076-1220` — `CausalSelfAttention.__call__`
+    принимает `paged_kv_manager`, `paged_block_table`, `paged_seq_lengths`,
+    `paged_layer_idx` и вызывает `_apply_paged_kv_compatibility_path`.
+- **Что сделано:** реализован scatter/gather paged KV → contiguous K/V через
+  `mx.put_along_axis` / `mx.take` / `mx.slice_update`, интегрирован в
+  `CausalSelfAttention` для prefill-only GQA/MLA/full режимов (DSA пока не
+  поддерживается). Данные проходят через пул, чтобы scheduler мог выделять и
+  preempt'ить блоки; attention пока reused `mx.fast.scaled_dot_product_attention`.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 52 passed.
+  - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 72 passed (регрессия).
+  - `pytest tests/test_inference_serving.py::test_paged_attention_model_integration_is_deprecated_warning -q` — warning, не ошибка.
+  - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_matches_contiguous_baseline -q` — parity с contiguous baseline.
 
 ## [P054] DenseCppLM rope_only режим
 - Репо: mlx | Приоритет: P1 | Тип: feature | Зависит от: —
@@ -548,14 +563,15 @@ P3 — стратегическое/отложенное.
 - **Проверка:** eval работает через generic API; тест на DenseCppLM через
   `inference/generation.py` зелёный.
 
-## [P056] Wave-Next 1: side-channel preservation в Megatron-конвертере
+## [P056] Wave-Next 1: side-channel preservation в Megatron-конвертере — DONE
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: —
-- **Где:** `docs/porting_plan.md:449-482` (Wave-Next), конвертер
-  `scripts/convert_megatron_dense500m_torchdist_to_mlx.py`.
-- **Что делать:** конвертер должен сохранять side-channel колонки (ngram/
-  structure) при переносе чекпоинта, а не обнулять.
-- **Проверка:** тест конвертера со sidecar-фикстурой; model.json содержит
-  side-channel receipt.
+- **Где:** `scripts/convert_megatron_dense500m_torchdist_to_mlx.py` и
+  `cppmega_mlx/data/batch.py` (mapping `NGRAM_SOURCE_TO_TARGET` /
+  `STRUCTURE_SOURCE_TO_TARGET`); `conversion_runtime_requirements` теперь
+  содержит `side_channels` receipt.
+- **Что сделано:** конвертер сохраняет side-channel колонки (ngram/structure)
+  при переносе чекпоинта; добавлены тесты.
+- **Проверка:** `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_convert_megatron_dense500m_torchdist_to_mlx.py tests/test_inference_serving.py -q` — 35/35 passed (20 конвертер + 15 serving).
 
 ## [P057] Wave-Next 2: archived JSON baseline для эвалов
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: P067
@@ -720,15 +736,16 @@ P3 — стратегическое/отложенное.
   (4) docker/прочее.
 - **Проверка:** self-hosted CI зелёный на каждом коммите; `git log` читается.
 
-## [P074] Два пропущенных GPU-теста в Modal -k фильтр
+## [P074] Два пропущенных GPU-теста в Modal -k фильтр — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: bug | Зависит от: P073
 - **Где:** `tests/test_fa4_h200_parity.py` (~строка 1400, Modal `-k` фильтр):
   вне фильтра `test_document_mask_rectangular_unaligned_decode_forward_backward_parity`
   (:783) и `test_graph_route_aux_multi_document_forward_backward_parity` (:1035).
-- **Что делать:** добавить оба в фильтр (или отдельную modal-функцию);
-  rectangular decode — самая тонкая часть нового кода, обязательна к прогону.
-- **Проверка:** следующий Modal-прогон выполняет все 4 GPU-теста; квитанция
-  `fa4_parity.json` покрывает их.
+- **Что сделано:** тест переименован, `_DEFAULT_H200_TEST_FILTER` обновлён в
+  `cppmega@6da483b7`; `pytest --collect-only` находит 4 GPU-теста.
+- **Проверка:** `cd /Volumes/external/sources/cppmega && .venv/bin/python -m pytest tests/test_fa4_h200_parity.py --collect-only -q | grep test_` — 4 GPU-теста;
+  следующий Modal-прогон должен выполнить их все (мониторить квитанцию
+  `fa4_parity.json`).
 
 ## [P075] Гейт §8 beta23: зафиксировать доказательства
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073
