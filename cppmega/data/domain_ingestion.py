@@ -278,6 +278,10 @@ class _JsonObjectLexState:
 
 
 _SQL_DOLLAR_QUOTE_RE = re.compile(rb"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_SQL_ROWBINARY_LITERAL_RE = re.compile(
+    rb"\bformat\s*\(\s*RowBinary\s*,\s*",
+    re.IGNORECASE,
+)
 
 
 def _scan_domain_stream(
@@ -431,11 +435,62 @@ def _validate_euc_tw_stream(
 def _sql_rowbinary_literal_is_byte_preserving(payload: bytes) -> bool:
     """Accept binary bytes only inside a complete RowBinary SQL literal."""
 
-    if b"format(rowbinary" not in payload.lower():
+    def single_quote_end(quote_start: int) -> int | None:
+        index = quote_start + 1
+        while index < len(payload):
+            byte = payload[index]
+            following = payload[index + 1] if index + 1 < len(payload) else None
+            if byte == 0x5C and following is not None:
+                index += 2
+                continue
+            if byte == 0x27:
+                if following == 0x27:
+                    index += 2
+                    continue
+                return index
+            index += 1
+        return None
+
+    def skip_space(index: int) -> int:
+        while index < len(payload) and payload[index] in b" \t\r\n":
+            index += 1
+        return index
+
+    literal_spans: list[tuple[int, int]] = []
+    for match in _SQL_ROWBINARY_LITERAL_RE.finditer(payload):
+        if len(literal_spans) >= 64:
+            return False
+        prefix = bytearray(payload[: match.start()])
+        _statement_cut, _lexical_cut, state = _scan_sql_chunk_prefix(
+            prefix,
+            limit=len(prefix),
+            initial_state=_SqlLexState(),
+        )
+        if state.mode != "normal":
+            continue
+        structure_start = skip_space(match.end())
+        if structure_start >= len(payload) or payload[structure_start] != 0x27:
+            continue
+        structure_end = single_quote_end(structure_start)
+        if structure_end is None:
+            continue
+        comma = skip_space(structure_end + 1)
+        if comma >= len(payload) or payload[comma] != 0x2C:
+            continue
+        data_start = skip_space(comma + 1)
+        if data_start >= len(payload) or payload[data_start] != 0x27:
+            continue
+        data_end = single_quote_end(data_start)
+        if data_end is None:
+            continue
+        closing_paren = skip_space(data_end + 1)
+        if closing_paren >= len(payload) or payload[closing_paren] != 0x29:
+            continue
+        literal_spans.append((data_start + 1, data_end))
+    if not literal_spans:
         return False
-    state = _SqlLexState()
+
     found_embedded_nul = False
-    scan_start = 0
     for index, byte in enumerate(payload):
         unsafe = (
             byte == 0
@@ -444,24 +499,10 @@ def _sql_rowbinary_literal_is_byte_preserving(payload: bytes) -> bool:
         )
         if not unsafe:
             continue
-        segment = bytearray(payload[scan_start:index])
-        _statement_cut, _lexical_cut, state = _scan_sql_chunk_prefix(
-            segment,
-            limit=len(segment),
-            initial_state=state,
-        )
-        if state.mode != "single_quote":
+        if not any(start <= index < end for start, end in literal_spans):
             return False
         found_embedded_nul = found_embedded_nul or byte == 0
-        scan_start = index
-
-    remainder = bytearray(payload[scan_start:])
-    _statement_cut, _lexical_cut, state = _scan_sql_chunk_prefix(
-        remainder,
-        limit=len(remainder),
-        initial_state=state,
-    )
-    return found_embedded_nul and state.mode in {"normal", "line_comment"}
+    return found_embedded_nul
 
 
 def _posix_shell_invalid_byte_test_is_byte_preserving(payload: bytes) -> bool:
@@ -480,11 +521,41 @@ def _posix_shell_invalid_byte_test_is_byte_preserving(payload: bytes) -> bool:
         payload[:marker_end].decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         return False
-    try:
-        payload[marker_end:].decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return True
-    return False
+    found_invalid_fixture = False
+    for line in payload[marker_end:].splitlines(keepends=True):
+        try:
+            line.decode("utf-8", errors="strict")
+            continue
+        except UnicodeDecodeError:
+            pass
+        prefix = b'test_ps "'
+        if not line.startswith(prefix):
+            return False
+        quote_start = len(prefix) - 1
+        index = quote_start + 1
+        quote_end: int | None = None
+        while index < len(line):
+            if line[index] == 0x5C and index + 1 < len(line):
+                index += 2
+                continue
+            if line[index] == 0x22:
+                quote_end = index
+                break
+            index += 1
+        if quote_end is None:
+            return False
+        try:
+            line[: quote_start + 1].decode("utf-8", errors="strict")
+            line[quote_end:].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        try:
+            line[quote_start + 1 : quote_end].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            found_invalid_fixture = True
+            continue
+        return False
+    return found_invalid_fixture
 
 
 def _validate_byte_preserving_domain_stream(

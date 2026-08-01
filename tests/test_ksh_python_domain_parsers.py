@@ -310,8 +310,11 @@ def test_rowbinary_sql_literal_preserves_every_source_byte(tmp_path: Path) -> No
     )
 
     encoded = (
-        b"-- binary format regression\n"
-        b"SELECT * FROM format(RowBinary, 'head\x00\x81\xff\x02tail');\n"
+        b"-- This query throw high-level exception instead of low-level "
+        b'"too large size passed to allocator":\n\n'
+        b"SELECT * FROM format(RowBinary,\n"
+        b"'payload String',\n"
+        b"'head\x00\x81\xff\x02tail'); -- { serverError TOO_LARGE_ARRAY_SIZE }\n"
     )
     path = tmp_path / "rowbinary.sql"
     path.write_bytes(encoded)
@@ -334,6 +337,21 @@ def test_rowbinary_policy_rejects_structural_nul(tmp_path: Path) -> None:
     path = tmp_path / "rowbinary.sql"
     path.write_bytes(
         b"SELECT * FROM format(RowBinary, 'safe');\x00DROP TABLE audit;\n"
+    )
+
+    with pytest.raises(ValueError, match="binary domain input contains NUL byte"):
+        list(iter_domain_file_chunks(path))
+
+
+def test_rowbinary_marker_does_not_authorize_unrelated_binary_literal(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / "rowbinary.sql"
+    path.write_bytes(
+        b"-- format(RowBinary, 'not executable SQL')\n"
+        b"SELECT 'unrelated\x00literal';\n"
     )
 
     with pytest.raises(ValueError, match="binary domain input contains NUL byte"):
@@ -372,6 +390,22 @@ def test_invalid_shell_bytes_without_fixture_contract_still_fail(
 
     path = tmp_path / "command.sh"
     path.write_bytes(b'#!/bin/sh\nprintf "x\x81x"\n')
+
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
+        list(iter_domain_file_chunks(path))
+
+
+def test_shell_byte_fixture_marker_does_not_authorize_arbitrary_invalid_bytes(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / "command.sh"
+    path.write_bytes(
+        b"#!/bin/sh\n"
+        b"# invalid 8-bit bytes\n"
+        b'printf "unrelated \x81 byte"\n'
+    )
 
     with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
         list(iter_domain_file_chunks(path))
