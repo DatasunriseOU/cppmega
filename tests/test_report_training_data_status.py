@@ -82,25 +82,14 @@ def test_live_source_progress_uses_archive_scope_not_mapping_superset(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "source"
-    _write_parquet(root / "reindexed" / "1024" / "repo.parquet")
+    (root / "reindexed").mkdir(parents=True)
     completion = root / "conveyor" / "_done.json"
     completion.parent.mkdir(parents=True)
     completion.write_text(
         json.dumps(
             {
                 "code_revision": {"git_commit": "a" * 40},
-                "done": {
-                    "repo::code": {
-                        "source": "code",
-                        "lengths": {
-                            "1024": {
-                                "rows": 1,
-                                "capacity_tokens": 1024,
-                                "valid_tokens": 15,
-                            }
-                        },
-                    }
-                },
+                "done": {},
                 "failed": {},
                 "source_repo_list": {
                     "mapping_count": 2,
@@ -129,6 +118,47 @@ def test_live_source_progress_uses_archive_scope_not_mapping_superset(
         encoding="utf-8",
     )
 
+    result = collect_live_source(
+        {
+            "root": str(root),
+            "completion_receipt": str(completion),
+            "launch_receipt": str(launch),
+        },
+        batch_size=192,
+        jobs=1,
+    )
+
+    assert result["parquet"]["files"] == 0
+    assert result["training_readable"] is False
+    assert "source conveyor has not produced Parquet yet" in result["blockers"]
+    assert result["conveyor"]["not_terminal"] == 1
+
+    _write_parquet(root / "reindexed" / "1024" / "repo.parquet")
+    completion.write_text(
+        json.dumps(
+            {
+                "code_revision": {"git_commit": "a" * 40},
+                "done": {
+                    "repo::code": {
+                        "source": "code",
+                        "lengths": {
+                            "1024": {
+                                "rows": 1,
+                                "capacity_tokens": 1024,
+                                "valid_tokens": 15,
+                            }
+                        },
+                    }
+                },
+                "failed": {},
+                "source_repo_list": {
+                    "mapping_count": 2,
+                    "sha256": "source-list",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     result = collect_live_source(
         {
             "root": str(root),
@@ -261,6 +291,26 @@ def test_publish_status_appends_changelog_only_for_semantic_change(
     assert entries[1]["numeric_delta"]["live_source"]["valid_tokens"] == 5
     current = json.loads((output / "current.json").read_text(encoding="utf-8"))
     assert current["status_sha256"] == "2" * 64
+
+
+def test_publish_status_accepts_live_source_before_first_parquet(
+    tmp_path: Path,
+) -> None:
+    status = _minimal_status(sha="1" * 64, live_tokens=0)
+    source = status["datasets"]["live_source"]["parquet"]
+    source.update(
+        {
+            "files": 0,
+            "rows": 0,
+            "buckets": {},
+            "schema": {"counts": {}, "metadata_by_sha256": {}},
+        }
+    )
+
+    paths = publish_status(status, tmp_path / "status")
+
+    entry = json.loads(paths["changelog"].read_text(encoding="utf-8"))
+    assert entry["summary"]["live_source"]["tokenizer_contract_sha256"] is None
 
 
 def _freshness_config(

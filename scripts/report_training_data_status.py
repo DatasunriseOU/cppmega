@@ -389,9 +389,10 @@ def _scan_parquet_snapshot_once(
     batch_size: int,
     jobs: int,
     classify_documents: bool,
+    allow_empty: bool,
 ) -> dict[str, object]:
     paths = _parquet_paths(root)
-    if not paths:
+    if not paths and not allow_empty:
         raise ValueError(f"{root}: no target-length Parquet files found")
     before = _path_inventory(root, paths)
     results = []
@@ -545,6 +546,7 @@ def scan_parquet_snapshot(
     jobs: int,
     classify_documents: bool,
     snapshot_retries: int = 2,
+    allow_empty: bool = False,
 ) -> dict[str, object]:
     """Scan one stable physical Parquet inventory or fail loudly."""
     last_error: RuntimeError | None = None
@@ -555,6 +557,7 @@ def scan_parquet_snapshot(
                 batch_size=batch_size,
                 jobs=jobs,
                 classify_documents=classify_documents,
+                allow_empty=allow_empty,
             )
         except RuntimeError as exc:
             last_error = exc
@@ -714,6 +717,7 @@ def collect_live_source(
         batch_size=batch_size,
         jobs=jobs,
         classify_documents=True,
+        allow_empty=True,
     )
     receipt_totals = _receipt_totals(done)
     physical_totals = {
@@ -744,9 +748,11 @@ def collect_live_source(
         blockers.append("source conveyor is still incomplete")
     if failed_count:
         blockers.append("source conveyor has failed units")
-    if not parquet["schema"]["uniform"]:
+    if not parquet["files"]:
+        blockers.append("source conveyor has not produced Parquet yet")
+    elif not parquet["schema"]["uniform"]:
         blockers.append("Parquet schemas are not uniform")
-    if not parquet["compression"]["all_zstd"]:
+    if parquet["files"] and not parquet["compression"]["all_zstd"]:
         blockers.append("not every Parquet column chunk uses ZSTD")
     if not parquet["classification"]["conserved"]:
         blockers.append("source-document classification is not token-conserving")
@@ -755,7 +761,7 @@ def collect_live_source(
 
     return {
         "state": "packed_unsealed",
-        "training_readable": not any(
+        "training_readable": bool(parquet["files"]) and not any(
             blocker
             for blocker in blockers
             if blocker
@@ -1523,7 +1529,8 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
             "release_ready": source["release_ready"],
             "schema_sha256s": sorted(source["parquet"]["schema"]["counts"]),
             "tokenizer_contract_sha256": next(
-                iter(source["parquet"]["schema"]["metadata_by_sha256"].values())
+                iter(source["parquet"]["schema"]["metadata_by_sha256"].values()),
+                {},
             ).get("cppmega.tokenizer_contract_sha256"),
             "source_repo_list_sha256": source["version"]["source_repo_list"][
                 "sha256"
