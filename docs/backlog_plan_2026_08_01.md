@@ -196,20 +196,28 @@ P3 — стратегическое/отложенное.
 ## [P013] Полный локальный прогон cppmega suite в общем venv (baseline) — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P012
 - **Где:** весь `tests/` кроме GPU-gated.
-- **Что сделано:** прогон выполнен в общем venv
-  `/Volumes/external/sources/.venvs/cppmega.mlx` на commit `5b6f65aa`.
+- **Что сделано:** первоначальный красный baseline перепроверен в
+  repository-owned venv `/Volumes/external/sources/.venvs/cppmega.source` с
+  exact-pinned Megatron `ba7b5ebc` и cppmega.mlx `65b6889f`.
+  Две настоящие причины ложного red baseline исправлены в `312f4749`:
+  cross-repo identity checks больше не используют исчезнувший hard-coded
+  checkout, а M2RNN import test корректно пропускается интерпретатором без MLX
+  и не использует pytest runtime patching.
   Результаты зафиксированы в
   `outputs/reports/local_suite_baseline_2026_08_01.json`:
-  - 2760 items, 2576 passed, 12 failed, 172 skipped, 510.69s.
-  - 11 failures — pre-existing environment/fixture gaps (missing sibling
-    checkouts, unset parity env vars, pinned Megatron checkout older than
-    document-isolation front, namespace-package shadowing от
-    `cppmega/cppmega_mlx/nn/_tilelang/`).
-  - 1 failure — transient `clang++` 60s timeout под нагрузкой полного прогона;
-    тот же тест проходит standalone за ~4s.
+  - tested commit `312f4749d38061254b418c40ccb8007142623d43`;
+    tested tree `61ca7b77c64b4621a9f9d0052b80e10298cacd06`;
+  - 2760 items, 2584 passed, 0 failed, 176 skipped, 429.25s;
+  - последующие коммиты до фиксации receipt меняли только этот backlog,
+    проверенное дерево исходного кода и тестов не менялось.
 - **Проверка:**
-  - `cat outputs/reports/local_suite_baseline_2026_08_01.json | jq '.passed, .failed, .skipped'` → 2576, 12, 172.
-  - `python -m pytest tests/test_nebius_h200_megatron_cpp_generation_eval.py::test_case3_gold_fixture_passes_repository_compile_and_link_gate -q` → 1 passed (проверка транзиентности).
+  - `jq '.status, .passed, .failed, .skipped' outputs/reports/local_suite_baseline_2026_08_01.json`
+    → `"passed"`, 2584, 0, 176.
+  - `python -m pytest tests/ -q -rf -p no:cacheprovider`
+    в зафиксированном environment contract → 2584 passed, 176 skipped.
+  - direct compile evaluations jobs 1, 3, 5 и 8 → 5/5 passed каждый;
+    прежний 60s `clang++` timeout был конкуренцией полного прогона, а не
+    основанием увеличивать timeout.
 
 ## [P014] Обновить docs/environment.md под shared venv + manifest — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: —
