@@ -158,6 +158,7 @@ def test_macos_lane_writes_a_pre_python_failure_receipt() -> None:
 
     assert "set -eEuo pipefail" in macos
     assert "trap 'on_pre_python_error' ERR" in macos
+    assert '"schema_version": "cppmega.repository-ci.v1"' in macos
     assert '"failure_stage": "workflow-preamble"' in macos
     assert 'pre_python_step="python_bin is executable"' in macos
     assert 'pre_python_step="verify tokenizer contract' in macos

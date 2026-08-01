@@ -36,7 +36,7 @@ jobs:
             local exit_code="$?"
             trap - ERR
             mkdir -p "${receipt_dir}"
-            printf '{"schema_version": 1, "kind": "lane", "run_id": "%s", "run_attempt": "%s", "lane": "macos-contracts", "status": "failed", "exit_code": %d, "failure_stage": "workflow-preamble", "error": "pre-python preamble failed at step: %s", "steps": []}\n' \
+            printf '{"schema_version": "cppmega.repository-ci.v1", "kind": "lane", "run_id": "%s", "run_attempt": "%s", "lane": "macos-contracts", "status": "failed", "exit_code": %d, "failure_stage": "workflow-preamble", "error": "pre-python preamble failed at step: %s", "steps": []}\n' \
               "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${exit_code}" "${pre_python_step}" \
               > "${receipt_dir}/receipt.json"
             exit "${exit_code}"
