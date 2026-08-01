@@ -267,7 +267,7 @@ jobs:
             echo "::warning::torch install attempt $n failed; retrying in $((30*n))s"
             sleep $((30 * n))
           done
-          python - <<'PY'
+          python3 - <<'PY'
           from importlib import metadata
           from importlib.util import find_spec
           from pathlib import Path
@@ -768,7 +768,7 @@ jobs:
               json.dumps(manifest, indent=2, sort_keys=True) + "\n"
           )
           PY
-          python -m json.tool wheels/CANDIDATE_MANIFEST.json >/dev/null
+          python3 -m json.tool wheels/CANDIDATE_MANIFEST.json >/dev/null
           sha256sum wheels/CANDIDATE_MANIFEST.json
 
       - name: Create / update Release
