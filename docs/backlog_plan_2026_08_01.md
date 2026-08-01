@@ -583,13 +583,16 @@ P3 — стратегическое/отложенное.
   задокументировать точный upstream-баг с repro.
 - **Проверка:** xfail снят или заменён на strict с ссылкой на issue.
 
-## [P051] xfail triage: test_galcov_stage_d (12 штук)
+## [P051] xfail triage: test_galcov_stage_d (12 штук) — DONE
 - Репо: mlx | Приоритет: P3 | Тип: task | Зависит от: —
-- **Где:** `tests/v4/test_galcov_stage_d.py` (12 xfail strict=False для
-  unmapped gallery-фикстур).
-- **Что делать:** либо замапить фикстуры, либо удалить мёртвые кейсы, либо
-  сделать strict=True с явной причиной.
-- **Проверка:** 0 xfail strict=False в файле.
+- **Где:** `tests/v4/test_galcov_stage_d.py:71-167` (gallery fixture),
+  `:198-206` (`test_gallery_fixture_known_gaps_are_zero`).
+- **Что сделано:** все 5 прежних gaps (GPT-2 XL, Tiny Aya, xLSTM 7B, Gemma 4
+  E2B/E4B) замаплены на presets в V7-Q04; условные `pytest.xfail` в
+  `:245-246`, `:262-263`, `:285-286` стали мёртвым кодом (preset всегда не
+  None). Добавлен regression-тест `test_gallery_fixture_known_gaps_are_zero`,
+  который fail-loud при появлении новых unmapped entries.
+- **Проверка:** `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/v4/test_galcov_stage_d.py -q` → 218 passed; `rg 'xfail.*strict=False' tests/v4/test_galcov_stage_d.py` — пусто.
 
 ## [P052] Starlette/httpx testclient deprecation в v4-тестах — DONE
 - Репо: mlx | Приоритет: P3 | Тип: chore | Зависит от: —
