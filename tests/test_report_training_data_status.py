@@ -15,6 +15,7 @@ from scripts.report_training_data_status import (
     _sha256,
     _without_volatile,
     check_heartbeat,
+    collect_live_source,
     collect_freshness,
     publish_status,
     scan_parquet_snapshot,
@@ -75,6 +76,77 @@ def test_parquet_snapshot_counts_batches_schema_and_logical_routes(
     }
     assert result["buckets"]["1024"]["batch"]["full_batches"] == 0
     assert result["buckets"]["1024"]["batch"]["remainder_rows"] == 1
+
+
+def test_live_source_progress_uses_archive_scope_not_mapping_superset(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    _write_parquet(root / "reindexed" / "1024" / "repo.parquet")
+    completion = root / "conveyor" / "_done.json"
+    completion.parent.mkdir(parents=True)
+    completion.write_text(
+        json.dumps(
+            {
+                "code_revision": {"git_commit": "a" * 40},
+                "done": {
+                    "repo::code": {
+                        "source": "code",
+                        "lengths": {
+                            "1024": {
+                                "rows": 1,
+                                "capacity_tokens": 1024,
+                                "valid_tokens": 15,
+                            }
+                        },
+                    }
+                },
+                "failed": {},
+                "source_repo_list": {
+                    "mapping_count": 2,
+                    "sha256": "source-list",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    launch = root / "launch.json"
+    launch.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega.canonical_source_launch_v1",
+                "expected_repository_count": 1,
+                "inputs": {
+                    "archive_inventory_receipt": {"repository_count": 1},
+                    "repo_list": {"sha256": "source-list"},
+                },
+                "outputs": {
+                    "conveyor_manifest": str(completion),
+                    "run_root": str(root),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = collect_live_source(
+        {
+            "root": str(root),
+            "completion_receipt": str(completion),
+            "launch_receipt": str(launch),
+        },
+        batch_size=192,
+        jobs=1,
+    )
+
+    assert result["conveyor"] == {
+        "mapping_count": 2,
+        "expected_repository_count": 1,
+        "done": 1,
+        "failed": 0,
+        "not_terminal": 0,
+    }
+    assert "source conveyor is still incomplete" not in result["blockers"]
 
 
 def _minimal_status(*, sha: str, live_tokens: int) -> dict[str, object]:

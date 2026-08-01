@@ -628,14 +628,25 @@ def collect_live_source(
     batch_size: int,
     jobs: int,
 ) -> dict[str, object]:
-    _require_keys(config, ("root", "completion_receipt"), where="source config")
+    _require_keys(
+        config,
+        ("root", "completion_receipt", "launch_receipt"),
+        where="source config",
+    )
     root = Path(str(config["root"]))
     completion_path = Path(str(config["completion_receipt"]))
+    launch_path = Path(str(config["launch_receipt"]))
     completion = _read_source_completion_summary(completion_path)
+    launch = _read_json(launch_path)
     _require_keys(
         completion,
         ("code_revision", "done", "failed_count", "source_repo_list"),
         where=str(completion_path),
+    )
+    _require_keys(
+        launch,
+        ("expected_repository_count", "inputs", "outputs", "schema"),
+        where=str(launch_path),
     )
     done = completion["done"]
     failed_count = int(completion["failed_count"])
@@ -644,6 +655,59 @@ def collect_live_source(
         raise ValueError(f"{completion_path}: done must be an object")
     if not isinstance(source_repo_list, Mapping):
         raise ValueError(f"{completion_path}: source_repo_list must be an object")
+    if launch["schema"] != "cppmega.canonical_source_launch_v1":
+        raise ValueError(f"{launch_path}: unsupported source launch schema")
+    launch_inputs = launch["inputs"]
+    launch_outputs = launch["outputs"]
+    if not isinstance(launch_inputs, Mapping) or not isinstance(
+        launch_outputs, Mapping
+    ):
+        raise ValueError(f"{launch_path}: inputs and outputs must be objects")
+    _require_keys(
+        launch_inputs,
+        ("archive_inventory_receipt", "repo_list"),
+        where=f"{launch_path}: inputs",
+    )
+    _require_keys(
+        launch_outputs,
+        ("conveyor_manifest", "run_root"),
+        where=f"{launch_path}: outputs",
+    )
+    archive_inventory = launch_inputs["archive_inventory_receipt"]
+    launch_repo_list = launch_inputs["repo_list"]
+    if not isinstance(archive_inventory, Mapping) or not isinstance(
+        launch_repo_list, Mapping
+    ):
+        raise ValueError(f"{launch_path}: source input receipts must be objects")
+    _require_keys(
+        archive_inventory,
+        ("repository_count",),
+        where=f"{launch_path}: archive inventory receipt",
+    )
+    _require_keys(
+        launch_repo_list,
+        ("sha256",),
+        where=f"{launch_path}: repo-list receipt",
+    )
+    _require_keys(
+        source_repo_list,
+        ("mapping_count", "sha256"),
+        where=f"{completion_path}: source_repo_list",
+    )
+    expected_repository_count = int(launch["expected_repository_count"])
+    if expected_repository_count <= 0:
+        raise ValueError(f"{launch_path}: expected_repository_count must be positive")
+    if int(archive_inventory["repository_count"]) != expected_repository_count:
+        raise ValueError(f"{launch_path}: archive repository count does not match launch")
+    if (
+        Path(str(launch_outputs["conveyor_manifest"])).resolve()
+        != completion_path.resolve()
+    ):
+        raise ValueError(f"{launch_path}: conveyor manifest does not match source config")
+    if Path(str(launch_outputs["run_root"])).resolve() != root.resolve():
+        raise ValueError(f"{launch_path}: run root does not match source config")
+    if launch_repo_list["sha256"] != source_repo_list["sha256"]:
+        raise ValueError(f"{launch_path}: repo-list binding does not match completion")
 
     parquet = scan_parquet_snapshot(
         root / "reindexed",
@@ -663,6 +727,11 @@ def collect_live_source(
     collisions = _casefold_collisions(done)
     mapping_count = int(source_repo_list["mapping_count"])
     terminal_count = len(done) + failed_count
+    if terminal_count > expected_repository_count:
+        raise ValueError(
+            f"{completion_path}: {terminal_count} terminal source units exceed "
+            f"archive scope {expected_repository_count}"
+        )
     categories = parquet["classification"]["by_category"]
     assert isinstance(categories, Mapping)
 
@@ -671,7 +740,7 @@ def collect_live_source(
         blockers.append("completion receipt totals differ from physical Parquet")
     if collisions and any(receipt_minus_physical.values()):
         blockers.append("case-folded source keys collide")
-    if terminal_count < mapping_count:
+    if terminal_count < expected_repository_count:
         blockers.append("source conveyor is still incomplete")
     if failed_count:
         blockers.append("source conveyor has failed units")
@@ -703,13 +772,19 @@ def collect_live_source(
         "version": {
             "code_revision": completion["code_revision"],
             "source_repo_list": source_repo_list,
+            "source_launch_receipt": {
+                "path": str(launch_path),
+                "sha256": hashlib.sha256(launch_path.read_bytes()).hexdigest(),
+                "expected_repository_count": expected_repository_count,
+            },
             "parquet_schema": parquet["schema"],
         },
         "conveyor": {
             "mapping_count": mapping_count,
+            "expected_repository_count": expected_repository_count,
             "done": len(done),
             "failed": failed_count,
-            "not_terminal": mapping_count - terminal_count,
+            "not_terminal": expected_repository_count - terminal_count,
         },
         "receipt_totals": receipt_totals,
         "physical_totals": physical_totals,

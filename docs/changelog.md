@@ -11,10 +11,15 @@ each other on APFS. An archive entry absent from the bound repo list still
 fails loudly instead of being silently discarded.
 
 The status reporter now treats case variants as a release blocker only when
-receipt totals actually differ from physical Parquet. Focused verification:
-81 tests passed. The legacy repo list still incorrectly maps the distinct
-`bionic` and `v8` snapshots to `nickg/nvc`; that identity defect remains
-fail-visible and is not claimed fixed here.
+receipt totals actually differ from physical Parquet. It also binds conveyor
+progress to the 501-repository archive launch receipt instead of mistaking the
+601-row mapping superset for the archive scope. Focused verification: 81
+source-path tests and the reporter archive-scope regression passed.
+
+Decoded Parquet rows show that the legacy archive aliases `bionic` and `v8`
+both contain NVC source, so their `nickg/nvc` project identity is correct. The
+unresolved defect is the provenance of those two alias/snapshot names, not the
+canonical project mapping.
 
 ## 2026-07-31: Packed-document model isolation
 

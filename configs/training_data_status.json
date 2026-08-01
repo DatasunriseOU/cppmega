@@ -4,7 +4,8 @@
   "output_dir": "/Volumes/external/sources/cppmega.mlx/outputs/training_data_status",
   "source": {
     "root": "/Users/dave/cppmega_data/source_full501_ec31cd49",
-    "completion_receipt": "/Users/dave/cppmega_data/source_full501_ec31cd49/conveyor/_done.json"
+    "completion_receipt": "/Users/dave/cppmega_data/source_full501_ec31cd49/conveyor/_done.json",
+    "launch_receipt": "/Users/dave/cppmega_data/source_full501_ec31cd49/launch_receipt.json"
   },
   "sealed_megatron": {
     "manifest": "/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/manifest.json"
