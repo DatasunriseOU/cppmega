@@ -9532,11 +9532,12 @@ def emit_build_documents(
     function dedup continues in ``dedup_root_functions``.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
-    with invalid text RAISES. NUL-bearing or malformed supported-encoding
+    with invalid text RAISES. Structural NULs and malformed supported-encoding
     explicit domain inputs also raise before any chunk is emitted. UTF-8,
-    BOM-marked UTF-16/32, filename-declared legacy SQL encodings, and strict
-    Windows-1252 are decoded without replacement. Only zero-length inputs are
-    skipped; whitespace is source content and remains losslessly represented.
+    BOM-marked UTF-16/32, filename-declared legacy SQL encodings, strict
+    Windows-1252, and narrowly verified byte-oriented fixture contracts are
+    decoded without replacement. Only zero-length inputs are skipped;
+    whitespace is source content and remains losslessly represented.
     """
     docs: list[dict] = []
     if not build_files:
