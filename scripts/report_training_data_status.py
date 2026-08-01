@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +33,8 @@ import pyarrow.parquet as pq
 STATUS_SCHEMA = "cppmega_training_data_status_v1"
 CONFIG_SCHEMA = "cppmega_training_data_status_config_v1"
 CHANGELOG_SCHEMA = "cppmega_training_data_status_change_v1"
+HEARTBEAT_SCHEMA = "cppmega_training_data_status_heartbeat_v1"
+DEFAULT_STALE_MINUTES = 30.0
 TARGET_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 REQUIRED_COUNTER_COLUMNS = (
     "valid_token_count",
@@ -1117,6 +1120,85 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _live_upstream_inputs(config: Mapping[str, object]) -> dict[str, Path]:
+    """Inputs fed by still-running fetchers.
+
+    Terminal artifacts (sealed bundles, the cancelled PR export, the legacy
+    CI sample) are pinned inputs and intentionally excluded: they are not
+    expected to change, so their age carries no signal.
+    """
+    inputs = {
+        "source_completion_receipt": Path(
+            str(config["source"]["completion_receipt"])
+        ),
+    }
+    for path in config["ci"]["progress_receipts"]:
+        inputs[f"ci_progress_receipt:{path}"] = Path(str(path))
+    return inputs
+
+
+def collect_freshness(
+    config: Mapping[str, object],
+    *,
+    stale_minutes: float,
+    now: float | None = None,
+) -> dict[str, object]:
+    """Report the age of each live upstream input and which ones are stale."""
+    checked = time.time() if now is None else now
+    stale_after_seconds = stale_minutes * 60.0
+    upstreams: dict[str, dict[str, object]] = {}
+    stale: list[str] = []
+    for name, path in sorted(_live_upstream_inputs(config).items()):
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            upstreams[name] = {"path": str(path), "missing": True, "stale": True}
+            stale.append(name)
+            continue
+        age_seconds = checked - mtime
+        is_stale = age_seconds > stale_after_seconds
+        upstreams[name] = {
+            "path": str(path),
+            "missing": False,
+            "mtime": datetime.fromtimestamp(mtime, timezone.utc).isoformat(),
+            "age_seconds": int(age_seconds),
+            "stale": is_stale,
+        }
+        if is_stale:
+            stale.append(name)
+    return {
+        "stale_minutes": stale_minutes,
+        "checked_at": datetime.fromtimestamp(checked, timezone.utc).isoformat(),
+        "stale": stale,
+        "upstreams": upstreams,
+    }
+
+
+def check_heartbeat(
+    path: Path,
+    *,
+    stale_after_seconds: float,
+    now: float | None = None,
+) -> dict[str, object]:
+    """Read a watcher heartbeat and report whether the watcher looks dead."""
+    checked = time.time() if now is None else now
+    heartbeat = _read_json(path)
+    _require_keys(heartbeat, ("schema", "pid", "recorded_at"), where=str(path))
+    if heartbeat["schema"] != HEARTBEAT_SCHEMA:
+        raise ValueError(
+            f"{path}: unsupported heartbeat schema {heartbeat['schema']!r}"
+        )
+    recorded = datetime.fromisoformat(str(heartbeat["recorded_at"])).timestamp()
+    age_seconds = checked - recorded
+    return {
+        "path": str(path),
+        "pid": int(heartbeat["pid"]),
+        "recorded_at": heartbeat["recorded_at"],
+        "age_seconds": int(age_seconds),
+        "stale": age_seconds > stale_after_seconds,
+    }
+
+
 def _validate_config(config: Mapping[str, object]) -> None:
     expected = {
         "schema",
@@ -1151,6 +1233,7 @@ def _without_volatile(value: object) -> object:
                 "generated_at",
                 "snapshot_completed_at",
                 "status_sha256",
+                "freshness",
             }
         }
     if isinstance(value, list):
@@ -1162,6 +1245,7 @@ def build_status(
     config: Mapping[str, object],
     *,
     jobs: int,
+    stale_minutes: float,
 ) -> dict[str, object]:
     _validate_config(config)
     batch_size = int(config["batch_size"])
@@ -1212,6 +1296,7 @@ def build_status(
             "ci": ci,
         },
     }
+    status["freshness"] = collect_freshness(config, stale_minutes=stale_minutes)
     status["status_sha256"] = _sha256(_without_volatile(status))
     return status
 
@@ -1436,6 +1521,7 @@ def publish_status(status: Mapping[str, object], output_dir: Path) -> dict[str, 
     current_json = output_dir / "current.json"
     current_markdown = output_dir / "current.md"
     changelog = output_dir / "changelog.jsonl"
+    heartbeat = output_dir / "heartbeat.json"
     lock_path = output_dir / "publish.lock"
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -1462,11 +1548,23 @@ def publish_status(status: Mapping[str, object], output_dir: Path) -> dict[str, 
                 handle.write(_canonical_bytes(entry))
                 handle.flush()
                 os.fsync(handle.fileno())
+        _atomic_write(
+            heartbeat,
+            _canonical_bytes(
+                {
+                    "schema": HEARTBEAT_SCHEMA,
+                    "pid": os.getpid(),
+                    "recorded_at": status["generated_at"],
+                    "status_sha256": status["status_sha256"],
+                }
+            ),
+        )
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return {
         "current_json": current_json,
         "current_markdown": current_markdown,
         "changelog": changelog,
+        "heartbeat": heartbeat,
     }
 
 
@@ -1485,18 +1583,46 @@ def main() -> int:
         default=0.0,
         help="Refresh forever at this interval; zero publishes once.",
     )
+    parser.add_argument(
+        "--stale-minutes",
+        type=float,
+        default=DEFAULT_STALE_MINUTES,
+        help=(
+            "Warn (stderr + freshness marker in current.json) when a live "
+            "upstream input is older than this many minutes."
+        ),
+    )
     args = parser.parse_args()
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
     if args.watch_seconds < 0:
         parser.error("--watch-seconds must be non-negative")
+    if args.stale_minutes <= 0:
+        parser.error("--stale-minutes must be positive")
 
     config = _read_json(args.config)
     _validate_config(config)
     output_dir = args.output_dir or Path(str(config["output_dir"]))
     while True:
-        status = build_status(config, jobs=args.jobs)
+        status = build_status(
+            config, jobs=args.jobs, stale_minutes=args.stale_minutes
+        )
         paths = publish_status(status, output_dir)
+        stale_upstreams = status["freshness"]["stale"]
+        if stale_upstreams:
+            print(
+                json.dumps(
+                    {
+                        "warning": "stale_upstreams",
+                        "generated_at": status["generated_at"],
+                        "stale_minutes": args.stale_minutes,
+                        "stale": stale_upstreams,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         print(
             json.dumps(
                 {

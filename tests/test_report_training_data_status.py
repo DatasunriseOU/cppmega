@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from scripts.report_training_data_status import (
+    HEARTBEAT_SCHEMA,
     STATUS_SCHEMA,
+    _sha256,
+    _without_volatile,
+    check_heartbeat,
+    collect_freshness,
     publish_status,
     scan_parquet_snapshot,
 )
@@ -181,3 +189,91 @@ def test_publish_status_appends_changelog_only_for_semantic_change(
     assert entries[1]["numeric_delta"]["live_source"]["valid_tokens"] == 5
     current = json.loads((output / "current.json").read_text(encoding="utf-8"))
     assert current["status_sha256"] == "2" * 64
+
+
+def _freshness_config(
+    source_receipt: Path, ci_receipt: Path
+) -> dict[str, object]:
+    return {
+        "source": {"completion_receipt": str(source_receipt)},
+        "ci": {"progress_receipts": [str(ci_receipt)]},
+    }
+
+
+def test_collect_freshness_flags_inputs_older_than_threshold(
+    tmp_path: Path,
+) -> None:
+    fresh = tmp_path / "done.json"
+    old = tmp_path / "fetch.progress.json"
+    fresh.write_text("{}", encoding="utf-8")
+    old.write_text("{}", encoding="utf-8")
+    now = time.time()
+    os.utime(fresh, (now - 60, now - 60))
+    os.utime(old, (now - 7200, now - 7200))
+
+    result = collect_freshness(
+        _freshness_config(fresh, old), stale_minutes=30.0, now=now
+    )
+
+    old_name = f"ci_progress_receipt:{old}"
+    assert result["stale"] == [old_name]
+    assert result["stale_minutes"] == 30.0
+    source = result["upstreams"]["source_completion_receipt"]
+    assert source["stale"] is False
+    assert source["missing"] is False
+    assert source["age_seconds"] == 60
+    assert result["upstreams"][old_name]["age_seconds"] == 7200
+
+
+def test_collect_freshness_treats_missing_input_as_stale(
+    tmp_path: Path,
+) -> None:
+    present = tmp_path / "fetch.progress.json"
+    present.write_text("{}", encoding="utf-8")
+    missing = tmp_path / "done.json"
+
+    result = collect_freshness(
+        _freshness_config(missing, present),
+        stale_minutes=30.0,
+        now=time.time(),
+    )
+
+    assert result["stale"] == ["source_completion_receipt"]
+    assert result["upstreams"]["source_completion_receipt"]["missing"] is True
+
+
+def test_freshness_block_is_excluded_from_status_hash() -> None:
+    first = _minimal_status(sha="0" * 64, live_tokens=15)
+    second = _minimal_status(sha="0" * 64, live_tokens=15)
+    first["freshness"] = {"stale": [], "upstreams": {"a": {"age_seconds": 1}}}
+    second["freshness"] = {
+        "stale": ["a"],
+        "upstreams": {"a": {"age_seconds": 9999}},
+    }
+
+    assert _sha256(_without_volatile(first)) == _sha256(_without_volatile(second))
+
+
+def test_publish_status_writes_heartbeat_and_check_detects_staleness(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "status"
+    status = _minimal_status(sha="1" * 64, live_tokens=15)
+    paths = publish_status(status, output)
+
+    heartbeat = json.loads(paths["heartbeat"].read_text(encoding="utf-8"))
+    assert heartbeat["schema"] == HEARTBEAT_SCHEMA
+    assert heartbeat["pid"] == os.getpid()
+    assert heartbeat["status_sha256"] == "1" * 64
+
+    recorded = datetime.fromisoformat(heartbeat["recorded_at"]).timestamp()
+    fresh = check_heartbeat(
+        paths["heartbeat"], stale_after_seconds=600.0, now=recorded + 60
+    )
+    assert fresh["stale"] is False
+    assert fresh["pid"] == os.getpid()
+    stale = check_heartbeat(
+        paths["heartbeat"], stale_after_seconds=600.0, now=recorded + 3600
+    )
+    assert stale["stale"] is True
+    assert stale["age_seconds"] == 3600
