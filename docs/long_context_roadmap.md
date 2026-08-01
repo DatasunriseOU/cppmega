@@ -63,11 +63,9 @@ every attention backend can read it consistently.
 
 ### MLA path
 
-`CppMegaFusedMLASelfAttentionAdapter` and the other adapters in
-`cppmega/megatron/mla_shared.py` now consume `window_size` from their kwargs and
-store it on the instance.  The spec builders that emit MLA `ModuleSpec` nodes
-still need to pass `window_size` in the params block; see
-`docs/document_isolation_swa_design.md` §2.3.
+No cppmega-specific kwarg is required.  The pinned Megatron MLA passes the
+shared `TransformerConfig` to `TEDotProductAttention`, which applies
+`config.window_size` and `config.window_attn_skip_freq` per layer.
 
 ### FA4 chunk-native path
 

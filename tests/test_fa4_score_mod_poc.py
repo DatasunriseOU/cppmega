@@ -9,7 +9,7 @@ flash_attn.cute is mocked so these tests run without a GPU.
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -1283,6 +1283,22 @@ class TestFA4WindowSizePlumbing:
             causal=True,
         )
         assert attn.window_size == (None, None)
+
+    def test_fa4_attention_reads_active_window_from_transformer_config(self):
+        from cppmega.megatron.fa4_score_mod_adapter import (
+            CppMegaFA4ScoreModAttention,
+        )
+
+        config = SimpleNamespace(
+            attention_dropout=0,
+            window_size=(8192, 0),
+            window_attn_skip_freq=2,
+        )
+        active = CppMegaFA4ScoreModAttention(config=config, layer_number=1)
+        skipped = CppMegaFA4ScoreModAttention(config=config, layer_number=2)
+
+        assert active.window_size == (8192, 0)
+        assert skipped.window_size == (None, None)
 
 
 # ---------------------------------------------------------------------------

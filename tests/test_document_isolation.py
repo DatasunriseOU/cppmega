@@ -509,6 +509,24 @@ def test_window_size_from_config_parses_int_and_tuple():
     assert _window_size_from_config(TupleWindow()) == (8192, 0)
 
 
+def test_window_size_from_config_honors_per_layer_skip_frequency():
+    config = SimpleNamespace(
+        window_size=(8192, 0),
+        window_attn_skip_freq=2,
+    )
+
+    assert _window_size_from_config(config, layer_number=1) == (8192, 0)
+    assert _window_size_from_config(config, layer_number=2) == (None, None)
+    with pytest.raises(ValueError, match="requires the attention layer number"):
+        _window_size_from_config(config)
+
+
+@pytest.mark.parametrize("window_size", [(1,), (-1, 0), ("8192", 0), True])
+def test_window_size_from_config_rejects_invalid_values(window_size):
+    with pytest.raises(ValueError, match="window_size"):
+        _window_size_from_config(SimpleNamespace(window_size=window_size))
+
+
 def test_mamba_cp_signature_guard_accepts_pinned_api():
     """The pinned Megatron commit must expose the expected private API."""
     _assert_mamba_cp_signatures()

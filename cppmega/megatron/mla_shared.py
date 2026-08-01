@@ -36,23 +36,8 @@ def _supports_pp_layer_offset(cls) -> bool:
         return False
 
 
-def _consume_window_size(kwargs: dict) -> tuple[int | None, int | None]:
-    """Extract window_size from kwargs so upstream MLA classes never see it.
-
-    Megatron MLA classes may or may not accept window_size directly.  We keep
-    the value on the adapter instance and rely on upstream to honour it when it
-    is supported; when it is not supported, the adapter still records it for
-    diagnostics and future plumbing.
-    """
-    window_size = kwargs.pop("window_size", (None, None))
-    if isinstance(window_size, int):
-        window_size = (window_size, 0)
-    return window_size
-
-
 class CppMegaMLASelfAttentionAdapter(MLASelfAttention):
     def __init__(self, *args, pp_layer_offset=None, **kwargs):
-        self._cppmega_window_size = _consume_window_size(kwargs)
         if pp_layer_offset is not None and _supports_pp_layer_offset(MLASelfAttention):
             super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
         else:
@@ -65,7 +50,6 @@ class CppMegaMLASelfAttentionAdapter(MLASelfAttention):
 
 class CppMegaFusedMLASelfAttentionAdapter(FusedMLASelfAttention):
     def __init__(self, *args, pp_layer_offset=None, **kwargs):
-        self._cppmega_window_size = _consume_window_size(kwargs)
         if pp_layer_offset is not None and _supports_pp_layer_offset(FusedMLASelfAttention):
             super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
         else:
@@ -80,7 +64,6 @@ if _HAS_ABSORBED_MLA:
 
     class CppMegaAbsorbedMLASelfAttentionAdapter(AbsorbedMLASelfAttention):
         def __init__(self, *args, pp_layer_offset=None, **kwargs):
-            self._cppmega_window_size = _consume_window_size(kwargs)
             if pp_layer_offset is not None and _supports_pp_layer_offset(AbsorbedMLASelfAttention):
                 super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
             else:

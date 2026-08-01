@@ -1,6 +1,6 @@
 # Document isolation + Sliding Window Attention: `window_size` plumbing design
 
-**Status**: design + partial implementation (2026-08-01)  
+**Status**: CPU contract implemented; H200 parity pending (2026-08-01)
 **Scope**: `cppmega/megatron/document_isolation.py`, `cppmega/megatron/fa4_score_mod_adapter.py`,
 `cppmega/megatron/mla_shared.py`, and the Megatron `TransformerConfig` → `ModuleSpec` wiring.  
 **Depends on**: P075 (beta23 gate evidence) for training seq_len > 8 k; the plumbing itself is
@@ -28,25 +28,22 @@ _make_document_causal_mask_mod(
 )
 ```
 
-But `CppMegaFA4ScoreModAttention.__init__` does **not** accept a `window_size`
-and `forward` always calls `_make_document_causal_mask_mod(..., causal=causal)`,
-leaving both window values at `None`.  The native FA4 `flash_attn_func` call also
-omits `window_size`, so even single-document rows run full causal attention.
+`CppMegaFA4ScoreModAttention` resolves the active per-layer window from
+`config.window_size` and `config.window_attn_skip_freq`.  Its packed-document
+callback owns the window predicate; single-document rows pass the same window
+to native FA4.
 
 ### 1.2 MLA (`mla_shared.py`)
 
-The adapters (`CppMegaMLASelfAttentionAdapter`, `CppMegaFusedMLASelfAttentionAdapter`,
-`CppMegaAbsorbedMLASelfAttentionAdapter`) pass `*args, **kwargs` straight to the
-upstream Megatron MLA class.  Megatron's MLA classes already forward `window_size`
-to `te.DotProductAttention` **if** the value is present in their constructor
-kwargs.  The gap is not in the adapter code — it is in the `ModuleSpec` params
-that the spec builders supply.  No cppmega spec currently passes `window_size`.
+The pinned Megatron MLA classes receive the shared `TransformerConfig`.
+`TEDotProductAttention` already reads `config.window_size` and
+`config.window_attn_skip_freq` while constructing each layer.  The cppmega MLA
+adapters must not consume or duplicate a `window_size` kwarg.
 
 ### 1.3 Document isolation masks
 
 - `_patch_te_attention`: when `attention_bias is None`, builds `PackedSeqParams`
-  and lets TE handle causal + SWA.  TE respects its own `window_size` argument,
-  but the patch never passes one, so multi-document rows fall back to full causal.
+  and lets the already-configured TE module handle causal + SWA.
 - `_patch_torch_attention`: builds a dense bool mask `cross_document | future`.
   It ignores any configured window, so even single-document rows attend to the
   full history.
@@ -79,10 +76,10 @@ use `(left, right)` with both values positive.
 
 ### 2.2 FA4 chunk-native attention
 
-Change `CppMegaFA4ScoreModAttention`:
+`CppMegaFA4ScoreModAttention`:
 
-1. Add `window_size: tuple[int | None, int | None] = (None, None)` to
-   `__init__` and store `self.window_size`.
+1. Resolves `window_size` from the explicit argument or the shared config,
+   including the per-layer skip frequency.
 2. In `forward`, when `document_mask_aux is not None`, pass
    `window_size_left` / `window_size_right` to `_make_document_causal_mask_mod`.
 3. When `document_mask_aux is None` (single-document row), pass
@@ -103,39 +100,11 @@ if window_size_right is not None and window_size_right >= 0:
 
 The only change is wiring the values through.
 
-### 2.3 MLA spec builders
+### 2.3 MLA
 
-Update every cppmega spec builder that emits an MLA self-attention `ModuleSpec`
-to include `window_size` in the params block when it is configured.  The adapter
-classes pass kwargs through, so no code change is needed inside
-`mla_shared.py`; only the callers need to pass it.
-
-Example in `nam56r_te_spec.py` (or equivalent):
-
-```python
-self_attention=ModuleSpec(
-    module=CppMegaFusedMLASelfAttentionAdapter,
-    params={
-        ...,
-        "window_size": getattr(config, "window_size", (None, None)),
-    },
-),
-```
-
-If the upstream Megatron `FusedMLASelfAttention` constructor does not accept
-`window_size`, wrap it with the adapter and absorb the argument there before
-calling `super().__init__`.  The adapters should therefore be defensive:
-
-```python
-class CppMegaFusedMLASelfAttentionAdapter(FusedMLASelfAttention):
-    def __init__(self, *args, window_size=(None, None), pp_layer_offset=None, **kwargs):
-        # window_size is consumed here and forwarded only if upstream accepts it.
-        if pp_layer_offset is not None and _supports_pp_layer_offset(FusedMLASelfAttention):
-            super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
-        else:
-            super().__init__(*args, **kwargs)
-        self._cppmega_window_size = window_size
-```
+No cppmega plumbing is needed.  MLA and its TE core attention share the same
+`TransformerConfig`; adding a second kwarg path would create two sources of
+truth.
 
 ### 2.4 Document isolation masks (torch / DSA)
 
@@ -151,9 +120,8 @@ if window_size_left is not None and window_size_left >= 0:
 instance.  The patch already has access to `self.config`.  This branch is a
 fallback; the FA4 and MLA paths are the production ones.
 
-For `_patch_te_attention`, the varlen path already delegates causal masking to
-TE.  TE's `TEDotProductAttention` will apply `window_size` if the spec builder
-passes it.  No extra code is required in the patch.
+For `_patch_te_attention`, the varlen path delegates causal masking to the TE
+module that was already constructed from `TransformerConfig`.
 
 ---
 
@@ -161,8 +129,8 @@ passes it.  No extra code is required in the patch.
 
 | Backend | Packed rows | Single-document rows | Where `window_size` comes from |
 |---|---|---|---|
-| TE / `TEDotProductAttention` | `PackedSeqParams` → TE applies window_size | TE applies window_size | `ModuleSpec` params |
-| FA4 chunk-native (`CppMegaFA4ScoreModAttention`) | `mask_mod` with left/right window | `flash_attn_func(window_size=...)` | `__init__` param / `ModuleSpec` params |
+| TE / `TEDotProductAttention` | `PackedSeqParams` → TE applies window_size | TE applies window_size | `TransformerConfig` |
+| FA4 chunk-native (`CppMegaFA4ScoreModAttention`) | `mask_mod` with left/right window | `flash_attn_func(window_size=...)` | explicit override or `TransformerConfig` |
 | Torch (`DotProductAttention`) | dense bool mask + window mask | dense bool mask + window mask | `self.config.window_size` read in patch |
 | DSA (`DSAttention`) | `-1` sentinel + dense bool mask + window mask | dense bool mask + window mask | `self.config.window_size` read in patch |
 
@@ -175,10 +143,9 @@ passes it.  No extra code is required in the patch.
 1. `test_fa4_score_mod_attention_accepts_window_size`
    - Construct `CppMegaFA4ScoreModAttention(window_size=(4, 0))`.
    - Assert `attn.window_size == (4, 0)`.
-2. `test_fa4_score_mod_attention_passes_window_to_mask_mod`
-   - Monkey-patch `_make_document_causal_mask_mod` to record arguments.
-   - Call `forward` with multi-document `document_ids` and `window_size=(4, 0)`.
-   - Assert recorded `window_size_left == 4` and `window_size_right == 0`.
+2. `test_fa4_score_mod_attention_reads_window_from_config`
+   - Construct active and skipped layers from one config.
+   - Assert the layer skip frequency is honored.
 3. `test_torch_attention_mask_includes_window`
    - Construct a `DotProductAttention` mock with `config.window_size = (2, 0)`.
    - Run `_patch_torch_attention` isolated forward.
@@ -225,10 +192,8 @@ a sequence of length 8.  The masks must be identical.
    indices (`q_absolute = q_idx + query_start`), so it is compatible with CP as
    long as the global sequence is reconstructed first.  This is already the
    contract in `map_sharded_sequence_by_document`.
-4. **MLA spec builders.**  The exact list of spec builders that need the param
-   must be enumerated.  Candidates: `nam56r_te_spec.py`, `nam56r_full_spec.py`,
-   `nam56r_noconv_spec.py`, `nam56r_lite_spec.py`, and any GPT spec that uses
-   `mla_shared.py`.
+4. **MLA.**  The pinned Megatron path already owns SWA through its shared
+   config; cppmega must keep that single source of truth.
 
 ---
 
@@ -236,12 +201,9 @@ a sequence of length 8.  The masks must be identical.
 
 1. `docs/document_isolation_swa_design.md` — this document.
 2. `CppMegaFA4ScoreModAttention` accepts and forwards `window_size`.
-3. Adapter classes in `mla_shared.py` accept `window_size` and forward it only
-   when upstream supports it.
-4. Spec builders pass `config.window_size` into MLA `ModuleSpec` params.
-5. `_patch_torch_attention` / `_patch_dsa_attention` read window from
+3. `_patch_torch_attention` / `_patch_dsa_attention` read window from
    `self.config` and extend the dense mask.
-6. CPU unit tests covering construction, mask-mod argument forwarding, and
+4. CPU unit tests covering construction, per-layer selection, and
    torch/DSA mask behavior.
 
 **GPU-required parity tests are deferred to the next H200/Modal slot and tracked

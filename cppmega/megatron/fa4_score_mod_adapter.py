@@ -1336,13 +1336,14 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
     def __init__(
         self,
         config: Any = None,
+        layer_number: int | None = None,
         *,
         num_attention_heads: int | None = None,
         head_dim: int | None = None,
         attention_dropout: float = 0.0,
         softmax_scale: float | None = None,
         causal: bool = True,
-        window_size: tuple[int | None, int | None] = (None, None),
+        window_size: tuple[int | None, int | None] | int | None = None,
         deterministic: bool = False,
         beta: float | None = None,
         call_weight: float = 1.0,
@@ -1367,12 +1368,22 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
             raise ValueError(
                 "CppMegaFA4ScoreModAttention is causal-only (POC constraint)"
             )
+        from cppmega.megatron.document_isolation import (
+            _normalize_window_size,
+            _window_size_from_config,
+        )
+
         self.config = config
+        self.layer_number = layer_number
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.softmax_scale = softmax_scale
         self.causal = causal
-        self.window_size = window_size
+        self.window_size = (
+            _window_size_from_config(config, layer_number=layer_number)
+            if window_size is None
+            else _normalize_window_size(window_size)
+        )
         self.deterministic = deterministic
         self.beta = beta
         self.call_weight = call_weight

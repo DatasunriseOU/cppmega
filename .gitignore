@@ -25,6 +25,8 @@ ckpt/
 checkpoints/
 
 .codex/*
+/backup/
+/embeddeddolt/
 
 # Secrets — real GitHub PATs / tokens. NEVER commit.
 .env

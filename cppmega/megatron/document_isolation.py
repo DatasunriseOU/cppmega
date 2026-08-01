@@ -674,17 +674,50 @@ def mask_sparse_topk_by_document(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.masked_fill(invalid, -1)
 
 
-def _window_size_from_config(config: Any) -> tuple[int | None, int | None]:
-    """Return (left, right) window size from a TransformerConfig-like object."""
+def _normalize_window_size(value: Any) -> tuple[int | None, int | None]:
+    """Return one validated ``(left, right)`` attention window."""
+    if value is None:
+        return None, None
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = (value, 0)
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise ValueError("window_size must be an integer or a two-item sequence")
+    window = tuple(value)
+    if any(
+        item is not None
+        and (isinstance(item, bool) or not isinstance(item, int) or item < 0)
+        for item in window
+    ):
+        raise ValueError("window_size entries must be non-negative integers or None")
+    return window
+
+
+def _window_size_from_config(
+    config: Any,
+    *,
+    layer_number: int | None = None,
+) -> tuple[int | None, int | None]:
+    """Return the active per-layer window from a TransformerConfig-like object."""
     if config is None:
         return None, None
     window_size = getattr(config, "window_size", None)
     if window_size is None:
         return None, None
-    if isinstance(window_size, int):
-        return window_size, 0
-    left, right, *_ = tuple(window_size) + (None, None)
-    return left, right
+    skip_frequency = getattr(config, "window_attn_skip_freq", None)
+    if skip_frequency is not None:
+        if layer_number is None:
+            raise ValueError(
+                "window_attn_skip_freq requires the attention layer number"
+            )
+        from megatron.core.transformer.utils import is_layer_window_attention
+
+        if not is_layer_window_attention(
+            window_size,
+            skip_frequency,
+            layer_number,
+        ):
+            return None, None
+    return _normalize_window_size(window_size)
 
 
 def _document_attention_mask(
@@ -882,7 +915,10 @@ def _patch_torch_attention() -> None:
             return installed(*bound.args, **bound.kwargs)
         if ids is None:
             raise RuntimeError("validated document layout did not return document_ids")
-        window_size = _window_size_from_config(getattr(self, "config", None))
+        window_size = _window_size_from_config(
+            getattr(self, "config", None),
+            layer_number=getattr(self, "layer_number", None),
+        )
         mask = _document_attention_mask(ids, window_size=window_size)
         existing_mask = bound.arguments["attention_mask"]
         if isinstance(existing_mask, torch.Tensor):
@@ -924,7 +960,10 @@ def _patch_dsa_attention() -> None:
             raise RuntimeError(
                 "active DSA sparse backend does not support document-isolated -1 indices"
             )
-        window_size = _window_size_from_config(getattr(self, "config", None))
+        window_size = _window_size_from_config(
+            getattr(self, "config", None),
+            layer_number=getattr(self, "layer_number", None),
+        )
         mask = _document_attention_mask(ids, window_size=window_size)
         existing_mask = bound.arguments["attention_mask"]
         if isinstance(existing_mask, torch.Tensor):
