@@ -54,6 +54,19 @@ import sys as _sys
 import warnings
 import weakref as _weakref
 
+from cppmega.megatron.deprecated_paths import (
+    require_deprecated_ack as _cppmega_require_deprecated_ack,
+)
+from cppmega.megatron.mxfp8_sidecar_refs import (
+    MXFP8_TN_SIDECAR_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
+)
+from cppmega.megatron.mxfp8_sidecar_refs import (
+    MXFP8_TN_SIDECAR_PERSISTENT_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
+)
+from cppmega.megatron.mxfp8_sidecar_refs import (
+    clear_mxfp8_sidecar_refs as _cppmega_clear_mxfp8_sidecar_refs,
+)
+
 _SUPPORTED_TE_VERSIONS = (
     "2.13",
     "2.13.0",
@@ -63,16 +76,6 @@ _SUPPORTED_TE_VERSIONS = (
     "2.15.0",
     "2.16.0.dev0",
     "2.16.0",
-)
-
-from cppmega.megatron.mxfp8_sidecar_refs import (
-    MXFP8_TN_SIDECAR_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
-)
-from cppmega.megatron.mxfp8_sidecar_refs import (
-    MXFP8_TN_SIDECAR_PERSISTENT_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
-)
-from cppmega.megatron.mxfp8_sidecar_refs import (
-    clear_mxfp8_sidecar_refs as _cppmega_clear_mxfp8_sidecar_refs,
 )
 
 
@@ -3250,10 +3253,6 @@ except Exception as _exc:  # pragma: no cover
 #
 # The TileLang kernel is parameterized for arbitrary d_v (works with d_v=512,
 # d_v=96, etc.) despite earlier comments claiming d_v=96 only.
-
-from cppmega.megatron.deprecated_paths import (
-    require_deprecated_ack as _cppmega_require_deprecated_ack,
-)
 
 
 def _cppmega_require_gather_scatter_ack(feature, reason):
