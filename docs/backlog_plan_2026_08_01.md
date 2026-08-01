@@ -759,15 +759,20 @@ P3 — стратегическое/отложенное.
 - **Проверка:** parity receipt с max-abs diff; `require_graph_routes=True`
   в конфиге эвала.
 
-## [P065] Решение по конверсии DSA/mamba3/MoE чекпоинтов
+## [P065] Решение по конверсии DSA/mamba3/MoE чекпоинтов — DONE
 - Репо: both | Приоритет: P1 | Тип: task | Зависит от: —
-- **Где:** `scripts/convert_megatron_dense500m_torchdist_to_mlx.py:104-110`
-  (явный NotImplementedError для не-dense500m), `docs/mamba3_mimo_p2_psiv_cache_design.md`.
-- **Что делать:** decision-док: переносить ли актуальный CUDA-трек (mamba3,
-  DSA, MoE, MTP) в MLX-чекпоинты; если да — эпик с подзадачами в bd
-  (привязать к `cppmega-mlx-c30.1`).
-- **Проверка:** decision-док в `docs/status/`; при «go» — эпик создан и
-  связан (`bd dep`).
+- **Где:** `mlx/docs/status/mamba3_dsa_mlx_conversion_decision.md`,
+  `mlx/scripts/convert_megatron_dense500m_torchdist_to_mlx.py:104-110`.
+- **Что сделано:** decision-док зафиксирован 2026-08-01: **Option C — staged
+  partial port** в порядке mamba3 → DSA → MoE → MTP. Обоснование: CUDA-трек
+  меняется, big-bang неустойчив; MLX reference-блоки уже есть, каждый этап —
+  преимущественно key-mapping + parity gate; MTP откладывается, так как нет
+  inference consumer. Финальный go/no-go rests with the owner; при «go»
+  создать bd epic `cppmega-mlx-c30.1` с подзадачами.
+- **Проверка:**
+  - `ls cppmega.mlx/docs/status/mamba3_dsa_mlx_conversion_decision.md` — файл существует.
+  - `grep -n "Option C" cppmega.mlx/docs/status/mamba3_dsa_mlx_conversion_decision.md` — строка 98.
+  - `grep '"title":"\[P065\]' cppmega.mlx/.beads/issues.jsonl` — status `closed`.
 
 ## [P066] Packed-document n-gram parity для сконвертированных моделей
 - Репо: both | Приоритет: P2 | Тип: task | Зависит от: P062
