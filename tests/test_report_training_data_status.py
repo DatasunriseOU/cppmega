@@ -80,6 +80,22 @@ def test_parquet_snapshot_counts_batches_schema_and_logical_routes(
     assert result["buckets"]["1024"]["batch"]["remainder_rows"] == 1
 
 
+def test_parquet_snapshot_ignores_atomic_staging_files(tmp_path: Path) -> None:
+    root = tmp_path / "packed"
+    _write_parquet(root / "1024" / "one.parquet")
+    (root / "1024" / ".one.partial.staged.parquet").write_bytes(b"partial")
+
+    result = scan_parquet_snapshot(
+        root,
+        batch_size=192,
+        jobs=1,
+        classify_documents=True,
+    )
+
+    assert result["files"] == 1
+    assert result["valid_tokens"] == 15
+
+
 def test_live_source_progress_uses_archive_scope_not_mapping_superset(
     tmp_path: Path,
 ) -> None:

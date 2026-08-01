@@ -158,7 +158,11 @@ def _parquet_paths(root: Path) -> list[tuple[int, Path]]:
         length = int(length_dir.name)
         if length not in TARGET_LENGTHS:
             continue
-        result.extend((length, path) for path in sorted(length_dir.glob("*.parquet")))
+        result.extend(
+            (length, path)
+            for path in sorted(length_dir.glob("*.parquet"))
+            if not path.name.startswith(".")
+        )
     return result
 
 
