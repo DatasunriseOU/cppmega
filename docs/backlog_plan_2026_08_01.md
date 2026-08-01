@@ -591,11 +591,13 @@ P3 — стратегическое/отложенное.
   сделать strict=True с явной причиной.
 - **Проверка:** 0 xfail strict=False в файле.
 
-## [P052] Starlette/httpx testclient deprecation в v4-тестах
+## [P052] Starlette/httpx testclient deprecation в v4-тестах — DONE
 - Репо: mlx | Приоритет: P3 | Тип: chore | Зависит от: —
-- **Где:** v4-тесты, использующие httpx TestClient (deprecation warnings).
-- **Что делать:** обновить на новый API (по тексту deprecation).
-- **Проверка:** `pytest tests/v4 -q` без Starlette deprecation в summary.
+- **Где:** `tests/v4/`.
+- **Что сделано:** в текущем дереве v4-suite не выдаёт Starlette/httpx deprecation
+  warnings; оставшиеся 14 warnings исходят от `torch.jit.script_method` в
+  `tests/v4/test_engram_v4.py` (upstream torch, не относится к этому пункту).
+- **Проверка:** `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/v4 -q` → 3158 passed, 16 skipped, 14 warnings (все от torch).
 
 ## [P053] Paged attention compatibility path в serving (фича) — PARTIAL
 - Репо: mlx | Приоритет: P2 | Тип: feature | Зависит от: —
