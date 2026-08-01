@@ -1163,24 +1163,28 @@ P3 — стратегическое/отложенное.
   - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_nam56r_readiness_assessment.py -q` — зелёный.
   - `grep '"title":"\[P098\]' cppmega.mlx/.beads/issues.jsonl` — status `closed`.
 
-## [P099] Обновить long_context_roadmap.md
+## [P099] Обновить long_context_roadmap.md — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: P075
 - **Где:** `docs/long_context_roadmap.md` (2026-04-14: пороги 4k→16k→128k,
   SWA/CP отложены).
-- **Что делать:** привести в соответствие с beta23-реальностью и document
-  isolation (CP-механика частично уже есть); переподтвердить владельцев
-  отложенных пунктов.
-- **Проверка:** даты/статусы актуальны; P083/P084 ссылаются на обновлённый док.
+- **Что сделано:** документ приведён в соответствие с beta23-реальностью и
+  document isolation; добавлен тест `tests/test_long_context_roadmap_current.py`
+  (`2441145e`).
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega && .venv/bin/python -m pytest tests/test_long_context_roadmap_current.py -q` → 1 passed.
+  - `grep -n "document isolation\|beta23\|128k" docs/long_context_roadmap.md` — актуальные статусы.
 
-## [P100] Квартальный docs sweep по политике retention
+## [P100] Квартальный docs sweep по политике retention — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: P076
 - **Где:** `docs/status/README.md` (политика: canonical/active/evidence/
   superseded/archived), `docs/sessions/README.md`.
-- **Что делать:** пройтись по dated-заметкам: проставить статусные метки,
-  обновить индексы; safe-reference check перед любыми перемещениями
-  (`rg -n "<file>" README.md docs cppmega scripts tests tools`).
-- **Проверка:** индекс `docs/status/README.md` покрывает все canonical-темы;
-  нет «осиротевших» dated-заметок без метки.
+- **Что сделано:** выполнен квартальный sweep 2026-08-01: добавлен
+  `docs/quarterly_docs_sweep_2026_08_01.md`, обновлены `docs/status/README.md`
+  и `docs/sessions/README.md`, добавлен тест
+  `tests/test_docs_retention_sweep_2026_08_01.py` (`3525b315`).
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega && .venv/bin/python -m pytest tests/test_docs_retention_sweep_2026_08_01.py -q` → 3 passed.
+  - `ls docs/quarterly_docs_sweep_2026_08_01.md` — файл существует.
 
 ---
 
