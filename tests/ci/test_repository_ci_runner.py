@@ -729,11 +729,21 @@ def test_contract_lane_manifests_include_runner_regressions_and_cuda_probes() ->
         assert "tests/ci/test_repository_ci_runner.py" in argv
         assert "tests/test_workflow_runner_policy.py" in argv
 
+    macos_argv = [
+        part
+        for command in lanes["macos-contracts"]["commands"]
+        for part in command["argv"]
+    ]
+    assert "tests/test_document_isolation_cp.py" in macos_argv
+    assert "tests/test_fa4_document_isolation.py" in macos_argv
+
     cuda_argv = [
         part for command in lanes["linux-cuda"]["commands"] for part in command["argv"]
     ]
     assert "tests/test_m2rnn_pararnn_tiled_cuda.py" in cuda_argv
     assert "tests/test_noconv_f2_gpu.py" in cuda_argv
+    assert "tests/test_document_isolation_cp.py" in cuda_argv
+    assert "tests/test_fa4_h200_parity.py" in cuda_argv
     assert lanes["linux-cuda"]["requires_cuda"] is True
 
     mlx_lanes = ci.load_lanes(CPPMEGA_MLX_LANES_CONFIG)
