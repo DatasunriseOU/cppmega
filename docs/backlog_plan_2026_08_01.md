@@ -188,16 +188,18 @@ P3 — стратегическое/отложенное.
 - **Проверка:** receipt в `outputs/reports/local_suite_baseline_2026_08_01.json`;
   0 failed (неизвестные падения — отдельные issues).
 
-## [P014] Обновить docs/environment.md под shared venv + manifest
+## [P014] Обновить docs/environment.md под shared venv + manifest — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: —
-- **Где:** `docs/environment.md`, раздел «Local Mac Source Receipt».
-- **Что делать:** добавить раздел: оба репо используют общий venv
-  `.venvs/cppmega.mlx`; манифест `cppmega-environment.json` в префиксе venv
-  (точный JSON с megatron_root=`Megatron-LM-test-e40feed4`); почему НЕ
-  `Megatron-LM-core_v0.18.0` (ba7b5eb тянет `triton`, недоступен на macOS);
-  формулы запуска тестов из шапки этого плана.
-- **Проверка:** свежая shell-сессия: `cd cppmega && .venv/bin/python -m pytest
-  tests/test_mxfp8_transpose_emit_shapes.py -q` — зелёный без env-переменных.
+- **Где:** `docs/environment.md:1-230` (shared venv receipt, manifest, test formulas).
+- **Что сделано:** раздел «Shared venv Receipt (2026-08-01)» уже описывает общий
+  `.venvs/cppmega.mlx`, манифест `cppmega-environment.json` с
+  `megatron_root=/Volumes/external/sources/Megatron-LM-test-e40feed4` и
+  `megatron_commit=e40feed4a060a84cd4cd1e5096316cc487014c87`, причину выбора
+  `test-e40feed4` вместо `core_v0.18.0` (ba7b5eb тянет Triton, недоступен на
+  macOS), и формулы запуска тестов из обоих checkout.
+- **Проверка:** свежая shell-сессия:
+  `cd /Volumes/external/sources/cppmega && .venv/bin/python3 -m pytest tests/test_mxfp8_transpose_emit_ext.py -q`
+  → 4 skipped, 20 warnings (все от зависимостей), без env-переменных.
 
 ---
 
