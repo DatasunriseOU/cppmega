@@ -698,9 +698,11 @@ P3 — стратегическое/отложенное.
   смешанные batch (prefill+decode в одном forward) поддерживаются. Follow-up
   `cppmega.mlx@62a3e269` до любой записи fail-closed проверяет отсутствующие и
   aliased physical blocks во всём live prefix.
-- **Что осталось:** DSA/Sparse-MLA в paged-пути, нативный
-  paged-attention/scatter kernel и memory/throughput receipts. До них это
-  совместимый prefill+decode path, а не завершённый production paged attention.
+- **Что осталось:** Sparse-MLA fp8 Path B/C в paged-пути (не роутятся),
+  нативный paged-attention/scatter kernel и memory/throughput receipts. До них
+  это совместимый prefill+decode path, а не завершённый production paged attention.
+  Dense-fallback для `mode='dsa'` разрешён в `cppmega.mlx@7a0378a5` (parity с
+  contiguous prefill и decode покрыт тестами).
 - **Проверка:**
   - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 62 passed.
   - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 76 passed (регрессия).
