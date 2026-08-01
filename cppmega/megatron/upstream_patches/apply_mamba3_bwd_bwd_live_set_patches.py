@@ -15,6 +15,7 @@ Keep it default-off until H100/H200 production gates show a real win.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -25,6 +26,8 @@ from pathlib import Path
 from cppmega.megatron.upstream_patches import (
     apply_mamba3_stage2_force_nontma_patches as stage2,
 )
+
+log = logging.getLogger(__name__)
 
 _ENV_FLAG = "CPPMEGA_MAMBA3_BWD_BWD_LIVE_SET"
 _ALLOW_MUTATION_FLAG = "MAMBA3_BWD_BWD_LIVE_SET_ALLOW_FILE_MUTATION"
@@ -183,6 +186,7 @@ def _is_live_set_patch_applied() -> bool:
         _validate_patched(path)
         return True
     except Exception:
+        log.debug("live-set patch detection failed", exc_info=True)
         return False
 
 
@@ -191,6 +195,7 @@ def _is_live_set_patch_absent() -> bool:
         text = _find_mamba3_bwd_file().read_text()
         return not _is_patched(text) and not _has_partial_markers(text)
     except Exception:
+        log.debug("live-set patch-absence detection failed", exc_info=True)
         return False
 
 
@@ -214,6 +219,7 @@ def apply_if_requested() -> bool:
         apply_all()
         return True
     if not _flag_enabled():
+        log.debug("live-set patch not requested: %s is not set", _ENV_FLAG)
         return False
     apply_all()
     return True

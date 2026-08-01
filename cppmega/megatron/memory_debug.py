@@ -1,7 +1,10 @@
 """CUDA memory inspection hook — enable via NANOCHAT_MEMORY_DEBUG=1."""
 from __future__ import annotations
+import logging
 import os, traceback
 import torch
+
+log = logging.getLogger(__name__)
 
 
 def _fmt_bytes(b: int | float) -> str:
@@ -40,9 +43,11 @@ def _collect_snapshot():
     try:
         return torch.cuda.memory._snapshot()
     except Exception:
+        log.debug("torch.cuda.memory._snapshot() failed; trying memory_snapshot()", exc_info=True)
         try:
             return {"segments": torch.cuda.memory_snapshot(), "device_traces": []}
         except Exception:
+            log.debug("torch.cuda.memory_snapshot() failed; no snapshot available", exc_info=True)
             return None
 
 
@@ -201,7 +206,7 @@ def _storage_nbytes(tensor: torch.Tensor, seen_storages: set[int] | None = None)
             seen_storages.add(ptr)
             return int(storage.nbytes())
         except Exception:
-            pass
+            log.debug("untyped_storage() size probe failed; falling back to numel*element_size", exc_info=True)
     return int(tensor.numel() * tensor.element_size())
 
 
@@ -226,6 +231,7 @@ def _object_nbytes(obj, seen_storages: set[int] | None = None) -> int:
         try:
             return int(_call_or_value(numel) * _call_or_value(element_size))
         except Exception:
+            log.debug("numel*element_size size probe failed for %r", type(obj).__name__, exc_info=True)
             return 0
     return 0
 
@@ -295,7 +301,7 @@ def dump_memory_after_first_step(model: torch.nn.Module, step: int) -> None:
         try:
             torch.cuda.memory._record_memory_history(enabled=None)
         except Exception:
-            pass
+            log.debug("could not stop memory history recording", exc_info=True)
     except Exception as e:
         print(f"  [memory_debug] Error: {e}")
         traceback.print_exc()

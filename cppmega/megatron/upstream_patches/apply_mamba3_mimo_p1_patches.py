@@ -52,9 +52,12 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # The exact text we expect to find before patching. Must match the upstream
 # kernels byte-for-byte, otherwise we raise so the next agent can reconcile.
@@ -329,6 +332,7 @@ def apply_all() -> None:
         import torch.distributed as dist
         dist_available = True
     except Exception:
+        log.debug("torch.distributed unavailable; falling back to file-lock guard", exc_info=True)
         dist = None  # type: ignore[assignment]
         dist_available = False
 
@@ -403,6 +407,7 @@ def apply_all() -> None:
 def apply_if_requested() -> bool:
     """Env-gated entry point. Returns True if patches were applied."""
     if os.environ.get("CPPMEGA_MAMBA3_P1", "0") not in ("1", "true", "True"):
+        log.debug("P1 patches not requested: CPPMEGA_MAMBA3_P1 is not set")
         return False
     apply_all()
     return True

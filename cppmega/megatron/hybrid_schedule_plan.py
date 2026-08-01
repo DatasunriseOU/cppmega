@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from contextlib import nullcontext
 from typing import Optional
@@ -24,6 +25,8 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +645,10 @@ def apply_hybrid_schedule_plan_patch():
         if hasattr(sched, "combined_forward_backward_step"):
             sched.combined_forward_backward_step = _patched_cfbs
     except Exception:
-        pass
+        log.warning(
+            "Hybrid EP A2A overlap patch: could not patch the "
+            "schedules.combined_forward_backward_step reference",
+            exc_info=True,
+        )
 
     print("[hybrid_schedule_plan] Hybrid EP A2A overlap patch applied", file=sys.stderr)

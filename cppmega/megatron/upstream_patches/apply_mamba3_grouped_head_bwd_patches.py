@@ -20,10 +20,13 @@ Rollback:
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sys
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _ENV_FLAG = "CPPMEGA_MAMBA3_GROUPED_HEAD_BWD"
 _ALLOW_MUTATION_FLAG = "MAMBA3_GROUPED_HEAD_BWD_ALLOW_FILE_MUTATION"
@@ -244,6 +247,7 @@ def _is_grouped_head_patch_applied() -> bool:
     try:
         return all(_is_patched_text(path.read_text()) for path in _target_paths())
     except Exception:
+        log.debug("grouped-head bwd patch detection failed", exc_info=True)
         return False
 
 
@@ -251,6 +255,7 @@ def _run_once_with_local_rank_guard(fn, is_done=None) -> None:
     try:
         import torch.distributed as dist
     except Exception:
+        log.debug("torch.distributed unavailable; falling back to file-lock guard", exc_info=True)
         dist = None  # type: ignore[assignment]
 
     if dist is not None and dist.is_available() and dist.is_initialized():
@@ -319,6 +324,7 @@ def apply_if_requested() -> bool:
         apply_all()
         return True
     if os.environ.get(_ENV_FLAG, "0") not in ("1", "true", "True"):
+        log.debug("grouped-head bwd patch not requested: %s is not set", _ENV_FLAG)
         return False
     apply_all()
     return True

@@ -18,11 +18,14 @@ Rollback:
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _ENV_FLAG = "CPPMEGA_MAMBA3_GQA_BWD"
 _ALLOW_MUTATION_FLAG = "MAMBA3_GQA_BWD_ALLOW_FILE_MUTATION"
@@ -211,6 +214,7 @@ def _is_gqa_bwd_patch_applied() -> bool:
             _validate_patched(path)
         return True
     except Exception:
+        log.debug("GQA bwd patch detection failed", exc_info=True)
         return False
 
 
@@ -222,6 +226,7 @@ def _is_gqa_bwd_patch_absent() -> bool:
             for path in _find_mamba3_bwd_files().values()
         )
     except Exception:
+        log.debug("GQA bwd patch-absence detection failed", exc_info=True)
         return False
 
 
@@ -229,6 +234,7 @@ def _run_once_with_local_rank_guard(fn, is_done=None) -> None:
     try:
         import torch.distributed as dist
     except Exception:
+        log.debug("torch.distributed unavailable; falling back to file-lock guard", exc_info=True)
         dist = None  # type: ignore[assignment]
 
     if dist is not None and dist.is_available() and dist.is_initialized():
@@ -296,6 +302,7 @@ def apply_if_requested() -> bool:
         apply_all()
         return True
     if os.environ.get(_ENV_FLAG, "0") not in ("1", "true", "True"):
+        log.debug("GQA bwd patch not requested: %s is not set", _ENV_FLAG)
         return False
     apply_all()
     return True

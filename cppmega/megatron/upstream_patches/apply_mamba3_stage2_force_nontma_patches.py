@@ -23,12 +23,15 @@ benefits from WS/TMA while bwd_bwd regresses when WS/TMA is enabled.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _ENV_FLAG = "CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA"
 _ALLOW_MUTATION_FLAG = "MAMBA3_STAGE2_FORCE_NONTMA_ALLOW_FILE_MUTATION"
@@ -222,6 +225,7 @@ def _is_stage2_patch_applied() -> bool:
         _validate_patched(path)
         return True
     except Exception:
+        log.debug("stage2 force-nonTMA patch detection failed", exc_info=True)
         return False
 
 
@@ -230,6 +234,7 @@ def _is_stage2_patch_absent() -> bool:
         text = _find_mamba3_bwd_file().read_text()
         return not _is_patched(text) and not _has_partial_stage2_markers(text)
     except Exception:
+        log.debug("stage2 force-nonTMA patch-absence detection failed", exc_info=True)
         return False
 
 
@@ -237,6 +242,7 @@ def _run_once_with_local_rank_guard(fn, is_done=None) -> None:
     try:
         import torch.distributed as dist
     except Exception:
+        log.debug("torch.distributed unavailable; falling back to file-lock guard", exc_info=True)
         dist = None  # type: ignore[assignment]
 
     if dist is not None and dist.is_available() and dist.is_initialized():
@@ -316,6 +322,7 @@ def apply_if_requested() -> bool:
         apply_all()
         return True
     if os.environ.get(_ENV_FLAG, "0") not in ("1", "true", "True"):
+        log.debug("stage2 force-nonTMA patch not requested: %s is not set", _ENV_FLAG)
         return False
     apply_all()
     return True

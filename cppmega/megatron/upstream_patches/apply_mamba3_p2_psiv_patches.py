@@ -45,8 +45,11 @@ Currently raises NotImplementedError — gate must stay OFF.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
+
+log = logging.getLogger(__name__)
 
 _ENV_FLAG = "CPPMEGA_MAMBA3_P2_PSIV_CACHE"
 
@@ -102,6 +105,7 @@ def apply_if_requested() -> bool:
     the `mamba3_psiv_cache._refuse_if_gated` contract.
     """
     if os.environ.get(_ENV_FLAG, "0") not in ("1", "true", "True"):
+        log.debug("P2 PsiV cache patch not requested: %s is not set", _ENV_FLAG)
         return False
     apply_all()  # will raise NotImplementedError
     return True

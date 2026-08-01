@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+
+log = logging.getLogger(__name__)
 
 
 _CUDA_EXT: Any | None = None
@@ -592,7 +595,7 @@ def try_grouped_direct(
         try:
             return True, _out_view_from_group_list(out, shape=(_EXPECTED_NUM_EXPERTS, n, k))
         except Exception:
-            pass
+            log.debug("grouped GEMM out-view reshape failed; returning raw result", exc_info=True)
         return True, result
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"

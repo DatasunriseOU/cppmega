@@ -7,6 +7,10 @@ the full runtime shim and its machine-specific monkey patches.
 
 from __future__ import annotations
 
+import logging
+
+log = logging.getLogger(__name__)
+
 MXFP8_TN_SIDECAR_ATTR = "_cppmega_mxfp8_rowwise_transpose"
 MXFP8_TN_SIDECAR_PERSISTENT_ATTR = "_cppmega_mxfp8_rowwise_transpose_persistent"
 MXFP8_TN_SIDECAR_REF_ATTRS = (
@@ -28,9 +32,11 @@ def clear_mxfp8_sidecar_refs(x: object) -> bool:
         try:
             delattr(x, attr)
         except Exception:
+            log.debug("delattr(%s) failed; trying setattr None", attr, exc_info=True)
             try:
                 setattr(x, attr, None)
             except Exception:
+                log.debug("setattr(%s, None) failed; leaving sidecar ref in place", attr, exc_info=True)
                 continue
         cleared = True
     return cleared
