@@ -682,6 +682,80 @@ SOURCE_CACHE_SENTINEL = ".cppmega_source_cache_complete.json"
 TAR_COLLIDING_FILE_BASENAME = "__cppmega_tar_file__"
 
 
+def _tar_collision_target(directory: Path) -> Path:
+    return directory / (TAR_COLLIDING_FILE_BASENAME + directory.suffix)
+
+
+def _ensure_tar_member_directory(
+    directory: Path,
+    *,
+    repo: str,
+    member_name: str,
+) -> None:
+    """Create a member parent, relocating an earlier colliding regular file."""
+    if directory.is_dir():
+        return
+    if os.path.lexists(directory):
+        if not directory.is_file() or directory.is_symlink():
+            raise RepoFailure(
+                repo,
+                "stream",
+                f"tar member {member_name!r} has unsupported non-directory parent "
+                f"{directory}; refusing to drop source content",
+            )
+        try:
+            staging_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=".cppmega-tar-relocate-",
+                    dir=directory.parent,
+                )
+            )
+        except OSError as exc:
+            raise RepoFailure(
+                repo,
+                "stream",
+                f"cannot stage file/directory tar collision at {directory}: {exc}",
+            ) from exc
+        staged_file = staging_dir / _tar_collision_target(directory).name
+        moved = False
+        rollback_error: OSError | None = None
+        try:
+            directory.rename(staged_file)
+            moved = True
+            staging_dir.rename(directory)
+        except OSError as exc:
+            if moved and os.path.lexists(staged_file) and not os.path.lexists(directory):
+                try:
+                    staged_file.rename(directory)
+                except OSError as rollback_exc:
+                    rollback_error = rollback_exc
+            try:
+                staging_dir.rmdir()
+            except OSError:
+                pass
+            detail = (
+                f"cannot preserve file/directory tar collision at {directory}: {exc}"
+            )
+            if rollback_error is not None:
+                detail += (
+                    f"; rollback failed ({rollback_error}); source remains at "
+                    f"{staged_file}"
+                )
+            raise RepoFailure(repo, "stream", detail) from exc
+        print(
+            f"[{repo}] preserving prior file/directory tar collision "
+            f"at {directory} as {_tar_collision_target(directory)}",
+            file=sys.stderr,
+        )
+        return
+    _ensure_tar_member_directory(
+        directory.parent,
+        repo=repo,
+        member_name=member_name,
+    )
+    directory.mkdir()
+
+
 def _source_cache_repo_dir(source_cache_dir: Path, repo: str) -> Path:
     return source_cache_dir / filesystem_repo_key(repo)
 
@@ -743,9 +817,7 @@ def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
 def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> bool:
     """Copy one tar member without silently dropping path-type collisions."""
     if target.exists() and target.is_dir():
-        collision_target = target / (
-            TAR_COLLIDING_FILE_BASENAME + target.suffix
-        )
+        collision_target = _tar_collision_target(target)
         if os.path.lexists(collision_target):
             raise RepoFailure(
                 repo,
@@ -760,6 +832,11 @@ def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> 
             file=sys.stderr,
         )
         target = collision_target
+    _ensure_tar_member_directory(
+        target.parent,
+        repo=repo,
+        member_name=member_name,
+    )
     reserved_name = TAR_COLLIDING_FILE_BASENAME + target.parent.suffix
     if target.name == reserved_name and os.path.lexists(target):
         raise RepoFailure(
@@ -768,14 +845,6 @@ def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> 
             f"tar member {member_name!r} collides with reserved tar path "
             f"{target}; refusing to overwrite source content",
         )
-    if target.parent.exists() and not target.parent.is_dir():
-        raise RepoFailure(
-            repo,
-            "stream",
-            f"tar member {member_name!r} has a non-directory parent "
-            f"{target.parent}; refusing to drop source content",
-        )
-    target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "wb") as out:
         shutil.copyfileobj(src, out)
     return True

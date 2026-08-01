@@ -135,6 +135,30 @@ def test_tar_member_path_collision_preserves_directory_and_file(
     assert preserved.read_bytes() == b"preserve me"
 
 
+def test_tar_member_file_before_child_preserves_both_paths(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "occupied.cc"
+    assert sr._copy_tar_member_file(
+        io.BytesIO(b"preserve parent"),
+        target,
+        repo="owner/repo",
+        member_name="cpp_all/owner/repo/occupied.cc",
+    )
+
+    child = target / "child.h"
+    assert sr._copy_tar_member_file(
+        io.BytesIO(b"preserve child"),
+        child,
+        repo="owner/repo",
+        member_name="cpp_all/owner/repo/occupied.cc/child.h",
+    )
+
+    preserved = target / f"{sr.TAR_COLLIDING_FILE_BASENAME}.cc"
+    assert preserved.read_bytes() == b"preserve parent"
+    assert child.read_bytes() == b"preserve child"
+
+
 def _aligned_overlong_doc() -> dict:
     text = "abcdefghijklmnopqrst"
     width = len(text)
