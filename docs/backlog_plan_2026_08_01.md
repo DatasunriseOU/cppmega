@@ -680,7 +680,7 @@ P3 — стратегическое/отложенное.
 ## [P053] Paged attention compatibility path в serving (фича) — PARTIAL
 - Репо: mlx | Приоритет: P2 | Тип: feature | Зависит от: —
 - **Где:**
-  - `cppmega_mlx/inference/serving.py:525-748` — `gather_paged_kv`,
+  - `cppmega_mlx/inference/serving.py:525-850` — `gather_paged_kv`,
     `scatter_paged_kv`, `_pad_or_trim_kv`; `require_model_integrated_paged_attention`
     переведён в `DeprecationWarning` (compatibility path доступен).
   - `cppmega_mlx/nn/attention.py:1076-1220` — `CausalSelfAttention.__call__`
@@ -705,15 +705,18 @@ P3 — стратегическое/отложенное.
   Dense-fallback для `mode='dsa'` разрешён в `cppmega.mlx@7a0378a5` (parity с
   contiguous prefill и decode покрыт тестами); `cppmega.mlx@eab00e33`
   fail-closed запрещает этот fallback при явно выбранном Sparse-MLA Path B/C.
-  Первый native TileLang kernel для decode-scatter приземлён в
+  Native TileLang decode-scatter path приземлён в
   `cppmega.mlx@e2e0d1fe`: opt-in `backend='tilelang'` в
   `scatter_paged_kv_offsets` (pool copy + dst scatter через tvm_ffi,
   caller-owned outputs), bit-exact parity с host loop, fail-closed на
   dtype/backend; receipt
   `outputs/reports/paged_kv_offsets_scatter_bench_2026_08_01.json`
-  (1.25–1.31x best, ~2x mean против host loop).
+  (1.25–1.31x best, ~2x mean против host loop). Follow-up
+  `cppmega.mlx@84a4b416` исправляет source-layout `[B,H,S,D]` при
+  token-major dispatch и проверяет distinct K/V для каждого
+  `(batch,head,token,dim)` настоящим Metal parity-тестом.
 - **Проверка:**
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 64 passed.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 67 passed.
   - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 76 passed (регрессия).
   - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_decode_matches_contiguous_cache tests/test_attention.py::test_paged_kv_compatibility_path_decode_mixed_batch -q` — parity с contiguous cache decode.
   - `pytest tests/test_inference_serving.py -k scatter_paged_kv_offsets -q` — offsets-scatter round-trip + fail-closed кейсы.
