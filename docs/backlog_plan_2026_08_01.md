@@ -219,15 +219,19 @@ P3 — стратегическое/отложенное.
 
 # Фаза B. cppmega — CI и инфраструктура (P015–P024)
 
-## [P015] Failure-receipt для subcommand `run` (оркестратор)
+## [P015] Failure-receipt для subcommand `run` (оркестратор) — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: —
-- **Где:** `scripts/ci/repository_runner.py` (fallback-receipt для `lane` уже
-  сделан аудитом; `run`/orchestrate не покрыт).
-- **Что делать:** аналогично `_write_early_failure_receipt`: при фатальной
-  ошибке `run` писать receipt в базовую `--receipt-dir` (там другая семантика
-  пути — проверить по коду). Тесты в `tests/ci/test_repository_ci_runner.py`.
-- **Проверка:** `CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest
-  tests/ci -q` — зелёный, включая новый тест.
+- **Где:** `scripts/ci/repository_runner.py:2047-2132` (`_write_early_failure_receipt`),
+  вызовы в `main()` на `OSError/RepositoryCIError/subprocess.SubprocessError`
+  (`:2124`) и на fallback `Exception` (`:2132`).
+- **Что сделано:** `run`/orchestrate уже покрыт общим `_write_early_failure_receipt`,
+  который пишет receipt в `--receipt-dir` с run_id, subcommand, exit_code и
+  redacted-сообщением. Добавлены/расширены тесты:
+  - `test_run_orchestrator_writes_failure_receipt_for_unknown_lane` (`tests/ci/test_repository_ci_runner.py:865`),
+  - `test_run_early_failure_receipt_generates_run_id_when_missing` (`:908`),
+  - `test_run_early_failure_receipt_does_not_clobber_an_existing_receipt` (`:931`),
+  - `test_run_early_failure_receipt_redacts_project_token_formats` (`:1005`).
+- **Проверка:** `CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest tests/ci -q` → 34 passed.
 
 ## [P016] Trap в ci-self-hosted.yml для pre-python падений
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P073 (policy-тест
