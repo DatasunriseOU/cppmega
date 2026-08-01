@@ -776,13 +776,21 @@ P3 — стратегическое/отложенное.
   - Canonical `main`: tree после revert совпадает с проверенным
     `cppmega.mlx@cdbdacd4`.
 
-## [P060] Полный mlx suite baseline (~7900 тестов)
+## [P060] Полный mlx suite baseline (~7900 тестов) — DONE
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: P052
 - **Где:** `tests/` + `tests/v4/` (всё).
-- **Что делать:** один полный прогон с фиксацией durations/skip/failed в
-  receipt (`outputs/`); все неожиданные failed — отдельными issues.
-- **Проверка:** receipt с 0 unexpected failed; время прогона зафиксировано
-  для будущего сравнения.
+- **Что сделано:** полный прогон в общем venv
+  `/Volumes/external/sources/.venvs/cppmega.mlx`.
+  Результаты зафиксированы в
+  `outputs/reports/mlx_full_suite_baseline_2026_08_01_rerun.json`:
+  - tested commit `0ebf49a10b028ba37c4339f9a491057280eaca57`;
+    tested tree `deb221aff245de651ad1adf9b52d3b486fa82c0d`;
+  - 7860 passed, 70 skipped, 2 xfailed, 0 failed, 1790.17s.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/ -q --durations=50`
+    → 7860 passed, 70 skipped, 2 xfailed, 0 failed.
+  - `jq '.summary.passed, .summary.failed, .summary.skipped' outputs/reports/mlx_full_suite_baseline_2026_08_01_rerun.json`
+    → 7860, 0, 70.
 
 ---
 

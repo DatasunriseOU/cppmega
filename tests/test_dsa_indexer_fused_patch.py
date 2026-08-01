@@ -354,18 +354,14 @@ try:
 finally:
     fused_patch._reset_graph_batch_override(token)
 '''
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
-            "CPPMEGA_GRAPH_BIAS_BETA": "1",
-            "CPPMEGA_H200_GRAPH_PRIOR_RECEIPT": str(receipt_path),
-        }
-    )
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(Path(__file__).resolve().parents[1]),
-        env=environment,
+        env=_real_megatron_subprocess_environment(
+            CPPMEGA_GRAPH_ROUTES_ENABLED="1",
+            CPPMEGA_GRAPH_BIAS_BETA="1",
+            CPPMEGA_H200_GRAPH_PRIOR_RECEIPT=str(receipt_path),
+        ),
         check=False,
         capture_output=True,
         text=True,
@@ -420,17 +416,13 @@ try:
 finally:
     fused_patch._reset_graph_batch_override(token)
 '''
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
-            "CPPMEGA_GRAPH_BIAS_BETA": "4",
-        }
-    )
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(Path(__file__).resolve().parents[1]),
-        env=environment,
+        env=_real_megatron_subprocess_environment(
+            CPPMEGA_GRAPH_ROUTES_ENABLED="1",
+            CPPMEGA_GRAPH_BIAS_BETA="4",
+        ),
         check=False,
         capture_output=True,
         text=True,

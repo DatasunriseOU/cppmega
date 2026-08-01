@@ -1330,10 +1330,21 @@ def apply_document_isolation_patch() -> bool:
     _patch_megatron_checkpoint()
 
     from megatron.core.models.gpt.gpt_model import GPTModel
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.models.mamba.mamba_model import MambaModel
 
-    for model_class in (GPTModel, HybridModel, MambaModel):
+    model_classes: list[type] = [GPTModel, MambaModel]
+    try:
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+        model_classes.append(HybridModel)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {
+            "megatron.core.models.hybrid",
+            "megatron.core.models.hybrid.hybrid_model",
+        }:
+            raise
+
+    for model_class in model_classes:
         _patch_model_input_transport(model_class)
     return True
 

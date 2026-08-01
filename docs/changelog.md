@@ -1,5 +1,14 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-01: Pinned Megatron subprocess isolation
+
+The two remaining DSA subprocess cases now reuse the existing exact-source
+environment helper, so they import the pinned Megatron checkout instead of
+ambient Python state. Document isolation accepts the older pinned checkout
+when its hybrid package is genuinely absent, while re-raising any missing
+transitive dependency. Cross-repository identity and recipe parity remain
+fail-closed when their exact MLX peer binding is absent.
+
 ## 2026-08-01: Global symbol index v5 and base16k export smoke
 
 Rebuilt the A1 global symbol index from nine base libraries: all nine
