@@ -54,6 +54,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -364,6 +365,45 @@ def hash_immutable_pr_store(path: Path) -> str:
     if wal.exists() and wal.stat().st_size:
         raise RepoListBindingError(f"PR store WAL appeared while hashing: {wal}")
     return digest
+
+
+def observe_immutable_pr_store(path: Path) -> dict[str, int | str]:
+    """Capture the SQLite facts required by source-composition provenance."""
+
+    path = path.expanduser()
+    if path.is_symlink():
+        raise PRCompletionBindingError(f"PR store must not be a symlink: {path}")
+    path = path.resolve()
+    wal = Path(f"{path}-wal")
+    if wal.exists() and wal.stat().st_size:
+        raise PRCompletionBindingError(f"PR store has an uncheckpointed WAL: {wal}")
+    before = path.stat()
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
+    try:
+        quick_check = tuple(
+            str(row[0]) for row in connection.execute("PRAGMA quick_check")
+        )
+        rows = int(connection.execute("SELECT COUNT(*) FROM prs").fetchone()[0])
+    finally:
+        connection.close()
+    after = path.stat()
+    if wal.exists() and wal.stat().st_size:
+        raise PRCompletionBindingError(f"PR store WAL appeared during validation: {wal}")
+    if _stat_identity(before) != _stat_identity(after):
+        raise PRCompletionBindingError(
+            f"PR store changed during SQLite validation: {path}"
+        )
+    if quick_check != ("ok",):
+        raise PRCompletionBindingError(
+            f"PR store quick_check failed: {quick_check}"
+        )
+    return {
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "size_bytes": after.st_size,
+        "quick_check": "ok",
+        "pr_rows": rows,
+    }
 
 
 def load_repo_list_snapshot(

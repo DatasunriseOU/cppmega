@@ -219,6 +219,27 @@ def test_supervisor_terminal_revalidation_can_ignore_launch_only_disk_gate(
     assert inputs["free_disk_bytes"] < args.minimum_free_bytes
 
 
+def test_supervisor_revalidates_recorded_inputs_through_shared_seam(
+    tmp_path: Path,
+) -> None:
+    repo, argv = _input_fixture(tmp_path)
+    args = supervisor.parse_args(argv)
+    inputs = supervisor.validate_inputs(args, repo_root=repo)
+
+    live, revalidation_args = supervisor.revalidate_recorded_inputs(
+        {
+            "code_revision": args.expected_code_revision,
+            "inputs": inputs,
+        },
+        run_root=Path(args.run_root),
+        repo_root=repo,
+    )
+
+    assert live["python"] == inputs["python"]
+    assert live["libclang"] == inputs["libclang"]
+    assert revalidation_args.expected_code_revision == args.expected_code_revision
+
+
 def test_supervisor_rejects_incompatible_resume_binding(
     tmp_path: Path,
 ) -> None:

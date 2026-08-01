@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,17 @@ PINNED_SOURCE_ENVIRONMENT = {
     "CPPMEGA_DEDUP_WAL_AUTOCHECKPOINT_PAGES": "10000",
     "CPPMEGA_DEDUP_JOURNAL_SIZE_LIMIT_BYTES": str(1024**3),
 }
+_RECORDED_INPUT_BINDINGS = (
+    "archive",
+    "archive_sha256_receipt",
+    "archive_inventory_receipt",
+    "repo_list",
+    "source_quarantine_manifest",
+    "tokenizer",
+    "python",
+    "libclang",
+    "code_revision",
+)
 _REMOVED_CHILD_ENVIRONMENT = frozenset(
     {
         "PYTHONHOME",
@@ -652,6 +664,53 @@ def build_child_environment(
     return environment
 
 
+def revalidate_recorded_inputs(
+    launch: dict[str, Any],
+    *,
+    run_root: Path,
+    repo_root: Path,
+) -> tuple[dict[str, Any], argparse.Namespace]:
+    """Re-run production input validation for an existing launch receipt."""
+
+    stored = launch.get("inputs")
+    if not isinstance(stored, dict):
+        raise TypeError("source launch inputs must be an object")
+
+    def field(name: str, key: str) -> object:
+        binding = stored.get(name)
+        if not isinstance(binding, dict) or key not in binding:
+            raise RuntimeError(f"source launch {name}.{key} is missing")
+        return binding[key]
+
+    args = argparse.Namespace(
+        archive=field("archive", "resolved_path"),
+        archive_sha256_receipt=field("archive_sha256_receipt", "path"),
+        archive_inventory_receipt=field("archive_inventory_receipt", "path"),
+        repo_list=field("repo_list", "path"),
+        source_quarantine_manifest=field("source_quarantine_manifest", "path"),
+        tokenizer=field("tokenizer", "path"),
+        python=field("python", "path"),
+        libclang=field("libclang", "path"),
+        expected_code_revision=launch.get("code_revision"),
+        run_root=str(run_root),
+        minimum_free_bytes=0,
+    )
+    live = validate_inputs(
+        args,
+        repo_root=repo_root,
+        enforce_minimum_free_disk=False,
+    )
+
+    def identity(inputs: dict[str, Any]) -> dict[str, Any]:
+        result = {name: dict(inputs[name]) for name in _RECORDED_INPUT_BINDINGS}
+        result["archive"].pop("requested_path", None)
+        return result
+
+    if _canonical_sha256(identity(live)) != _canonical_sha256(identity(stored)):
+        raise RuntimeError("source launch inputs drifted")
+    return live, args
+
+
 def _spawn_child(
     command: list[str],
     *,
@@ -698,13 +757,92 @@ def _terminate_child_group(
         child.poll()
         try:
             os.killpg(child.pid, 0)
-        except ProcessLookupError:
+        except (PermissionError, ProcessLookupError):
             break
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
     else:
         _signal_child_group(child, signal.SIGKILL)
     if child.poll() is None:
         child.wait()
+
+
+def run_supervised_child(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    log_path: Path,
+    on_started: Callable[[int], None],
+) -> int:
+    """Run one process group with the canonical two-stage signal policy."""
+
+    child: subprocess.Popen[bytes] | None = None
+    forwarded = 0
+
+    def forward(signum: int, _frame: object) -> None:
+        nonlocal forwarded
+        if child is not None:
+            forwarded += 1
+            if forwarded == 1:
+                _forward_child_signal(child, signum)
+            else:
+                _signal_child_group(child, signum)
+
+    previous_sigint = signal.signal(signal.SIGINT, forward)
+    previous_sigterm = signal.signal(signal.SIGTERM, forward)
+    try:
+        with log_path.open("ab", buffering=0) as log:
+            child = _spawn_child(
+                command,
+                cwd=cwd,
+                environment=environment,
+                log=log,
+            )
+            try:
+                on_started(child.pid)
+                return _portable_exit_code(child.wait())
+            except BaseException:
+                _terminate_child_group(child)
+                raise
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def write_exit_receipt(
+    path: Path,
+    *,
+    launch_path: Path,
+    code_revision: str,
+    return_code: int,
+    manifest_path: Path,
+    completion_path: Path,
+    terminal_coverage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write the canonical exit binding shared by source supervisors."""
+
+    receipt: dict[str, Any] = {
+        "schema": EXIT_SCHEMA,
+        "finished_at": _utc_now(),
+        "exit_code": return_code,
+        "status": "success" if return_code == 0 else "failed",
+        "code_revision": code_revision,
+        "launch_receipt_sha256": _sha256_file(launch_path),
+        "done_manifest": None,
+        "completion_receipt": None,
+        "terminal_coverage": terminal_coverage,
+    }
+    for field, artifact in (
+        ("done_manifest", manifest_path),
+        ("completion_receipt", completion_path),
+    ):
+        if artifact.is_file() and not artifact.is_symlink():
+            receipt[field] = {
+                "path": str(artifact.resolve()),
+                "sha256": _sha256_file(artifact),
+            }
+    _atomic_json(path, receipt)
+    return receipt
 
 
 def verify_completion_receipt(
@@ -880,44 +1018,22 @@ def _run(args: argparse.Namespace) -> int:
         }
         _atomic_json(launch_path, launch_receipt)
 
-        environment = build_child_environment(inputs)
-        child: subprocess.Popen[bytes] | None = None
-        forwarded_signal_count = 0
+        def mark_started(child_pid: int) -> None:
+            launch_receipt.update(
+                status="running",
+                started_at=_utc_now(),
+                supervisor_pid=os.getpid(),
+                child_pid=child_pid,
+            )
+            _atomic_json(launch_path, launch_receipt)
 
-        def forward(signum: int, _frame: object) -> None:
-            nonlocal forwarded_signal_count
-            if child is not None:
-                forwarded_signal_count += 1
-                if forwarded_signal_count == 1:
-                    _forward_child_signal(child, signum)
-                else:
-                    _signal_child_group(child, signum)
-
-        previous_sigint = signal.signal(signal.SIGINT, forward)
-        previous_sigterm = signal.signal(signal.SIGTERM, forward)
-        try:
-            with (run_root / "run.log").open("ab", buffering=0) as log:
-                child = _spawn_child(
-                    command,
-                    cwd=_REPO_ROOT,
-                    environment=environment,
-                    log=log,
-                )
-                try:
-                    launch_receipt["status"] = "running"
-                    launch_receipt["started_at"] = _utc_now()
-                    launch_receipt["supervisor_pid"] = os.getpid()
-                    launch_receipt["child_pid"] = child.pid
-                    _atomic_json(launch_path, launch_receipt)
-                    raw_return_code = child.wait()
-                except BaseException:
-                    _terminate_child_group(child)
-                    raise
-        finally:
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGTERM, previous_sigterm)
-
-        return_code = _portable_exit_code(raw_return_code)
+        return_code = run_supervised_child(
+            command,
+            cwd=_REPO_ROOT,
+            environment=build_child_environment(inputs),
+            log_path=run_root / "run.log",
+            on_started=mark_started,
+        )
         done_manifest = run_root / "conveyor" / "_done.json"
         completion_receipt = run_root / "conveyor" / "completion_receipt.json"
         terminal_coverage = None
@@ -939,28 +1055,15 @@ def _run(args: argparse.Namespace) -> int:
                 inputs=terminal_inputs,
             )
             terminal_coverage["immutable_inputs_reverified_at_finish"] = True
-        exit_receipt: dict[str, Any] = {
-            "schema": EXIT_SCHEMA,
-            "finished_at": _utc_now(),
-            "exit_code": return_code,
-            "status": "success" if return_code == 0 else "failed",
-            "code_revision": args.expected_code_revision,
-            "launch_receipt_sha256": _sha256_file(launch_path),
-            "done_manifest": None,
-            "completion_receipt": None,
-            "terminal_coverage": terminal_coverage,
-        }
-        if done_manifest.is_file():
-            exit_receipt["done_manifest"] = {
-                "path": str(done_manifest),
-                "sha256": _sha256_file(done_manifest),
-            }
-        if completion_receipt.is_file():
-            exit_receipt["completion_receipt"] = {
-                "path": str(completion_receipt),
-                "sha256": _sha256_file(completion_receipt),
-            }
-        _atomic_json(run_root / "exit_receipt.json", exit_receipt)
+        write_exit_receipt(
+            run_root / "exit_receipt.json",
+            launch_path=launch_path,
+            code_revision=args.expected_code_revision,
+            return_code=return_code,
+            manifest_path=done_manifest,
+            completion_path=completion_receipt,
+            terminal_coverage=terminal_coverage,
+        )
         return return_code
     finally:
         lock_stream.close()

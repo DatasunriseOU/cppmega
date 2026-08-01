@@ -12,7 +12,7 @@ from cppmega.data.source_conveyor_composition import (
     SOURCE_COMPOSITION_PLAN_SCHEMA,
     load_source_composition,
 )
-
+from scripts import commit_source_conveyor_supervisor as commit_supervisor
 
 _BUCKETS = (1024,)
 _REPOSITORIES = ("alpha", "beta")
@@ -523,6 +523,45 @@ def test_source_composition_resolves_revision_bound_code_repair(
     )
     assert commit_run["pr_completion"]["status"] == "verified"
     assert commit_run["pr_completion"]["stored_pr_count"] == 2
+
+
+def test_commit_supervisor_plan_is_accepted_by_source_composition(
+    tmp_path: Path,
+) -> None:
+    original_plan, code_root, commit_root = _composition_fixture(tmp_path)
+    fixture = json.loads(original_plan.read_text(encoding="utf-8"))
+    code_run = fixture["runs"][0]
+    manifest_path = Path(code_run["manifest"])
+    exit_path = Path(code_run["exit_receipt"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["done"]["beta::code"] = {"lengths": _lengths()}
+    manifest["failed"] = {}
+    _write_json(manifest_path, manifest)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt.update(status="success", exit_code=0)
+    exit_receipt["done_manifest"]["sha256"] = _sha256(manifest_path)
+    _write_json(exit_path, exit_receipt)
+
+    plan_path = tmp_path / "commit-supervisor-plan.json"
+    commit_supervisor._write_composition_plan(
+        plan_path,
+        code_run={
+            "launch_path": Path(code_run["launch_receipt"]),
+            "exit_path": exit_path,
+            "manifest_path": manifest_path,
+        },
+        commit_run_root=Path(fixture["runs"][2]["launch_receipt"]).parent,
+        dedup_receipt=Path(fixture["dedup_receipt"]),
+    )
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+    assert composition.receipt["status"] == "complete"
+    assert len(composition.receipt["runs"]) == 2
 
 
 def test_bundle_stages_every_source_composition_proof(tmp_path: Path) -> None:

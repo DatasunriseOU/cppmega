@@ -206,6 +206,7 @@ RepoListSnapshot = src.RepoListSnapshot
 load_repo_list_snapshot = src.load_repo_list_snapshot
 load_repo_list_contracts = src.load_repo_list_contracts
 load_pr_completion_binding = src.load_pr_completion_binding
+observe_immutable_pr_store = src.observe_immutable_pr_store
 revalidate_pr_completion_binding = src.revalidate_pr_completion_binding
 _pr_completion_identity = src.pr_completion_identity
 
