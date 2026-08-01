@@ -323,6 +323,4 @@ def test_release_gate_remote_hydration_never_assembles_local_image():
         keyword for keyword in function_decorator.keywords if keyword.arg == "image"
     )
 
-    assert ast.unparse(image_keyword.value) == (
-        "_image() if modal.is_local() else modal.Image.debian_slim()"
-    )
+    assert ast.unparse(image_keyword.value) == "_image() if modal.is_local() else None"
