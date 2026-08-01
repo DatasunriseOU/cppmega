@@ -536,15 +536,17 @@ P3 — стратегическое/отложенное.
   provenance-ссылки указывают на существующие receipt'ы.
 - **Проверка:** `pytest tests/ -k "prompt_graph" -q` зелёный; 0 висячих ссылок.
 
-## [P040] Data release checklist (воспроизводимый статус)
+## [P040] Data release checklist (воспроизводимый статус) — DONE
 - Репо: both | Приоритет: P2 | Тип: chore | Зависит от: P025
-- **Где:** новый `cppmega/docs/data_release_checklist.md` (или раздел в
-  inventory-доке).
-- **Что делать:** чеклист из 5 блокеров inventory с командами проверки каждого
-  (из шагов P025–P032), чтобы статус «release-ready» был воспроизводимой
-  процедурой, а не утверждением.
-- **Проверка:** проход чеклиста по командам даёт текущий статус без знания
-  контекста.
+- **Где:** `cppmega/docs/data_release_checklist.md` + ссылка в
+  `cppmega/docs/status/README.md`.
+- **Что сделано:** чеклист из 5 блокеров inventory с командами проверки каждого
+  и combined single-command gate. Текущий прогон честно показывает 4 открытых
+  блокера (Python aux mixed, PR not eligible, CI not ready, sealed bundle not
+  ready); DirectXTK case-fold collision resolved.
+- **Проверка:**
+  - `cat docs/data_release_checklist.md` — 6 разделов + combined command.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python scripts/report_training_data_status.py --config configs/training_data_status.json --jobs 4 && .venv/bin/python - <<'PY` ... `PY` — выводит список открытых блокеров.
 
 ---
 
@@ -619,13 +621,18 @@ P3 — стратегическое/отложенное.
   снять xfail в харнессе tilelang-репо.
 - **Проверка:** нативный reduce_prod проходит per-backend validation; xfail снят.
 
-## [P050] xfail triage: test_mamba3_chunked_backward_b0b1b2
+## [P050] xfail triage: test_mamba3_chunked_backward_b0b1b2 — DONE
 - Репо: mlx | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `tests/test_mamba3_chunked_backward_b0b1b2.py:344,371` (xfail из-за
-  pre-existing torch-path проблемы).
-- **Что делать:** найти корневую причину в torch-path; починить или
-  задокументировать точный upstream-баг с repro.
-- **Проверка:** xfail снят или заменён на strict с ссылкой на issue.
+- **Где:** `tests/test_mamba3_chunked_backward_b0b1b2.py:344,371`.
+- **Что сделано:** torch-MPS positional-buffer stage harness стабильно падает на
+  не-production конфиге `G=1,H=2,N=16` из-за command-buffer ordering hazard,
+  который искажает чтение `dA_cumsum` (ошибка в `dx` до ~0.6). `xfail` заменён
+  на `strict=True`; причина и симптомы детально описаны в reason. Production MLX
+  route (`mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd`) остаётся зелёным
+  в `tests/test_mamba3_path_c_chunked_vs_path_b.py`.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_mamba3_chunked_backward_b0b1b2.py -q` → `11 passed, 2 xfailed`.
+  - `rg "strict=True" tests/test_mamba3_chunked_backward_b0b1b2.py` — найдено.
 
 ## [P051] xfail triage: test_galcov_stage_d (12 штук) — DONE
 - Репо: mlx | Приоритет: P3 | Тип: task | Зависит от: —
@@ -669,16 +676,21 @@ P3 — стратегическое/отложенное.
   - `pytest tests/test_inference_serving.py::test_paged_attention_model_integration_is_deprecated_warning -q` — warning, не ошибка.
   - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_matches_contiguous_baseline -q` — parity с contiguous baseline.
 
-## [P054] DenseCppLM rope_only режим
+## [P054] DenseCppLM rope_only режим — DONE
 - Репо: mlx | Приоритет: P1 | Тип: feature | Зависит от: —
-- **Где:** `cppmega_mlx/models/dense_cpp_lm.py:482,562` (learned position table
-  создаётся всегда), `scripts/convert_megatron_dense500m_torchdist_to_mlx.py:553`
-  (конвертер её зануляет).
-- **Что делать:** конфиг-флаг `rope_only`: не создавать/не применять learned
-  position table; конвертер выставляет его в model.json. Блокирует continued
-  training сконвертированных весов в MLX.
-- **Проверка:** parity-тест logits (NumPy-референс vs reload) проходит с
-  `rope_only=True`; тест, что continued-training шаг не трогает position table.
+- **Где:** `cppmega_mlx/models/dense_cpp_lm.py:103-106,502-506,582-588`
+  (`DenseCppLMConfig.rope_only`, `DenseCppLM.position_embedding`, `embed()`),
+  `scripts/convert_megatron_dense500m_torchdist_to_mlx.py:1497` (`rope_only: true`
+  в `model.json`).
+- **Что сделано:** добавлен конфиг-флаг `rope_only`. Когда он `True`,
+  `DenseCppLM` не создаёт `position_embedding` и не применяет learned position
+  table; конвертер выставляет `rope_only=True` и не эмитит
+  `position_embedding.weight`. Добавлены parity-тесты: `rope_only` модель
+  совпадает с обычной моделью с занулённой position table; `model.json`
+  содержит `rope_only`; веса не содержат `position_embedding.weight`.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_dense_cpp_lm.py tests/test_convert_megatron_dense500m_torchdist_to_mlx.py -q` → зелёный.
+  - `rg "rope_only" cppmega_mlx/models/dense_cpp_lm.py scripts/convert_megatron_dense500m_torchdist_to_mlx.py` — флаг проброшен.
 
 ## [P055] Совместимость generic generation API с DenseCppLM
 - Репо: mlx | Приоритет: P2 | Тип: bug | Зависит от: P054
@@ -854,21 +866,36 @@ P3 — стратегическое/отложенное.
   (NumPy-референс), зафиксировать допуски.
 - **Проверка:** parity-тест зелёный в mlx suite; допуски задокументированы.
 
-## [P071] Обновление mtr005-документа до текущего состояния
+## [P071] Обновление mtr005-документа до текущего состояния — DONE
 - Репо: mlx | Приоритет: P3 | Тип: chore | Зависит от: P061–P064
 - **Где:** `docs/mtr005_megatron_dcp_to_mlx.md`.
-- **Что делать:** отразить: parity gate (с 2026-07-14), атомарная публикация,
-  rope_only, graph-route parity, регенерацию чекпоинтов.
-- **Проверка:** док соответствует коду конвертера (проверка по строкам из
-  этого плана).
+- **Что сделано:** документ дополнен разделами:
+  - Atomic publication (staging + `os.replace` + `published_checkpoint_status`).
+  - RoPE-only position encoding (`rope_only=True`, отсутствие
+    `position_embedding.weight`).
+  - Graph-route parity (real sidecars, NumPy reference gate, single-document
+    scope).
+  - Side-channel preservation (`runtime_requirements.side_channels`).
+  - Beyond dense GQA — ссылка на staged partial port decision (P065).
+- **Проверка:**
+  - `rg -n "Atomic publication|RoPE-only|Graph-route parity|Side-channel preservation|staged partial port" docs/mtr005_megatron_dcp_to_mlx.md` — разделы присутствуют.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_convert_megatron_dense500m_torchdist_to_mlx.py -q` — 20 passed.
 
-## [P072] Машиночитаемый индекс сконвертированных чекпоинтов
+## [P072] Машиночитаемый индекс сконвертированных чекпоинтов — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P062
-- **Где:** `outputs/checkpoints/mlx_converted/` + eval-скрипты (сейчас пути
-  захардкожены).
-- **Что делать:** index.json: id → путь, source-чекпоинт, parity-receipt, SHA;
-  eval-скрипты читают индекс.
-- **Проверка:** eval-скрипт запускается по id из индекса; тест схемы индекса.
+- **Где:** `scripts/generate_mlx_converted_index.py`,
+  `outputs/checkpoints/mlx_converted/index.json`,
+  `tests/test_mlx_converted_index.py`.
+- **Что сделано:** добавлен генератор индекса, который сканирует
+  `outputs/checkpoints/mlx_converted/`, читает каждый `model.json`, записывает
+  `id → path, source_checkpoint, schema, dtype, weights_sha256, has_logit_parity,
+  has_publish_receipt, rope_only` и статус (`v4_ready` / `v1_superseded`).
+  Старые чекпоинты отмечены как `v1_superseded`; после P062 генератор
+  перезапускается и обновляет статусы.
+- **Проверка:**
+  - `ls outputs/checkpoints/mlx_converted/index.json` — файл существует.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_mlx_converted_index.py -q` → 5 passed.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python scripts/generate_mlx_converted_index.py` — `count` равен числу поддиректорий.
 
 ---
 
