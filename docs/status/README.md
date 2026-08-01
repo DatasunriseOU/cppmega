@@ -38,6 +38,9 @@ Use one of these labels in new docs and in index rows:
 | Data preparation | [../data_preparation.md](../data_preparation.md) | Dataset/tokenizer pipeline. |
 | Training-data inventory | [training_data_inventory.md](training_data_inventory.md) | Live token counts, versions, sidecars, Parquet paths, eligibility, and changelog. |
 | Long-context roadmap | [../long_context_roadmap.md](../long_context_roadmap.md) | Context-length thresholds and deferred work. |
+| Document isolation — varlen design | [../document_isolation_varlen_design.md](../document_isolation_varlen_design.md) | cu_seqlens vs mask path trade-offs. |
+| Document isolation — SWA | [../document_isolation_swa_design.md](../document_isolation_swa_design.md) | `window_size` plumbing for packed documents. |
+| Document isolation — CP 128k | [../document_isolation_cp128k_design.md](../document_isolation_cp128k_design.md) | Context-parallel plan for the 128k phase. |
 
 ## Active Dated Notes
 
@@ -75,6 +78,10 @@ Use one of these labels in new docs and in index rows:
 6. If many notes accumulate for one topic, create or update a canonical status
    doc under `docs/status/` and link the individual dated notes as evidence.
    Avoid mass moves unless the reference check is clean.
+7. **Quarterly sweep**: once per quarter, review dated notes older than 90 days.
+   Mark them `archived` in [../sessions/README.md](../sessions/README.md) unless
+   they remain actively referenced by open code, tests, or canonical docs.
+   Record the sweep in `docs/sessions/YYYY-MM-DD-docs-sweep.md`.
 
 ## Suggested Paths For New Docs
 

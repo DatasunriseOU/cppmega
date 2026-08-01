@@ -28,12 +28,12 @@ rules.
 
 | Date | Notes | Status |
 | --- | --- | --- |
-| 2026-04-15 | [GB10 regression](../gb10_regression_investigation_2026_04_15.md), [grad NaN investigation](../grad_nan_investigation_2026_04_15.md), [grad NaN bisect](../grad_nan_bisect_2026_04_15.md) | evidence |
-| 2026-04-14 | [session findings](../findings_2026_04_14_session.md), [FP8 research](../fp8_research_session_2026_04_14.md), [Mamba fork canonical](../mamba_fork_canonical_2026_04_14.md), [session closeout](../session_3_closeout_2026_04_14.md), [gap audit](../session_3_gap_audit.md) | evidence |
-| 2026-04-13 | [FP8 optimization session](../fp8_optimization_session_2026_04_13.md), [optimization session](../optimization_session_2026_04_13.md), [optimization session RU](../optimization_session_2026_04_13_ru.md) | evidence |
-| 2026-04-12 | [Blackwell feature sweep](../blackwell_feature_sweep_2026_04_12.md), [DSA EP=2 sweep](../dsa_ep2_tilelang_sweep_2026_04_12.md), [NAM56R grid search](../nam56r_grid_search_2026_04_12.md) | evidence |
-| 2026-04-11 | [GB10 bwd_bwd conclusion](../gb10_bwd_bwd_optimization_conclusion.md), [Modal B200 sweep](../modal_b200_cutile_variant_sweep_2026_04_11.md), [NAM56R baseline](../nam56r_mimo7_baseline_2026_04_11.md), [nsys profile](../nam56r_mimo7_nsys_profile_2026_04_11.md), [reproducibility](../nam56r_mimo7_reproducibility_2026_04_11.md), [VPP result](../nam56r_mimo7_vpp_112k_2026_04_11.md), [MTP plan](../nam56r_mtp_optimization_plan_2026_04_11.md), [MTP plan RU](../nam56r_mtp_optimization_plan_2026_04_11_ru.md), [session summary RU](../session_2026_04_11_summary_ru.md) | evidence |
-| 2026-04-10 | [Modal B200 cuTile status](../modal_b200_cutile_status.md) | evidence |
+| 2026-04-15 | [GB10 regression](../gb10_regression_investigation_2026_04_15.md), [grad NaN investigation](../grad_nan_investigation_2026_04_15.md), [grad NaN bisect](../grad_nan_bisect_2026_04_15.md) | archived |
+| 2026-04-14 | [session findings](../findings_2026_04_14_session.md), [FP8 research](../fp8_research_session_2026_04_14.md), [Mamba fork canonical](../mamba_fork_canonical_2026_04_14.md), [session closeout](../session_3_closeout_2026_04_14.md), [gap audit](../session_3_gap_audit.md) | archived |
+| 2026-04-13 | [FP8 optimization session](../fp8_optimization_session_2026_04_13.md), [optimization session](../optimization_session_2026_04_13.md), [optimization session RU](../optimization_session_2026_04_13_ru.md) | archived |
+| 2026-04-12 | [Blackwell feature sweep](../blackwell_feature_sweep_2026_04_12.md), [DSA EP=2 sweep](../dsa_ep2_tilelang_sweep_2026_04_12.md), [NAM56R grid search](../nam56r_grid_search_2026_04_12.md) | archived |
+| 2026-04-11 | [GB10 bwd_bwd conclusion](../gb10_bwd_bwd_optimization_conclusion.md), [Modal B200 sweep](../modal_b200_cutile_variant_sweep_2026_04_11.md), [NAM56R baseline](../nam56r_mimo7_baseline_2026_04_11.md), [nsys profile](../nam56r_mimo7_nsys_profile_2026_04_11.md), [reproducibility](../nam56r_mimo7_reproducibility_2026_04_11.md), [VPP result](../nam56r_mimo7_vpp_112k_2026_04_11.md), [MTP plan](../nam56r_mtp_optimization_plan_2026_04_11.md), [MTP plan RU](../nam56r_mtp_optimization_plan_2026_04_11_ru.md), [session summary RU](../session_2026_04_11_summary_ru.md) | archived |
+| 2026-04-10 | [Modal B200 cuTile status](../modal_b200_cutile_status.md) | archived |
 
 ## Adding A New Note
 
