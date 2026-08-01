@@ -702,9 +702,10 @@ P3 — стратегическое/отложенное.
   нативный paged-attention/scatter kernel и memory/throughput receipts. До них
   это совместимый prefill+decode path, а не завершённый production paged attention.
   Dense-fallback для `mode='dsa'` разрешён в `cppmega.mlx@7a0378a5` (parity с
-  contiguous prefill и decode покрыт тестами).
+  contiguous prefill и decode покрыт тестами); `cppmega.mlx@eab00e33`
+  fail-closed запрещает этот fallback при явно выбранном Sparse-MLA Path B/C.
 - **Проверка:**
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 62 passed.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 64 passed.
   - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 76 passed (регрессия).
   - `pytest tests/test_attention.py::test_paged_kv_compatibility_path_decode_matches_contiguous_cache tests/test_attention.py::test_paged_kv_compatibility_path_decode_mixed_batch -q` — parity с contiguous cache decode.
   - `pytest tests/test_inference_serving.py -k scatter_paged_kv_offsets -q` — offsets-scatter round-trip + fail-closed кейсы.
