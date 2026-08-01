@@ -4,6 +4,13 @@ Branch: `worker/mamba3-stage2-force-nontma`
 
 Goal: fix the H200 productionish crash from the stage2 force-nonTMA benchmark.
 
+> Superseded safety decision (2026-08-01): this document records a historical
+> benchmark shape, not the current production contract. The exact
+> `R=2/chunk=32/N=P=32` training gate later reached the flattened TMA bwd_fwd
+> kernel and failed with `CUDA_ERROR_ILLEGAL_INSTRUCTION` plus GPU Xid 13/43.
+> Both backward kernels must now keep `TL_DISABLE_TMA_LOWER=True` and
+> `TL_DISABLE_WARP_SPECIALIZED=True`.
+
 ## Problem
 
 The previous `stage2_force_nontma` benchmark used `bf_num_stages=2` and

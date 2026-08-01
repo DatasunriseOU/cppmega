@@ -1,5 +1,33 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-01: Mamba3 backward TMA path restored to fail-closed
+
+The Stage2 patch now preserves
+`TL_DISABLE_TMA_LOWER=True` and
+`TL_DISABLE_WARP_SPECIALIZED=True` on both Mamba3 backward kernels. The
+structural Q/K and QK_DOT flattening, targeted non-TMA copies, and existing
+`bf_num_stages=1` / `bb_num_stages=0` defaults remain unchanged.
+
+This restores the repository's documented H200 safety boundary. A fresh exact
+`R=2`, `chunk=32`, `N=P=32` run reached the flattened TMA bwd_fwd kernel but
+failed with `CUDA_ERROR_ILLEGAL_INSTRUCTION` and GPU Xid 13/43. Generated CUDA
+and executable SASS were byte-identical across TileLang `3dff66ef`,
+`6c338795`, and the native Bind-role candidate `629e3414`, excluding the
+Bind-role change as the runtime cause. The Stage2 validator and focused tests
+now fail closed if either backward kernel re-enables TMA lowering or warp
+specialization.
+
+The immutable candidate image now includes and applies the exact Stage2 patch
+during its Docker build. The ordered H200 release gate never overlays
+production source: it binds the candidate commit, OCI digest, release manifest,
+and wheel hashes; verifies installed TileLang/tvm-ffi payloads against the
+pinned wheel `RECORD`s; and reopens the durable prerequisite receipt/JUnit
+chain before advancing.
+
+The candidate remains unpromoted until a rebuilt immutable image passes the
+ordered exact H200 one-test, `R=2/chunk=32` 3/3, and
+`R=4/chunk=16` 3/3 gates.
+
 ## 2026-08-01: Final dbfe runtime image receipts
 
 The final wheel release is bound to source

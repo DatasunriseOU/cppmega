@@ -87,6 +87,18 @@ RUN set -eu; \
 COPY . /opt/cppmega
 RUN python -m pip install -e /opt/cppmega --no-build-isolation --no-deps
 
+# Apply the repository-bound Mamba3 Stage2 safety patch while building the
+# immutable image. Runtime gates verify this state and never mutate it.
+RUN cd /opt/cppmega \
+    && CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA=1 \
+       MAMBA3_STAGE2_FORCE_NONTMA_ALLOW_FILE_MUTATION=1 \
+       python -m \
+       cppmega.megatron.upstream_patches.apply_mamba3_stage2_force_nontma_patches \
+    && python -c "\
+from cppmega.megatron.upstream_patches import apply_mamba3_stage2_force_nontma_patches as stage2; \
+assert stage2._is_stage2_patch_applied(); \
+assert not stage2._is_stage2_patch_absent()"
+
 # --- runtime env (mirrors modal_cppmega_base.py) ----------------------------
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin:/sbin \

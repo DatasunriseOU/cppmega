@@ -1,15 +1,5 @@
 --- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
 +++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
-@@ -35,8 +35,7 @@
- @tilelang.jit(
-     out_idx=[],
-     pass_configs={
--        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
--        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
-         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-     })
- def mamba_mimo_bwd_fwd(
 @@ -71,16 +70,18 @@
      @T.prim_func
      def mamba_mimo_bwd_fwd_kernel(
@@ -124,16 +114,6 @@
                  # NOTE: we can recycle k_trap_scaled_frag from earlier, however,
                  # that is slower, so choose to recopy from smem:
                  k_state_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
-@@ -498,8 +503,7 @@
- @tilelang.jit(
-     out_idx=[],
-     pass_configs={
--        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
--        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
-         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-     })
- def mamba_mimo_bwd_bwd(
 @@ -534,8 +538,9 @@
      @T.prim_func
      def mamba_mimo_bwd_bwd_kernel(

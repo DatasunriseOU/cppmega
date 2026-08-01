@@ -18,4 +18,7 @@ venv
 .vscode
 *.log
 *.bak
-upstream_prs/examples
+upstream_prs/examples/*
+!upstream_prs/examples/13_tilelang_floormod_dbz/
+upstream_prs/examples/13_tilelang_floormod_dbz/*
+!upstream_prs/examples/13_tilelang_floormod_dbz/mamba3_bwd_stage2_force_nontma.patch
