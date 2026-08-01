@@ -441,14 +441,23 @@ P3 — стратегическое/отложенное.
 - **Что делать:** прогнать сэмпл-экспорт; сохранить receipt.
 - **Проверка:** receipt с числом сэмплов; выборка проходит schema-валидацию.
 
-## [P035] Staleness-алерт для training_data_status watcher
+## [P035] Staleness-алерт для training_data_status watcher — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: —
-- **Где:** `scripts/report_training_data_status.py` (бежит PID 63328,
-  `--watch-seconds 300`), launchd plist в `configs/launchd/`.
-- **Что делать:** добавить предупреждение (лог + метка в current.json), если
-  upstream-источники старше N минут или watcher сам мёртв (heartbeat-файл).
-- **Проверка:** наведённая остановка watcher'а → heartbeat устаревает, алерт в
-  логе; `log show`/`launchctl list` подтверждают plist жив.
+- **Где:** `scripts/report_training_data_status.py:1204-1387` (`_live_upstream_inputs`,
+  `collect_freshness`, `check_heartbeat`, `build_status`),
+  `configs/launchd/ai.cppmega.training-data-status.plist`.
+- **Что сделано:** freshness-секция уже пишется в `current.json`:
+  - `freshness.upstreams` — возраст каждого live upstream input и флаг `stale`;
+  - `freshness.heartbeat` — PID, `recorded_at`, `age_seconds`, флаг `stale`;
+  - `freshness.stale` — список stale upstream'ов.
+  Главный цикл (`main`:1660-1749) при наличии stale upstream'ов или stale
+  heartbeat пишет warning в `changelog.jsonl`.
+- **Проверка:**
+  - `python3 -c "import json; d=json.load(open('cppmega.mlx/outputs/training_data_status/current.json')); print(d['freshness']['stale'], d['freshness']['heartbeat']['stale'])"`.
+  - `ps aux | grep report_training_data_status` — watcher запущен (PID меняется).
+  - `tail cppmega.mlx/outputs/training_data_status/changelog.jsonl` — при stale
+    условиях появляются записи с `warning: stale_upstreams` или
+    `warning: stale_watcher_heartbeat`.
 
 ## [P036] Паритет token_* колонок между репо (mirror_mlx_parquet)
 - Репо: both | Приоритет: P2 | Тип: task | Зависит от: P026
