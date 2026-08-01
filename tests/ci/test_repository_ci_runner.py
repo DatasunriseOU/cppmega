@@ -858,3 +858,181 @@ def test_early_failure_receipt_redacts_secrets(tmp_path: Path) -> None:
 
     assert secret not in receipt["error"]
     assert "<redacted>" in receipt["error"]
+
+
+def test_run_orchestrator_writes_failure_receipt_for_unknown_lane(
+    tmp_path: Path,
+) -> None:
+    lanes_path = _minimal_lane_config(tmp_path / "lanes.json")
+    hosts_path = _minimal_host_config(tmp_path / "hosts.json")
+    receipt_base = tmp_path / "receipts"
+
+    exit_code = ci.main(
+        [
+            "run",
+            "--hosts-config",
+            str(hosts_path),
+            "--lanes-config",
+            str(lanes_path),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--receipt-dir",
+            str(receipt_base),
+            "--run-id",
+            "unit-run-failure",
+            "--lane",
+            "does-not-exist",
+        ]
+    )
+    receipt_dir = receipt_base / "unit-run-failure"
+    receipt = json.loads(
+        (receipt_dir / "orchestration.json").read_text(encoding="utf-8")
+    )
+    log = (receipt_dir / "orchestrator-failure.log").read_text(encoding="utf-8")
+
+    assert exit_code == 2
+    assert receipt["schema_version"] == ci.SCHEMA_VERSION
+    assert receipt["kind"] == "orchestration"
+    assert receipt["run_id"] == "unit-run-failure"
+    assert receipt["status"] == "failed"
+    assert receipt["exit_code"] == exit_code
+    assert receipt["failure_stage"] == "orchestrator"
+    assert receipt["dry_run"] is False
+    assert "does-not-exist" in receipt["error"]
+    assert "Traceback" in log
+    assert "unknown lane ids" in log
+
+
+def test_run_early_failure_receipt_generates_run_id_when_missing(
+    tmp_path: Path,
+) -> None:
+    receipt_base = tmp_path / "receipts"
+    args = argparse.Namespace(
+        command="run",
+        receipt_dir=str(receipt_base),
+        run_id=None,
+        ref="HEAD",
+        dry_run=False,
+    )
+
+    ci._write_early_failure_receipt(args, RuntimeError("preflight crash"))
+    receipts = list(receipt_base.glob("direct-*/orchestration.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+
+    assert receipt["kind"] == "orchestration"
+    assert receipt["run_id"] == receipts[0].parent.name
+    assert receipt["status"] == "failed"
+    assert receipt["failure_stage"] == "orchestrator"
+
+
+def test_run_early_failure_receipt_does_not_clobber_an_existing_receipt(
+    tmp_path: Path,
+) -> None:
+    receipt_dir = tmp_path / "receipts" / "unit-run-keep"
+    receipt_dir.mkdir(parents=True)
+    existing = {
+        "schema_version": ci.SCHEMA_VERSION,
+        "kind": "orchestration",
+        "status": "passed",
+    }
+    (receipt_dir / "orchestration.json").write_text(
+        json.dumps(existing), encoding="utf-8"
+    )
+    args = argparse.Namespace(
+        command="run",
+        receipt_dir=str(tmp_path / "receipts"),
+        run_id="unit-run-keep",
+        ref="HEAD",
+        dry_run=False,
+    )
+
+    ci._write_early_failure_receipt(args, RuntimeError("post-receipt crash"))
+    receipt = json.loads(
+        (receipt_dir / "orchestration.json").read_text(encoding="utf-8")
+    )
+
+    assert receipt == existing
+    assert "post-receipt crash" in (
+        receipt_dir / "orchestrator-failure.log"
+    ).read_text(encoding="utf-8")
+
+
+_GITHUB_CLASSIC_PAT = "ghp_0123456789abcdefABCDEF0123456789"
+_GITHUB_FINE_GRAINED_PAT = "github_pat_11ABCDEFGH0abcdefghijklm_nopqrstuvwxyz0123456789"
+_NEBIUS_API_KEY = "nebius-unit-test-key-N0123456789abcdefghij"
+_MODAL_TOKEN_ID = "ak-unitTEST0123456789abcdef"
+_MODAL_TOKEN_SECRET = "as-unitTEST0123456789abcdef"
+
+
+def test_step_logs_redact_project_token_formats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEBIUS_API_KEY", _NEBIUS_API_KEY)
+    monkeypatch.setenv("MODAL_TOKEN_ID", _MODAL_TOKEN_ID)
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", _MODAL_TOKEN_SECRET)
+    code = (
+        f"print('pat={_GITHUB_CLASSIC_PAT}'); "
+        f"print('fine={_GITHUB_FINE_GRAINED_PAT}'); "
+        f"print('Authorization: Bearer {_NEBIUS_API_KEY}'); "
+        f"print('modal id {_MODAL_TOKEN_ID} secret {_MODAL_TOKEN_SECRET}')"
+    )
+    result = ci.run_step(
+        name="redaction",
+        command=(sys.executable, "-c", code),
+        cwd=tmp_path,
+        log_path=tmp_path / "redaction.log",
+        timeout_seconds=5,
+    )
+    log = (tmp_path / "redaction.log").read_text(encoding="utf-8")
+
+    assert result["status"] == "passed"
+    for token in (
+        _GITHUB_CLASSIC_PAT,
+        _GITHUB_FINE_GRAINED_PAT,
+        _NEBIUS_API_KEY,
+        _MODAL_TOKEN_ID,
+        _MODAL_TOKEN_SECRET,
+    ):
+        assert token not in log
+    assert "ghp_" not in log
+    assert "github_pat_" not in log
+    assert "<redacted>" in log
+
+
+def test_run_early_failure_receipt_redacts_project_token_formats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEBIUS_API_KEY", _NEBIUS_API_KEY)
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", _MODAL_TOKEN_SECRET)
+    receipt_base = tmp_path / "receipts"
+    args = argparse.Namespace(
+        command="run",
+        receipt_dir=str(receipt_base),
+        run_id="unit-run-redact",
+        ref="HEAD",
+        dry_run=False,
+    )
+    failure = RuntimeError(
+        f"auth failed for {_GITHUB_CLASSIC_PAT} and {_GITHUB_FINE_GRAINED_PAT}; "
+        f"token={_NEBIUS_API_KEY}; modal {_MODAL_TOKEN_SECRET}"
+    )
+
+    ci._write_early_failure_receipt(args, failure)
+    receipt_dir = receipt_base / "unit-run-redact"
+    receipt = json.loads(
+        (receipt_dir / "orchestration.json").read_text(encoding="utf-8")
+    )
+    log = (receipt_dir / "orchestrator-failure.log").read_text(encoding="utf-8")
+
+    assert receipt["kind"] == "orchestration"
+    for token in (
+        _GITHUB_CLASSIC_PAT,
+        _GITHUB_FINE_GRAINED_PAT,
+        _NEBIUS_API_KEY,
+        _MODAL_TOKEN_SECRET,
+    ):
+        assert token not in receipt["error"]
+        assert token not in log
+    assert "<redacted>" in receipt["error"]
+    assert "<redacted>" in log

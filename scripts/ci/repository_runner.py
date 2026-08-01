@@ -2028,15 +2028,19 @@ def _build_parser() -> argparse.ArgumentParser:
 def _write_early_failure_receipt(
     args: argparse.Namespace, exc: BaseException
 ) -> None:
-    """Best-effort minimal receipt when the lane orchestrator dies early.
+    """Best-effort minimal receipt when the orchestrator dies early.
 
     The workflow uploads ``--receipt-dir`` with ``if-no-files-found: error``,
     so a crash before ``run_lane`` writes its own receipt (unknown lane id,
     unreadable lane config, unexpected exception) must still leave a
     ``receipt.json`` plus a traceback log behind to preserve the root cause.
+    The ``run`` subcommand fails the same way before ``orchestrate`` writes
+    ``orchestration.json``; there ``--receipt-dir`` is a base directory and
+    the receipt lives under ``<base>/<run_id>/orchestration.json``.
     """
 
-    if getattr(args, "command", None) != "lane":
+    command = getattr(args, "command", None)
+    if command not in {"lane", "run"}:
         return
     receipt_dir_value = getattr(args, "receipt_dir", None)
     if not receipt_dir_value:
@@ -2045,17 +2049,25 @@ def _write_early_failure_receipt(
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     try:
         receipt_dir = Path(str(receipt_dir_value)).resolve()
+        run_id = getattr(args, "run_id", None)
+        receipt_name = "receipt.json"
+        if command == "run":
+            run_id = run_id or _new_run_id()
+            receipt_dir = receipt_dir / run_id
+            receipt_name = "orchestration.json"
         receipt_dir.mkdir(parents=True, exist_ok=True)
         now = _utc_now()
         receipt = {
             "schema_version": SCHEMA_VERSION,
-            "kind": "lane",
-            "run_id": getattr(args, "run_id", None),
-            "lane": getattr(args, "lane", None),
+            "kind": "orchestration" if command == "run" else "lane",
+            "run_id": run_id,
+            "lane": getattr(args, "lane", None) if command == "lane" else None,
             "status": "failed",
             "exit_code": 2,
             "failure_stage": "orchestrator",
-            "error": redactor.text(f"orchestrator failed before lane completion: {exc}"),
+            "error": redactor.text(
+                f"orchestrator failed before {command} completion: {exc}"
+            ),
             "started_at": now,
             "completed_at": now,
             "host": {
@@ -2067,7 +2079,10 @@ def _write_early_failure_receipt(
             },
             "steps": [],
         }
-        receipt_path = receipt_dir / "receipt.json"
+        if command == "run":
+            receipt["dry_run"] = bool(getattr(args, "dry_run", False))
+            receipt["source"] = {"requested_ref": getattr(args, "ref", None)}
+        receipt_path = receipt_dir / receipt_name
         if not receipt_path.is_file():
             _write_json(receipt_path, receipt)
         (receipt_dir / "orchestrator-failure.log").write_text(
