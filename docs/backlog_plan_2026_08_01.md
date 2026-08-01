@@ -125,16 +125,16 @@ P3 — стратегическое/отложенное.
   `rg -n "except.*:\\s*pass" cppmega/megatron/upstream_patches/apply_*.py` —
   пусто.
 
-## [P009] Deprecation-заголовок для mamba3_author_spec.py
+## [P009] Deprecation-заголовок для mamba3_author_spec.py — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: — (НЕ трогать
   `author_mamba3_spec.py` — он в активном фронте)
-- **Где:** `cppmega/megatron/mamba3_author_spec.py` (deprecated-path с env-гейтом,
-  `deprecated_paths.py`).
-- **Что делать:** добавить в docstring модуля явную пометку: deprecated,
-  заменён на `author_mamba3_spec.py`, удалить после <дата/условие>. Устраняет
-  путаницу двух почти одноимённых модулей.
-- **Проверка:** `pytest tests/ -k deprecated_paths -q`; `head -20` файла
-  содержит пометку.
+- **Где:** `cppmega/megatron/mamba3_author_spec.py:1-6`.
+- **Что сделано:** docstring модуля уже содержит явную пометку
+  «Deprecated 2026-08-01: replaced by ``author_mamba3_spec.py``; retained for
+  historical reference and scheduled for removal» и упоминание env-гейта
+  `deprecated_paths.require_deprecated_ack`.
+- **Проверка:** `pytest tests/ -k deprecated_paths -q` → 1 passed, 18 skipped;
+  `head -20 cppmega/megatron/mamba3_author_spec.py` содержит пометку.
 
 ## [P010] Решение по PsiV cache scaffold (Phase A замер или архив)
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: —
