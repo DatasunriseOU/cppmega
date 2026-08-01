@@ -3,9 +3,10 @@ name: build-wheels
 # Candidate-only workflow on candidate/tilelang-role-3dff66ef.
 #
 # Build exactly the TileLang/tvm-ffi pair from the native role-classification
-# fix, then overlay it onto the immutable production wheel release. The
-# resulting complete prerelease remains bound to this candidate cppmega
-# commit and must not be promoted to main/STACK.lock before the H200 gates.
+# and dependent shared-RMW planning fixes, then overlay it onto the immutable
+# production wheel release. The resulting complete prerelease remains bound
+# to this candidate cppmega commit and must not be promoted to main/STACK.lock
+# before the H200 gates.
 
 on:
   workflow_dispatch:
@@ -82,7 +83,7 @@ jobs:
             # Candidate-only override. Do not copy to STACK.lock before H200
             # stage2+GQA and the exact three Mamba tests pass.
             repo: DatasunriseOU/tilelang
-            ref: 629e3414b13274ddcfdff2082db86373b0c218ae
+            ref: a951e3c8a4e2e1092579939d6bc31631ee1a4d8f
             submodules: "true"
             extra_env: ""
 
@@ -714,7 +715,7 @@ jobs:
           BASE_WHEEL_TAG: wheels-dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
           BASE_SOURCE_SHA: dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39
           CANDIDATE_CPPMEGA_SHA: ${{ github.sha }}
-          CANDIDATE_TILELANG_SHA: 629e3414b13274ddcfdff2082db86373b0c218ae
+          CANDIDATE_TILELANG_SHA: a951e3c8a4e2e1092579939d6bc31631ee1a4d8f
           CANDIDATE_TVM_SHA: e25ca6ae50beee0e907b1e5ed32949879caddde1
           CANDIDATE_TVM_FFI_SHA: 521efeb30bfd9e4946b248b3d76e6391028233a3
         run: |
@@ -780,7 +781,7 @@ jobs:
             gh release create "$TAG" \
               --target "${{ github.sha }}" \
               --title "cppmega TileLang candidate wheels ${{ needs.resolve.outputs.tag }}" \
-              --notes "Candidate-only complete wheel set: immutable production wheels from dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39 overlaid with TileLang 629e3414b13274ddcfdff2082db86373b0c218ae and its matched tvm-ffi. Do not promote before H200 stage2+GQA and exact 3/3 Mamba gates." \
+              --notes "Candidate-only complete wheel set: immutable production wheels from dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39 overlaid with TileLang a951e3c8a4e2e1092579939d6bc31631ee1a4d8f (native Bind-role plus fail-closed copy-dependent shared-RMW planning) and its matched tvm-ffi. Do not promote before H200 stage2+GQA and exact 3/3 Mamba gates." \
               --prerelease
           read -r tag_type tag_sha < <(
             gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" \

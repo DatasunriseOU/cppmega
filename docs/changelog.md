@@ -11,11 +11,15 @@ structural Q/K and QK_DOT flattening, targeted non-TMA copies, and existing
 This restores the repository's documented H200 safety boundary. A fresh exact
 `R=2`, `chunk=32`, `N=P=32` run reached the flattened TMA bwd_fwd kernel but
 failed with `CUDA_ERROR_ILLEGAL_INSTRUCTION` and GPU Xid 13/43. Generated CUDA
-and executable SASS were byte-identical across TileLang `3dff66ef`,
-`6c338795`, and the native Bind-role candidate `629e3414`, excluding the
-Bind-role change as the runtime cause. The Stage2 validator and focused tests
-now fail closed if either backward kernel re-enables TMA lowering or warp
-specialization.
+and executable SASS from the previously tested revisions were byte-identical
+across TileLang `3dff66ef`, `6c338795`, and the native Bind-role state,
+excluding the Bind-role change as the runtime cause. The current exact
+candidate `a951e3c8a4e2e1092579939d6bc31631ee1a4d8f` retains that fix and
+adds fail-closed planning for an exact copy-dependent shared-memory RMW. It is
+not covered by the historical SASS comparison and therefore remains gated on
+a rebuilt immutable release and the ordered H200 run. The Stage2 validator and
+focused tests fail closed if either backward kernel re-enables TMA lowering or
+warp specialization.
 
 The immutable candidate image now includes and applies the exact Stage2 patch
 during its Docker build. The ordered H200 release gate never overlays
