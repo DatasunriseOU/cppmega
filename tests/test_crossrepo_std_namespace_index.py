@@ -108,6 +108,98 @@ def test_member_selection_pins_std_to_stdlib_headers():
         extensionless=bool(libc.get("index_extensionless_headers")))
 
 
+def test_global_store_reopens_external_and_location_identities(tmp_path):
+    b = _load_builder()
+    external_file = b.ip.canonical_external_provider_file(
+        "boost",
+        "boost/move.hpp",
+        source="test global store",
+    )
+    external_key = b.ip.canonical_symbol_identity(
+        qname="boost::move",
+        kind="FUNCTION_DECL",
+        usr="c:@N@boost@F@move#",
+        canonical_signature="display=move()",
+        project="boostorg/boost",
+        provider="boost",
+        include_provenance="boost/move.hpp",
+    )
+    location_key = b.ip.canonical_symbol_identity(
+        qname="local::anonymous",
+        kind="STRUCT_DECL",
+        project="owner/repo",
+        file="src/local.cpp",
+        line=31,
+        column=9,
+        repo_file_location_fallback=True,
+    )
+    db = str(tmp_path / "global.sqlite")
+    store = b.GlobalSymbolStore(db)
+    store.insert_symbols(
+        [
+            b.GlobalSymbolRecord(
+                qname="boost::move",
+                base_lib="boost",
+                base_repo="boostorg/boost",
+                kind=2,
+                sym_type="func",
+                file=external_file,
+                line=7,
+                column=4,
+                end_line=9,
+                is_public=1,
+                token_est=8,
+                body_len=32,
+                text="void boost::move() { int value = 1; }",
+                symbol_key=external_key,
+                usr="c:@N@boost@F@move#",
+                canonical_signature="display=move()",
+                symbol_kind="FUNCTION_DECL",
+                provider="boost",
+                include_provenance="boost/move.hpp",
+            ),
+            b.GlobalSymbolRecord(
+                qname="local::anonymous",
+                base_lib="local",
+                base_repo="owner/repo",
+                kind=4,
+                sym_type="type",
+                file="src/local.cpp",
+                line=31,
+                column=9,
+                end_line=33,
+                is_public=1,
+                token_est=8,
+                body_len=32,
+                text="struct anonymous { int value; };",
+                symbol_key=location_key,
+                symbol_kind="STRUCT_DECL",
+                provider="owner/repo",
+                include_provenance="src/local.cpp",
+            ),
+        ]
+    )
+    store.conn.commit()
+    store.close()
+
+    b.GlobalSymbolStore(db).close()
+    reader = b.ip.GlobalSymbolReader(db)
+    try:
+        assert reader.lookup_candidates("boost::move")[0]["column"] == 4
+    finally:
+        reader.close()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE symbols SET column=10 WHERE symbol_key=?",
+        (location_key,),
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(b.ip.SymbolIdentityError, match="serialized fields"):
+        b.GlobalSymbolStore(db)
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end — REAL libclang parse of a synthetic std-like tree.
 # --------------------------------------------------------------------------- #

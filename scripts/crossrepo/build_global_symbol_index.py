@@ -349,7 +349,7 @@ def normalized_body_len(text: str) -> int:
 # --------------------------------------------------------------------------- #
 # SQLite global symbol store.
 # --------------------------------------------------------------------------- #
-GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 4
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -361,6 +361,7 @@ class GlobalSymbolRecord:
     sym_type: str
     file: str
     line: int
+    column: int
     end_line: int
     is_public: int
     token_est: int
@@ -386,6 +387,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     sym_type     TEXT NOT NULL,   -- 'func' | 'type'
     file         TEXT NOT NULL,
     line         INTEGER NOT NULL,
+    column       INTEGER NOT NULL DEFAULT 0,
     end_line     INTEGER NOT NULL,
     is_public    INTEGER NOT NULL,
     token_est    INTEGER NOT NULL,
@@ -487,6 +489,8 @@ class GlobalSymbolStore:
             "base_lib",
             "base_repo",
             "file",
+            "line",
+            "column",
             "symbol_key",
             "symbol_id",
             "usr",
@@ -512,7 +516,7 @@ class GlobalSymbolStore:
             else ", '' AS include_provenance"
         )
         rows = self.conn.execute(
-            "SELECT symbol_uid, qname, base_lib, base_repo, file, line, symbol_key, "
+            "SELECT symbol_uid, qname, base_lib, base_repo, file, line, column, symbol_key, "
             "symbol_id, usr, canonical_signature, symbol_kind, "
             "identity_schema_version" + select_tail + " FROM symbols"
         ).fetchall()
@@ -525,6 +529,7 @@ class GlobalSymbolStore:
                 base_repo,
                 file,
                 line,
+                column,
                 symbol_key,
                 symbol_id_hex,
                 usr,
@@ -560,12 +565,18 @@ class GlobalSymbolStore:
                     f"{self.path}:{symbol_uid}: synthetic legacy signature cannot "
                     "establish canonical clang identity; rebuild the index"
                 )
+            detected_provider, detected_include = ip.symbol_provider_provenance(
+                str(file)
+            )
+            provider = str(stored_provider or detected_provider or project_id)
+            include_provenance = str(stored_include or detected_include or file)
             if has_location_identity:
                 ip.validate_repo_file_location_identity_claim(
                     str(symbol_key),
                     project=project_id,
                     file=str(file),
                     line=int(line),
+                    column=int(column),
                     kind=str(symbol_kind),
                     qname=str(qname),
                     source=f"{self.path}:{symbol_uid}",
@@ -579,7 +590,11 @@ class GlobalSymbolStore:
                     "project": project_id,
                     "file": str(file),
                     "line": int(line),
+                    "column": int(column),
                 }
+                if "\x1fprovider=" in str(symbol_key):
+                    identity_kwargs["provider"] = provider
+                    identity_kwargs["include_provenance"] = include_provenance
                 expected_keys = {
                     ip.canonical_symbol_identity(**identity_kwargs),
                     ip.canonical_symbol_identity(
@@ -597,9 +612,6 @@ class GlobalSymbolStore:
                     f"{self.path}:{symbol_uid}: stored symbol_id {symbol_id_hex!r} "
                     f"does not match canonical key ({expected_hex})"
                 )
-            detected_provider, detected_include = ip.symbol_provider_provenance(str(file))
-            provider = str(stored_provider or detected_provider or project_id)
-            include_provenance = str(stored_include or detected_include or file)
             if base_lib == "std" and (not detected_provider or not detected_include):
                 raise ip.SymbolIdentityError(
                     f"{self.path}:{symbol_uid}: std provider/include provenance "
@@ -683,6 +695,7 @@ class GlobalSymbolStore:
             "canonical_signature",
             "symbol_kind",
             "identity_schema_version",
+            "column",
             "provider",
             "include_provenance",
         }
@@ -711,15 +724,26 @@ class GlobalSymbolStore:
                 f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
             )
         for row in self.conn.execute(
-            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, symbol_kind "
+            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, column, "
+            "symbol_kind "
             "FROM symbols WHERE usr='' AND canonical_signature=''"
         ):
-            symbol_uid, symbol_key, qname, project_id, file, line, symbol_kind = row
+            (
+                symbol_uid,
+                symbol_key,
+                qname,
+                project_id,
+                file,
+                line,
+                column,
+                symbol_kind,
+            ) = row
             ip.validate_repo_file_location_identity_claim(
                 str(symbol_key),
                 project=str(project_id),
                 file=str(file),
                 line=int(line),
+                column=int(column),
                 kind=str(symbol_kind),
                 qname=str(qname),
                 source=f"{self.path}:{symbol_uid}",
@@ -834,12 +858,13 @@ class GlobalSymbolStore:
                     project=project_id,
                     file=record.file,
                     line=record.line,
+                    column=record.column,
                     kind=record.symbol_kind,
                     qname=record.qname,
                     source=f"{project_id}:{record.file}:{record.line}",
                 )
             else:
-                identity_kwargs = {
+                identity_kwargs: dict[str, object] = {
                     "qname": record.qname,
                     "kind": record.symbol_kind,
                     "usr": record.usr,
@@ -847,7 +872,19 @@ class GlobalSymbolStore:
                     "project": project_id,
                     "file": record.file,
                     "line": record.line,
+                    "column": record.column,
                 }
+                # Records for external-provider symbols carry a key produced by
+                # ``canonical_external_usr_identity``; project-local base-lib
+                # records reuse the ordinary USR form and only store provider/
+                # include provenance as metadata, so do not mix the two forms.
+                if (
+                    record.provider
+                    and record.include_provenance
+                    and "\x1fprovider=" in record.symbol_key
+                ):
+                    identity_kwargs["provider"] = record.provider
+                    identity_kwargs["include_provenance"] = record.include_provenance
                 expected_keys = {
                     ip.canonical_symbol_identity(**identity_kwargs),
                     ip.canonical_symbol_identity(
@@ -1033,6 +1070,7 @@ class GlobalSymbolStore:
                 record.sym_type,
                 record.file,
                 record.line,
+                record.column,
                 record.end_line,
                 record.is_public,
                 record.token_est,
@@ -1051,10 +1089,10 @@ class GlobalSymbolStore:
         ]
         self.conn.executemany(
             "INSERT OR IGNORE INTO symbols "
-            "(symbol_uid, qname, base_lib, base_repo, kind, sym_type, file, line, end_line, "
+            "(symbol_uid, qname, base_lib, base_repo, kind, sym_type, file, line, column, end_line, "
             " is_public, token_est, body_len, text, symbol_key, symbol_id, usr, canonical_signature, "
             " symbol_kind, identity_schema_version, provider, include_provenance) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             keyed_rows,
         )
 
@@ -2278,6 +2316,7 @@ def _index_lib_from_dir_uncommitted(
                     sym_type="func",
                     file=frel,
                     line=d["line"],
+                    column=d.get("column", 0),
                     end_line=d.get("end_line", 0),
                     is_public=1,
                     token_est=tok,
@@ -2316,6 +2355,7 @@ def _index_lib_from_dir_uncommitted(
                     sym_type="type",
                     file=frel,
                     line=d["line"],
+                    column=d.get("column", 0),
                     end_line=d.get("end_line", 0),
                     is_public=1,
                     token_est=tok,

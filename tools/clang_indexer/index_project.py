@@ -1272,6 +1272,7 @@ def validate_repo_file_location_identity_claim(
     project: str,
     file: str,
     line: int,
+    column: int,
     kind: str,
     qname: str,
     source: str,
@@ -1283,6 +1284,7 @@ def validate_repo_file_location_identity_claim(
         "project": require_project_identity(project, source=f"{source}:project"),
         "file": _normalize_repo_relative_identity_file(file),
         "line": int(line),
+        "column": int(column),
         "kind": _normalize_signature_text(kind),
         "qname": normalize_qualified_name(qname),
     }
@@ -1290,6 +1292,7 @@ def validate_repo_file_location_identity_claim(
         "project": identity.project,
         "file": identity.file,
         "line": identity.line,
+        "column": identity.column,
         "kind": identity.kind,
         "qname": identity.qname,
     }
@@ -1792,7 +1795,7 @@ def _compute_symbol_id(symbol_key: str) -> int:
 
 class FunctionDef:
     """A function definition with its source location and call references."""
-    __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
+    __slots__ = ['name', 'qualified_name', 'file', 'line', 'column', 'end_line', 'text',
                  'callees', 'referenced_types', 'dep_level', 'is_definition',
                  'ast_depth', 'sibling_index', 'ast_node_type',
                  'baselib_callees', 'symbol_key', 'symbol_id', 'usr',
@@ -1804,7 +1807,8 @@ class FunctionDef:
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
-                 end_line: int = 0, ast_depth: list[int] | None = None,
+                 column: int = 0, end_line: int = 0,
+                 ast_depth: list[int] | None = None,
                  sibling_index: list[int] | None = None,
                  ast_node_type: list[int] | None = None,
                  referenced_types: list | None = None,
@@ -1827,6 +1831,7 @@ class FunctionDef:
         self.qualified_name = normalize_qualified_name(qualified_name)
         self.file = file
         self.line = line
+        self.column = int(column or 0)
         self.end_line = end_line or (line + text.count('\n'))
         self.text = text
         self.callees = [normalize_qualified_name(value) for value in callees]
@@ -1852,6 +1857,7 @@ class FunctionDef:
             canonical_signature=self.canonical_signature,
             file=file,
             line=line,
+            column=self.column,
             force_file_scope=True,
         )
         self.symbol_id = _compute_symbol_id(self.symbol_key)
@@ -1899,7 +1905,8 @@ class FunctionDef:
         """Serialize for multiprocessing IPC."""
         return {
             'name': self.name, 'qualified_name': self.qualified_name,
-            'file': self.file, 'line': self.line, 'text': self.text,
+            'file': self.file, 'line': self.line, 'column': self.column,
+            'text': self.text,
             'callees': self.callees, 'is_definition': self.is_definition,
             'end_line': self.end_line,
             'ast_depth': self.ast_depth,
@@ -1937,12 +1944,12 @@ class TypeDef:
     the function chunk's ``referenced_types``). Definitions usually live in
     headers, which is why headers are now part of the index file set.
     """
-    __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
+    __slots__ = ['name', 'qualified_name', 'file', 'line', 'column', 'end_line', 'text',
                  'kind', 'symbol_key', 'symbol_id', 'usr',
                  'canonical_signature', 'symbol_kind']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
-                 text: str, kind: int, end_line: int = 0,
+                 text: str, kind: int, column: int = 0, end_line: int = 0,
                  symbol_key: str | None = None, usr: str | None = None,
                  canonical_signature: str | None = None,
                  symbol_kind: str = "type"):
@@ -1950,6 +1957,7 @@ class TypeDef:
         self.qualified_name = normalize_qualified_name(qualified_name)
         self.file = file
         self.line = line
+        self.column = int(column or 0)
         self.end_line = end_line or (line + text.count('\n'))
         self.text = text
         # node-bucket kind for parts_info (4=class/struct, 7=typedef/using)
@@ -1963,6 +1971,7 @@ class TypeDef:
             canonical_signature=self.canonical_signature,
             file=file,
             line=line,
+            column=self.column,
             force_file_scope=True,
         )
         self.symbol_id = _compute_symbol_id(self.symbol_key)
@@ -1970,7 +1979,8 @@ class TypeDef:
     def to_dict(self) -> dict:
         return {
             'name': self.name, 'qualified_name': self.qualified_name,
-            'file': self.file, 'line': self.line, 'text': self.text,
+            'file': self.file, 'line': self.line, 'column': self.column,
+            'text': self.text,
             'kind': self.kind, 'end_line': self.end_line,
             'symbol_key': self.symbol_key,
             'usr': self.usr,
@@ -3275,6 +3285,7 @@ def parse_translation_unit(
                     qualified_name=qname,
                     file=(_cursor_rel_file(cursor) if allow_system_types else rel_path),
                     line=cursor.location.line,
+                    column=getattr(cursor.location, "column", 0),
                     text=text,
                     callees=callees,
                     is_definition=True,
@@ -3333,6 +3344,7 @@ def parse_translation_unit(
                         qualified_name=qname,
                         file=_cursor_rel_file(cursor),
                         line=cursor.location.line,
+                        column=getattr(cursor.location, "column", 0),
                         text=td_text,
                         kind=type_bucket,
                         end_line=cursor.extent.end.line,
@@ -3370,6 +3382,7 @@ def parse_translation_unit(
                     qualified_name=qname,
                     file=_cursor_rel_file(cursor),
                     line=cursor.location.line,
+                    column=getattr(cursor.location, "column", 0),
                     text=header_decl_text,
                     kind=header_decl_kind,
                     end_line=cursor.extent.end.line,
@@ -5529,7 +5542,7 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------- #
 CROSSLINK_MAX_DEPS_PER_DOC = 12
 CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
-GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 4
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 5
 
 
 class AmbiguousGlobalSymbolError(SymbolIdentityError):
@@ -5609,6 +5622,7 @@ class GlobalSymbolReader:
             "canonical_signature",
             "symbol_kind",
             "identity_schema_version",
+            "column",
             "provider",
             "include_provenance",
         }
@@ -5638,15 +5652,26 @@ class GlobalSymbolReader:
                 f"{SYMBOL_IDENTITY_SCHEMA_VERSION}. Migrate or rebuild the index."
             )
         for row in self._conn.execute(
-            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, symbol_kind "
+            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, column, "
+            "symbol_kind "
             "FROM symbols WHERE usr='' AND canonical_signature=''"
         ):
-            symbol_uid, symbol_key, qname, project_id, file, line, symbol_kind = row
+            (
+                symbol_uid,
+                symbol_key,
+                qname,
+                project_id,
+                file,
+                line,
+                column,
+                symbol_kind,
+            ) = row
             validate_repo_file_location_identity_claim(
                 str(symbol_key),
                 project=str(project_id),
                 file=str(file),
                 line=int(line),
+                column=int(column),
                 kind=str(symbol_kind),
                 qname=str(qname),
                 source=f"global symbol index {path}:{symbol_uid}",
@@ -5697,10 +5722,10 @@ class GlobalSymbolReader:
             return [dict(record) for record in self._cache[key]]
         rows = self._conn.execute(
             "SELECT symbol_uid, symbol_key, symbol_id, qname, base_lib, base_repo, text, "
-            "token_est, kind, file, line, end_line, usr, canonical_signature, "
+            "token_est, kind, file, line, column, end_line, usr, canonical_signature, "
             "symbol_kind, identity_schema_version, provider, include_provenance "
             "FROM symbols WHERE qname=? AND sym_type='func' "
-            "ORDER BY base_repo, file, line, symbol_uid",
+            "ORDER BY base_repo, file, line, column, symbol_uid",
             (key,),
         ).fetchall()
         records = tuple(
@@ -5716,13 +5741,14 @@ class GlobalSymbolReader:
                 "kind": row[8],
                 "file": row[9],
                 "line": row[10],
-                "end_line": row[11],
-                "usr": row[12],
-                "canonical_signature": row[13],
-                "symbol_kind": row[14],
-                "identity_schema_version": row[15],
-                "provider": row[16],
-                "include_provenance": row[17],
+                "column": row[11],
+                "end_line": row[12],
+                "usr": row[13],
+                "canonical_signature": row[14],
+                "symbol_kind": row[15],
+                "identity_schema_version": row[16],
+                "provider": row[17],
+                "include_provenance": row[18],
             }
             for row in rows
         )
