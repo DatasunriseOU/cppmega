@@ -67,8 +67,11 @@ _SUPPORTED_TE_VERSIONS = (
 
 from cppmega.megatron.mxfp8_sidecar_refs import (
     MXFP8_TN_SIDECAR_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
+)
+from cppmega.megatron.mxfp8_sidecar_refs import (
     MXFP8_TN_SIDECAR_PERSISTENT_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
-    MXFP8_TN_SIDECAR_REF_ATTRS as _CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS,
+)
+from cppmega.megatron.mxfp8_sidecar_refs import (
     clear_mxfp8_sidecar_refs as _cppmega_clear_mxfp8_sidecar_refs,
 )
 
@@ -178,7 +181,7 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 
         def _cppmega_check_mxfp8_support():
             if _torch.cuda.is_available():
-                major, minor = _torch.cuda.get_device_capability()
+                major, _minor = _torch.cuda.get_device_capability()
                 if major == 12:
                     return True, ""
             return _orig_check_mxfp8_support()
@@ -394,17 +397,26 @@ if (
     or _te_backward_override in ("dequantized", "high_precision")
 ):
     try:
-        import functools as _functools
         import atexit as _atexit
+        import functools as _functools
+
         import torch as _torch
         import transformer_engine_torch as _tex
-        from transformer_engine.common.recipe import MXFP8BlockScaling as _TE_MXFP8Recipe
-        from transformer_engine.pytorch.tensor import MXFP8Quantizer as _TE_MXFP8Quantizer
-        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TE_MXFP8Tensor
+        from transformer_engine.common.recipe import (
+            MXFP8BlockScaling as _TE_MXFP8Recipe,
+        )
         from transformer_engine.pytorch.module import linear as _TE_LINEAR_MODULE
+        from transformer_engine.pytorch.tensor import (
+            MXFP8Quantizer as _TE_MXFP8Quantizer,
+        )
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+            MXFP8Tensor as _TE_MXFP8Tensor,
+        )
 
         try:
-            from transformer_engine.common.recipe import NVFP4BlockScaling as _TE_NVFP4Recipe
+            from transformer_engine.common.recipe import (
+                NVFP4BlockScaling as _TE_NVFP4Recipe,
+            )
         except Exception as _nvfp4_import_exc:  # pragma: no cover
             print(
                 "[cppmega_fp8_shim] NVFP4BlockScaling import skipped "
@@ -614,7 +626,7 @@ if (
 
             _attrs = []
             if hasattr(_x, "__dict__"):
-                _attrs = sorted(str(_k) for _k in _x.__dict__.keys())
+                _attrs = sorted(str(_k) for _k in _x.__dict__)
             return (
                 f"type={type(_x).__name__}, shape={getattr(_x, 'shape', None)}, "
                 f"dtype={getattr(_x, 'dtype', None)}, "
@@ -763,18 +775,10 @@ if (
             if _old_sidecar is not None and _old_sidecar is not _sidecar:
                 _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _old_sidecar)
             _had_sidecar = _old_sidecar is _sidecar
-            setattr(_x, "_te_rowwise_transpose_for_backward", _sidecar)
-            setattr(
-                _x,
-                "_te_rowwise_transpose_for_backward_unregister",
-                _cppmega_unregister_mxfp8_sidecar,
-            )
+            _x._te_rowwise_transpose_for_backward = _sidecar
+            _x._te_rowwise_transpose_for_backward_unregister = _cppmega_unregister_mxfp8_sidecar
             setattr(_x, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
-            setattr(
-                _x,
-                "_cppmega_mxfp8_rowwise_transpose_unregister",
-                _cppmega_unregister_mxfp8_sidecar,
-            )
+            _x._cppmega_mxfp8_rowwise_transpose_unregister = _cppmega_unregister_mxfp8_sidecar
             setattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, bool(persistent))
             if not _had_sidecar:
                 _bytes = _cppmega_mxfp8_sidecar_nbytes(_sidecar)
@@ -800,18 +804,10 @@ if (
                 _old_sidecar = getattr(_x, "_te_rowwise_transpose_for_backward", None)
             if _old_sidecar is not None and _old_sidecar is not _sidecar:
                 _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _old_sidecar)
-            setattr(_x, "_te_rowwise_transpose_for_backward", _sidecar)
-            setattr(
-                _x,
-                "_te_rowwise_transpose_for_backward_unregister",
-                _cppmega_unregister_mxfp8_sidecar,
-            )
+            _x._te_rowwise_transpose_for_backward = _sidecar
+            _x._te_rowwise_transpose_for_backward_unregister = _cppmega_unregister_mxfp8_sidecar
             setattr(_x, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
-            setattr(
-                _x,
-                "_cppmega_mxfp8_rowwise_transpose_unregister",
-                _cppmega_unregister_mxfp8_sidecar,
-            )
+            _x._cppmega_mxfp8_rowwise_transpose_unregister = _cppmega_unregister_mxfp8_sidecar
             setattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, False)
 
         def _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _sidecar=None):
@@ -881,11 +877,7 @@ if (
                     delattr(_x, "_te_gemm_ready_rowwise_transpose_for_backward")
                 except Exception:
                     try:
-                        setattr(
-                            _x,
-                            "_te_gemm_ready_rowwise_transpose_for_backward",
-                            None,
-                        )
+                        _x._te_gemm_ready_rowwise_transpose_for_backward = None
                     except Exception:
                         pass
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_direct_saved_operand")
@@ -925,8 +917,8 @@ if (
             _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _sidecar)
 
         def _cppmega_mark_rowwise_transpose_operand(_x):
-            setattr(_x, "_te_rowwise_transpose_for_backward_operand", True)
-            setattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", True)
+            _x._te_rowwise_transpose_for_backward_operand = True
+            _x._cppmega_mxfp8_rowwise_transpose_operand = True
             return _x
 
         def _cppmega_patch_te_linear_direct_saved_operand():
@@ -965,11 +957,7 @@ if (
                             )
                         except Exception:
                             try:
-                                setattr(
-                                    tensor,
-                                    "_te_gemm_ready_rowwise_transpose_for_backward",
-                                    None,
-                                )
+                                tensor._te_gemm_ready_rowwise_transpose_for_backward = None
                             except Exception:
                                 pass
                         _cppmega_record_bwd_stat(
@@ -1985,9 +1973,7 @@ if (
                 return False
             if _cppmega_is_mxfp8_rowwise_transpose_operand(_item):
                 return True
-            if _cppmega_peek_mxfp8_sidecar(_item) is not None:
-                return True
-            return False
+            return _cppmega_peek_mxfp8_sidecar(_item) is not None
 
         def _cppmega_take_gemm_ready_grouped_transpose(_item):
             if _cppmega_is_mxfp8_rowwise_transpose_operand(_item):
@@ -2031,13 +2017,15 @@ if (
                     _missing_item = needs_transpose[_missing_idx]
                     return (
                         False,
-                        "missing_gemm_ready_grouped_transpose:"
-                        f"{_missing_idx}:"
-                        f" roles={getattr(_missing_item, '_te_mxfp8_grouped_linear_roles', None)}"
-                        f" layouts={getattr(_missing_item, '_te_mxfp8_grouped_linear_layouts', None)}"
-                        f" operands={getattr(_missing_item, '_te_mxfp8_grouped_linear_operands', None)}"
-                        f" grouped_no_mat={getattr(_missing_item, '_te_mxfp8_grouped_linear_no_transpose_materialization', None)}"
-                        f" {_cppmega_mxfp8_debug_desc(_missing_item)}",
+                        (
+                            "missing_gemm_ready_grouped_transpose:"
+                            f"{_missing_idx}:"
+                            f" roles={getattr(_missing_item, '_te_mxfp8_grouped_linear_roles', None)}"
+                            f" layouts={getattr(_missing_item, '_te_mxfp8_grouped_linear_layouts', None)}"
+                            f" operands={getattr(_missing_item, '_te_mxfp8_grouped_linear_operands', None)}"
+                            f" grouped_no_mat={getattr(_missing_item, '_te_mxfp8_grouped_linear_no_transpose_materialization', None)}"
+                            f" {_cppmega_mxfp8_debug_desc(_missing_item)}"
+                        ),
                     )
                 return False, f"missing_gemm_ready_grouped_transpose:{missing[0]}"
 
@@ -2090,8 +2078,10 @@ if (
                 except Exception as _cutlass_exc:  # pragma: no cover
                     return (
                         False,
-                        f"cutlass_native_unavailable:{type(_cutlass_exc).__name__}: "
-                        f"{_cutlass_exc}",
+                        (
+                            f"cutlass_native_unavailable:{type(_cutlass_exc).__name__}: "
+                            f"{_cutlass_exc}"
+                        ),
                     )
             if _te_mxfp8_bwd_backend == "flashinfer_cutlass":
                 try:
@@ -2099,8 +2089,10 @@ if (
                 except Exception as _flashinfer_exc:  # pragma: no cover
                     return (
                         False,
-                        f"flashinfer_cutlass_unavailable:{type(_flashinfer_exc).__name__}: "
-                        f"{_flashinfer_exc}",
+                        (
+                            f"flashinfer_cutlass_unavailable:{type(_flashinfer_exc).__name__}: "
+                            f"{_flashinfer_exc}"
+                        ),
                     )
 
             _new_args = list(_args)
@@ -2245,9 +2237,7 @@ if (
                                 if isinstance(_direct_result, _torch.Tensor):
                                     return [_direct_result], [None] * len(A), None
                                 return _direct_result
-                            if isinstance(_direct_result, (list, tuple)) or isinstance(
-                                _direct_result, _torch.Tensor
-                            ):
+                            if isinstance(_direct_result, (list, tuple, _torch.Tensor)):
                                 return _direct_result, [None] * len(A), None
                             return _direct_result
                         _direct_reason = str(_direct_result)
@@ -2488,7 +2478,9 @@ if (
             return True
 
         from transformer_engine.pytorch.module import base as _te_module_base
-        from transformer_engine.pytorch.quantization import FP8GlobalStateManager as _TE_FP8State
+        from transformer_engine.pytorch.quantization import (
+            FP8GlobalStateManager as _TE_FP8State,
+        )
 
         assert hasattr(_te_module_base, "TransformerEngineBaseModule"), (
             "transformer_engine.pytorch.module.base.TransformerEngineBaseModule "
@@ -2550,25 +2542,28 @@ if (
             _grad_shape = _cppmega_flattened_lastdim_shape(
                 getattr(_grad_output, "_columnwise_data", None)
             )
-            if _source_shape is not None and _grad_shape is not None:
-                # _grad_output is already flattened by TE. The source may still
-                # be [sequence, batch, hidden], but the logical 2D shapes must
-                # match for scale reuse.
-                if _source_shape != _grad_shape:
-                    _reason = (
-                        "dense_grad_output_source_shape_mismatch:"
-                        f"{_source_shape}!={_grad_shape}"
+            # _grad_output is already flattened by TE. The source may still
+            # be [sequence, batch, hidden], but the logical 2D shapes must
+            # match for scale reuse.
+            if (
+                _source_shape is not None
+                and _grad_shape is not None
+                and _source_shape != _grad_shape
+            ):
+                _reason = (
+                    "dense_grad_output_source_shape_mismatch:"
+                    f"{_source_shape}!={_grad_shape}"
+                )
+                _cppmega_record_bwd_stat(
+                    "mxfp8_dense_grad_output_transpose_emit_failed",
+                    _reason,
+                )
+                if _te_mxfp8_transpose_emit_backend == "te":
+                    raise RuntimeError(
+                        "Cannot emit MXFP8 dense wgrad grad-output transpose: "
+                        f"{_reason}"
                     )
-                    _cppmega_record_bwd_stat(
-                        "mxfp8_dense_grad_output_transpose_emit_failed",
-                        _reason,
-                    )
-                    if _te_mxfp8_transpose_emit_backend == "te":
-                        raise RuntimeError(
-                            "Cannot emit MXFP8 dense wgrad grad-output transpose: "
-                            f"{_reason}"
-                        )
-                    return _grad_output
+                return _grad_output
 
             _before = _cppmega_has_gemm_ready_dense_transpose(_grad_output)
             _out = _cppmega_attach_mxfp8_rowwise_transpose(
@@ -2654,46 +2649,12 @@ if (
                 _quantizer.optimize_for_gemm = False
                 if hasattr(_quantizer, "quantize_rowwise_transpose"):
                     _emit_enabled = _te_mxfp8_transpose_emit_backend in ("auto", "te")
-                    setattr(
-                        _quantizer,
-                        "_te_rowwise_transpose_for_backward_enabled",
-                        _emit_enabled,
-                    )
-                    setattr(
-                        _quantizer,
-                        "_te_rowwise_transpose_for_backward_with_gemm_swizzled_scales",
-                        bool(_te_mxfp8_transpose_emit_swizzled),
-                    )
-                    setattr(
-                        _quantizer,
-                        "_te_rowwise_transpose_for_backward_strict",
-                        bool(_te_mxfp8_transpose_emit_strict),
-                    )
-                    setattr(
-                        _quantizer,
-                        "_te_skip_eager_rowwise_transpose_for_backward",
-                        bool(
-                            _emit_enabled
-                            and _te_mxfp8_dense_saved_operands
-                            and _te_linear_deferred_saved_operand
-                            and _role in ("input", "grad_output", "weight")
-                        ),
-                    )
-                    setattr(
-                        _quantizer,
-                        "_te_dual_output_quantize_for_backward_enabled",
-                        bool(
-                            _emit_enabled
-                            and _te_mxfp8_dense_saved_operands
-                            and _te_linear_deferred_saved_operand
-                            and _role in ("input", "grad_output")
-                        ),
-                    )
-                    setattr(
-                        _quantizer,
-                        "_te_compact_columnwise_for_backward_enabled",
-                        bool(_te_mxfp8_compact_columnwise_backward),
-                    )
+                    _quantizer._te_rowwise_transpose_for_backward_enabled = _emit_enabled
+                    _quantizer._te_rowwise_transpose_for_backward_with_gemm_swizzled_scales = bool(_te_mxfp8_transpose_emit_swizzled)
+                    _quantizer._te_rowwise_transpose_for_backward_strict = bool(_te_mxfp8_transpose_emit_strict)
+                    _quantizer._te_skip_eager_rowwise_transpose_for_backward = bool(_emit_enabled and _te_mxfp8_dense_saved_operands and _te_linear_deferred_saved_operand and _role in ("input", "grad_output", "weight"))
+                    _quantizer._te_dual_output_quantize_for_backward_enabled = bool(_emit_enabled and _te_mxfp8_dense_saved_operands and _te_linear_deferred_saved_operand and _role in ("input", "grad_output"))
+                    _quantizer._te_compact_columnwise_for_backward_enabled = bool(_te_mxfp8_compact_columnwise_backward)
 
         def _cppmega_force_compact_many_if_needed(_quantizers, _recipe, *, _role=None):
             if isinstance(_quantizers, (list, tuple)):
@@ -2954,31 +2915,11 @@ if (
                     and _te_mxfp8_transpose_emit_backend in ("auto", "te")
                 ):
                     if _te_mxfp8_dense_saved_operands and _te_linear_deferred_saved_operand:
-                        setattr(
-                            output_quantizer,
-                            "_te_rowwise_transpose_for_backward_enabled",
-                            True,
-                        )
-                        setattr(
-                            output_quantizer,
-                            "_te_rowwise_transpose_for_backward_with_gemm_swizzled_scales",
-                            bool(_te_mxfp8_transpose_emit_swizzled),
-                        )
-                        setattr(
-                            output_quantizer,
-                            "_te_rowwise_transpose_for_backward_strict",
-                            bool(_te_mxfp8_transpose_emit_strict),
-                        )
-                        setattr(
-                            output_quantizer,
-                            "_te_skip_eager_rowwise_transpose_for_backward",
-                            True,
-                        )
-                        setattr(
-                            output_quantizer,
-                            "_te_compact_columnwise_for_backward_enabled",
-                            bool(_te_mxfp8_compact_columnwise_backward),
-                        )
+                        output_quantizer._te_rowwise_transpose_for_backward_enabled = True
+                        output_quantizer._te_rowwise_transpose_for_backward_with_gemm_swizzled_scales = bool(_te_mxfp8_transpose_emit_swizzled)
+                        output_quantizer._te_rowwise_transpose_for_backward_strict = bool(_te_mxfp8_transpose_emit_strict)
+                        output_quantizer._te_skip_eager_rowwise_transpose_for_backward = True
+                        output_quantizer._te_compact_columnwise_for_backward_enabled = bool(_te_mxfp8_compact_columnwise_backward)
                     _ln_out, _mu, _rsigma = _orig_apply_normalization(
                         inputmat,
                         ln_out,
@@ -3310,7 +3251,9 @@ except Exception as _exc:  # pragma: no cover
 # The TileLang kernel is parameterized for arbitrary d_v (works with d_v=512,
 # d_v=96, etc.) despite earlier comments claiming d_v=96 only.
 
-from cppmega.megatron.deprecated_paths import require_deprecated_ack as _cppmega_require_deprecated_ack
+from cppmega.megatron.deprecated_paths import (
+    require_deprecated_ack as _cppmega_require_deprecated_ack,
+)
 
 
 def _cppmega_require_gather_scatter_ack(feature, reason):
@@ -3326,13 +3269,21 @@ _sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").strip().low
 _dsa_fp8_attention = os.environ.get("CPPMEGA_DSA_FP8_ATTENTION", "0") == "1"
 if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
     try:
-        from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa as _dsa_mod,
+        )
 
         _existing_unfused = getattr(_dsa_mod, "unfused_dsa_fn", None)
         from cppmega.megatron.sparse_mla_ops.sparse_mla import (
             SparseMLA as _cppmega_sparse_mla_cls,
+        )
+        from cppmega.megatron.sparse_mla_ops.sparse_mla import (
             SparseMLA_FP8 as _cppmega_sparse_mla_fp8_cls,
+        )
+        from cppmega.megatron.sparse_mla_ops.sparse_mla import (
             sparse_mla_as_unfused_dsa as _sparse_mla_bf16_fn,
+        )
+        from cppmega.megatron.sparse_mla_ops.sparse_mla import (
             sparse_mla_fp8_as_unfused_dsa as _sparse_mla_fp8_fn,
         )
 
@@ -3348,7 +3299,7 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
         if _existing_unfused is not None and not getattr(
             _existing_unfused, "__cppmega_sparse_dsa_patched__", False
         ):
-            setattr(_sparse_mla_fn, "__cppmega_sparse_dsa_patched__", True)
+            _sparse_mla_fn.__cppmega_sparse_dsa_patched__ = True
             _dsa_mod.unfused_dsa_fn = _sparse_mla_fn
             print(
                 "[cppmega_fp8_shim] TileLang SparseMLA applied "
@@ -3369,10 +3320,15 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
             "TileLang SparseMLA patch failure fallback to gather_scatter",
             "Silent fallback hides kernel/import failures and can materialize more memory.",
         )
-        from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
-        from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn as _sparse_dsa_fn
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa as _dsa_mod,
+        )
 
-        setattr(_sparse_dsa_fn, "__cppmega_sparse_dsa_patched__", True)
+        from cppmega.megatron.dsa_sparse_attention import (
+            sparse_dsa_fn as _sparse_dsa_fn,
+        )
+
+        _sparse_dsa_fn.__cppmega_sparse_dsa_patched__ = True
         _dsa_mod.unfused_dsa_fn = _sparse_dsa_fn
         print("[cppmega_fp8_shim] DEPRECATED fallback: gather_scatter sparse_dsa_fn applied")
 else:
@@ -3382,14 +3338,19 @@ else:
         "The fused TileLang SparseMLA path is the current default.",
     )
     try:
-        from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
-        from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn as _sparse_dsa_fn
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa as _dsa_mod,
+        )
+
+        from cppmega.megatron.dsa_sparse_attention import (
+            sparse_dsa_fn as _sparse_dsa_fn,
+        )
 
         _existing_unfused = getattr(_dsa_mod, "unfused_dsa_fn", None)
         if _existing_unfused is not None and not getattr(
             _existing_unfused, "__cppmega_sparse_dsa_patched__", False
         ):
-            setattr(_sparse_dsa_fn, "__cppmega_sparse_dsa_patched__", True)
+            _sparse_dsa_fn.__cppmega_sparse_dsa_patched__ = True
             _dsa_mod.unfused_dsa_fn = _sparse_dsa_fn
             print(
                 "[cppmega_fp8_shim] gather_scatter sparse_dsa_fn applied "

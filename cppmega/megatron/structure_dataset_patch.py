@@ -16,10 +16,10 @@ import warnings
 from collections.abc import Mapping
 from functools import wraps
 from math import prod
-from typing import Dict, Any, Optional
+from typing import Any
 
-import torch  # type: ignore[import-not-found]
 import numpy as np
+import torch  # type: ignore[import-not-found]
 
 from cppmega.megatron.domain_route_contract import (
     CASE5_RECEIPT_KEY,
@@ -71,11 +71,11 @@ def _graph_capacity(name: str) -> int:
     return value
 
 
-def _set_current_structure_batch(batch: Dict[str, torch.Tensor] | None) -> None:
+def _set_current_structure_batch(batch: dict[str, torch.Tensor] | None) -> None:
     _local_storage.current_structure_batch = batch
 
 
-def _get_current_structure_batch() -> Dict[str, torch.Tensor] | None:
+def _get_current_structure_batch() -> dict[str, torch.Tensor] | None:
     return getattr(_local_storage, "current_structure_batch", None)
 
 
@@ -257,7 +257,9 @@ def _validate_production_objective_batch(
         )
     objective_ids = structure_batch.get("objective_ids")
     if not isinstance(objective_ids, torch.Tensor):
-        raise ValueError("production objective batch requires objective_ids tensor")
+        raise ValueError(  # noqa: TRY004 - public contract: callers catch ValueError
+            "production objective batch requires objective_ids tensor"
+        )
     tokens = batch["tokens"]
     labels = batch["labels"]
     loss_mask = batch["loss_mask"]
@@ -352,8 +354,8 @@ def _padded_token_sidecar_tensor(tokens: torch.Tensor, *, col: str) -> torch.Ten
 
 
 def _pop_structure_batch(
-    batch: Dict[str, torch.Tensor] | None,
-) -> Dict[str, torch.Tensor] | None:
+    batch: dict[str, torch.Tensor] | None,
+) -> dict[str, torch.Tensor] | None:
     """Remove cppmega sidecar tensors from a Megatron batch and stash them."""
     if batch is None:
         _set_current_structure_batch(None)
@@ -385,12 +387,12 @@ def _pop_structure_batch(
     return None
 
 
-def _take_cppmega_sidecars(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def _take_cppmega_sidecars(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Remove cppmega-owned tensors before Megatron filters the core batch."""
     return {col: batch.pop(col) for col in _CPPMEGA_BATCH_COLS if col in batch}
 
 
-def _batch_transport_device(batch: Dict[str, torch.Tensor] | None) -> torch.device:
+def _batch_transport_device(batch: dict[str, torch.Tensor] | None) -> torch.device:
     if batch is not None:
         for value in batch.values():
             if isinstance(value, torch.Tensor):
@@ -461,14 +463,14 @@ def _payload_columns(present: set[str], *, opaque: bool) -> list[str]:
 
 
 def _prepare_source_payloads(
-    sidecars: Dict[str, torch.Tensor],
+    sidecars: dict[str, torch.Tensor],
     *,
     device: torch.device,
-) -> tuple[Dict[str, torch.Tensor], Dict[bool, torch.Tensor], _TPBridgeIssue | None]:
+) -> tuple[dict[str, torch.Tensor], dict[bool, torch.Tensor], _TPBridgeIssue | None]:
     if not sidecars:
         return {}, {}, (_TP_BRIDGE_MISSING, -1, None)
 
-    prepared: Dict[str, torch.Tensor] = {}
+    prepared: dict[str, torch.Tensor] = {}
     for col_index, col in enumerate(_CPPMEGA_BATCH_COLS):
         if col not in sidecars:
             continue
@@ -485,7 +487,7 @@ def _prepare_source_payloads(
             return {}, {}, (_TP_BRIDGE_SHAPE, col_index, None)
         prepared[col] = tensor
 
-    payloads: Dict[bool, torch.Tensor] = {}
+    payloads: dict[bool, torch.Tensor] = {}
     for opaque in (False, True):
         cols = _payload_columns(set(prepared), opaque=opaque)
         if not cols:
@@ -548,22 +550,22 @@ def _bridge_protocol_error(
 
 
 def _broadcast_cppmega_sidecars(
-    source_sidecars: Dict[str, torch.Tensor],
+    source_sidecars: dict[str, torch.Tensor],
     *,
-    batch: Dict[str, torch.Tensor] | None,
+    batch: dict[str, torch.Tensor] | None,
     tp_rank: int,
     broadcast_src_rank: int,
     broadcast_group: Any,
     transport_device: torch.device | None = None,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Broadcast sidecars without depending on Megatron retaining custom keys."""
     if broadcast_group is None or (
         hasattr(broadcast_group, "size") and broadcast_group.size() == 1
     ):
         return source_sidecars
     device = transport_device or _batch_transport_device(batch)
-    prepared: Dict[str, torch.Tensor] = {}
-    payloads: Dict[bool, torch.Tensor] = {}
+    prepared: dict[str, torch.Tensor] = {}
+    payloads: dict[bool, torch.Tensor] = {}
     issue: _TPBridgeIssue | None = None
     if tp_rank == 0:
         prepared, payloads, issue = _prepare_source_payloads(
@@ -613,13 +615,13 @@ def _broadcast_cppmega_sidecars(
             cause=cause,
         )
 
-    shapes: Dict[str, tuple[int, ...]] = {}
+    shapes: dict[str, tuple[int, ...]] = {}
     for col, row in zip(_CPPMEGA_BATCH_COLS, header_rows[1:], strict=True):
         ndim = int(row[0])
         if ndim >= 0:
             shapes[col] = tuple(int(value) for value in row[1 : ndim + 1])
 
-    received: Dict[str, torch.Tensor] = {}
+    received: dict[str, torch.Tensor] = {}
     for opaque in (False, True):
         cols = _payload_columns(set(shapes), opaque=opaque)
         if not cols:
@@ -837,7 +839,7 @@ def _lazy_init_objective_ids(dataset: Any) -> np.ndarray | None:
         dataset._cppmega_objective_ids = None
         return None
     if not isinstance(wrapper, dict):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 - public contract: callers catch ValueError
             f"[cppmega-patch] objective_contract must be an object in {json_path!r}"
         )
     binding = wrapper.get("objective_id_sidecar")
@@ -920,7 +922,7 @@ def _safe_sidecar_path(
     return joined
 
 
-def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
+def _lazy_init_side_channels(dataset: Any) -> dict[str, dict[str, Any]]:
     """Load JSON sidecar and initialize numpy.memmap for all defined side-channel columns."""
     if (
         hasattr(dataset, "_side_channels_cache")
@@ -1087,7 +1089,7 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
     return dataset._side_channels_cache
 
 
-def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
+def _lazy_init_graph_sidecars(dataset: Any) -> dict[str, dict[str, Any]]:
     if (
         hasattr(dataset, "_graph_sidecars_cache")
         and dataset._graph_sidecars_cache is not None
@@ -1272,7 +1274,7 @@ def _align_token_sidecar_tensor(
     target_len: int,
     col: str,
     idx: int,
-    pad_value: int | float = 0,
+    pad_value: float = 0,
 ) -> torch.Tensor:
     """Align a token sidecar to Megatron's possibly padded sample length."""
 
@@ -1482,13 +1484,13 @@ def _cap_1d(
 
 
 def _build_graph_route_tensors(
-    graph_sidecars: Dict[str, Dict[str, Any]],
+    graph_sidecars: dict[str, dict[str, Any]],
     spans: list[dict[str, int]],
     *,
     target_len: int,
     max_edges: int,
     max_chunks: int,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     call_edges: list[tuple[int, int]] = []
     type_edges: list[tuple[int, int]] = []
     domain_edges: list[tuple[int, int, int]] = []
@@ -1668,8 +1670,8 @@ try:
     orig_getitem = GPTDataset.__getitem__
 
     def patched_getitem(
-        self: GPTDataset, idx: Optional[int]
-    ) -> Dict[str, torch.Tensor]:
+        self: GPTDataset, idx: int | None
+    ) -> dict[str, torch.Tensor]:
         sample = orig_getitem(self, idx)
 
         structure_enabled = _env_flag("CPPMEGA_STRUCTURE_ENABLED")

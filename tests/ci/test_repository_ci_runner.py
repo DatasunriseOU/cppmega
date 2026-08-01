@@ -14,7 +14,6 @@ import pytest
 
 from scripts.ci import repository_runner as ci
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOSTS_CONFIG = REPO_ROOT / "configs" / "ci" / "hosts.json"
 LANES_CONFIG = REPO_ROOT / "configs" / "ci" / "lanes.json"
@@ -388,8 +387,10 @@ def test_lane_subprocess_binds_project_imports_to_reviewed_checkout(
         command=[
             "{python}",
             "-c",
-            "from pathlib import Path; import cppmega; "
-            "print(Path(cppmega.__file__).resolve())",
+            (
+                "from pathlib import Path; import cppmega; "
+                "print(Path(cppmega.__file__).resolve())"
+            ),
         ],
     )
     receipt_dir = tmp_path / "lane-receipt"

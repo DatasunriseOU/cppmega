@@ -23,9 +23,9 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 SCHEMA_VERSION = "cppmega.repository-ci.v1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -129,11 +129,11 @@ class RepositoryCIError(RuntimeError):
 
 
 def _utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 def _new_run_id() -> str:
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"direct-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
@@ -460,7 +460,7 @@ def capture_provenance(repo_root: Path) -> dict[str, Any]:
         timeout=60,
     )
     branch = _git_optional(repo_root, "symbolic-ref", "--short", "-q", "HEAD")
-    worktree_material = f"{root}\0{git_dir}".encode("utf-8")
+    worktree_material = f"{root}\0{git_dir}".encode()
     return {
         "captured_at": _utc_now(),
         "head_commit": head,
@@ -2089,7 +2089,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"[repository-ci] fatal: {_Redactor().text(str(exc))}", file=sys.stderr)
         _write_early_failure_receipt(args, exc)
         return 2
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any fatal must still write the receipt
         print(
             f"[repository-ci] fatal: unexpected {type(exc).__name__}: "
             f"{_Redactor().text(str(exc))}",

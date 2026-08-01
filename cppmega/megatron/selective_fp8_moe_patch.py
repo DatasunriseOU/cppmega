@@ -29,7 +29,6 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import nullcontext
-from typing import Set
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +42,7 @@ SELECTIVE_FP8_MOE_ENV = "CPPMEGA_SELECTIVE_FP8_MOE"
 _PATCH_MARKER = "__cppmega_selective_fp8_moe_patched__"
 
 
-def _compute_moe_layer_indices() -> Set[int]:
+def _compute_moe_layer_indices() -> set[int]:
     """Return the set of 0-based layer indices that are MoE ('E') layers.
 
     Uses the same pattern/depth resolution as ``nam56r_layout.py`` so it
@@ -125,7 +124,8 @@ def apply_selective_fp8_moe_patch(*, force: bool = False) -> bool:
     # future edit removes that isinstance guard, warn loudly.
     try:
         from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod  # noqa
-        _dsa_src = open(_dsa_mod.__file__, "r", encoding="utf-8").read()
+        with open(_dsa_mod.__file__, "r", encoding="utf-8") as _dsa_f:
+            _dsa_src = _dsa_f.read()
         if "_use_fp8_mla" not in _dsa_src:
             print(
                 "[cppmega] WARNING: DSA Patch 9 (_use_fp8_mla dispatch) not "

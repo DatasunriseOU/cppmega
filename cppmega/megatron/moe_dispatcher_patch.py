@@ -88,8 +88,7 @@ def apply_moe_dispatcher_identity_sort_patch(*, force: bool = False) -> bool:
         return False
 
     try:
-        from megatron.core.transformer.moe import moe_utils
-        from megatron.core.transformer.moe import token_dispatcher
+        from megatron.core.transformer.moe import moe_utils, token_dispatcher
     except Exception:
         log.warning(
             "MoE identity-sort patch not installed: Megatron MoE modules "
@@ -116,7 +115,7 @@ def apply_moe_dispatcher_identity_sort_patch(*, force: bool = False) -> bool:
         return original(input, split_sizes, sorted_idxs, probs=probs, fused=fused)
 
     setattr(_cppmega_sort_chunks_by_idxs, _PATCH_MARKER, True)
-    setattr(_cppmega_sort_chunks_by_idxs, "__wrapped_sort_chunks_by_idxs__", original)
+    _cppmega_sort_chunks_by_idxs.__wrapped_sort_chunks_by_idxs__ = original  # type: ignore[attr-defined]
     moe_utils.sort_chunks_by_idxs = _cppmega_sort_chunks_by_idxs
     token_dispatcher.sort_chunks_by_idxs = _cppmega_sort_chunks_by_idxs
     return True
