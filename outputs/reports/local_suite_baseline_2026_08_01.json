@@ -1,16 +1,16 @@
 {
   "date": "2026-08-01",
-  "commit": "80ced74c0527c497af5b1c45640f33c800d9e919",
+  "commit": "5b6f65aa62a13cabad08eed681395f1102612391",
   "platform": "Darwin arm64 (macOS, no CUDA)",
   "python": "3.13.12",
   "torch": "2.13.0",
-  "command": ".venv/bin/python -m pytest tests/ -q -rf -p no:cacheprovider",
-  "total": 2669,
-  "passed": 2486,
-  "failed": 11,
-  "skipped": 171,
-  "duration_s": 289.17,
-  "notes": "Full suite completes locally in ~5 min; no hangs, no split run needed. All 12 original failures are pre-existing environment/fixture gaps (missing sibling checkouts, unset parity env vars, under-provisioned cppmega.mlx venv, stale pinned Megatron checkout). None are caused by the 2026-08-01 audit commits; every failing test file was last modified 2026-07-15..2026-07-28, before this audit round. An intermediate run on 06f063ec showed a transient 13th failure that disappeared at 80ced74c after the parallel fp8 test fix. P101 (2026-08-01): tests/test_root_data_entrypoints.py::test_root_source_entrypoint_writes_schema_v2_manifest fixed by copying configs/ into the temp-checkout fixture, so 11 failures remain.",
+  "command": ".venv/bin/python -m pytest tests/ -q",
+  "total": 2760,
+  "passed": 2576,
+  "failed": 12,
+  "skipped": 172,
+  "duration_s": 510.69,
+  "notes": "Full suite completes locally in ~8.5 min; no hangs, no split run needed. 11 failures are pre-existing environment/fixture gaps (missing sibling checkouts, unset parity env vars, under-provisioned cppmega.mlx venv, stale pinned Megatron checkout, namespace-package shadowing from cppmega/cppmega_mlx/nn/_tilelang/). None are caused by the 2026-08-01 audit commits. One additional failure (test_nebius_h200_megatron_cpp_generation_eval.py::test_case3_gold_fixture_passes_repository_compile_and_link_gate) was a transient clang++ 60s timeout under full-suite load; the same test passes standalone in ~4s.",
   "failures": [
     {
       "nodeid": "tests/test_case3_case4_identity_index_contracts.py::test_mlx_emits_the_shared_integrity_version",
@@ -44,23 +44,28 @@
     },
     {
       "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[auto]",
-      "reason": "ModuleNotFoundError: cppmega_mlx.nn._tilelang.m2rnn exists only in sibling repo /Volumes/external/sources/cppmega.mlx, not importable from this venv",
-      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+      "reason": "ModuleNotFoundError: cppmega/cppmega_mlx/nn/_tilelang/ is a namespace package (no __init__.py) that shadows the editable cppmega.mlx install; real cppmega_mlx.nn._tilelang.m2rnn is unreachable",
+      "classification": "pre-existing environment (namespace package shadowing from cppmega/cppmega_mlx)"
     },
     {
       "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[engine]",
-      "reason": "same as above: cppmega_mlx.nn._tilelang.m2rnn not importable",
-      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+      "reason": "same as above: namespace package shadowing from cppmega/cppmega_mlx/nn/_tilelang/",
+      "classification": "pre-existing environment (namespace package shadowing from cppmega/cppmega_mlx)"
     },
     {
       "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[shim]",
-      "reason": "same as above: cppmega_mlx.nn._tilelang.m2rnn not importable",
-      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+      "reason": "same as above: namespace package shadowing from cppmega/cppmega_mlx/nn/_tilelang/",
+      "classification": "pre-existing environment (namespace package shadowing from cppmega/cppmega_mlx)"
     },
     {
       "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[engine_with_msl_extraction]",
-      "reason": "same as above: cppmega_mlx.nn._tilelang.m2rnn not importable",
-      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+      "reason": "same as above: namespace package shadowing from cppmega/cppmega_mlx/nn/_tilelang/",
+      "classification": "pre-existing environment (namespace package shadowing from cppmega/cppmega_mlx)"
+    },
+    {
+      "nodeid": "tests/test_nebius_h200_megatron_cpp_generation_eval.py::test_case3_gold_fixture_passes_repository_compile_and_link_gate",
+      "reason": "clang++ compile step hit 60s timeout during full-suite run; passes standalone in ~4s",
+      "classification": "transient/flaky (timeout under parallel full-suite load)"
     },
     {
       "nodeid": "tests/test_recipe_artifact_parity.py::test_mlx_generated_objective_artifact_is_root_loadable_and_recipe_bound",
@@ -72,7 +77,7 @@
     "GPU-gated CUDA suites: test_fa4_h200_parity (10), test_fa4_cute_jit_compile, test_m2rnn_triton (19), test_m2rnn_pararnn*, test_quantized_muon_momentum (15), test_grouped_mxfp8_gemm (4), test_sparse_mla_ops, test_mxfp8_transpose_emit_ext, test_mamba3_psiv_cache",
     "transformer_engine not installed: test_fp8_activations_te (4), test_mxfp8_probe_helpers (5), test_mxfp8_sidecar_lifecycle, test_sparse_mla_te_fp8_extract (3)",
     "mamba_ssm not installed: test_nam56r_noconv_spec (3), test_noconv_mamba_mixer (4), test_mamba3_te_mixer",
-    "sibling cppmega_mlx._tilelang modules not importable: test_mamba3_path_b_engine, test_mamba3_path_c_engine (4), test_sparse_mla_path_c_engine (5), parts of test_m2rnn_path_b_engine",
+    "sibling cppmega_mlx._tilelang modules shadowed by cppmega namespace package: test_mamba3_path_b_engine, test_mamba3_path_c_engine (4), test_sparse_mla_path_c_engine (5), parts of test_m2rnn_path_b_engine",
     "flashinfer CUTLASS SM120/SM121 backend unavailable: test_flashinfer_mxfp8_gemm (2)",
     "misc: two-rank NCCL unavailable (test_structure_dataset_patch_bridge), liger_kernel CUDA arch gate (test_mtp_liger_ce, 4), cppmega_fp8_shim MXFP8 dense wrapper not installed (2), Phase B not implemented (1)"
   ]

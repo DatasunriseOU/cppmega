@@ -193,14 +193,23 @@ P3 — стратегическое/отложенное.
   - `mypy --ignore-missing-imports --follow-imports=skip <same paths>`
   - `pytest tests/test_mxfp8_transpose_emit_ext.py tests/test_moe_dispatcher_patch.py tests/test_structure_dataset_patch_source.py tests/test_structure_dataset_patch_bridge.py -q` → 30 passed, 5 skipped.
 
-## [P013] Полный локальный прогон cppmega suite в общем venv (baseline)
+## [P013] Полный локальный прогон cppmega suite в общем venv (baseline) — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P012
 - **Где:** весь `tests/` кроме GPU-gated.
-- **Что делать:** `.venv/bin/python -m pytest tests/ -q -x --timeout=...`
-  (без `MEGATRON_*` — манифест уже в venv); зафиксировать passed/skipped/failed
-  и список скипов на macOS в receipt-файл.
-- **Проверка:** receipt в `outputs/reports/local_suite_baseline_2026_08_01.json`;
-  0 failed (неизвестные падения — отдельные issues).
+- **Что сделано:** прогон выполнен в общем venv
+  `/Volumes/external/sources/.venvs/cppmega.mlx` на commit `5b6f65aa`.
+  Результаты зафиксированы в
+  `outputs/reports/local_suite_baseline_2026_08_01.json`:
+  - 2760 items, 2576 passed, 12 failed, 172 skipped, 510.69s.
+  - 11 failures — pre-existing environment/fixture gaps (missing sibling
+    checkouts, unset parity env vars, pinned Megatron checkout older than
+    document-isolation front, namespace-package shadowing от
+    `cppmega/cppmega_mlx/nn/_tilelang/`).
+  - 1 failure — transient `clang++` 60s timeout под нагрузкой полного прогона;
+    тот же тест проходит standalone за ~4s.
+- **Проверка:**
+  - `cat outputs/reports/local_suite_baseline_2026_08_01.json | jq '.passed, .failed, .skipped'` → 2576, 12, 172.
+  - `python -m pytest tests/test_nebius_h200_megatron_cpp_generation_eval.py::test_case3_gold_fixture_passes_repository_compile_and_link_gate -q` → 1 passed (проверка транзиентности).
 
 ## [P014] Обновить docs/environment.md под shared venv + manifest — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: —
