@@ -48,7 +48,7 @@
                  gamma_frag = T.alloc_fragment([chunk_size], T.float32)
                  for cs in T.Parallel(chunk_size):
                      gamma_frag[cs] = dt_frag[cs] * T.sigmoid(trap_frag[cs])
-@@ -231,30 +234,32 @@
+@@ -231,30 +234,31 @@
                  PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])
                  T.copy(PsiV_reshaped_frag, PsiV_shared)
 
@@ -56,11 +56,10 @@
 -                T.copy(Q[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], q_reshaped_shared)
 -                q_frag = T.alloc_fragment([chunk_size, R, N], dtype)
 -                T.copy(q_reshaped_shared, q_frag)
-+                # TMA-fix: 2D load directly into q_shared [fused_chunk_size, N] since
-+                # Q is now [B, S*R, G, N]. No rank-3 view needed.
-+                T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], q_shared)
 +                q_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
-+                T.copy(q_shared, q_frag)
++                # Load flattened Q directly into registers. q_shared has one producer
++                # in this pipeline lifetime: the biased fragment write below.
++                T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], q_frag, disable_tma=True)
                  for cs, r, n in T.Parallel(chunk_size, R, N):
 -                    q_frag[cs, r, n] += q_bias_frag[r, n]
 -                T.copy(q_frag, q_reshaped_shared)
@@ -72,10 +71,10 @@
 +                    q_frag[cs * R + r, n] += q_bias_frag[r, n]
 +                T.copy(q_frag, q_shared)
 +
-+                # TMA-fix: 2D load directly into k_shared [fused_chunk_size, N].
-+                T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], k_shared)
 +                k_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
-+                T.copy(k_shared, k_frag)
++                # Match Q: keep the raw flattened load in registers so k_shared has
++                # a single producer after bias application.
++                T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], k_frag, disable_tma=True)
                  for cs, r, n in T.Parallel(chunk_size, R, N):
 -                    k_frag[cs, r, n] += k_bias_frag[r, n]
 -                T.copy(k_frag, k_reshaped_shared)
@@ -96,7 +95,7 @@
                          qk_dot_full_shared[cs * R + r_out, cs * R + r_in]
 
                  # --- Rotary Q/K + Trap Scaling ---
-@@ -302,7 +307,7 @@
+@@ -302,7 +306,7 @@
 
                  # Strictly causal masking over chunk steps (exclude same-step diagonal).
                  da_cs__or__exp_da_cs_shared = T.alloc_shared([chunk_size], T.float32)
@@ -105,7 +104,7 @@
                  for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
                      qk_intrachunk_frag[csr_i, csr_j] = T.if_then_else(
                                                  csr_i//R > csr_j//R,
-@@ -461,7 +466,7 @@
+@@ -461,7 +465,7 @@
 
                  # DA_CS_REV scales stepwise K contribution into the new state.
                  dA_cs_rev_frag = T.alloc_fragment([chunk_size], T.float32)
@@ -114,7 +113,7 @@
                  # NOTE: we can recycle k_trap_scaled_frag from earlier, however,
                  # that is slower, so choose to recopy from smem:
                  k_state_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
-@@ -534,8 +538,9 @@
+@@ -534,8 +537,9 @@
      @T.prim_func
      def mamba_mimo_bwd_bwd_kernel(
              DOUT: T.Tensor(DOUT_shape, dtype),  # type: ignore
@@ -126,7 +125,7 @@
              V: T.Tensor([B, S, H, P], dtype),  # type: ignore
              Q_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
              K_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
-@@ -560,7 +565,8 @@
+@@ -560,7 +564,8 @@
              D: T.Tensor([H], T.float32), # type: ignore
              DD: T.Tensor([B, H], T.float32), # type: ignore
 
@@ -136,7 +135,7 @@
              # DQK_DOT: T.Tensor([B, H, S, R, R], dtype), # type: ignore
              DDA: T.Tensor([B, H, S], T.float32), # type: ignore
              DSSDA: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
-@@ -624,7 +630,9 @@
+@@ -624,7 +629,9 @@
              dk_shared = T.alloc_shared([fused_chunk_size, N], dtype)
              dq_shared = T.alloc_shared([fused_chunk_size, N], dtype)
 
@@ -147,7 +146,7 @@
 
              k_pre_trap_shared = T.alloc_shared([fused_chunk_size, N], dtype)
 
-@@ -707,9 +715,9 @@
+@@ -707,9 +714,9 @@
                                                              0.0)
 
                  trap_frag = T.alloc_fragment([chunk_size], T.float32)
@@ -159,7 +158,7 @@
                  gamma_frag = T.alloc_fragment([chunk_size], T.float32)
                  for cs in T.Parallel(chunk_size):
                      gamma_frag[cs] = dt_frag[cs] * T.sigmoid(trap_frag[cs])
-@@ -755,17 +763,15 @@
+@@ -755,17 +762,15 @@
                      T.reduce_sum(T.view(dPhiO_frag, shape=[fused_chunk_size*P]), dD_frag, clear=False)
 
                  # --- Prepare Rotated/Scaled QK and Compute dPsiV ---
@@ -185,7 +184,7 @@
                  T.copy(q_shared, q_pre_rot_shared) # Save pre-rotated q for later:
                  # Apply rotary to q:
                  q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
-@@ -779,26 +785,27 @@
+@@ -779,26 +784,27 @@
                      q_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
                      q_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
 
@@ -226,7 +225,7 @@
                  # Apply Trap-specific scaling:
                  k_trap_scaled_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
                  T.copy(k_pre_trap_shared, k_trap_scaled_frag)
-@@ -811,7 +818,7 @@
+@@ -811,7 +817,7 @@
                  T.gemm(k_shared, dstates_shared, dPsiV_frag, clear_accum=True)
                  dA_cs_rev_frag = T.alloc_fragment([chunk_size], T.float32)
                  dA_cs_rev_shared = T.alloc_shared([chunk_size], T.float32)
@@ -235,7 +234,7 @@
                  T.copy(dA_cs_rev_shared, dA_cs_rev_frag)
                  for csr, p in T.Parallel(fused_chunk_size, P):
                      # DA_CS_REV scales per-step state contribution into dPsiV.
-@@ -857,17 +864,16 @@
+@@ -857,17 +863,16 @@
                  # Compute the contribution from the qk_dot term:
                  # NOTE: recomputing qk_dot here is much slower than just loading from
                  # the result of the bwd_fwd kernel
@@ -259,7 +258,7 @@
                  T.copy(dPsiV_D_fused_frag, dPsiV_combined_shared)
 
                  # --- Compute dV and dPsi from dPsiV ---
-@@ -903,21 +909,23 @@
+@@ -903,21 +908,23 @@
                  # Compute dqk_from_diag, which is the contribution to dQ/dK from qk_dot:
                  dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
                  T.gemm(dPhiO_shared, PsiV_shared, dqk_from_diag_frag, transpose_B=True, clear_accum=True) # (cs*r_out, cs*r_in)
@@ -288,7 +287,7 @@
                  # Apply shifted gamma to dqk:
                  gamma_qk_frag = T.alloc_fragment([chunk_size], accum_dtype)
                  T.copy(gamma_cached_frag, gamma_qk_frag) # Apply shifted gamma
-@@ -937,7 +945,7 @@
+@@ -937,7 +944,7 @@
                  ddA_state_kv_prereduce_frag_reshaped = T.view(ddA_state_kv_prereduce_frag, shape=[chunk_size, R*N])
                  ddA_state_kv_frag = T.alloc_fragment([chunk_size], accum_dtype)
                  T.reduce_sum(ddA_state_kv_prereduce_frag_reshaped, ddA_state_kv_frag, dim=-1, clear=True)
@@ -297,7 +296,7 @@
 
                  # Interchunk path uses k_scaled * exp(dA_cs_rev) in forward,
                  # so apply exp(dA_cs_rev) to the interchunk dk term only.
-@@ -986,7 +994,7 @@
+@@ -986,7 +993,7 @@
                      dfactor_prereduce_frag[cs, r, n] = k_factor_frag[cs, r, n] * dk_nodiag_frag[cs*R + r, n]
                  dfactor_frag = T.alloc_fragment([chunk_size], accum_dtype)
                  T.reduce_sum(T.view(dfactor_prereduce_frag, shape=[chunk_size, R*N]), dfactor_frag, dim=-1, clear=True)
@@ -306,7 +305,7 @@
                  # Account for the effect of trap_scale = gamma + shifted_gamma:
                  trap_scale_dk_frag = T.alloc_fragment([chunk_size], dtype)
                  T.copy(trap_scale_shared, trap_scale_dk_frag)
-@@ -1020,7 +1028,7 @@
+@@ -1020,7 +1027,7 @@
                  dda_frag = T.alloc_fragment([chunk_size,], T.float32)
                  for cs in T.Parallel(chunk_size):
                      dda_frag[cs] = ddA_state_passing[0]
@@ -315,7 +314,7 @@
 
                  dq_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
                  T.gemm(dPhiO_shared, states_shared, dq_frag, transpose_B=True, clear_accum=True)
-@@ -1032,12 +1040,12 @@
+@@ -1032,12 +1039,12 @@
                  dda_cs_frag = T.alloc_fragment([chunk_size], accum_dtype)
                  T.reduce_sum(T.view(dda_cs_prereduce_frag, shape=[chunk_size, R*N]),
                               dda_cs_frag, dim=-1, clear=True)
@@ -330,7 +329,7 @@
                  T.copy(dA_cs_shared, dA_cs_dq_frag)
                  for csr, n in T.Parallel(fused_chunk_size, N):
                      # DA_CS scales interchunk q-state contribution in backward.
-@@ -1177,9 +1185,9 @@
+@@ -1177,9 +1184,9 @@
          rotary_dim_divisor,
          dtype,
          bf_threads=128,
@@ -342,7 +341,7 @@
          ):
      # TileLang kernel expects contiguous last-dim strides for DOUT.
      B, S, R, G, N = q.shape
-@@ -1195,27 +1203,35 @@
+@@ -1195,27 +1202,35 @@
      else:
          dz_tilelang = None
          dmimo_z = None
@@ -384,7 +383,7 @@
                      q_bias,
                      k_bias,
                      mimo_v,
-@@ -1264,8 +1280,8 @@
+@@ -1264,8 +1279,8 @@
                                               bb_num_stages)
      bwd_bwd_kernel(
              dout,
