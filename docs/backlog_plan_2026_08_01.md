@@ -594,13 +594,19 @@ P3 — стратегическое/отложенное.
 - **Проверка:** два receipt с совпадающей конфигурацией; числовой diff
   зафиксирован (входит в P095).
 
-## [P059] Wave-Next 4: checkpoint sharding для больших моделей
+## [P059] Wave-Next 4: checkpoint sharding для больших моделей — DONE
 - Репо: mlx | Приоритет: P3 | Тип: feature | Зависит от: —
-- **Где:** `cppmega_mlx/training` (checkpoint/resume), `docs/porting_plan.md:449-482`.
-- **Что делать:** шардирование safetensors-чекпоинтов (size cap на шард,
-  index-файл), resume из шардов.
-- **Проверка:** roundtrip-тест save→shard→resume с bit-exact state; smoke на
-  модели > порога шардирования.
+- **Где:** `cppmega_mlx/training/checkpoint.py`, `tests/test_checkpoint.py`.
+- **Что сделано:** шардирование safetensors-чекпоинтов реализовано и влито в
+  `cppmega.mlx@647b8036`. `save_checkpoint` принимает `max_file_size_gb` и
+  разбивает веса модели на `model-XXXXX-of-YYYYY.safetensors` с
+  `model.safetensors.index.json` (`weight_map`); оптимизатор и
+  gradient-accumulator сохраняются в отдельных нешардированных файлах.
+  `load_checkpoint` читает индекс и собирает тензоры обратно. Покрыто тестами
+  roundtrip, очисткой stale-файлов и метаданными.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && source ../.venvs/cppmega.mlx/bin/activate && python3 -m pytest tests/test_checkpoint.py -q` → 90 passed.
+  - Commit: `cppmega.mlx@647b8036` (`wip/checkpoint-sharding-20260801` → main ff-merge).
 
 ## [P060] Полный mlx suite baseline (~7900 тестов)
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: P052
