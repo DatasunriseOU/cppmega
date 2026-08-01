@@ -713,14 +713,23 @@ P3 — стратегическое/отложенное.
 Контракт: `mlx/docs/mtr005_megatron_dcp_to_mlx.md`; конвертер
 `mlx/scripts/convert_megatron_dense500m_torchdist_to_mlx.py` (1515 строк).
 
-## [P061] Атомарная публикация + SHA-256 в конвертере
+## [P061] Атомарная публикация + SHA-256 в конвертере — DONE
 - Репо: mlx | Приоритет: P1 | Тип: bug | Зависит от: —
-- **Где:** `scripts/convert_megatron_dense500m_torchdist_to_mlx.py:1419,1472-1477`
-  (два независимых `os.replace`, нет SHA результата и completion-маркера пары).
-- **Что делать:** единый completion-маркер (model.json + safetensors атомарны
-  как пара), SHA-256 safetensors в model.json, тест на прерванную публикацию.
-- **Проверка:** тесты конвертера (974 строки, синтетика) + новый тест
-  прерванной записи зелёные; model.json содержит `sha256` и completion-поле.
+- **Где:** `mlx/scripts/convert_megatron_dense500m_torchdist_to_mlx.py:355-369`
+  (`_sha256_receipt`), `:1495-1511` (atomic `os.replace` pair),
+  `:1513-1551` (`published_checkpoint_status`).
+- **Что сделано:**
+  - `model.json` пишется как staging-файл рядом с весами, затем оба файла
+    атомарно публикуются через `os.replace`.
+  - `model.json["publish"]` содержит `completion_marker` и `weights_sha256`.
+  - `published_checkpoint_status` fail-closed: отсутствие маркера,
+    отсутствие `weights_sha256` или несовпадение SHA возвращает `complete: False`
+    с причиной.
+- **Проверка:**
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_convert_megatron_dense500m_torchdist_to_mlx.py -q` → 20 passed.
+  - Тесты `test_publish_receipt_records_weights_sha256_and_completion`,
+    `test_published_checkpoint_status_rejects_weights_without_completion_marker`,
+    `test_published_checkpoint_status_detects_weights_sha_mismatch` — зелёные.
 
 ## [P062] Перегенерация 6 mlx_converted чекпоинтов
 - Репо: both | Приоритет: P1 | Тип: task | Зависит от: P061, P054
