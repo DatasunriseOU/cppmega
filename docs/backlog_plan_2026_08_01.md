@@ -252,15 +252,22 @@ P3 — стратегическое/отложенное.
 - **Проверка:** наведённое падение → в Summary виден JSON причины без скачивания
   artifact.
 
-## [P018] Свежие CI-диагностики: outputs/ci_diagnostics устарели
+## [P018] Свежие CI-диагностики: outputs/ci_diagnostics устарели — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: chore | Зависит от: —
-- **Где:** `outputs/ci_diagnostics/` (последние fetch jsonl от 2026-07-20),
-  скрипты fetch в `scripts/` и `mlx/fetch_ci_diagnostics.py`.
-- **Что делать:** прогнать fetch заново, убедиться, что receipt'ы обеих lane
-  (macos/linux) скачиваются; если механизм устарел — задокументировать новый
-  источник (GitHub artifacts, retention 14d).
-- **Проверка:** свежие jsonl в `outputs/ci_diagnostics/` с датой прогона;
-  `domain-routed-codegen.json` не единственный свежий файл.
+- **Где:** `outputs/ci_diagnostics/`, `outputs/ci_diagnostics/README.md`,
+  `scripts/fetch_ci_diagnostics.py`, `scripts/fetch_ci_logs.py`.
+- **Что сделано:** оба источника диагностик обновлены 2026-08-01:
+  - Upstream repo diagnostics: 15 `.jsonl` файлов, 7 из них непустые
+    (`cgal`, `ChibiOS`, `clamav`, `Crow`, `dpdk`, `flash-attention`, `geant4`).
+  - Lane receipts: `lane_receipts/macos-30676130389-1/` и
+    `lane_receipts/linux-30673683695-1/` с валидными `receipt.json` и логами.
+  - `README.md` задокументирован с датами refresh, командами `gh run download`
+    и retention 14d.
+- **Проверка:**
+  - `find outputs/ci_diagnostics -maxdepth 1 -name '*.jsonl' -newer docs/backlog_plan_2026_08_01.md | wc -l` → 15.
+  - `find outputs/ci_diagnostics/lane_receipts -type f | wc -l` → 12.
+  - `python -c "import json; json.load(open('outputs/ci_diagnostics/lane_receipts/macos-30676130389-1/receipt.json'))"` — OK.
+  - `python -c "import json; [json.loads(l) for l in open('outputs/ci_diagnostics/cgal.jsonl')]"` — OK.
 
 ## [P019] Контрольная сборка mamba_ssm wheel с verify-шагом — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073 (build-wheels.yml
