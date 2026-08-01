@@ -29,13 +29,10 @@ GHCR_DIGEST = os.environ.get(
     "GHCR_DIGEST",
     "sha256:08c5db7368d1037d930e0825281468927de9c85b12ba10373fe07e082150d983",
 )
-# FA4 beta23 image digest (flash-attn-4 4.0.0b23 + apache-tvm-ffi >=0.1.12).
-# Placeholder until docker/Dockerfile.beta23 is built and pushed to GHCR; see
-# docs/fa4_beta23_upgrade_plan.md. Replace with the real digest from:
-#   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/datasunriseou/cppmega:beta23
+# FA4 beta23 image built from wheels-e2057f89890c7d6da14bbafc38ab89870e254f06.
 GHCR_DIGEST_BETA23 = os.environ.get(
     "GHCR_DIGEST_BETA23",
-    "sha256:PLACEHOLDER_BETA23_DIGEST_NOT_YET_PUSHED",
+    "sha256:1da4a890e741ae91f005ad8edef81c3c5d0a72437532d88ff55e346a10fb6197",
 )
 # Opt into the beta23 image with CPPMEGA_BETA23=1 or a --beta23 flag on the
 # modal run command line. Image selection happens at import time because the

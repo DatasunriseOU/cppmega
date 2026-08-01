@@ -33,11 +33,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 GHCR_REPO = "ghcr.io/datasunriseou/cppmega"
 GHCR_DIGEST = "sha256:08c5db7368d1037d930e0825281468927de9c85b12ba10373fe07e082150d983"
-# FA4 beta23 image digest. Replace PLACEHOLDER with the real digest after push:
-#   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/datasunriseou/cppmega:beta23
+# FA4 beta23 image built from wheels-e2057f89890c7d6da14bbafc38ab89870e254f06.
 GHCR_DIGEST_BETA23 = os.environ.get(
     "GHCR_DIGEST_BETA23",
-    "sha256:PLACEHOLDER_BETA23_DIGEST_NOT_YET_PUSHED",
+    "sha256:1da4a890e741ae91f005ad8edef81c3c5d0a72437532d88ff55e346a10fb6197",
 )
 USE_BETA23 = os.environ.get("CPPMEGA_BETA23", "0") == "1" or "--beta23" in sys.argv
 GHCR_REF = f"{GHCR_REPO}@{GHCR_DIGEST_BETA23 if USE_BETA23 else GHCR_DIGEST}"
