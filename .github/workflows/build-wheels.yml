@@ -267,7 +267,7 @@ jobs:
             echo "::warning::torch install attempt $n failed; retrying in $((30*n))s"
             sleep $((30 * n))
           done
-          python3 - <<'PY'
+          python - <<'PY'
           from importlib import metadata
           from importlib.util import find_spec
           from pathlib import Path
@@ -719,7 +719,7 @@ jobs:
           CANDIDATE_TVM_FFI_SHA: 521efeb30bfd9e4946b248b3d76e6391028233a3
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python3 - <<'PY'
           import json
           import os
           from pathlib import Path
