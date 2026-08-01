@@ -118,7 +118,7 @@ def test_root_source_entrypoint_writes_schema_v2_manifest(
 ) -> None:
     checkout = tmp_path / "checkout"
     ignored = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
-    for relative in ("scripts", "cppmega", "tools/clang_indexer"):
+    for relative in ("scripts", "cppmega", "tools/clang_indexer", "configs"):
         shutil.copytree(
             REPO_ROOT / relative,
             checkout / relative,

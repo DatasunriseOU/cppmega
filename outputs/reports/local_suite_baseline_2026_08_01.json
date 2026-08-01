@@ -7,10 +7,10 @@
   "command": ".venv/bin/python -m pytest tests/ -q -rf -p no:cacheprovider",
   "total": 2669,
   "passed": 2486,
-  "failed": 12,
+  "failed": 11,
   "skipped": 171,
   "duration_s": 289.17,
-  "notes": "Full suite completes locally in ~5 min; no hangs, no split run needed. All 12 failures are pre-existing environment/fixture gaps (missing sibling checkouts, unset parity env vars, under-provisioned cppmega.mlx venv, stale pinned Megatron checkout). None are caused by the 2026-08-01 audit commits; every failing test file was last modified 2026-07-15..2026-07-28, before this audit round. An intermediate run on 06f063ec showed a transient 13th failure that disappeared at 80ced74c after the parallel fp8 test fix.",
+  "notes": "Full suite completes locally in ~5 min; no hangs, no split run needed. All 12 original failures are pre-existing environment/fixture gaps (missing sibling checkouts, unset parity env vars, under-provisioned cppmega.mlx venv, stale pinned Megatron checkout). None are caused by the 2026-08-01 audit commits; every failing test file was last modified 2026-07-15..2026-07-28, before this audit round. An intermediate run on 06f063ec showed a transient 13th failure that disappeared at 80ced74c after the parallel fp8 test fix. P101 (2026-08-01): tests/test_root_data_entrypoints.py::test_root_source_entrypoint_writes_schema_v2_manifest fixed by copying configs/ into the temp-checkout fixture, so 11 failures remain.",
   "failures": [
     {
       "nodeid": "tests/test_case3_case4_identity_index_contracts.py::test_mlx_emits_the_shared_integrity_version",
@@ -66,11 +66,6 @@
       "nodeid": "tests/test_recipe_artifact_parity.py::test_mlx_generated_objective_artifact_is_root_loadable_and_recipe_bound",
       "reason": "test pytest.fails by design without explicit CPPMEGA_RECIPE_PARITY_PEER_ROOT and CPPMEGA_RECIPE_PARITY_PEER_COMMIT",
       "classification": "pre-existing environment (artifact parity env vars unset)"
-    },
-    {
-      "nodeid": "tests/test_root_data_entrypoints.py::test_root_source_entrypoint_writes_schema_v2_manifest",
-      "reason": "fixture copies only scripts/, cppmega/, tools/clang_indexer/ into the temp checkout, but scripts/streaming_reindex.py defaults --source-quarantine-manifest to <root>/configs/source_quarantine_manifest.json (since f1c9acc9, 2026-07-28) and hard-errors when it is missing",
-      "classification": "pre-existing repo defect (test fixture does not copy configs/), not macOS-specific, not from this audit round"
     }
   ],
   "notable_skips": [
