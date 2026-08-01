@@ -944,6 +944,39 @@ def test_valgrind_style_header_loads_with_sane_fallback_args(
     }
 
 
+def test_mixed_case_cpp_suffix_forces_cpp_language(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "Outgoing.Cpp"
+    source.write_text(
+        "namespace tapi {\n"
+        "class Outgoing {\n"
+        "public:\n"
+        "    int call() const { return 3; }\n"
+        "};\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-x", "c", "-std=c11", "-Wno-everything"],
+        str(source),
+    )
+
+    assert adapted[:2] == ["-x", "c++"]
+    assert "-std=c11" not in adapted
+    translation_unit = index_project.Index.create().parse(
+        str(source),
+        args=adapted,
+    )
+    assert not [
+        diagnostic
+        for diagnostic in translation_unit.diagnostics
+        if int(diagnostic.severity) >= 3
+    ]
+
+
 def test_valgrind_fallback_status_is_emitted_in_source_sidecars(
     tmp_path: Path,
 ) -> None:
