@@ -65,13 +65,13 @@ def _peer_graph_recipe_module():
     configured = os.environ.get("CPPMEGA_RECIPE_PARITY_PEER_ROOT")
     expected_commit = os.environ.get("CPPMEGA_RECIPE_PARITY_PEER_COMMIT")
     if not configured or not expected_commit:
-        pytest.skip(
+        pytest.fail(
             "recipe parity requires explicit CPPMEGA_RECIPE_PARITY_PEER_ROOT "
             "and CPPMEGA_RECIPE_PARITY_PEER_COMMIT"
         )
     peer_root = Path(configured).expanduser().resolve()
     if not peer_root.is_dir():
-        pytest.skip(f"cross-repository recipe parity worktree is unavailable: {peer_root}")
+        pytest.fail(f"cross-repository recipe parity worktree is unavailable: {peer_root}")
     actual_commit = subprocess.run(
         ("git", "-C", str(peer_root), "rev-parse", "HEAD"),
         check=True,
