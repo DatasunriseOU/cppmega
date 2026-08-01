@@ -57,10 +57,32 @@ The switch is a runtime arg, not a model surgery:
 --attention-window-size 8192
 ```
 
-Verify our MLA spec honors `window_size` when seq > window: read
-`cppmega/megatron/mla_shared.py` and check the `window_size` pass-through
-to `te.DotProductAttention`. If not wired, add the pass-through (trivial,
-~5 LOC).
+The `window_size` value should be placed on `TransformerConfig` (e.g.
+`config.window_size = (left, right)` with `right = 0` for causal SWA) so that
+every attention backend can read it consistently.
+
+### MLA path
+
+`CppMegaFusedMLASelfAttentionAdapter` and the other adapters in
+`cppmega/megatron/mla_shared.py` now consume `window_size` from their kwargs and
+store it on the instance.  The spec builders that emit MLA `ModuleSpec` nodes
+still need to pass `window_size` in the params block; see
+`docs/document_isolation_swa_design.md` §2.3.
+
+### FA4 chunk-native path
+
+`CppMegaFA4ScoreModAttention` accepts `window_size` and forwards it to:
+
+- the native FA4 `flash_attn_func` for single-document rows (fast path), and
+- the packed-document `mask_mod` callback for multi-document rows.
+
+See `docs/document_isolation_swa_design.md` for the full plumbing design.
+
+### Torch / DSA fallback paths
+
+`document_isolation.py` builds the dense document-isolation mask and now also
+applies `config.window_size` when it is set.  This keeps CPU / reference
+attention consistent with the TE and FA4 backends.
 
 ## Context extension phase
 

@@ -674,18 +674,38 @@ def mask_sparse_topk_by_document(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.masked_fill(invalid, -1)
 
 
-def _document_attention_mask(ids: torch.Tensor) -> torch.Tensor:
+def _window_size_from_config(config: Any) -> tuple[int | None, int | None]:
+    """Return (left, right) window size from a TransformerConfig-like object."""
+    if config is None:
+        return None, None
+    window_size = getattr(config, "window_size", None)
+    if window_size is None:
+        return None, None
+    if isinstance(window_size, int):
+        return window_size, 0
+    left, right, *_ = tuple(window_size) + (None, None)
+    return left, right
+
+
+def _document_attention_mask(
+    ids: torch.Tensor,
+    *,
+    causal: bool = True,
+    window_size: tuple[int | None, int | None] = (None, None),
+) -> torch.Tensor:
     sequence_length = ids.shape[1]
+    q_idx = torch.arange(sequence_length, device=ids.device).view(1, -1, 1)
+    kv_idx = torch.arange(sequence_length, device=ids.device).view(1, 1, -1)
     cross_document = ids[:, :, None] != ids[:, None, :]
-    future = torch.triu(
-        torch.ones(
-            (sequence_length, sequence_length),
-            dtype=torch.bool,
-            device=ids.device,
-        ),
-        diagonal=1,
-    )
-    return (cross_document | future).unsqueeze(1)
+    mask = cross_document
+    if causal:
+        mask = mask | (q_idx < kv_idx)
+    window_left, window_right = window_size
+    if window_left is not None and window_left >= 0:
+        mask |= kv_idx < q_idx - window_left
+    if window_right is not None and window_right >= 0:
+        mask |= kv_idx > q_idx + window_right
+    return mask.unsqueeze(1)
 
 
 def _reshape_te_output(result: Any, *, batch_size: int, sequence_length: int) -> Any:
@@ -862,7 +882,8 @@ def _patch_torch_attention() -> None:
             return installed(*bound.args, **bound.kwargs)
         if ids is None:
             raise RuntimeError("validated document layout did not return document_ids")
-        mask = _document_attention_mask(ids)
+        window_size = _window_size_from_config(getattr(self, "config", None))
+        mask = _document_attention_mask(ids, window_size=window_size)
         existing_mask = bound.arguments["attention_mask"]
         if isinstance(existing_mask, torch.Tensor):
             mask |= existing_mask.to(device=mask.device, dtype=torch.bool)
@@ -903,7 +924,8 @@ def _patch_dsa_attention() -> None:
             raise RuntimeError(
                 "active DSA sparse backend does not support document-isolated -1 indices"
             )
-        mask = _document_attention_mask(ids)
+        window_size = _window_size_from_config(getattr(self, "config", None))
+        mask = _document_attention_mask(ids, window_size=window_size)
         existing_mask = bound.arguments["attention_mask"]
         if isinstance(existing_mask, torch.Tensor):
             mask |= existing_mask.to(device=mask.device, dtype=torch.bool)
@@ -1212,7 +1234,13 @@ def _patch_model_input_transport(model_class: type) -> None:
 
 
 def apply_document_isolation_patch() -> bool:
-    """Install all pinned Megatron seams used by packed cppmega training."""
+    """Install all pinned Megatron seams used by packed cppmega training.
+
+    Design references:
+      - `docs/document_isolation_varlen_design.md` — varlen/cu_seqlens path.
+      - `docs/document_isolation_swa_design.md` — sliding-window `window_size`
+        plumbing for packed-document attention.
+    """
 
     _assert_mamba_cp_signatures()
     _patch_mtp_roll()

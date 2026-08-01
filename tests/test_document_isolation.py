@@ -10,11 +10,13 @@ from torch.utils.checkpoint import checkpoint
 from cppmega.megatron import structure_dataset_patch
 from cppmega.megatron.document_isolation import (
     _assert_mamba_cp_signatures,
+    _document_attention_mask,
     _exchange_pipeline_document_ids,
     _patch_dsa_attention,
     _patch_model_input_transport,
     _patch_te_attention,
     _received_document_ids,
+    _window_size_from_config,
     bind_current_structure_batch,
     map_sequence_by_document,
     mask_sparse_topk_by_document,
@@ -434,6 +436,77 @@ def test_varlen_design_doc_is_referenced_from_map_sequence_source():
     )
     assert "## 5. Decision and next steps" in design
     assert "cu_seqlens" in design
+
+
+def test_swa_design_doc_is_referenced_from_isolation_source():
+    """The SWA plumbing path must reference its design decision."""
+    source = Path(
+        "cppmega/megatron/document_isolation.py"
+    ).read_text(encoding="utf-8")
+    assert "docs/document_isolation_swa_design.md" in source
+    design = Path("docs/document_isolation_swa_design.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## 5. Risks and open questions" in design
+    assert "window_size" in design
+
+
+def test_document_attention_mask_ignores_window_when_unset():
+    """Without window_size the mask is only cross-document + causal."""
+    ids = torch.tensor([[1, 1, 1, 2, 2]], dtype=torch.long)
+    mask = _document_attention_mask(ids)
+    # Position 2 (doc 1) may attend to positions 0,1,2 and may not see doc 2.
+    assert not mask[0, 0, 2, 0]
+    assert not mask[0, 0, 2, 1]
+    assert not mask[0, 0, 2, 2]
+    assert mask[0, 0, 2, 3]   # cross-document block
+    assert mask[0, 0, 2, 4]   # cross-document block
+
+
+def test_document_attention_mask_applies_left_window():
+    """A left window masks positions farther than window_size_left behind q."""
+    ids = torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long)
+    mask = _document_attention_mask(ids, window_size=(2, None))
+    # Position 3 with left window 2 may attend to 1,2,3; not 0.
+    assert mask[0, 0, 3, 0]
+    assert not mask[0, 0, 3, 1]
+    assert not mask[0, 0, 3, 2]
+    assert not mask[0, 0, 3, 3]
+    # Future positions remain masked by causal.
+    assert mask[0, 0, 3, 4]
+
+
+def test_document_attention_mask_applies_right_window():
+    """A right window masks positions farther than window_size_right ahead of q."""
+    ids = torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long)
+    # Disable causal so the right-window predicate is observable in isolation.
+    mask = _document_attention_mask(ids, causal=False, window_size=(None, 1))
+    # Position 2 with right window 1 may attend to 0,1,2,3; not 4.
+    assert not mask[0, 0, 2, 0]
+    assert not mask[0, 0, 2, 1]
+    assert not mask[0, 0, 2, 2]
+    assert not mask[0, 0, 2, 3]
+    assert mask[0, 0, 2, 4]
+
+
+def test_window_size_from_config_parses_int_and_tuple():
+    """Helpers accept int, tuple, or missing config field."""
+    assert _window_size_from_config(None) == (None, None)
+
+    class NoWindow:
+        pass
+
+    assert _window_size_from_config(NoWindow()) == (None, None)
+
+    class IntWindow:
+        window_size = 4096
+
+    assert _window_size_from_config(IntWindow()) == (4096, 0)
+
+    class TupleWindow:
+        window_size = (8192, 0)
+
+    assert _window_size_from_config(TupleWindow()) == (8192, 0)
 
 
 def test_mamba_cp_signature_guard_accepts_pinned_api():

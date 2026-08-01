@@ -1342,6 +1342,7 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
         attention_dropout: float = 0.0,
         softmax_scale: float | None = None,
         causal: bool = True,
+        window_size: tuple[int | None, int | None] = (None, None),
         deterministic: bool = False,
         beta: float | None = None,
         call_weight: float = 1.0,
@@ -1371,6 +1372,7 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
         self.head_dim = head_dim
         self.softmax_scale = softmax_scale
         self.causal = causal
+        self.window_size = window_size
         self.deterministic = deterministic
         self.beta = beta
         self.call_weight = call_weight
@@ -1388,8 +1390,9 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
             self._first_forward_logged = True
             log.info(
                 "[cppmega] FA4 chunk-native score_mod attention active "
-                "(causal=%s, deterministic=%s)",
+                "(causal=%s, window_size=%s, deterministic=%s)",
                 self.causal,
+                self.window_size,
                 self.deterministic,
             )
 
@@ -1584,23 +1587,28 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 aux_tensors_arg = []
             document_ids_q_index = len(aux_tensors_arg)
             aux_tensors_arg.extend(document_mask_aux)
+            window_left, window_right = self.window_size
             mask_mod_fn = _make_document_causal_mask_mod(
                 document_ids_q_index,
                 document_ids_q_index + 1,
                 causal=causal,
+                window_size_left=window_left,
+                window_size_right=window_right,
             )
 
         # In FA4 4.0.0b23's SM90 dispatch, the native causal/local branch does
         # not apply mask_mod. For packed rows the callback therefore owns the
         # complete document + causal predicate; single-document rows retain
-        # the native causal fast path.
+        # the native causal fast path and native window_size handling.
         native_causal = causal if mask_mod_fn is None else False
+        native_window_size = self.window_size if mask_mod_fn is None else (None, None)
         out = flash_attn_func(
             q=q,
             k=k,
             v=v,
             softmax_scale=scale,
             causal=native_causal,
+            window_size=native_window_size,
             score_mod=score_mod_fn,
             score_mod_bwd=score_mod_bwd_fn,
             aux_tensors=aux_tensors_arg,

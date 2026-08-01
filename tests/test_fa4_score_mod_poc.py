@@ -1250,6 +1250,42 @@ class TestFA4RejectsDenseTensor:
 
 
 # ---------------------------------------------------------------------------
+# 7b. test_fa4_window_size_plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestFA4WindowSizePlumbing:
+    """Verify CppMegaFA4ScoreModAttention accepts and stores window_size."""
+
+    def test_fa4_attention_stores_window_size(self):
+        """window_size is accepted as a constructor argument and stored."""
+        from cppmega.megatron.fa4_score_mod_adapter import (
+            CppMegaFA4ScoreModAttention,
+        )
+
+        attn = CppMegaFA4ScoreModAttention(
+            num_attention_heads=4,
+            head_dim=32,
+            causal=True,
+            window_size=(8192, 0),
+        )
+        assert attn.window_size == (8192, 0)
+
+    def test_fa4_attention_default_window_size_is_none(self):
+        """Default window_size is (None, None) for full causal attention."""
+        from cppmega.megatron.fa4_score_mod_adapter import (
+            CppMegaFA4ScoreModAttention,
+        )
+
+        attn = CppMegaFA4ScoreModAttention(
+            num_attention_heads=4,
+            head_dim=32,
+            causal=True,
+        )
+        assert attn.window_size == (None, None)
+
+
+# ---------------------------------------------------------------------------
 # 8. test_mamba_builder_uses_chunk_native
 # ---------------------------------------------------------------------------
 
