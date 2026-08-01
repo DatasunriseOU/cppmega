@@ -1,5 +1,21 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-01: Case-safe source artifact isolation
+
+Source archive names are now encoded into injective, case-insensitive-safe
+filesystem keys for transient work, source/extract caches, and code/commit
+Parquet publication. Logical repository names and canonical project identities
+remain unchanged in manifests and sidecars, so case variants such as
+`DirectXTK` and `directxtk` retain both distinct snapshots without overwriting
+each other on APFS. An archive entry absent from the bound repo list still
+fails loudly instead of being silently discarded.
+
+The status reporter now treats case variants as a release blocker only when
+receipt totals actually differ from physical Parquet. Focused verification:
+81 tests passed. The legacy repo list still incorrectly maps the distinct
+`bionic` and `v8` snapshots to `nickg/nvc`; that identity defect remains
+fail-visible and is not claimed fixed here.
+
 ## 2026-07-31: Packed-document model isolation
 
 Promoted canonical packed `doc_ids` from graph-only metadata to a required

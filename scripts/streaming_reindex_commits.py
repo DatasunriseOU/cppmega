@@ -1035,7 +1035,7 @@ def stream_repo_subtrees_with_git(
                     )
                 cur_repo = repo
                 active = should_process(repo)
-                cur_dir = work_root / repo / "_src"
+                cur_dir = work_root / sr.filesystem_repo_key(repo) / "_src"
                 if active:
                     cur_dir.mkdir(parents=True, exist_ok=True)
             if not active or not within:
@@ -1343,7 +1343,7 @@ def publish_range_outputs(
             rkey,
             packed_by_length,
             output_root=COMMIT_OUTPUT_ROOT,
-            filename=f"{repo}_r{start_idx}.parquet",
+            filename=sr.commit_output_filename(repo, start_idx),
             prepare_staged=recompress_zstd_max,
             stats_reader=_parquet_stats,
             remove_lengths=sorted(all_lengths - set(packed_by_length)),
@@ -1518,6 +1518,7 @@ def process_range(
                 promoted = True
         info = {
             "source": "commits",
+            "artifact_filename": sr.commit_output_filename(repo, start_idx),
             "repo": repo,
             "project_id": project_id,
             "pr_eligible": pr_owner_repo is not None,
@@ -1599,7 +1600,7 @@ def process_one_repo(
         manifest.mark_started(f"{repo}::repo")
         if not resume:
             manifest.mark_started_prefix(f"{repo}::r")
-    repo_work = work_root / repo
+    repo_work = work_root / sr.filesystem_repo_key(repo)
     repo_work.mkdir(parents=True, exist_ok=True)
     smallest = lengths_sorted[0]
     try:
@@ -1970,7 +1971,7 @@ def main(argv: list[str]) -> int:
                     raise SystemExit(f"--repo-path is not a git repo (no .git): {rp_path}")
                 # Stage into work_root/<name>/_src so .git deletion is isolated to the copy.
                 name = rp_path.name
-                staged = work_root / name / "_src"
+                staged = work_root / sr.filesystem_repo_key(name) / "_src"
                 staged.mkdir(parents=True, exist_ok=True)
                 _log(f"STAGE (local copy) {name} <- {rp_path}")
                 # Copy including .git (commits need it); excludes match the stream.

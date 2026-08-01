@@ -1106,7 +1106,7 @@ def validate_memory_plan(
 # --------------------------------------------------------------------------- #
 def extract_cache_dir(repo: str) -> Path:
     """Repo-keyed directory holding commit JSONL plus validation metadata."""
-    return EXTRACT_CACHE_ROOT / repo
+    return EXTRACT_CACHE_ROOT / sr.filesystem_repo_key(repo)
 
 
 def extract_cache_config_receipt() -> dict:
@@ -1422,7 +1422,7 @@ def _validate_completed_external_cache(
             legacy_source = extract_history._repo_source_context(
                 str(repo_dir),
                 max_commits=0,
-                repo_name=repo_dir.name,
+                repo_name=repo,
                 notes="auto",
             )
             legacy_fingerprint = extract_history._job_fingerprint(
@@ -1557,7 +1557,7 @@ def _ensure_external_commit_records(
                 repo,
                 repo_dir,
                 cache_jsonl,
-                canonical_project_id or repo_dir.name,
+                canonical_project_id or repo,
             )
             legacy_identity = (
                 canonical_project_id is not None
@@ -1622,7 +1622,9 @@ def _discover_existing_jsonl(repo: str, work_root: Path, work_parent: Path) -> P
     # missing/mismatched sentinel would turn a truncated or corrupt extract into
     # a freshly stamped "done" corpus. Legacy work roots remain eligible because
     # they are outside the stable cache and predate its sentinel protocol.
-    candidates: list[Path] = [work_root / repo / f"{repo}_commits.jsonl"]
+    candidates: list[Path] = [
+        work_root / sr.filesystem_repo_key(repo) / f"{repo}_commits.jsonl"
+    ]
     parents = {p for p in (work_parent, DEFAULT_WORK_PARENT) if p is not None}
     for parent in parents:
         if parent.exists():
@@ -2879,7 +2881,11 @@ def run_code_half(
     RAISES RepoFailure on any stage failure (no fallback).
     """
     stage_id = sr.code_stage_id(repo) if dedup_db is not None else None
-    stage_db = sr.code_stage_db(work_root / repo, repo) if dedup_db is not None else None
+    stage_db = (
+        sr.code_stage_db(work_root / sr.filesystem_repo_key(repo), repo)
+        if dedup_db is not None
+        else None
+    )
     promoted = False
     try:
         try:
@@ -2917,7 +2923,7 @@ def run_code_half(
         jobs: list[tuple[Path, Future]] = []
         try:
             for L in info.get("lengths", {}):
-                dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
+                dest = sr.OUTPUT_ROOT / str(L) / sr.code_output_filename(repo)
                 if dest.exists():
                     if recompressor is None:
                         if revision_guard is not None:
@@ -2977,7 +2983,7 @@ CodeRunner = Callable[
 
 def remove_code_outputs(repo: str, lengths: Iterable[str | int]) -> None:
     for length in lengths:
-        dest = sr.OUTPUT_ROOT / str(length) / f"{repo}.parquet"
+        dest = sr.OUTPUT_ROOT / str(length) / sr.code_output_filename(repo)
         if dest.exists():
             dest.unlink()
 
@@ -4052,7 +4058,7 @@ def process_one_repo(
     --retain-partial-work for the older zero-rework resume mode. RULE #1: a
     failure in one half is recorded; the other half still runs.
     """
-    repo_work = work_root / repo
+    repo_work = work_root / sr.filesystem_repo_key(repo)
     repo_work.mkdir(parents=True, exist_ok=True)
     try:
         project_id = sr.require_project_identity(

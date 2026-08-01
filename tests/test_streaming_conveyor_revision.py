@@ -662,6 +662,23 @@ def test_repo_list_validation_rejects_duplicate_bare_name(
         conveyor.load_repo_list_snapshot(source_repo_list, role="source")
 
 
+def test_repo_filesystem_keys_isolate_case_variants() -> None:
+    upper = conveyor.sr.filesystem_repo_key("DirectXTK")
+    lower = conveyor.sr.filesystem_repo_key("directxtk")
+
+    assert lower == "directxtk"
+    assert upper == "%44irect%58%54%4b"
+    assert upper.casefold() != lower.casefold()
+    assert (
+        conveyor.sr.code_output_filename("DirectXTK").casefold()
+        != conveyor.sr.code_output_filename("directxtk").casefold()
+    )
+    assert (
+        conveyor.sr.commit_output_filename("DirectXTK", 0).casefold()
+        != conveyor.sr.commit_output_filename("directxtk", 0).casefold()
+    )
+
+
 def test_source_repo_list_finish_revalidation_detects_drift(
     tmp_path: Path,
 ) -> None:

@@ -284,6 +284,30 @@ def _safe_stage_name(value: str) -> str:
     return value.replace("/", "_").replace(":", "_")
 
 
+def filesystem_repo_key(repo: str) -> str:
+    """Encode a logical repo name into one case-insensitive-safe path component."""
+    if not isinstance(repo, str) or not repo:
+        raise ValueError("repo must be a non-empty string")
+    return "".join(
+        chr(byte)
+        if (
+            ord("a") <= byte <= ord("z")
+            or ord("0") <= byte <= ord("9")
+            or byte in (ord("_"), ord("-"))
+        )
+        else f"%{byte:02x}"
+        for byte in repo.encode("utf-8")
+    )
+
+
+def code_output_filename(repo: str) -> str:
+    return f"{filesystem_repo_key(repo)}.parquet"
+
+
+def commit_output_filename(repo: str, start_idx: int) -> str:
+    return f"{filesystem_repo_key(repo)}_r{start_idx}.parquet"
+
+
 def code_stage_db(work: Path, repo: str) -> Path:
     return work / f"{_safe_stage_name(repo)}.dedup_stage.sqlite"
 
@@ -658,17 +682,43 @@ SOURCE_CACHE_SENTINEL = ".cppmega_source_cache_complete.json"
 
 
 def _source_cache_repo_dir(source_cache_dir: Path, repo: str) -> Path:
-    return source_cache_dir / repo
+    return source_cache_dir / filesystem_repo_key(repo)
 
 
 def _source_cache_staging_dir(source_cache_dir: Path, repo: str) -> Path:
     staging = source_cache_dir / ".staging"
     staging.mkdir(parents=True, exist_ok=True)
-    return staging / f"{repo}.{os.getpid()}.{time.time_ns()}"
+    return staging / f"{filesystem_repo_key(repo)}.{os.getpid()}.{time.time_ns()}"
 
 
 def _source_cache_complete(repo_dir: Path) -> bool:
     return (repo_dir / SOURCE_CACHE_SENTINEL).exists()
+
+
+def _source_cache_repo_name(repo_dir: Path) -> str:
+    sentinel = repo_dir / SOURCE_CACHE_SENTINEL
+    try:
+        document = json.loads(sentinel.read_text(encoding="utf-8"))
+        repo = document["repo"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RepoFailure(
+            repo_dir.name,
+            "source_cache",
+            f"invalid source-cache sentinel {sentinel}: {exc}",
+        ) from exc
+    if not isinstance(repo, str) or not repo:
+        raise RepoFailure(
+            repo_dir.name,
+            "source_cache",
+            f"invalid repo identity in source-cache sentinel {sentinel}",
+        )
+    if repo_dir.name not in {repo, filesystem_repo_key(repo)}:
+        raise RepoFailure(
+            repo,
+            "source_cache",
+            f"source-cache path {repo_dir} does not match sentinel repo {repo!r}",
+        )
+    return repo
 
 
 def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
@@ -714,17 +764,19 @@ def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> 
 def _iter_complete_source_cache(
     source_cache_dir: Path,
     should_process: Callable[[str], bool],
-) -> set[str]:
-    yielded: set[str] = set()
+) -> dict[str, Path]:
+    yielded: dict[str, Path] = {}
     if not source_cache_dir.exists():
         return yielded
     for repo_dir in sorted(p for p in source_cache_dir.iterdir() if p.is_dir()):
         if repo_dir.name == ".staging":
             continue
-        repo = repo_dir.name
-        if not _source_cache_complete(repo_dir) or not should_process(repo):
+        if not _source_cache_complete(repo_dir):
             continue
-        yielded.add(repo)
+        repo = _source_cache_repo_name(repo_dir)
+        if not should_process(repo):
+            continue
+        yielded[repo] = repo_dir
     return yielded
 
 
@@ -752,12 +804,12 @@ def stream_repo_subtrees(
     """
     import tarfile
 
-    cached_yielded: set[str] = set()
+    cached_yielded: dict[str, Path] = {}
     if source_cache_dir is not None:
         source_cache_dir.mkdir(parents=True, exist_ok=True)
         cached_yielded = _iter_complete_source_cache(source_cache_dir, should_process)
-        for repo in sorted(cached_yielded):
-            yield repo, _source_cache_repo_dir(source_cache_dir, repo)
+        for repo, repo_dir in sorted(cached_yielded.items()):
+            yield repo, repo_dir
         if source_cache_only:
             return
 
@@ -821,7 +873,7 @@ def stream_repo_subtrees(
                     else:
                         cur_dir = _source_cache_staging_dir(source_cache_dir, repo)
                 else:
-                    cur_dir = work_root / repo / "_src"
+                    cur_dir = work_root / filesystem_repo_key(repo) / "_src"
                 if active:
                     assert cur_dir is not None
                     cur_dir.mkdir(parents=True, exist_ok=True)
@@ -1524,7 +1576,7 @@ def publish_outputs(
             repo,
             packed_by_length,
             output_root=OUTPUT_ROOT,
-            filename=f"{repo}.parquet",
+            filename=code_output_filename(repo),
             remove_lengths=sorted(all_lengths - set(packed_by_length)),
         )
     except RepoFailure:
@@ -1597,7 +1649,7 @@ def process_one_repo(
     outputs/reindexed/<L>/<repo>.parquet. A given doc therefore appears in
     exactly one bucket -- never replicated across target lengths.
     """
-    work = work_root / repo
+    work = work_root / filesystem_repo_key(repo)
     project_id = require_project_identity(
         project_id, source=f"process_one_repo({repo})"
     )
@@ -1665,6 +1717,7 @@ def process_one_repo(
             success_without_promote = True
         result = {
             "source": "code",
+            "artifact_filename": code_output_filename(repo),
             "lengths": per_length,
             "stage_timings_s": timings,
             "materialize_stats": materialize_stats,
@@ -1691,7 +1744,7 @@ def process_one_commit_source(
     *,
     project_id: str,
 ) -> dict:
-    work = work_root / key
+    work = work_root / filesystem_repo_key(key)
     project_id = require_project_identity(
         project_id, source=f"process_one_commit_source({key})"
     )
@@ -1982,7 +2035,10 @@ def main(argv: list[str]) -> int:
             # smallest bucket. Mirror streaming_reindex_commits.py:466.
             cumulative_valid += info["lengths"].get(str(smallest), {}).get("valid_tokens", 0)
             if not args.keep_temp:
-                shutil.rmtree(work_root / key, ignore_errors=True)
+                shutil.rmtree(
+                    work_root / filesystem_repo_key(key),
+                    ignore_errors=True,
+                )
         except RepoFailure as exc:
             print(f"FAIL {manifest_key}: {exc}", file=sys.stderr)
             manifest.mark_failed(manifest_key, exc.stage, exc.detail)
@@ -2062,7 +2118,10 @@ def main(argv: list[str]) -> int:
                     manifest.mark_failed(repo, exc.stage, exc.detail)
                 finally:
                     if not args.keep_temp:
-                        shutil.rmtree(work_root / repo, ignore_errors=True)
+                        shutil.rmtree(
+                            work_root / filesystem_repo_key(repo),
+                            ignore_errors=True,
+                        )
                 stop = False
                 if args.max_repos is not None and processed >= args.max_repos:
                     stop = True

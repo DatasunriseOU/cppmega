@@ -669,7 +669,7 @@ def collect_live_source(
     blockers = []
     if any(receipt_minus_physical.values()):
         blockers.append("completion receipt totals differ from physical Parquet")
-    if collisions:
+    if collisions and any(receipt_minus_physical.values()):
         blockers.append("case-folded source keys collide")
     if terminal_count < mapping_count:
         blockers.append("source conveyor is still incomplete")
