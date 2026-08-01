@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
@@ -99,6 +99,20 @@ OBJECTIVE_SCHEDULE_ALGORITHM = (
 )
 GRAPH_ELIGIBILITY_RECEIPT_SCHEMA = "cppmega_objective_graph_eligibility_v1"
 OBJECTIVE_REALIZATION_RECEIPT_SCHEMA = "cppmega_objective_realization_v1"
+OBJECTIVE_SOURCE_SNAPSHOT_SCHEMA = "cppmega_objective_source_snapshot_v2"
+OBJECTIVE_SOURCE_POOL_MANIFEST_SCHEMA = "cppmega_ci_objective_pool_manifest_v1"
+OBJECTIVE_SOURCE_POOL_SCHEDULE = "alternate_primary_seed_v1"
+OBJECTIVE_SOURCE_POOL_NAMES = ("primary_ci", "objective_seed")
+OBJECTIVE_SOURCE_POOL_MANIFEST_PATH = "objective_source_pool_manifest.json"
+OBJECTIVE_CI_EXPORT_RECEIPT_PATH = "ci_export_receipt.json"
+OBJECTIVE_CI_EXPORT_SCHEMAS = {
+    "cppmega_ci_content_store_case5_export_v2",
+    "cppmega_ci_content_store_case5_export_v4",
+}
+OBJECTIVE_SOURCE_BUCKETS = (1024, 2048, 4096, 8192, 16384)
+_BOUNDED_SOURCE_SAMPLING_MODE = (
+    "deterministic_shard_row_group_record_batch_shuffle_v2"
+)
 
 _EXPECTED_TYPED_SOURCES = {
     "ifim_instruction": "ifim_instruction_token_ids",
@@ -175,6 +189,335 @@ def _canonical_value_sha256(value: object) -> str:
         ensure_ascii=True,
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_digest(value: object, *, where: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{where} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _source_file_records(
+    raw_records: object,
+    *,
+    where: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_records, list) or not raw_records:
+        raise ValueError(f"{where} must be a non-empty list")
+    records: list[dict[str, Any]] = []
+    paths: list[str] = []
+    for index, raw_record in enumerate(raw_records):
+        record = _mapping(raw_record, where=f"{where}[{index}]")
+        if set(record) != {"path", "rows", "size_bytes", "sha256"}:
+            raise ValueError(f"{where}[{index}] file binding keys are invalid")
+        raw_path = record.get("path")
+        path = PurePosixPath(raw_path) if isinstance(raw_path, str) else None
+        if (
+            path is None
+            or not raw_path
+            or path.is_absolute()
+            or path.as_posix() != raw_path
+            or ".." in path.parts
+            or path.suffix != ".parquet"
+        ):
+            raise ValueError(f"{where}[{index}].path is invalid")
+        paths.append(raw_path)
+        records.append(
+            {
+                "path": raw_path,
+                "rows": _positive_int(
+                    record.get("rows"), where=f"{where}[{index}].rows"
+                ),
+                "size_bytes": _positive_int(
+                    record.get("size_bytes"),
+                    where=f"{where}[{index}].size_bytes",
+                ),
+                "sha256": _sha256_digest(
+                    record.get("sha256"),
+                    where=f"{where}[{index}].sha256",
+                ),
+            }
+        )
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise ValueError(f"{where} paths must be unique and sorted")
+    return records
+
+
+def _source_artifact_set_sha256(records: list[dict[str, Any]]) -> str:
+    return _canonical_value_sha256(
+        [
+            {
+                "path": record["path"],
+                "size": record["size_bytes"],
+                "sha256": record["sha256"],
+            }
+            for record in records
+        ]
+    )
+
+
+def _validate_bounded_source_pool(
+    raw_pool: object,
+    *,
+    sequence_length: int,
+    where: str,
+) -> tuple[list[dict[str, Any]], int]:
+    pool = _mapping(raw_pool, where=where)
+    if set(pool) != {
+        "schema",
+        "sequence_length",
+        "file_count",
+        "row_count",
+        "files",
+        "sampling",
+        "artifact_set_sha256",
+    }:
+        raise ValueError(f"{where} keys are invalid")
+    if (
+        pool.get("schema") != "cppmega_objective_source_snapshot_v1"
+        or pool.get("sequence_length") != sequence_length
+    ):
+        raise ValueError(f"{where} schema or sequence length is invalid")
+    records = _source_file_records(pool.get("files"), where=f"{where}.files")
+    row_count = sum(record["rows"] for record in records)
+    if (
+        pool.get("file_count") != len(records)
+        or pool.get("row_count") != row_count
+        or pool.get("artifact_set_sha256")
+        != _source_artifact_set_sha256(records)
+    ):
+        raise ValueError(f"{where} file accounting drifted")
+
+    sampling = _mapping(pool.get("sampling"), where=f"{where}.sampling")
+    if set(sampling) != {
+        "mode",
+        "seed",
+        "requested_samples",
+        "full_passes",
+        "tail_rows",
+        "min_row_reuse",
+        "max_row_reuse",
+        "record_batch_rows",
+        "producer",
+        "ordering",
+        "cursor_semantics",
+        "final_cursor",
+    }:
+        raise ValueError(f"{where}.sampling keys are invalid")
+    if sampling.get("mode") != _BOUNDED_SOURCE_SAMPLING_MODE:
+        raise ValueError(f"{where}.sampling.mode is invalid")
+    _positive_int(
+        sampling.get("seed"), where=f"{where}.sampling.seed", allow_zero=True
+    )
+    requested = _positive_int(
+        sampling.get("requested_samples"),
+        where=f"{where}.sampling.requested_samples",
+    )
+    full_passes, tail_rows = divmod(requested, row_count)
+    if (
+        sampling.get("full_passes") != full_passes
+        or sampling.get("tail_rows") != tail_rows
+        or sampling.get("min_row_reuse") != full_passes
+        or sampling.get("max_row_reuse")
+        != full_passes + int(tail_rows > 0)
+    ):
+        raise ValueError(f"{where}.sampling reuse accounting drifted")
+    batch_rows = _positive_int(
+        sampling.get("record_batch_rows"),
+        where=f"{where}.sampling.record_batch_rows",
+    )
+    producer = _mapping(
+        sampling.get("producer"), where=f"{where}.sampling.producer"
+    )
+    if set(producer) != {"name", "version", "row_group_rows"} or (
+        producer.get("name") != "pyarrow.parquet.ParquetFile.iter_batches"
+        or producer.get("version") != 1
+    ):
+        raise ValueError(f"{where}.sampling.producer is invalid")
+    row_group_rows = producer.get("row_group_rows")
+    if (
+        not isinstance(row_group_rows, list)
+        or len(row_group_rows) != len(records)
+    ):
+        raise ValueError(f"{where}.sampling.producer row groups are invalid")
+    normalized_groups: list[list[int]] = []
+    for index, raw_groups in enumerate(row_group_rows):
+        if not isinstance(raw_groups, list) or not raw_groups:
+            raise ValueError(f"{where}.sampling.producer row groups are invalid")
+        groups = [
+            _positive_int(
+                rows,
+                where=f"{where}.sampling.producer.row_group_rows[{index}]",
+            )
+            for rows in raw_groups
+        ]
+        if sum(groups) != records[index]["rows"]:
+            raise ValueError(f"{where}.sampling.producer row counts drifted")
+        normalized_groups.append(groups)
+    if sampling.get("ordering") != {
+        "permutation": "sha256_sort_key_v1",
+        "epochs": "ascending",
+        "shards": "seeded_permutation_per_epoch",
+        "row_groups": "seeded_permutation_per_shard_epoch",
+        "record_batches": "physical_order_within_row_group",
+        "rows": "seeded_permutation_within_record_batch",
+    } or sampling.get("cursor_semantics") != "last_yielded_row_v1":
+        raise ValueError(f"{where}.sampling ordering or cursor semantics drifted")
+
+    cursor = _mapping(
+        sampling.get("final_cursor"), where=f"{where}.sampling.final_cursor"
+    )
+    cursor_keys = {
+        "epoch",
+        "shard_position",
+        "shard_index",
+        "row_group_position",
+        "row_group_index",
+        "record_batch_index",
+        "row_shuffle_position",
+        "row_index_in_record_batch",
+        "source_index",
+    }
+    if set(cursor) != cursor_keys:
+        raise ValueError(f"{where}.sampling.final_cursor keys are invalid")
+    values = {
+        key: _positive_int(
+            cursor.get(key),
+            where=f"{where}.sampling.final_cursor.{key}",
+            allow_zero=True,
+        )
+        for key in cursor_keys
+    }
+    if (
+        values["source_index"] != requested - 1
+        or values["epoch"] != (requested - 1) // row_count
+        or values["shard_position"] >= len(records)
+        or values["shard_index"] >= len(records)
+    ):
+        raise ValueError(f"{where}.sampling.final_cursor is outside the source")
+    groups = normalized_groups[values["shard_index"]]
+    if (
+        values["row_group_position"] >= len(groups)
+        or values["row_group_index"] >= len(groups)
+    ):
+        raise ValueError(f"{where}.sampling.final_cursor row group is invalid")
+    group_rows = groups[values["row_group_index"]]
+    batch_start = values["record_batch_index"] * batch_rows
+    current_batch_rows = min(batch_rows, group_rows - batch_start)
+    if (
+        current_batch_rows < 1
+        or values["row_shuffle_position"] >= current_batch_rows
+        or values["row_index_in_record_batch"] >= current_batch_rows
+    ):
+        raise ValueError(f"{where}.sampling.final_cursor record batch is invalid")
+    return records, requested
+
+
+def _validate_two_pool_source_snapshot(contract: Mapping[str, Any]) -> None:
+    raw_snapshot = contract.get("source_snapshot")
+    if raw_snapshot is None:
+        return
+    snapshot = _mapping(raw_snapshot, where="source_snapshot")
+    schema = snapshot.get("schema")
+    if schema == "cppmega_objective_source_snapshot_v1":
+        return
+    if schema != OBJECTIVE_SOURCE_SNAPSHOT_SCHEMA:
+        raise ValueError("source_snapshot schema is unsupported")
+    if set(snapshot) != {
+        "schema",
+        "sequence_length",
+        "algorithm",
+        "pool_order",
+        "source_pool_manifest",
+        "ci_export_receipt",
+        "pools",
+    }:
+        raise ValueError("source_snapshot keys are invalid")
+    sequence_length = _positive_int(
+        snapshot.get("sequence_length"), where="source_snapshot.sequence_length"
+    )
+    if (
+        snapshot.get("algorithm") != OBJECTIVE_SOURCE_POOL_SCHEDULE
+        or snapshot.get("pool_order") != list(OBJECTIVE_SOURCE_POOL_NAMES)
+    ):
+        raise ValueError("source_snapshot pool schedule drifted")
+    for field, expected_path in (
+        ("source_pool_manifest", OBJECTIVE_SOURCE_POOL_MANIFEST_PATH),
+        ("ci_export_receipt", OBJECTIVE_CI_EXPORT_RECEIPT_PATH),
+    ):
+        descriptor = _mapping(
+            snapshot.get(field), where=f"source_snapshot.{field}"
+        )
+        if set(descriptor) != {"path", "size_bytes", "sha256"} or (
+            descriptor.get("path") != expected_path
+        ):
+            raise ValueError(f"source_snapshot.{field} descriptor is invalid")
+        _positive_int(
+            descriptor.get("size_bytes"),
+            where=f"source_snapshot.{field}.size_bytes",
+        )
+        _sha256_digest(
+            descriptor.get("sha256"), where=f"source_snapshot.{field}.sha256"
+        )
+
+    pools = _mapping(snapshot.get("pools"), where="source_snapshot.pools")
+    if set(pools) != set(OBJECTIVE_SOURCE_POOL_NAMES):
+        raise ValueError("source_snapshot.pools are invalid")
+    requested = {
+        name: _validate_bounded_source_pool(
+            pools[name],
+            sequence_length=sequence_length,
+            where=f"source_snapshot.pools.{name}",
+        )[1]
+        for name in OBJECTIVE_SOURCE_POOL_NAMES
+    }
+    selection = _mapping(
+        contract.get("source_selection"), where="source_selection"
+    )
+    consumed = _positive_int(
+        selection.get("source_rows_consumed"),
+        where="source_selection.source_rows_consumed",
+    )
+    if requested != {
+        "primary_ci": (consumed + 1) // 2,
+        "objective_seed": consumed // 2,
+    }:
+        raise ValueError("source_snapshot pool consumption drifted")
+    cursor = _mapping(
+        _mapping(
+            selection.get("resume"), where="source_selection.resume"
+        ).get("last_yielded_cursor"),
+        where="source_selection.resume.last_yielded_cursor",
+    )
+    last_pool = (consumed - 1) % 2
+    if (
+        cursor.get("pool_index") != last_pool
+        or cursor.get("pool_source_index")
+        != requested[OBJECTIVE_SOURCE_POOL_NAMES[last_pool]] - 1
+        or cursor.get("primary_rows_yielded") != requested["primary_ci"]
+        or cursor.get("objective_seed_rows_yielded")
+        != requested["objective_seed"]
+        or cursor.get("next_pool_index") != consumed % 2
+    ):
+        raise ValueError("source_selection two-pool replay cursor drifted")
+    windows = selection.get("windows")
+    if not isinstance(windows, list) or not windows:
+        raise ValueError("source_selection windows are missing")
+    for index, raw_window in enumerate(windows):
+        window = _mapping(raw_window, where=f"source_selection.windows[{index}]")
+        selected = window.get("selected_source_indices")
+        if (
+            not isinstance(selected, list)
+            or not any(value % 2 == 0 for value in selected)
+            or not any(value % 2 == 1 for value in selected)
+        ):
+            raise ValueError(
+                f"source_selection.windows[{index}] must use both source pools"
+            )
 
 
 def _schedule_receipt_locations(value: object, *, where: str) -> list[str]:
@@ -827,6 +1170,7 @@ def validate_objective_contract(
             window_quotas=window_quotas,
             graph_relations=tuple(relations),
         )
+    _validate_two_pool_source_snapshot(contract)
     if require_schedule_receipt:
         _require_canonical_schedule_receipt(contract)
 
@@ -879,6 +1223,185 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_two_pool_source_bindings(
+    contract: Mapping[str, Any],
+    *,
+    root: Path,
+) -> None:
+    raw_snapshot = contract.get("source_snapshot")
+    if not isinstance(raw_snapshot, Mapping) or (
+        raw_snapshot.get("schema") != OBJECTIVE_SOURCE_SNAPSHOT_SCHEMA
+    ):
+        return
+    snapshot = raw_snapshot
+    bound: dict[str, tuple[Mapping[str, Any], bytes]] = {}
+    for field in ("source_pool_manifest", "ci_export_receipt"):
+        descriptor = _mapping(
+            snapshot.get(field), where=f"source_snapshot.{field}"
+        )
+        path = _artifact_file(
+            root,
+            descriptor.get("path"),
+            where=f"source_snapshot.{field}.path",
+        )
+        raw = path.read_bytes()
+        if (
+            len(raw) != descriptor.get("size_bytes")
+            or hashlib.sha256(raw).hexdigest() != descriptor.get("sha256")
+        ):
+            raise ValueError(f"source_snapshot.{field} byte binding drifted")
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"source_snapshot.{field} is not valid JSON") from exc
+        bound[field] = (
+            _mapping(payload, where=f"source_snapshot.{field}"),
+            raw,
+        )
+
+    manifest, _manifest_raw = bound["source_pool_manifest"]
+    if set(manifest) != {
+        "schema",
+        "algorithm",
+        "sequence_lengths",
+        "ci_export",
+        "primary_ci",
+        "objective_seed",
+        "producer",
+    } or (
+        manifest.get("schema") != OBJECTIVE_SOURCE_POOL_MANIFEST_SCHEMA
+        or manifest.get("algorithm") != OBJECTIVE_SOURCE_POOL_SCHEDULE
+        or manifest.get("sequence_lengths") != list(OBJECTIVE_SOURCE_BUCKETS)
+    ):
+        raise ValueError("source pool manifest contract is invalid")
+    producer = _mapping(
+        manifest.get("producer"), where="source pool manifest producer"
+    )
+    if set(producer) != {
+        "repository",
+        "git_commit",
+        "script",
+        "script_sha256",
+    } or (
+        producer.get("repository") != "cppmega"
+        or producer.get("script")
+        != "scripts/data/prepare_ci_objective_source_manifest.py"
+        or not isinstance(producer.get("git_commit"), str)
+        or len(producer["git_commit"]) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in producer["git_commit"]
+        )
+    ):
+        raise ValueError("source pool manifest producer binding is invalid")
+    _sha256_digest(
+        producer.get("script_sha256"),
+        where="source pool manifest producer.script_sha256",
+    )
+
+    primary = _mapping(
+        manifest.get("primary_ci"), where="source pool manifest primary_ci"
+    )
+    files_by_length = _mapping(
+        primary.get("files_by_sequence_length"),
+        where="source pool manifest primary_ci.files_by_sequence_length",
+    )
+    if (
+        set(primary) != {"files_by_sequence_length"}
+        or set(files_by_length)
+        != {str(bucket) for bucket in OBJECTIVE_SOURCE_BUCKETS}
+    ):
+        raise ValueError("source pool manifest primary inventory is invalid")
+    manifest_primary = {
+        bucket: _source_file_records(
+            files_by_length[str(bucket)],
+            where=(
+                "source pool manifest primary_ci.files_by_sequence_length."
+                f"{bucket}"
+            ),
+        )
+        for bucket in OBJECTIVE_SOURCE_BUCKETS
+    }
+    seed = _mapping(
+        manifest.get("objective_seed"),
+        where="source pool manifest objective_seed",
+    )
+    if set(seed) != {"files"}:
+        raise ValueError("source pool manifest objective seed is invalid")
+    manifest_seed = _source_file_records(
+        seed.get("files"), where="source pool manifest objective_seed.files"
+    )
+    pools = _mapping(snapshot.get("pools"), where="source_snapshot.pools")
+    sequence_length = int(snapshot["sequence_length"])
+    snapshot_primary = _source_file_records(
+        _mapping(
+            pools.get("primary_ci"), where="source_snapshot.pools.primary_ci"
+        ).get("files"),
+        where="source_snapshot.pools.primary_ci.files",
+    )
+    snapshot_seed = _source_file_records(
+        _mapping(
+            pools.get("objective_seed"),
+            where="source_snapshot.pools.objective_seed",
+        ).get("files"),
+        where="source_snapshot.pools.objective_seed.files",
+    )
+    if (
+        manifest_primary.get(sequence_length) != snapshot_primary
+        or manifest_seed != snapshot_seed
+    ):
+        raise ValueError("source pool manifest differs from source_snapshot pools")
+
+    ci_export = _mapping(
+        manifest.get("ci_export"), where="source pool manifest ci_export"
+    )
+    if set(ci_export) != {
+        "path",
+        "sha256",
+        "schema",
+        "status",
+        "source_completion",
+    } or (
+        ci_export.get("path") != "export_receipt.json"
+        or ci_export.get("schema") not in OBJECTIVE_CI_EXPORT_SCHEMAS
+        or ci_export.get("status") != "complete"
+        or ci_export.get("sha256")
+        != snapshot["ci_export_receipt"]["sha256"]
+    ):
+        raise ValueError("source pool manifest CI export binding is invalid")
+    receipt, receipt_raw = bound["ci_export_receipt"]
+    if (
+        hashlib.sha256(receipt_raw).hexdigest() != ci_export.get("sha256")
+        or receipt.get("schema") != ci_export.get("schema")
+        or receipt.get("status") != "complete"
+    ):
+        raise ValueError("source pool manifest differs from its CI export receipt")
+    completion = _mapping(
+        ci_export.get("source_completion"),
+        where="source pool manifest ci_export.source_completion",
+    )
+    if (
+        completion.get("schema") != receipt.get("schema")
+        or completion.get("status") != "complete"
+    ):
+        raise ValueError("source pool manifest CI completion binding is invalid")
+    if receipt["schema"].endswith("_v4"):
+        if (
+            receipt.get("completion_mode") != "inventory-exhaustive"
+            or receipt.get("production_complete") is not True
+            or completion.get("completion_mode") != "inventory-exhaustive"
+            or completion.get("production_complete") is not True
+        ):
+            raise ValueError("production CI source pool is not inventory-exhaustive")
+    elif (
+        receipt.get("production_complete") is True
+        or receipt.get("completion_mode") == "inventory-exhaustive"
+        or completion.get("production_complete") is True
+        or completion.get("completion_mode") == "inventory-exhaustive"
+    ):
+        raise ValueError("threshold CI source pool claims exhaustive completion")
 
 
 def _stat_signature(value: os.stat_result) -> ObjectiveShardStat:
@@ -1007,6 +1530,7 @@ def load_objective_materialization_artifact(
     )
     if contract_ref.get("sha256") != contract.sha256:
         raise ValueError("objective_contract.sha256 does not match contract payload")
+    _verify_two_pool_source_bindings(contract.payload, root=root)
     documents = _positive_int(artifact.get("documents"), where="documents")
     if documents != contract.payload["totals"]["samples"]:
         raise ValueError("artifact documents does not match objective contract totals")

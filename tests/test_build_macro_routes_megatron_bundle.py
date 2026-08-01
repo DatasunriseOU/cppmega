@@ -30,6 +30,7 @@ from scripts.ci_source_binding_projection import (
     REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
 )
 import scripts.data.build_macro_routes_megatron_bundle as builder
+import scripts.data.prepare_ci_objective_source_manifest as objective_manifest
 from scripts.canonical_parquet_ledger import CanonicalParquetLedgerWriter
 from scripts.data.build_macro_routes_megatron_bundle import (
     BUNDLE_KNOWN_LIMITATIONS,
@@ -514,6 +515,45 @@ def _write_content_store_ci_export(
     manifest_path = root / "export_receipt.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return manifest_path
+
+
+def test_ci_objective_source_manifest_reuses_receipt_allowlist_and_freezes_seed(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    receipt_path = _write_content_store_ci_export(ci_root)
+    seed_root = tmp_path / "seed"
+    code = seed_root / "code" / "1024" / "code.parquet"
+    commit = seed_root / "commits" / "1024" / "commit.parquet"
+    for path in (code, commit):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"value": [1]}), path, compression="zstd")
+
+    manifest = objective_manifest.build_source_pool_manifest(
+        ci_root=ci_root,
+        ci_receipt_path=receipt_path,
+        objective_seed_root=seed_root,
+        seed_globs=("code/1024/*.parquet", "commits/1024/*.parquet"),
+        buckets=builder.DEFAULT_BUCKETS,
+        producer={"script": "fixture"},
+    )
+
+    assert manifest["schema"] == objective_manifest.MANIFEST_SCHEMA
+    assert manifest["algorithm"] == objective_manifest.SCHEDULE
+    assert manifest["sequence_lengths"] == list(builder.DEFAULT_BUCKETS)
+    assert [
+        record["path"] for record in manifest["objective_seed"]["files"]
+    ] == ["code/1024/code.parquet", "commits/1024/commit.parquet"]
+    assert [
+        record["path"]
+        for record in manifest["primary_ci"]["files_by_sequence_length"]["1024"]
+    ] == [
+        "1024/ci-case5-train-1024-000000.parquet",
+        "1024/ci-case5-validation-1024-000001.parquet",
+    ]
+    completion = manifest["ci_export"]["source_completion"]
+    assert completion["status"] == "complete"
+    assert "production_complete" not in completion
 
 
 def _write_pr_export(

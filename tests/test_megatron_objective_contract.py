@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import cppmega.megatron.objective_contract as objective_contract
 from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     STAGE1_GRAPH_TOPK,
@@ -280,6 +281,157 @@ def _write_materialization_artifact(
     return artifact_path
 
 
+def _source_record(path: str, *, rows: int = 3) -> dict[str, object]:
+    return {
+        "path": path,
+        "rows": rows,
+        "size_bytes": 123,
+        "sha256": hashlib.sha256(path.encode("ascii")).hexdigest(),
+    }
+
+
+def _source_artifact_digest(records: list[dict[str, object]]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [
+                {
+                    "path": record["path"],
+                    "size": record["size_bytes"],
+                    "sha256": record["sha256"],
+                }
+                for record in records
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _source_pool_snapshot(record: dict[str, object]) -> dict[str, object]:
+    records = [record]
+    return {
+        "schema": "cppmega_objective_source_snapshot_v1",
+        "sequence_length": 1024,
+        "file_count": 1,
+        "row_count": 3,
+        "files": records,
+        "sampling": {
+            "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
+            "seed": 17,
+            "requested_samples": 3,
+            "full_passes": 1,
+            "tail_rows": 0,
+            "min_row_reuse": 1,
+            "max_row_reuse": 1,
+            "record_batch_rows": 64,
+            "producer": {
+                "name": "pyarrow.parquet.ParquetFile.iter_batches",
+                "version": 1,
+                "row_group_rows": [[3]],
+            },
+            "ordering": {
+                "permutation": "sha256_sort_key_v1",
+                "epochs": "ascending",
+                "shards": "seeded_permutation_per_epoch",
+                "row_groups": "seeded_permutation_per_shard_epoch",
+                "record_batches": "physical_order_within_row_group",
+                "rows": "seeded_permutation_within_record_batch",
+            },
+            "cursor_semantics": "last_yielded_row_v1",
+            "final_cursor": {
+                "epoch": 0,
+                "shard_position": 0,
+                "shard_index": 0,
+                "row_group_position": 0,
+                "row_group_index": 0,
+                "record_batch_index": 0,
+                "row_shuffle_position": 2,
+                "row_index_in_record_batch": 2,
+                "source_index": 2,
+            },
+        },
+        "artifact_set_sha256": _source_artifact_digest(records),
+    }
+
+
+def _attach_two_pool_source_snapshot(
+    tmp_path: Path,
+    contract: dict[str, object],
+) -> None:
+    primary = _source_record("1024/ci.parquet")
+    seed = _source_record("commits/1024/seed.parquet")
+    receipt = {
+        "schema": "cppmega_ci_content_store_case5_export_v2",
+        "status": "complete",
+    }
+    receipt_raw = json.dumps(receipt, sort_keys=True).encode("utf-8")
+    (tmp_path / "ci_export_receipt.json").write_bytes(receipt_raw)
+    primary_by_length = {
+        str(bucket): [
+            primary
+            if bucket == 1024
+            else _source_record(f"{bucket}/ci.parquet")
+        ]
+        for bucket in (1024, 2048, 4096, 8192, 16384)
+    }
+    manifest = {
+        "schema": "cppmega_ci_objective_pool_manifest_v1",
+        "algorithm": "alternate_primary_seed_v1",
+        "sequence_lengths": [1024, 2048, 4096, 8192, 16384],
+        "ci_export": {
+            "path": "export_receipt.json",
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+            "schema": receipt["schema"],
+            "status": "complete",
+            "source_completion": {
+                "schema": receipt["schema"],
+                "status": "complete",
+            },
+        },
+        "primary_ci": {"files_by_sequence_length": primary_by_length},
+        "objective_seed": {"files": [seed]},
+        "producer": {
+            "repository": "cppmega",
+            "git_commit": "a" * 40,
+            "script": "scripts/data/prepare_ci_objective_source_manifest.py",
+            "script_sha256": "b" * 64,
+        },
+    }
+    manifest_raw = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    (tmp_path / "objective_source_pool_manifest.json").write_bytes(manifest_raw)
+    contract["source_snapshot"] = {
+        "schema": "cppmega_objective_source_snapshot_v2",
+        "sequence_length": 1024,
+        "algorithm": "alternate_primary_seed_v1",
+        "pool_order": ["primary_ci", "objective_seed"],
+        "source_pool_manifest": {
+            "path": "objective_source_pool_manifest.json",
+            "size_bytes": len(manifest_raw),
+            "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        },
+        "ci_export_receipt": {
+            "path": "ci_export_receipt.json",
+            "size_bytes": len(receipt_raw),
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+        },
+        "pools": {
+            "primary_ci": _source_pool_snapshot(primary),
+            "objective_seed": _source_pool_snapshot(seed),
+        },
+    }
+    resume = contract["source_selection"]["resume"]  # type: ignore[index]
+    resume["last_yielded_cursor"].update(  # type: ignore[index]
+        {
+            "pool_index": 1,
+            "pool_source_index": 2,
+            "primary_rows_yielded": 3,
+            "objective_seed_rows_yielded": 3,
+            "next_pool_index": 0,
+        }
+    )
+
+
 def test_valid_contract_has_stable_digest_and_distinct_objective_ids() -> None:
     contract = _valid_contract()
 
@@ -447,6 +599,51 @@ def test_objective_materialization_artifact_opens_exact_bound_inputs(
         (tmp_path / "objectives_00000.parquet").resolve(),
     )
     assert artifact.contract.sha256 == artifact.payload["objective_contract"]["sha256"]
+
+
+def test_objective_artifact_opens_bound_two_pool_source_snapshot(
+    tmp_path: Path,
+) -> None:
+    contract = _valid_contract()
+    _attach_two_pool_source_snapshot(tmp_path, contract)
+
+    artifact = load_objective_materialization_artifact(
+        _write_materialization_artifact(tmp_path, contract=contract)
+    )
+
+    assert artifact.contract.payload["source_snapshot"]["schema"] == (
+        "cppmega_objective_source_snapshot_v2"
+    )
+
+
+def test_objective_artifact_rejects_two_pool_manifest_byte_drift(
+    tmp_path: Path,
+) -> None:
+    contract = _valid_contract()
+    _attach_two_pool_source_snapshot(tmp_path, contract)
+    artifact_path = _write_materialization_artifact(tmp_path, contract=contract)
+    (tmp_path / "objective_source_pool_manifest.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source_pool_manifest byte binding drifted"):
+        load_objective_materialization_artifact(artifact_path)
+
+
+def test_two_pool_source_snapshot_rejects_seed_only_schedule_window(
+    tmp_path: Path,
+) -> None:
+    contract = _valid_contract()
+    _attach_two_pool_source_snapshot(tmp_path, contract)
+    contract["source_selection"]["windows"][0]["selected_source_indices"] = [  # type: ignore[index]
+        1,
+        3,
+        5,
+    ]
+
+    with pytest.raises(ValueError, match="must use both source pools"):
+        objective_contract._validate_two_pool_source_snapshot(contract)
 
 
 def test_objective_materialization_artifact_rejects_missing_schedule(
