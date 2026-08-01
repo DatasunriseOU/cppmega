@@ -53,6 +53,14 @@ _PATCHED_MARKERS = {
     "bf_default": "bf_num_stages=1",
     "bb_default": "bb_num_stages=0",
     "direct_qk": "qk_dot_shared[cs, r_out * R + r_in]",
+    "bf_q_direct_fragment": (
+        "T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
+        "i_h_qk, :], q_frag, disable_tma=True)"
+    ),
+    "bf_k_direct_fragment": (
+        "T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
+        "i_h_qk, :], k_frag, disable_tma=True)"
+    ),
     "bwd_tma_disabled": "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True",
     "bwd_ws_disabled": "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True",
 }
@@ -98,7 +106,9 @@ def _is_patched(text: str) -> bool:
 
 
 def _has_partial_stage2_markers(text: str) -> bool:
-    structural_count = sum(marker in text for marker in _STRUCTURAL_PATCHED_MARKERS.values())
+    structural_count = sum(
+        marker in text for marker in _STRUCTURAL_PATCHED_MARKERS.values()
+    )
     if structural_count == 0:
         return False
     full_count = sum(marker in text for marker in _PATCHED_MARKERS.values())
@@ -109,15 +119,40 @@ def _validate_patched(path: Path) -> None:
     text = path.read_text()
     missing = [name for name, marker in _PATCHED_MARKERS.items() if marker not in text]
     if missing:
-        raise RuntimeError(f"{path}: patched validation failed, missing markers {missing}")
+        raise RuntimeError(
+            f"{path}: patched validation failed, missing markers {missing}"
+        )
+    bwd_fwd_start = text.find("def mamba_mimo_bwd_fwd(")
+    bwd_bwd_start = text.find("def mamba_mimo_bwd_bwd(", bwd_fwd_start + 1)
+    if bwd_fwd_start < 0 or bwd_bwd_start < 0:
+        raise RuntimeError(f"{path}: could not isolate the bwd_fwd kernel source")
+    bwd_fwd = text[bwd_fwd_start:bwd_bwd_start]
+    unsafe_shared_loads = (
+        (
+            "q_shared",
+            "T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
+            "i_h_qk, :], q_shared)",
+        ),
+        (
+            "k_shared",
+            "T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
+            "i_h_qk, :], k_shared)",
+        ),
+    )
+    overlapping = [
+        buffer_name for buffer_name, marker in unsafe_shared_loads if marker in bwd_fwd
+    ]
+    if overlapping:
+        raise RuntimeError(
+            f"{path}: bwd_fwd has overlapping raw and biased shared writes for "
+            f"{overlapping}; raw Q/K must load directly into fragments"
+        )
     if "bb_num_stages=1" in text:
         raise RuntimeError(
             f"{path}: rollback guard tripped - found bb_num_stages=1. "
             "The production candidate must stay bf=1,bb=0."
         )
-    tma_disabled_count = text.count(
-        "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True"
-    )
+    tma_disabled_count = text.count("tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True")
     ws_disabled_count = text.count(
         "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True"
     )
@@ -269,7 +304,10 @@ def _run_once_with_local_rank_guard(fn, is_done=None) -> None:
     try:
         import torch.distributed as dist
     except Exception:
-        log.debug("torch.distributed unavailable; falling back to file-lock guard", exc_info=True)
+        log.debug(
+            "torch.distributed unavailable; falling back to file-lock guard",
+            exc_info=True,
+        )
         dist = None  # type: ignore[assignment]
 
     if dist is not None and dist.is_available() and dist.is_initialized():
@@ -316,9 +354,7 @@ def _run_once_with_local_rank_guard(fn, is_done=None) -> None:
             with open(lock_path) as lock_fh:
                 fcntl.flock(lock_fh.fileno(), fcntl.LOCK_SH)
                 try:
-                    if sentinel in lock_fh.read() and (
-                        is_done is None or is_done()
-                    ):
+                    if sentinel in lock_fh.read() and (is_done is None or is_done()):
                         return
                 finally:
                     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
