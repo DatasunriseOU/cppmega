@@ -98,19 +98,41 @@ def test_empty_index_log_rejects_lossy_build_receipt() -> None:
     assert sr._classify_empty_index_project_log(log) == "domain_source_loss"
 
 
-def test_tar_member_path_collision_fails_instead_of_dropping_source(
+def test_tar_member_path_collision_preserves_directory_and_file(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "occupied"
     target.mkdir()
+    child = target / "child.cc"
+    child.write_text("int child;\n", encoding="utf-8")
 
-    with pytest.raises(sr.RepoFailure, match="refusing to drop source content"):
+    assert sr._copy_tar_member_file(
+        io.BytesIO(b"preserve me"),
+        target,
+        repo="owner/repo",
+        member_name="cpp_all/owner/repo/occupied",
+    )
+    assert child.read_text(encoding="utf-8") == "int child;\n"
+    preserved = target / sr.TAR_COLLIDING_FILE_BASENAME
+    assert preserved.read_bytes() == b"preserve me"
+    with pytest.raises(sr.RepoFailure, match="refusing to overwrite source content"):
         sr._copy_tar_member_file(
-            io.BytesIO(b"preserve me"),
+            io.BytesIO(b"replace me"),
             target,
             repo="owner/repo",
             member_name="cpp_all/owner/repo/occupied",
         )
+    with pytest.raises(sr.RepoFailure, match="reserved tar path"):
+        sr._copy_tar_member_file(
+            io.BytesIO(b"replace me"),
+            preserved,
+            repo="owner/repo",
+            member_name=(
+                "cpp_all/owner/repo/occupied/"
+                f"{sr.TAR_COLLIDING_FILE_BASENAME}"
+            ),
+        )
+    assert preserved.read_bytes() == b"preserve me"
 
 
 def _aligned_overlong_doc() -> dict:

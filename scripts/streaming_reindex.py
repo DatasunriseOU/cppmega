@@ -679,6 +679,7 @@ def _is_excluded(within: str) -> bool:
 
 
 SOURCE_CACHE_SENTINEL = ".cppmega_source_cache_complete.json"
+TAR_COLLIDING_FILE_BASENAME = "__cppmega_tar_file__"
 
 
 def _source_cache_repo_dir(source_cache_dir: Path, repo: str) -> Path:
@@ -742,11 +743,30 @@ def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
 def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> bool:
     """Copy one tar member without silently dropping path-type collisions."""
     if target.exists() and target.is_dir():
+        collision_target = target / (
+            TAR_COLLIDING_FILE_BASENAME + target.suffix
+        )
+        if os.path.lexists(collision_target):
+            raise RepoFailure(
+                repo,
+                "stream",
+                f"tar member {member_name!r} collides with an existing directory "
+                f"at {target} and reserved file {collision_target} already exists; "
+                "refusing to overwrite source content",
+            )
+        print(
+            f"[{repo}] preserving file/directory tar collision "
+            f"{member_name!r} as {collision_target}",
+            file=sys.stderr,
+        )
+        target = collision_target
+    reserved_name = TAR_COLLIDING_FILE_BASENAME + target.parent.suffix
+    if target.name == reserved_name and os.path.lexists(target):
         raise RepoFailure(
             repo,
             "stream",
-            f"tar member {member_name!r} collides with an existing directory "
-            f"at {target}; refusing to drop source content",
+            f"tar member {member_name!r} collides with reserved tar path "
+            f"{target}; refusing to overwrite source content",
         )
     if target.parent.exists() and not target.parent.is_dir():
         raise RepoFailure(
