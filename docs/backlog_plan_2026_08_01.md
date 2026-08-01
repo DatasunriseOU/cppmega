@@ -699,11 +699,19 @@ P3 — стратегическое/отложенное.
   `cppmega.mlx@62a3e269` до любой записи fail-closed проверяет отсутствующие и
   aliased physical blocks во всём live prefix.
 - **Что осталось:** Sparse-MLA fp8 Path B/C в paged-пути (не роутятся),
-  нативный paged-attention/scatter kernel и memory/throughput receipts. До них
-  это совместимый prefill+decode path, а не завершённый production paged attention.
+  нативный paged-attention kernel и in-place scatter ABI (убрать pool copy).
+  До них это совместимый prefill+decode path, а не завершённый production
+  paged attention.
   Dense-fallback для `mode='dsa'` разрешён в `cppmega.mlx@7a0378a5` (parity с
   contiguous prefill и decode покрыт тестами); `cppmega.mlx@eab00e33`
   fail-closed запрещает этот fallback при явно выбранном Sparse-MLA Path B/C.
+  Первый native TileLang kernel для decode-scatter приземлён в
+  `cppmega.mlx@e2e0d1fe`: opt-in `backend='tilelang'` в
+  `scatter_paged_kv_offsets` (pool copy + dst scatter через tvm_ffi,
+  caller-owned outputs), bit-exact parity с host loop, fail-closed на
+  dtype/backend; receipt
+  `outputs/reports/paged_kv_offsets_scatter_bench_2026_08_01.json`
+  (1.25–1.31x best, ~2x mean против host loop).
 - **Проверка:**
   - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_inference_serving.py tests/test_attention.py -q` — 64 passed.
   - `pytest tests/test_hybrid_lm.py tests/test_dense_cpp_lm.py tests/test_dense_cpp_lm_grad_checkpoint.py -q` — 76 passed (регрессия).
