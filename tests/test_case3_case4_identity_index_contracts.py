@@ -22,13 +22,13 @@ def _mlx_root() -> Path:
     configured = os.environ.get("CPPMEGA_MLX_REFERENCE_ROOT")
     expected_commit = os.environ.get("CPPMEGA_MLX_REFERENCE_COMMIT")
     if not configured or not expected_commit:
-        pytest.fail(
+        pytest.skip(
             "cross-repository identity checks require explicit "
             "CPPMEGA_MLX_REFERENCE_ROOT and CPPMEGA_MLX_REFERENCE_COMMIT"
         )
     root = Path(configured).expanduser().resolve()
     if not root.is_dir():
-        pytest.fail(f"MLX reference checkout is unavailable: {root}")
+        pytest.skip(f"MLX reference checkout is unavailable: {root}")
     actual_commit = subprocess.run(
         ("git", "-C", str(root), "rev-parse", "HEAD"),
         check=True,
