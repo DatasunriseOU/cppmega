@@ -130,6 +130,36 @@ def test_python_edges_with_universal_newlines_anchor_to_tokens(
     assert len(tokenized["token_domain_edges"]) == len(enriched["domain_edges"])
 
 
+@pytest.mark.parametrize("gap", ("\v", "\f"))
+def test_domain_edges_anchor_to_next_token_across_tokenizer_gap(
+    tokenizer,
+    gap: str,
+) -> None:
+    source = f"left{gap}right"
+    tokenized = materialize_tokenized_enriched_batch(
+        [
+            {
+                "text": source,
+                "repo": "owner/repo",
+                "filepath": "src/control-gap.cc",
+                "domain_edges": [
+                    {
+                        "from_char": 0,
+                        "to_char": source.index(gap),
+                        "kind": int(DomainEdgeKind.AST_PARENT),
+                    }
+                ],
+            }
+        ],
+        tokenizer,
+        num_threads=1,
+    )[0]
+
+    assert tokenized["token_domain_edges"] == [
+        {"from": 1, "to": 2, "kind": int(DomainEdgeKind.AST_PARENT)}
+    ]
+
+
 def test_multiline_embedded_sql_span_uses_first_and_last_overlapping_tokens(
     tokenizer,
 ) -> None:
