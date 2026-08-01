@@ -760,21 +760,24 @@ P3 — стратегическое/отложенное.
 - **Проверка:** два receipt с совпадающей конфигурацией; числовой diff
   зафиксирован (входит в P095).
 
-## [P059] Wave-Next 4: checkpoint sharding для больших моделей — WIP ISOLATED
+## [P059] Wave-Next 4: checkpoint sharding для больших моделей — DONE
 - Репо: mlx | Приоритет: P3 | Тип: feature | Зависит от: —
 - **Где:** `cppmega_mlx/training/checkpoint.py`, `tests/test_checkpoint.py`.
-- **Что сделано:** точный прототип сохранён и pushed в
-  `wip/checkpoint-sharding-20260801@647b8036`; из `main` удалён обратимым
-  `cppmega.mlx@64d47925`.
-- **Почему не DONE:** переключение sharded↔single не транзакционно, shard index
-  принимает небезопасные относительные пути, а очистка может удалить index
-  раньше stale-shard’ов. Нужны fail-closed проверки и проверка отказа записи,
-  прежде чем менять production checkpoint format.
+- **Что сделано:** прототип из `wip/checkpoint-sharding-20260801@647b8036`
+  повторно применён на main в `cppmega.mlx@acd857f2` и закрыты все три
+  trust-boundary/data-loss сценария из аудита:
+  - переключение sharded↔single теперь транзакционно: stale-layout файлы
+    удаляются только после записи нового metadata.json, а shard index
+    публикуется атомарно через tmp + `os.replace`; краш в любой точке
+    оставляет прежний layout загружаемым;
+  - `_load_shard_index` fail-closed: каждый `weight_map` value обязан
+    соответствовать схеме `model-NNNNN-of-NNNNN.safetensors`; абсолютные
+    пути, `..`, подкаталоги и чужие имена отклоняются до обращения к файлам;
+  - `_remove_stale_sharded_weights` удаляет shard-файлы первыми, index —
+    строго последним, и только при наличии index (чужие каталоги не трогаем).
 - **Проверка:**
-  - Прототип: `pytest tests/test_checkpoint.py -q` → 90 passed, но перечисленные
-    trust-boundary/data-loss сценарии тестами не закрыты.
-  - Canonical `main`: tree после revert совпадает с проверенным
-    `cppmega.mlx@cdbdacd4`.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_checkpoint.py -q` → 100 passed (3 roundtrip-теста прототипа + 6 новых на cleanup ordering, unsafe index paths и крах до metadata-write в обе стороны).
+  - `pytest tests/test_checkpoint.py tests/test_package_exports.py tests/test_tiny_train.py -q` → 116 passed.
 
 ## [P060] Полный mlx suite baseline (~7900 тестов) — DONE
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: P052
