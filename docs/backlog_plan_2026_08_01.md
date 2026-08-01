@@ -1035,7 +1035,17 @@ P3 — стратегическое/отложенное.
 
 # Фаза H. Стратегические решения (P097–P100)
 
-## [P097] V9 go/no-go
+## [P097] V9 go/no-go — DONE
+- Репо: mlx | Приоритет: P1 | Тип: task | Зависит от: —
+- **Где:** `VisualBuilderPlan-v9.md:4-6`, `:253-277`.
+- **Что сделано:** решение зафиксировано 2026-08-01: V9 = U01 (Draft tabs strip)
+  + U02 (Floating canvas toolbar); U03–U10 deferred to V10. Обоснование —
+  August release blockers потребляют весь P1/P2 capacity, а U01/U02 закрывают
+  gallery→train round trip и визуальную поверхность.
+- **Проверка:**
+  - `grep -n "V9 scope decision" cppmega.mlx/VisualBuilderPlan-v9.md` → строка 253.
+  - `grep -n "U01\|U02" cppmega.mlx/VisualBuilderPlan-v9.md | head -10` — U01/U02 в
+    scope, U03–U10 в deferral-таблице.
 - Репо: mlx | Приоритет: P1 | Тип: task | Зависит от: —
 - **Где:** `VisualBuilderPlan-v9.md` (статус «planned 2026-05-24», 2+ месяца без
   движения), `vbgui/STYLE.md:161-165`; существующие эпики `cppmega-mlx-zozw` (V9),
