@@ -1867,11 +1867,13 @@ def discover_project_domain_files(
     extra_exclude_dirs: set[str] | None = None,
     include_cpp: bool = True,
     invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
+    excluded_paths: set[str] | None = None,
 ) -> list[DiscoveredDomainFile]:
     """Discover typed text inputs without opening unrelated binary assets."""
 
     root_path = Path(root)
     skip_dirs = {".git"} | (extra_exclude_dirs or set())
+    excluded = {os.path.abspath(path) for path in (excluded_paths or set())}
     discovered: list[DiscoveredDomainFile] = []
 
     def candidate_paths() -> Iterator[Path]:
@@ -1881,6 +1883,8 @@ def discover_project_domain_files(
                 yield Path(directory) / name
 
     for path in candidate_paths():
+        if os.path.abspath(path) in excluded:
+            continue
         explicit_candidate = _is_explicit_domain_path(path, include_cpp=include_cpp)
         signature_candidate = _allows_domain_content_signatures(path)
         if not explicit_candidate and not signature_candidate:

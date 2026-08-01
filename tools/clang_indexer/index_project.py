@@ -3356,15 +3356,19 @@ def find_shell_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
     invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
+    excluded_paths: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Find shell sources, including extensionless files with a shell shebang."""
 
     skip_dirs = {'.git'} | (extra_exclude_dirs or set())
+    excluded = {os.path.abspath(path) for path in (excluded_paths or set())}
     files: list[tuple[str, str]] = []
     for root, dirs, filenames in os.walk(project_dir):
         dirs[:] = [directory for directory in dirs if directory not in skip_dirs]
         for fname in filenames:
             filepath = os.path.join(root, fname)
+            if os.path.abspath(filepath) in excluded:
+                continue
             try:
                 shell_kind = _classify_shell_file(filepath, fname)
             except ValueError as exc:
@@ -10375,6 +10379,7 @@ def process_project(
         else None
     )
     quarantine_receipt: dict[str, object] | None = None
+    quarantined_paths: set[str] = set()
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
 
@@ -10389,10 +10394,28 @@ def process_project(
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     if source_quarantine is not None:
-        cpp_files, quarantine_receipt = source_quarantine.filter_candidates(
+        quarantine_candidates = list(cpp_files)
+        candidate_identities = {
+            os.path.abspath(candidate) for candidate in quarantine_candidates
+        }
+        for relative_path in source_quarantine.entries_by_path:
+            candidate = os.path.abspath(os.path.join(project_dir, relative_path))
+            if candidate not in candidate_identities:
+                quarantine_candidates.append(candidate)
+                candidate_identities.add(candidate)
+        _kept_candidates, quarantine_receipt = source_quarantine.filter_candidates(
             project_dir,
-            cpp_files,
+            quarantine_candidates,
         )
+        quarantined_paths = {
+            os.path.abspath(os.path.join(project_dir, relative_path))
+            for relative_path in source_quarantine.entries_by_path
+        }
+        cpp_files = [
+            candidate
+            for candidate in cpp_files
+            if os.path.abspath(candidate) not in quarantined_paths
+        ]
         assert source_quarantine_receipt is not None
         _write_source_quarantine_receipt(
             source_quarantine_receipt,
@@ -10415,6 +10438,7 @@ def process_project(
         project_dir,
         extra_exclude_dirs=extra_exclude_dirs,
         invalid_input_handler=invalid_handler,
+        excluded_paths=quarantined_paths,
     )
     print(f"  Found {len(shell_files)} project shell files", file=sys.stderr)
     from cppmega.data.domain_ingestion import discover_project_domain_files
@@ -10424,6 +10448,7 @@ def process_project(
         extra_exclude_dirs=extra_exclude_dirs,
         include_cpp=False,
         invalid_input_handler=invalid_handler,
+        excluded_paths=quarantined_paths,
     )
     domain_files_by_path = {
         os.path.abspath(filepath): (os.path.abspath(filepath), build_kind)

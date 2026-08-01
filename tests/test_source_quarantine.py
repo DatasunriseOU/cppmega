@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
+import zipfile
 
 import pytest
 
@@ -23,6 +25,7 @@ RELATIVE_PARSER_CRASH_FIXTURE = (
 )
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
+RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
 
 
 def _xml_bytes() -> bytes:
@@ -113,6 +116,18 @@ def _mixed_utf8_utf16le_c_array_bytes(*, byte_count: int = 1024) -> bytes:
         f"/* 0x00000000 */ {byte_literals}}};\n"
     ).encode("utf-16le")
     return prefix + generated
+
+
+def _self_executing_zip_bytes() -> bytes:
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, mode="w") as archive:
+        archive.writestr("payload.txt", "exact fixture payload\n")
+    return (
+        b"#!/bin/sh\n"
+        b'exec java -jar "$0" "$@"\n'
+        b"exit 1\n"
+        + archive_buffer.getvalue()
+    )
 
 
 def _write_manifest(
@@ -338,6 +353,55 @@ def test_exact_quarantine_filters_mixed_utf16_generated_binary_blob(
     assert receipt["entries"][0]["classification"] == "generated_binary_blob"
 
 
+def test_exact_quarantine_filters_self_executing_zip(
+    tmp_path: Path,
+) -> None:
+    payload = _self_executing_zip_bytes()
+    candidate = tmp_path / RELATIVE_EXECUTABLE_ARCHIVE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="generated_executable_archive",
+        detected_format="posix_shell_appended_zip",
+        relative_path=RELATIVE_EXECUTABLE_ARCHIVE,
+        reason="self-executing archive fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["detected_format"] == (
+        "posix_shell_appended_zip"
+    )
+
+
+def test_executable_archive_quarantine_rejects_invalid_zip(
+    tmp_path: Path,
+) -> None:
+    payload = b'#!/bin/sh\nexec java -jar "$0" "$@"\nPK\x03\x04not-a-zip\n'
+    candidate = tmp_path / RELATIVE_EXECUTABLE_ARCHIVE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="generated_executable_archive",
+        detected_format="posix_shell_appended_zip",
+        relative_path=RELATIVE_EXECUTABLE_ARCHIVE,
+        reason="forged self-executing archive",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="appended ZIP is invalid"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_generated_binary_blob_quarantine_rejects_small_c_array(
     tmp_path: Path,
 ) -> None:
@@ -476,6 +540,46 @@ def test_checked_in_threadx_generated_blob_manifest_matches_upstream_receipt() -
     assert entry["detected_format"] == "mixed_utf8_utf16le_c_array"
 
 
+@pytest.mark.parametrize(
+    ("project_id", "relative_path", "size_bytes", "sha256"),
+    [
+        (
+            "python/cpython",
+            "Lib/test/archivetestdata/exe_with_z64",
+            978,
+            "b1a8382acacce4022b02daa25b293ddfc1dc6ce6a3ddb8b3d95b517592c5a428",
+        ),
+        (
+            "questdb/questdb",
+            "core/src/main/bin/linux-x86-64/jfrconv",
+            125326,
+            "1806e97395e39bd37386eb3ef4ad0a2e83fe9a70b6a05e6779d542684342def4",
+        ),
+    ],
+)
+def test_checked_in_executable_archive_manifest_matches_archive_receipt(
+    project_id: str,
+    relative_path: str,
+    size_bytes: int,
+    sha256: str,
+) -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item for item in manifest["entries"] if item["project_id"] == project_id
+    )
+
+    assert entry["relative_path"] == relative_path
+    assert entry["size_bytes"] == size_bytes
+    assert entry["sha256"] == sha256
+    assert entry["classification"] == "generated_executable_archive"
+    assert entry["detected_format"] == "posix_shell_appended_zip"
+
+
 def test_clang_crash_quarantine_requires_independent_fixture_signature(
     tmp_path: Path,
 ) -> None:
@@ -556,3 +660,35 @@ def test_process_project_writes_atomic_bound_receipt(
     assert omission_receipt["unique_reference_count"] == 0
     assert omission_receipt["location_count"] == 0
     assert omission_receipt["locations"] == []
+
+
+def test_process_project_quarantines_non_cpp_executable_archive(
+    tmp_path: Path,
+) -> None:
+    payload = _self_executing_zip_bytes()
+    candidate = tmp_path / RELATIVE_EXECUTABLE_ARCHIVE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    receipt_path = tmp_path / "receipts/source.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="generated_executable_archive",
+        detected_format="posix_shell_appended_zip",
+        relative_path=RELATIVE_EXECUTABLE_ARCHIVE,
+        reason="self-executing archive fixture",
+    )
+
+    documents = ip.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id=PROJECT_ID,
+        source_quarantine_manifest=str(manifest),
+        source_quarantine_receipt=str(receipt_path),
+    )
+
+    assert documents == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["relative_path"] == RELATIVE_EXECUTABLE_ARCHIVE

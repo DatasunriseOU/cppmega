@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 from typing import Iterable
+import zipfile
 
 
 MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v1"
@@ -41,6 +42,7 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "clang_debug_parser_crash_pragma",
     ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
+    ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
 }
@@ -314,6 +316,53 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
                 "but the generated binary-array contract is incomplete"
+            )
+        return
+
+    if entry.detected_format == "posix_shell_appended_zip":
+        payload = path.read_bytes()
+        archive_start = payload.find(b"PK\x03\x04")
+        if archive_start <= 0:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                "but an appended ZIP local header is absent"
+            )
+        try:
+            shell_prefix = payload[:archive_start].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                f"but the shell prefix is not UTF-8: {exc}"
+            ) from exc
+        first_line = shell_prefix.splitlines()[0] if shell_prefix else ""
+        if (
+            first_line not in {"#!/bin/sh", "#!/bin/bash"}
+            or '"$0"' not in shell_prefix
+            or "\x00" in shell_prefix
+            or not shell_prefix.endswith("\n")
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                "but the self-executing shell contract is incomplete"
+            )
+        try:
+            with zipfile.ZipFile(path) as archive:
+                members = archive.infolist()
+                first_bad_member = archive.testzip()
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                f"but the appended ZIP is invalid: {exc}"
+            ) from exc
+        if not members or not any(not member.is_dir() for member in members):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                "but the appended ZIP has no file members"
+            )
+        if first_bad_member is not None:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared posix_shell_appended_zip "
+                f"but ZIP CRC validation failed for {first_bad_member!r}"
             )
         return
 
