@@ -1061,9 +1061,10 @@ class TestBiasEquivalenceCPU:
 # Modal entrypoint (run as: modal run tests/test_fa4_h200_parity.py)
 # ---------------------------------------------------------------------------
 
-# Direct OCI manifest resolved from GHCR latest on 2026-07-31.
+# Direct OCI manifest built from
+# wheels-dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39.
 _GHCR_IMAGE_DIGEST = (
-    "sha256:ef5398736aced3de8e5f5c544554dca1789e312abfffae06b4ab701297e60fc4"
+    "sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc"
 )
 _DEFAULT_H200_TEST_FILTER = (
     "all_gradients_combined or "

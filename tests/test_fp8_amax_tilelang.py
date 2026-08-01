@@ -292,20 +292,16 @@ def test_tilelang_supports_with_reason_returns_2tuple():
 
 @pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
 def test_fp8_pack_rejects_nonfinite_input():
-    """fp8_pack_tilelang must raise FloatingPointError on Inf, not
+    """fp8_pack_tilelang must raise FloatingPointError on NaN or Inf, not
     silently produce a degenerate (0 or NaN) scale that poisons downstream
     weights. Wave-3 self-audit: closes the silent-NaN-propagation hole
     in the host-side scale derivation.
 
-    NaN is the documented wave-11 exception: the pre-filter substitutes the
-    amax identity (0.0) for NaN before the cross-block reduction (CUDA
-    atomicMax is UB on NaN; the Metal CAS loop would spin forever), so a
-    NaN-poisoned input now yields the finite max over the real data instead
-    of raising. The NaN case below locks that trade-off in so a filter
-    regression (NaN leaking into the scale derivation) still fails loudly.
+    Wave-11 still filters NaN out of the atomic maximum to avoid undefined
+    CUDA atomicMax behaviour and a Metal CAS-loop hang. The reference now
+    carries a separate device poison flag so the pack boundary rejects NaN
+    without passing it through that reduction.
     """
-
-    import math
 
     device = _pick_device()
     if device.type == "cpu":
@@ -313,20 +309,11 @@ def test_fp8_pack_rejects_nonfinite_input():
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch.float8_e4m3fn not available in this build")
 
-    for poison in [float("inf"), float("-inf")]:
+    for poison in [float("nan"), float("inf"), float("-inf")]:
         x = torch.randn(32, 256, dtype=torch.float16, device=device)
         x[0, 0] = poison
         with pytest.raises(FloatingPointError, match=r"non-finite values"):
             fp8_pack_tilelang(x)
-
-    # Wave-11 NaN filter semantics: finite scale derived from the real data,
-    # no hang, no NaN scale.
-    x = torch.randn(32, 256, dtype=torch.float16, device=device)
-    x[0, 0] = float("nan")
-    _fp8_out, scale, _orig_dtype = fp8_pack_tilelang(x)
-    assert math.isfinite(scale.item()), (
-        "wave-11 NaN filter regressed: NaN leaked into the scale derivation"
-    )
 
 
 @pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")

@@ -17,7 +17,7 @@ import modal
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _GHCR_IMAGE_DIGEST = (
-    "sha256:1da4a890e741ae91f005ad8edef81c3c5d0a72437532d88ff55e346a10fb6197"
+    "sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc"
 )
 _GHCR_REF = (
     f"{os.environ.get('GHCR_REPO', 'ghcr.io/datasunriseou/cppmega')}"
