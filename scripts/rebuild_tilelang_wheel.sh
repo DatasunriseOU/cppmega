@@ -9,9 +9,9 @@
 #   (_ObjectSlotsMeta), but TileLang's vendored TVM (882a774) lacks the fix
 #   from apache/tvm#18938 (TVMDerivedObject.__slots__ = ("__dict__","__weakref__")).
 #   Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12, so it is
-#   NOT usable. The DatasunriseOU/tilelang fork at 334266af is the clean path:
+#   NOT usable. The DatasunriseOU/tilelang fork at ab7160de is the clean path:
 #     - carries upstream tile-ai/tilelang#2071 (removes the <0.1.10 cap)
-#     - vendored TVM submodule = DatasunriseOU/tvm@911772cf, which includes
+#     - vendored TVM submodule = DatasunriseOU/tvm@e25ca6ae, which includes
 #       apache/tvm#18938 (the __slots__ fix) and restores the nvbench CUDA
 #       L2-cache-flush header that TVM still compiles
 #     - vendored tvm-ffi = DatasunriseOU/tvm-ffi@521efeb3
@@ -31,8 +31,8 @@
 #
 # Env overrides:
 #   TILELANG_REPO    fork repo URL   (default: DatasunriseOU/tilelang)
-#   TILELANG_REF     fork commit     (default: 334266af...)
-#   TILELANG_TVM_REF vendored TVM commit (default: 911772cf...)
+#   TILELANG_REF     fork commit     (default: ab7160de...)
+#   TILELANG_TVM_REF vendored TVM commit (default: e25ca6ae...)
 #   TILELANG_TVM_FFI_REF vendored tvm-ffi commit (default: 521efeb3...)
 #   TILELANG_SRC_DIR clone dir        (default: $HOME/tilelang-build)
 #   WHEELS_DIR       output dir       (default: <repo>/wheels)
@@ -40,11 +40,11 @@
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-334266afd448ae06e7893119a0ebb72d7fe1e776}"
+TILELANG_REF="${TILELANG_REF:-ab7160de46be9e94ca6af8c7005113ee2c27200c}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.
-TILELANG_TVM_REF="${TILELANG_TVM_REF:-911772cf9d9e597b51a55ccdb96539034a69cfe6}"
+TILELANG_TVM_REF="${TILELANG_TVM_REF:-e25ca6ae50beee0e907b1e5ed32949879caddde1}"
 TILELANG_TVM_FFI_REF="${TILELANG_TVM_FFI_REF:-521efeb30bfd9e4946b248b3d76e6391028233a3}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

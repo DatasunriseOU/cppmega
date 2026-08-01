@@ -447,8 +447,8 @@ def test_image_build_binds_triggering_source_and_wheel_release() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "334266afd448ae06e7893119a0ebb72d7fe1e776"
-    tvm_commit = "911772cf9d9e597b51a55ccdb96539034a69cfe6"
+    tilelang_commit = "ab7160de46be9e94ca6af8c7005113ee2c27200c"
+    tvm_commit = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
     tvm_ffi_commit = "521efeb30bfd9e4946b248b3d76e6391028233a3"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
     ffi_wheel_name = (
@@ -474,6 +474,8 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     modal_base = (REPO_ROOT / "scripts" / "modal_cppmega_base.py").read_text(
         encoding="utf-8"
     )
+    assert "threadblock_swizzle_pattern" in workflow
+    assert "is_pure_function(tvm.tirx.PrimFunc([], body))" in workflow
     modal_runtime = [
         (REPO_ROOT / path).read_text(encoding="utf-8")
         for path in (

@@ -3,8 +3,8 @@
 Builds ABI-matched tvm-ffi and TileLang wheels on a Modal H100, then installs
 flash-attn-4==4.0.0b23 and verifies the complete stack imports cleanly.
 
-The fork at 334266af carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
-restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@911772cf,
+The fork at ab7160de carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
+restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@e25ca6ae,
 removes the apache-tvm-ffi<0.1.10 cap, and completes the CUDA driver stub.
 
 The clone and build directory are disposable container scratch. The compressed
@@ -24,8 +24,8 @@ import pathlib
 import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
-TILELANG_COMMIT = "334266afd448ae06e7893119a0ebb72d7fe1e776"
-TILELANG_TVM_COMMIT = "911772cf9d9e597b51a55ccdb96539034a69cfe6"
+TILELANG_COMMIT = "ab7160de46be9e94ca6af8c7005113ee2c27200c"
+TILELANG_TVM_COMMIT = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
 TILELANG_TVM_FFI_COMMIT = "521efeb30bfd9e4946b248b3d76e6391028233a3"
 EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 EXPECTED_TVM_FFI_WHEEL = (
@@ -37,9 +37,15 @@ import tilelang
 import flash_attn
 from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
 import tvm.ffi
+from tvm.s_tir.analysis import is_pure_function
 assert tilelang.__version__ == "0.1.9", tilelang.__version__
 assert metadata.version("apache-tvm-ffi") == "0.1.13.post5"
 assert metadata.version("flash-attn-4") == "4.0.0b23"
+body = tvm.tirx.AttrStmt(
+    None, "threadblock_swizzle_pattern", 0, tvm.tirx.Evaluate(0)
+)
+assert body.node is None
+assert is_pure_function(tvm.tirx.PrimFunc([], body))
 print(f"tilelang version: {tilelang.__version__}")
 print(f"flash-attn-4 version: {metadata.version('flash-attn-4')}")
 print(f"tvm.ffi version: {tvm.ffi.__version__}")
