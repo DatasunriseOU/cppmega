@@ -1191,6 +1191,118 @@ def test_header_macro_emission_preserves_mixed_legacy_bytes(
     assert "\ufffd" not in docs[0]["text"]
 
 
+def test_macro_registry_compacts_shared_definitions_without_losing_root_views(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    (tmp_path / "shared.h").write_text(
+        "#define VALUE 1\n"
+        "#undef VALUE\n"
+        "#define VALUE 2\n",
+        encoding="utf-8",
+    )
+    roots = []
+    for stem in ("alpha", "beta"):
+        root = tmp_path / f"{stem}.cpp"
+        root.write_text(
+            '#include "shared.h"\n'
+            f"int {stem}() {{ return VALUE; }}\n",
+            encoding="utf-8",
+        )
+        roots.append(str(root))
+
+    index = index_project.ProjectIndex()
+    stats = index_project.register_header_macros(
+        index,
+        roots,
+        project_dir=str(tmp_path),
+        project_id="fixture/shared-macro-views",
+        macro_usage_texts_by_file={
+            "alpha.cpp": [("VALUE", 2)],
+            "beta.cpp": [("VALUE", 2)],
+        },
+        max_retained_macros=2,
+    )
+
+    assert stats["canonical_macro_definitions"] == 2
+    assert stats["macro_visibility_records"] == 4
+    assert stats["compacted_macro_occurrences"] == 2
+    assert len(index.macro_definitions) == 2
+
+    alpha = index_project._select_visible_macro(
+        index,
+        "VALUE",
+        target_file="alpha.cpp",
+        max_line=2,
+    )
+    beta = index_project._select_visible_macro(
+        index,
+        "VALUE",
+        target_file="beta.cpp",
+        max_line=2,
+    )
+    assert alpha is not None
+    assert beta is not None
+    assert alpha.text == beta.text == "#undef VALUE\n#define VALUE 2\n"
+    assert alpha.visible_in_file == "alpha.cpp"
+    assert beta.visible_in_file == "beta.cpp"
+    assert alpha.sequence == 1
+    assert beta.sequence == 3
+    assert alpha.previous is not None
+    assert beta.previous is not None
+    assert alpha.previous.text == beta.previous.text == "#define VALUE 1\n"
+    assert alpha.previous.visible_in_file == "alpha.cpp"
+    assert beta.previous.visible_in_file == "beta.cpp"
+    assert alpha.previous.sequence == 0
+    assert beta.previous.sequence == 2
+    assert [
+        (macro.visible_in_file, macro.sequence)
+        for macro in index_project._used_macro_defs(
+            index,
+            [("return VALUE;", 2)],
+            target_file="beta.cpp",
+            max_line=2,
+        )
+    ] == [("beta.cpp", 2), ("beta.cpp", 3)]
+
+
+def test_macro_registry_bound_counts_distinct_source_definitions(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    roots = []
+    for stem in ("one", "two"):
+        (tmp_path / f"{stem}.h").write_text(
+            "#define VALUE 1\n",
+            encoding="utf-8",
+        )
+        root = tmp_path / f"{stem}.cpp"
+        root.write_text(
+            f'#include "{stem}.h"\n'
+            f"int {stem}() {{ return VALUE; }}\n",
+            encoding="utf-8",
+        )
+        roots.append(str(root))
+
+    with pytest.raises(
+        MemoryError,
+        match=r"canonical definition registry bound: .*limit=1",
+    ):
+        index_project.register_header_macros(
+            index_project.ProjectIndex(),
+            roots,
+            project_dir=str(tmp_path),
+            project_id="fixture/distinct-macro-definitions",
+            macro_usage_texts_by_file={
+                "one.cpp": [("VALUE", 2)],
+                "two.cpp": [("VALUE", 2)],
+            },
+            max_retained_macros=1,
+        )
+
+
 def test_parse_pool_emits_heartbeat_while_a_batch_is_still_running(
     capsys,
 ) -> None:

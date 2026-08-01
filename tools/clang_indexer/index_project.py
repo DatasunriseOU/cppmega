@@ -2049,6 +2049,41 @@ class MacroDef:
         self.symbol_id = _compute_symbol_id(self.symbol_key)
 
 
+class _MacroVisibilityRecord:
+    """Compact root-specific view of one canonical macro definition."""
+
+    __slots__ = ["definition", "visible_line", "sequence", "previous"]
+
+    def __init__(
+        self,
+        definition: MacroDef,
+        *,
+        visible_line: int,
+        sequence: int,
+        previous: "_MacroVisibilityRecord | None",
+    ):
+        self.definition = definition
+        self.visible_line = int(visible_line)
+        self.sequence = int(sequence)
+        self.previous = previous
+
+
+def _macro_definition_key(macro: MacroDef) -> tuple[object, ...]:
+    """Identity of source definition content, excluding root visibility."""
+
+    return (
+        macro.name,
+        macro.file,
+        macro.line,
+        macro.text,
+        tuple(macro.params),
+        tuple(macro.condition_names),
+        tuple(macro.condition_lines),
+        macro.undef_text,
+        macro.project_id,
+    )
+
+
 class ProjectIndex:
     """Cross-file function index for a single project."""
 
@@ -2077,6 +2112,15 @@ class ProjectIndex:
         self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
         self.macro_definitions: list[MacroDef] = []
         self._macro_occurrence_keys: set[tuple[str, str, str, int, int]] = set()
+        self._macro_definition_by_key: dict[
+            tuple[object, ...],
+            MacroDef,
+        ] = {}
+        self.macro_visibility_by_file: dict[
+            str,
+            dict[str, list[_MacroVisibilityRecord]],
+        ] = {}
+        self.macro_visibility_record_count = 0
         self.symbol_id_registry = SymbolIdentityRegistry()
         self.symbol_id_keys = self.symbol_id_registry.keys_by_id
 
@@ -2126,6 +2170,70 @@ class ProjectIndex:
         self.macros_by_name[macro.name].append(macro)
         self.macro_definitions.append(macro)
         self.macros[macro.name] = macro
+
+    def new_canonical_macro_definition_count(
+        self,
+        macros: Sequence[MacroDef],
+    ) -> int:
+        keys = {_macro_definition_key(macro) for macro in macros}
+        return sum(key not in self._macro_definition_by_key for key in keys)
+
+    def add_macro_environment(
+        self,
+        target_file: str,
+        macros: Sequence[MacroDef],
+    ) -> tuple[int, int]:
+        """Compact one root's retained macros into canonical defs + views."""
+
+        if target_file in self.macro_visibility_by_file:
+            raise ValueError(
+                f"macro visibility environment already exists for {target_file}"
+            )
+        environment: dict[str, list[_MacroVisibilityRecord]] = defaultdict(list)
+        records_by_occurrence: dict[int, _MacroVisibilityRecord] = {}
+        canonical_before = len(self.macro_definitions)
+        visibility_count = 0
+        for macro in sorted(macros, key=lambda item: item.sequence):
+            definition_key = _macro_definition_key(macro)
+            canonical = self._macro_definition_by_key.get(definition_key)
+            if canonical is None:
+                canonical = MacroDef(
+                    name=macro.name,
+                    file=macro.file,
+                    line=macro.line,
+                    text=macro.text,
+                    params=macro.params,
+                    project_id=macro.project_id,
+                    visible_in_file=macro.file,
+                    visible_line=macro.line,
+                    sequence=len(self.macro_definitions),
+                    condition_names=macro.condition_names,
+                    condition_lines=macro.condition_lines,
+                    undef_text=macro.undef_text,
+                )
+                self._macro_definition_by_key[definition_key] = canonical
+                self.add_macro(canonical)
+            previous = None
+            if macro.previous is not None:
+                previous = records_by_occurrence.get(id(macro.previous))
+                if previous is None:
+                    raise ValueError(
+                        "retained macro environment omitted a previous "
+                        f"definition: root={target_file} macro={macro.name}"
+                    )
+            record = _MacroVisibilityRecord(
+                canonical,
+                visible_line=macro.visible_line,
+                sequence=macro.sequence,
+                previous=previous,
+            )
+            records_by_occurrence[id(macro)] = record
+            environment[macro.name].append(record)
+            visibility_count += 1
+
+        self.macro_visibility_by_file[target_file] = dict(environment)
+        self.macro_visibility_record_count += visibility_count
+        return len(self.macro_definitions) - canonical_before, visibility_count
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
@@ -8923,20 +9031,37 @@ def register_header_macros(
             0,
             root_discovered_macros - len(retained_candidate_ids),
         )
-        if len(index.macro_definitions) + len(retained) > max_retained_macros:
+        incoming_canonical = index.new_canonical_macro_definition_count(
+            retained
+        )
+        if (
+            len(index.macro_definitions) + incoming_canonical
+            > max_retained_macros
+        ):
             raise MemoryError(
-                "macro scan exceeded the retained registry bound: "
-                f"root={root_rel} retained={len(index.macro_definitions)} "
-                f"incoming={len(retained)} limit={max_retained_macros}. "
+                "macro scan exceeded the canonical definition registry bound: "
+                f"root={root_rel} canonical={len(index.macro_definitions)} "
+                f"incoming_canonical={incoming_canonical} "
+                f"visibility_records={index.macro_visibility_record_count} "
+                f"limit={max_retained_macros}. "
                 "Raise CPPMEGA_MAX_RETAINED_MACROS only after inspecting macro "
                 "retention telemetry."
             )
-        before = len(index.macro_definitions)
-        for macro in retained:
-            index.add_macro(macro)
-        registered = len(index.macro_definitions) - before
+        registered, visibility_count = index.add_macro_environment(
+            root_rel,
+            retained,
+        )
         stats["registered_macros"] += registered
-        stats["retained_macro_occurrences"] += registered
+        stats["retained_macro_occurrences"] += visibility_count
+        stats["compacted_macro_occurrences"] += (
+            visibility_count - registered
+        )
+        stats["macro_visibility_records"] = (
+            index.macro_visibility_record_count
+        )
+        stats["canonical_macro_definitions"] = len(
+            index.macro_definitions
+        )
 
     seen_roots: set[str] = set()
     for path in header_files:
@@ -9016,6 +9141,57 @@ def _select_visible_macro(
     max_line: int | None,
     before_sequence: int | None = None,
 ) -> MacroDef | None:
+    if (
+        target_file is not None
+        and target_file in index.macro_visibility_by_file
+    ):
+        records = index.macro_visibility_by_file[target_file].get(name, [])
+        scoped_records = [
+            record
+            for record in records
+            if (max_line is None or record.visible_line <= max_line)
+            and (
+                before_sequence is None
+                or record.sequence < before_sequence
+            )
+        ]
+        if not scoped_records:
+            return None
+        selected = max(
+            scoped_records,
+            key=lambda record: (record.visible_line, record.sequence),
+        )
+        materialized: dict[int, MacroDef] = {}
+
+        def materialize(record: _MacroVisibilityRecord) -> MacroDef:
+            cached = materialized.get(id(record))
+            if cached is not None:
+                return cached
+            definition = record.definition
+            view = MacroDef(
+                name=definition.name,
+                file=definition.file,
+                line=definition.line,
+                text=definition.text,
+                params=definition.params,
+                project_id=definition.project_id,
+                visible_in_file=target_file,
+                visible_line=record.visible_line,
+                sequence=record.sequence,
+                condition_names=definition.condition_names,
+                condition_lines=definition.condition_lines,
+                undef_text=definition.undef_text,
+                previous=(
+                    materialize(record.previous)
+                    if record.previous is not None
+                    else None
+                ),
+            )
+            materialized[id(record)] = view
+            return view
+
+        return materialize(selected)
+
     candidates = list(index.macros_by_name.get(name, []))
     if not candidates:
         return None
