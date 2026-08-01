@@ -10567,10 +10567,13 @@ def process_project(
             if candidate not in candidate_identities:
                 quarantine_candidates.append(candidate)
                 candidate_identities.add(candidate)
-        _kept_candidates, quarantine_receipt = source_quarantine.filter_candidates(
+        kept_candidates, quarantine_receipt = source_quarantine.filter_candidates(
             project_dir,
             quarantine_candidates,
         )
+        kept_candidate_identities = {
+            os.path.abspath(candidate) for candidate in kept_candidates
+        }
         quarantined_paths = {
             os.path.abspath(os.path.join(project_dir, relative_path))
             for relative_path in source_quarantine.entries_by_path
@@ -10578,7 +10581,7 @@ def process_project(
         cpp_files = [
             candidate
             for candidate in cpp_files
-            if os.path.abspath(candidate) not in quarantined_paths
+            if os.path.abspath(candidate) in kept_candidate_identities
         ]
         assert source_quarantine_receipt is not None
         _write_source_quarantine_receipt(

@@ -515,7 +515,7 @@ class ProjectSourceQuarantine:
         missing = sorted(set(self.entries_by_path) - set(consumed))
         if missing:
             raise SourceQuarantineError(
-                f"{self.project_id}: manifest entries were not discovered as C/C++ "
+                f"{self.project_id}: manifest entries were not discovered as source "
                 f"candidates: {missing}"
             )
         quarantined_entries = [

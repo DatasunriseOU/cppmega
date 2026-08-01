@@ -612,7 +612,10 @@ def test_quarantine_entry_must_be_discovered_and_cannot_hide_parse_errors(
     manifest = tmp_path / "quarantine.json"
     _write_manifest(manifest, payload)
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
-    with pytest.raises(SourceQuarantineError, match="were not discovered"):
+    with pytest.raises(
+        SourceQuarantineError,
+        match="were not discovered as source candidates",
+    ):
         policy.filter_candidates(tmp_path, [])
 
     _write_manifest(
