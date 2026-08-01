@@ -1345,6 +1345,7 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
         causal: bool = True,
         window_size: tuple[int | None, int | None] | int | None = None,
         deterministic: bool = False,
+        pg_collection: Any = None,
         beta: float | None = None,
         call_weight: float = 1.0,
         type_weight: float = 1.0,
@@ -1369,14 +1370,36 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 "CppMegaFA4ScoreModAttention is causal-only (POC constraint)"
             )
         from cppmega.megatron.document_isolation import (
-            _require_packed_attention_cp1,
             _normalize_window_size,
             _window_size_from_config,
         )
 
-        _require_packed_attention_cp1(config, backend="FA4")
+        configured_cp_size = int(getattr(config, "context_parallel_size", 1))
+        if configured_cp_size < 1:
+            raise ValueError(
+                "CppMegaFA4ScoreModAttention requires context_parallel_size >= 1"
+            )
+        cp_group = getattr(pg_collection, "cp", None)
+        if cp_group is None:
+            actual_cp_size = 1
+        else:
+            size = getattr(cp_group, "size", None)
+            if not callable(size):
+                raise TypeError(
+                    "CppMegaFA4ScoreModAttention pg_collection.cp must expose size()"
+                )
+            actual_cp_size = int(size())
+        if actual_cp_size != configured_cp_size:
+            raise ValueError(
+                "CppMegaFA4ScoreModAttention configured context_parallel_size="
+                f"{configured_cp_size}, but pg_collection.cp has size "
+                f"{actual_cp_size}"
+            )
         self.config = config
         self.layer_number = layer_number
+        self.pg_collection = pg_collection
+        self.cp_group = cp_group
+        self.context_parallel_size = actual_cp_size
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.softmax_scale = softmax_scale
@@ -1470,6 +1493,29 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
             raise ValueError(
                 f"value must be [S, B, Hk, D], got shape {tuple(value.shape)}"
             )
+        if packed_seq_params is not None:
+            raise ValueError(
+                "CppMegaFA4ScoreModAttention does not support packed_seq_params"
+            )
+        if self.context_parallel_size > 1 and inference_context is not None:
+            raise NotImplementedError(
+                "CppMegaFA4ScoreModAttention context parallelism does not "
+                "support inference KV-cache geometry"
+            )
+
+        # Megatron CP stores two zigzag chunks per rank. Restore global token
+        # order before building document-mask aux or invoking FA4; every rank
+        # runs the same global beta23 kernel, then retains its local zigzag
+        # output shard below. The gather/scatter autograd pair reduces QKV
+        # gradients across the CP group without materializing host copies.
+        if self.context_parallel_size > 1:
+            from cppmega.megatron.document_isolation import (
+                gather_context_parallel_sequence,
+            )
+
+            query = gather_context_parallel_sequence(query, self.cp_group)
+            key = gather_context_parallel_sequence(key, self.cp_group)
+            value = gather_context_parallel_sequence(value, self.cp_group)
 
         # --- SBHD → BSHD transpose (Megatron ABI: sequence-first) ---
         q = query.transpose(0, 1)  # [S,B,H,D] -> [B,S,H,D]
@@ -1490,11 +1536,6 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 f"num_attention_heads ({num_heads}) must be divisible by "
                 f"num_kv_heads ({num_kv_heads}) for GQA"
             )
-        if packed_seq_params is not None:
-            raise ValueError(
-                "CppMegaFA4ScoreModAttention does not support packed_seq_params"
-            )
-
         # Refuse dense tensor bias by contract.
         if isinstance(attention_bias, torch.Tensor):
             raise TypeError(
@@ -1504,7 +1545,7 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 "materialization."
             )
 
-        # Sequence parallel guard. Context parallelism is rejected at init.
+        # Sequence parallel remains unsupported; context parallel is handled above.
         if self.config is not None:
             if getattr(self.config, "sequence_parallel", False):
                 raise RuntimeError(
@@ -1633,5 +1674,11 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
         # FA4 returns [B, S, H, D]; Megatron expects [S, B, H*D].
         out = out.transpose(0, 1)  # [B,S,H,D] -> [S,B,H,D]
         out = out.reshape(out.size(0), out.size(1), -1)  # [S,B,H,D] -> [S,B,H*D]
+        if self.context_parallel_size > 1:
+            from cppmega.megatron.document_isolation import (
+                scatter_context_parallel_sequence,
+            )
+
+            out = scatter_context_parallel_sequence(out, self.cp_group)
 
         return out

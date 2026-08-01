@@ -28,9 +28,13 @@ Design doc: docs/fa4_parity_test_design.md
 from __future__ import annotations
 
 import math
+import multiprocessing
 import os
 import sys
+import traceback
 from contextlib import contextmanager
+from datetime import timedelta
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
@@ -382,6 +386,158 @@ def _production_fa4_attention_forward(
     ).transpose(0, 1)
 
 
+def _fa4_context_parallel_worker(
+    rank: int,
+    init_method: str,
+    results,
+) -> None:
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        torch.distributed.init_process_group(
+            "nccl",
+            init_method=init_method,
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=180),
+        )
+        cp_group = torch.distributed.group.WORLD
+
+        from megatron.core.ssm.mamba_context_parallel import (
+            _redo_attention_load_balancing,
+        )
+
+        batch_size = 1
+        torch.manual_seed(420)
+        global_q, global_k, global_v = (
+            torch.randn(
+                batch_size,
+                S,
+                H,
+                D,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            for _ in range(3)
+        )
+        document_ids = torch.tensor(
+            [[1] * (S // 2) + [2] * (S // 2)],
+            device=device,
+            dtype=torch.int32,
+        )
+        structure_batch = _parity_structure_batch()
+        structure_batch["document_ids"] = document_ids
+        bias_state = build_chunk_native_graph_bias(
+            structure_batch,
+            batch_size=batch_size,
+            seqlen_q=S,
+            seqlen_k=S,
+            device=device,
+            dtype=torch.bfloat16,
+            beta=BETA,
+            call_weight=CALL_WEIGHT,
+            type_weight=TYPE_WEIGHT,
+            domain_weight=DOMAIN_WEIGHT,
+            build_weight=BUILD_WEIGHT,
+        )
+
+        reference_q, reference_k, reference_v = (
+            tensor.detach().clone().requires_grad_(True)
+            for tensor in (global_q, global_k, global_v)
+        )
+        reference_module = CppMegaFA4ScoreModAttention(
+            config=SimpleNamespace(
+                attention_dropout=0.0,
+                context_parallel_size=1,
+                sequence_parallel=False,
+            ),
+            layer_number=1,
+            num_attention_heads=H,
+            head_dim=D,
+            pg_collection=SimpleNamespace(cp=None),
+        )
+        with _structure_batch(structure_batch):
+            reference_output = reference_module(
+                reference_q.transpose(0, 1),
+                reference_k.transpose(0, 1),
+                reference_v.transpose(0, 1),
+                attention_bias=bias_state,
+            )
+        torch.manual_seed(421)
+        output_probe = torch.randn_like(reference_output)
+        (reference_output * output_probe).sum().backward()
+
+        def local_zigzag(tensor: torch.Tensor) -> torch.Tensor:
+            balanced = _redo_attention_load_balancing(
+                tensor.transpose(0, 1),
+                2,
+                packed_seq_params=None,
+            )
+            return balanced.chunk(2, dim=0)[rank].contiguous()
+
+        local_q, local_k, local_v = (
+            local_zigzag(tensor).detach().clone().requires_grad_(True)
+            for tensor in (global_q, global_k, global_v)
+        )
+        cp_module = CppMegaFA4ScoreModAttention(
+            config=SimpleNamespace(
+                attention_dropout=0.0,
+                context_parallel_size=2,
+                sequence_parallel=False,
+            ),
+            layer_number=1,
+            num_attention_heads=H,
+            head_dim=D,
+            pg_collection=SimpleNamespace(cp=cp_group),
+        )
+        with _structure_batch(structure_batch):
+            local_output = cp_module(
+                local_q,
+                local_k,
+                local_v,
+                attention_bias=bias_state,
+            )
+
+        expected_local_output = local_zigzag(
+            reference_output.transpose(0, 1)
+        ).reshape_as(local_output)
+        local_probe = local_zigzag(
+            output_probe.transpose(0, 1)
+        ).reshape_as(local_output)
+        torch.testing.assert_close(
+            local_output,
+            expected_local_output,
+            atol=3e-3,
+            rtol=FWD_RTOL,
+        )
+        (local_output * local_probe).sum().backward()
+
+        for name, local_tensor, reference_tensor in (
+            ("dQ", local_q, reference_q),
+            ("dK", local_k, reference_k),
+            ("dV", local_v, reference_v),
+        ):
+            if local_tensor.grad is None or reference_tensor.grad is None:
+                raise RuntimeError(f"FA4 CP {name} gradient is missing")
+            expected_local_grad = local_zigzag(reference_tensor.grad)
+            torch.testing.assert_close(
+                local_tensor.grad,
+                expected_local_grad,
+                atol=DOCUMENT_BWD_ATOL,
+                rtol=BWD_RTOL,
+            )
+
+        torch.distributed.barrier()
+        results.put(("ok", rank))
+    except Exception:
+        results.put(("error", rank, traceback.format_exc()))
+        raise
+    finally:
+        _set_current_structure_batch(None)
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
 # ---------------------------------------------------------------------------
 # Parity test class
 # ---------------------------------------------------------------------------
@@ -625,6 +781,31 @@ class TestFA4H200Parity:
                 rtol=BWD_RTOL,
                 msg=f"FA4 {name} gradient diverges from dense-bias reference",
             )
+
+    def test_context_parallel_global_document_forward_backward_parity(
+        self,
+        tmp_path,
+    ):
+        """Two H200 ranks match the global packed-document FA4 computation."""
+        if torch.cuda.device_count() < 2:
+            pytest.skip("FA4 context-parallel parity requires two CUDA devices")
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        init_method = f"file://{tmp_path / 'fa4-cp-init'}"
+        processes = [
+            context.Process(
+                target=_fa4_context_parallel_worker,
+                args=(rank, init_method, results),
+            )
+            for rank in range(2)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=300)
+        messages = [results.get(timeout=5) for _ in range(2)]
+        assert all(process.exitcode == 0 for process in processes), messages
+        assert sorted(messages) == [("ok", 0), ("ok", 1)]
 
     def test_document_mask_only_partial_tile_forward_backward_parity(self):
         """Exact mask handles short unaligned documents and a partial tile."""
@@ -1068,11 +1249,12 @@ _GHCR_IMAGE_DIGEST = (
 )
 _DEFAULT_H200_TEST_FILTER = (
     "all_gradients_combined or "
+    "context_parallel_global_document_forward_backward_parity or "
     "graph_route_aux_multi_document_forward_backward_parity or "
     "document_mask_only_partial_tile_forward_backward_parity or "
     "document_mask_rectangular_unaligned_decode_forward_backward_parity"
 )
-_EXPECTED_H200_TEST_COUNT = 4
+_EXPECTED_H200_TEST_COUNT = 5
 
 
 def _modal_image():
@@ -1143,7 +1325,7 @@ if _modal is not None:
     import pathlib as _pathlib
     import subprocess as _subprocess
 
-    _MODAL_GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:1")
+    _MODAL_GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:2")
     _modal_app = _modal.App("cppmega-fa4-parity")
     _results_vol = _modal.Volume.from_name(
         "cppmega-test-results", create_if_missing=True
@@ -1314,7 +1496,7 @@ print(json.dumps({
         stack = _json.loads(probe.stdout.splitlines()[-1])
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0"
+        env["CUDA_VISIBLE_DEVICES"] = "0,1"
         env["CPPMEGA_FA4_MAX_RARE_PER_ROW"] = "8"
         command = [
             sys.executable,

@@ -1301,17 +1301,32 @@ class TestFA4WindowSizePlumbing:
         assert active.window_size == (8192, 0)
         assert skipped.window_size == (None, None)
 
-    def test_fa4_attention_rejects_context_parallelism(self):
-        """CP is rejected with a pointer to the 128k CP design doc."""
+    def test_fa4_attention_accepts_explicit_context_parallel_group(self):
+        """The CoreAttentionBuilder pg_collection reaches the FA4 runtime."""
         from cppmega.megatron.fa4_score_mod_adapter import (
             CppMegaFA4ScoreModAttention,
         )
+
+        class FakeGroup:
+            def size(self):
+                return 2
 
         class FakeConfig:
             context_parallel_size = 2
             attention_dropout = 0.0
 
-        with pytest.raises(NotImplementedError, match="document_isolation_cp128k"):
+        pg_collection = SimpleNamespace(cp=FakeGroup())
+        attention = CppMegaFA4ScoreModAttention(
+            config=FakeConfig(),
+            num_attention_heads=4,
+            head_dim=32,
+            causal=True,
+            pg_collection=pg_collection,
+        )
+        assert attention.pg_collection is pg_collection
+        assert attention.cp_group is pg_collection.cp
+
+        with pytest.raises(ValueError, match=r"pg_collection\.cp"):
             CppMegaFA4ScoreModAttention(
                 config=FakeConfig(),
                 num_attention_heads=4,

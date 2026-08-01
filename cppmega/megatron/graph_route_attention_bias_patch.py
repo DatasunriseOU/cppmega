@@ -33,6 +33,7 @@ from cppmega.megatron.graph_objective_loss import (
 )
 from cppmega.megatron.fa4_score_mod_adapter import (
     ChunkNativeGraphBias,
+    CppMegaFA4ScoreModAttention,
     build_fa4_attention_bias_from_structure_batch,
     fa4_score_mod_enabled,
 )
@@ -602,15 +603,48 @@ def _graph_attention_bias_for_layer(
         )
 
     tensor = _hidden_shape_tensor(hidden_states)
-    if getattr(getattr(layer, "config", None), "sequence_parallel", False):
+    config = getattr(layer, "config", None)
+    if getattr(config, "sequence_parallel", False):
         raise RuntimeError(
             "dense graph-route attention bias does not support sequence_parallel yet; "
             "disable sequence_parallel or use DSA graph top-k bias"
         )
-    if int(getattr(getattr(layer, "config", None), "context_parallel_size", 1)) != 1:
+    configured_cp_size = int(getattr(config, "context_parallel_size", 1))
+    self_attention = getattr(layer, "self_attention", None)
+    pg_collection = getattr(self_attention, "pg_collection", None)
+    cp_group = getattr(pg_collection, "cp", None)
+    if cp_group is None:
+        actual_cp_size = 1
+    else:
+        size = getattr(cp_group, "size", None)
+        if not callable(size):
+            raise TypeError(
+                "graph-route attention pg_collection.cp must expose size()"
+            )
+        actual_cp_size = int(size())
+    if actual_cp_size != configured_cp_size:
         raise RuntimeError(
-            "dense graph-route attention bias does not support context_parallel_size > 1 yet"
+            "graph-route attention configured context_parallel_size="
+            f"{configured_cp_size}, but self_attention.pg_collection.cp has "
+            f"size {actual_cp_size}"
         )
+
+    use_fa4 = fa4_score_mod_enabled()
+    if actual_cp_size > 1:
+        core_attention = getattr(self_attention, "core_attention", None)
+        if not use_fa4 or not isinstance(
+            core_attention,
+            CppMegaFA4ScoreModAttention,
+        ):
+            raise RuntimeError(
+                "context-parallel graph-route attention supports only FA4 "
+                "chunk-native bias; dense TE/torch attention remains fail-closed"
+            )
+        if inference_context is not None:
+            raise NotImplementedError(
+                "context-parallel FA4 graph-route attention does not support "
+                "incremental decode geometry"
+            )
     beta = resolve_graph_bias_beta()
 
     # --- Resolve weights once (used in cache key and all build paths) ---
@@ -642,8 +676,25 @@ def _graph_attention_bias_for_layer(
     # --- Content-based cache lookup ---
     sb_identity = _structure_batch_cache_key(sb_for_key)
     batch_sz = int(tensor.shape[1])
-    seqlen_q = int(tensor.shape[0])
-    use_fa4 = fa4_score_mod_enabled()
+    local_seqlen_q = int(tensor.shape[0])
+    seqlen_q = local_seqlen_q * actual_cp_size
+    if actual_cp_size > 1:
+        from cppmega.megatron.document_isolation import _raw_document_ids
+
+        document_ids = _raw_document_ids(required=True)
+        if document_ids is None:
+            raise RuntimeError(
+                "context-parallel FA4 graph-route attention requires document_ids"
+            )
+        if document_ids.dim() == 1:
+            document_ids = document_ids.unsqueeze(0)
+        expected_shape = (batch_sz, seqlen_q)
+        if tuple(document_ids.shape) != expected_shape:
+            raise ValueError(
+                "context-parallel FA4 global sequence geometry "
+                f"{expected_shape} does not match document_ids shape "
+                f"{tuple(document_ids.shape)}"
+            )
 
     # Geometry differs between decode (rectangular) and prefill/train (square).
     if state is not None:

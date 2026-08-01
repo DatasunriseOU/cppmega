@@ -15,6 +15,7 @@ from cppmega.megatron.document_isolation import (
     _validate_model_parallel_topology,
     map_sequence_by_document,
     map_sharded_sequence_by_document,
+    roll_tensor_by_document,
 )
 
 
@@ -225,6 +226,108 @@ def _run_world(backend: str, init_method: str) -> None:
         ("ok", 1),
         ("ok", 0),
     ]
+
+
+def _mtp_roll_worker(rank: int, init_method: str, results) -> None:
+    try:
+        torch.distributed.init_process_group(
+            "gloo",
+            init_method=init_method,
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=90),
+        )
+        cp_group = torch.distributed.group.WORLD
+        document_ids = torch.tensor([[1, 1, 2, 2, 2, 3, 3, 3]])
+
+        def reject_fallback(*_args, **_kwargs):
+            raise AssertionError("packed-document CP roll used the fallback")
+
+        for sequence_dim, values, weights in (
+            (
+                0,
+                torch.arange(1.0, 9.0).view(8, 1, 1),
+                torch.linspace(0.25, 2.0, 8).view(8, 1, 1),
+            ),
+            (
+                1,
+                torch.arange(1.0, 9.0).view(1, 8),
+                torch.linspace(0.25, 2.0, 8).view(1, 8),
+            ),
+        ):
+            structure_dataset_patch._set_current_structure_batch(
+                {"document_ids": document_ids}
+            )
+            reference_input = values.detach().clone().requires_grad_(True)
+            reference_rolled, reference_sum = roll_tensor_by_document(
+                reference_input,
+                shifts=-1,
+                dims=sequence_dim,
+                fallback=reject_fallback,
+            )
+            ((reference_rolled * weights).sum() + 0.25 * reference_sum).backward()
+            if reference_input.grad is None:
+                raise RuntimeError("MTP reference backward did not populate gradients")
+
+            balanced_input = _balanced(
+                values.movedim(sequence_dim, 0),
+                2,
+                undo=False,
+            )
+            local_input = (
+                balanced_input.chunk(2, dim=0)[rank]
+                .movedim(0, sequence_dim)
+                .detach()
+                .clone()
+                .requires_grad_(True)
+            )
+            local_weights = (
+                _balanced(weights.movedim(sequence_dim, 0), 2, undo=False)
+                .chunk(2, dim=0)[rank]
+                .movedim(0, sequence_dim)
+            )
+            expected_local = (
+                _balanced(
+                    reference_rolled.detach().movedim(sequence_dim, 0),
+                    2,
+                    undo=False,
+                )
+                .chunk(2, dim=0)[rank]
+                .movedim(0, sequence_dim)
+            )
+
+            actual, local_sum = roll_tensor_by_document(
+                local_input,
+                shifts=-1,
+                dims=sequence_dim,
+                cp_group=cp_group,
+                fallback=reject_fallback,
+            )
+            torch.testing.assert_close(actual, expected_local)
+            torch.testing.assert_close(local_sum, expected_local.sum())
+            ((actual * local_weights).sum() + 0.25 * local_sum).backward()
+            if local_input.grad is None:
+                raise RuntimeError("MTP CP backward did not populate gradients")
+
+            expected_local_grad = (
+                _balanced(
+                    reference_input.grad.movedim(sequence_dim, 0),
+                    2,
+                    undo=False,
+                )
+                .chunk(2, dim=0)[rank]
+                .movedim(0, sequence_dim)
+            )
+            torch.testing.assert_close(local_input.grad, expected_local_grad)
+
+        results.put(("ok", rank))
+    except Exception:
+        results.put(("error", rank, traceback.format_exc()))
+        raise
+    finally:
+        structure_dataset_patch._set_current_structure_batch(None)
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 def _combined_worker(rank: int, init_method: str, results) -> None:
@@ -558,6 +661,28 @@ def test_gloo_sp_cp_reassembly_isolation_pipeline_and_gradients(tmp_path):
     if not torch.distributed.is_available():
         pytest.skip("torch.distributed unavailable")
     _run_world("gloo", f"file://{tmp_path / 'gloo-init'}")
+
+
+def test_gloo_packed_document_mtp_cp_roll_parity(tmp_path):
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    init_method = f"file://{tmp_path / 'mtp-roll-init'}"
+    processes = [
+        context.Process(
+            target=_mtp_roll_worker,
+            args=(rank, init_method, results),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=90)
+    messages = [results.get(timeout=5) for _ in range(2)]
+    assert all(process.exitcode == 0 for process in processes), messages
+    assert sorted(messages) == [("ok", 0), ("ok", 1)]
 
 
 def test_document_mapping_allows_projected_input_and_state_output_widths():

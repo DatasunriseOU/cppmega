@@ -616,29 +616,59 @@ def roll_tensor_by_document(
         raise RuntimeError(
             "document_ids and upstream packed_seq_params cannot both drive MTP"
         )
-    if cp_group is not None and cp_group.size() > 1:
-        raise NotImplementedError(
-            "packed-document MTP does not support context parallelism"
-        )
 
     sequence_dim = dims % tensor.dim()
+    cp_size, _cp_rank = _group_size_rank(cp_group)
+    rolled_input = tensor
+    if cp_size > 1:
+        if sequence_length % cp_size:
+            raise ValueError(
+                f"global document sequence length {sequence_length} is not "
+                f"divisible by context parallel size {cp_size}"
+            )
+        if tensor.shape[sequence_dim] * cp_size != sequence_length:
+            raise ValueError(
+                "cannot align global document_ids with context-parallel MTP "
+                f"tensor shape {tuple(tensor.shape)} along dim {sequence_dim}: "
+                f"local length {tensor.shape[sequence_dim]} * cp_size {cp_size} "
+                f"!= global length {sequence_length}"
+            )
+        sequence_first = tensor.movedim(sequence_dim, 0)
+        sequence_first = gather_context_parallel_sequence(
+            sequence_first,
+            cp_group,
+        )
+        rolled_input = sequence_first.movedim(0, sequence_dim)
+
     valid = torch.zeros_like(ids, dtype=torch.bool)
     valid[:, :-1] = (ids[:, :-1] > 0) & (ids[:, :-1] == ids[:, 1:])
-    rolled = torch.roll(tensor, shifts=-1, dims=sequence_dim)
-    if tensor.shape[:2] == (batch_size, sequence_length) and sequence_dim == 1:
+    rolled = torch.roll(rolled_input, shifts=-1, dims=sequence_dim)
+    if (
+        rolled_input.shape[:2] == (batch_size, sequence_length)
+        and sequence_dim == 1
+    ):
         mask = valid
-    elif tensor.shape[:2] == (sequence_length, batch_size) and sequence_dim == 0:
+    elif (
+        rolled_input.shape[:2] == (sequence_length, batch_size)
+        and sequence_dim == 0
+    ):
         mask = valid.transpose(0, 1)
     else:
         raise ValueError(
             "cannot align document_ids with rolled tensor shape "
-            f"{tuple(tensor.shape)} along dim {sequence_dim}"
+            f"{tuple(rolled_input.shape)} along dim {sequence_dim}"
         )
     while mask.dim() < rolled.dim():
         mask = mask.unsqueeze(-1)
     rolled = torch.where(
         mask, rolled, torch.zeros((), dtype=rolled.dtype, device=rolled.device)
     )
+    if cp_size > 1:
+        sequence_first = scatter_context_parallel_sequence(
+            rolled.movedim(sequence_dim, 0),
+            cp_group,
+        )
+        rolled = sequence_first.movedim(0, sequence_dim)
     return rolled, rolled.sum()
 
 
