@@ -16,9 +16,12 @@ Rollback guard:
     CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA_ROLLBACK=1
     python -m cppmega.megatron.upstream_patches.apply_mamba3_stage2_force_nontma_patches
 
-The patch is intentionally asymmetric by default: ``bf_num_stages=1`` and
-``bb_num_stages=0``. H200 productionish benchmarking showed that bwd_fwd
-benefits from WS/TMA while bwd_bwd regresses when WS/TMA is enabled.
+The patch keeps both backward kernels fail-closed with TMA lowering and warp
+specialization disabled. Exact H200 runtime validation showed that the
+flattened bwd_fwd TMA path can compile but raises
+``CUDA_ERROR_ILLEGAL_INSTRUCTION``. The structural flattening and targeted
+non-TMA copies remain useful, while ``bf_num_stages=1`` and
+``bb_num_stages=0`` stay as the existing call defaults.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ _PATCHED_MARKERS = {
     "bf_default": "bf_num_stages=1",
     "bb_default": "bb_num_stages=0",
     "direct_qk": "qk_dot_shared[cs, r_out * R + r_in]",
+    "bwd_tma_disabled": "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True",
+    "bwd_ws_disabled": "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True",
 }
 
 _STRUCTURAL_PATCHED_MARKERS = {
@@ -109,6 +114,25 @@ def _validate_patched(path: Path) -> None:
         raise RuntimeError(
             f"{path}: rollback guard tripped - found bb_num_stages=1. "
             "The production candidate must stay bf=1,bb=0."
+        )
+    tma_disabled_count = text.count(
+        "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True"
+    )
+    ws_disabled_count = text.count(
+        "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True"
+    )
+    if tma_disabled_count < 2 or ws_disabled_count < 2:
+        raise RuntimeError(
+            f"{path}: both backward kernels must keep TMA lowering and warp "
+            "specialization disabled; "
+            f"tma_disabled={tma_disabled_count}, ws_disabled={ws_disabled_count}"
+        )
+    if (
+        "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False" in text
+        or "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False" in text
+    ):
+        raise RuntimeError(
+            f"{path}: unsafe backward TMA/warp-specialization enable marker found"
         )
     disable_tma_count = text.count("disable_tma=True")
     if disable_tma_count < 10:
@@ -176,7 +200,10 @@ def _do_patch() -> None:
     _atomic_replace_from(patched, path)
     _validate_patched(path)
     print("  DONE stage2 force-nonTMA patch applied")
-    print("  Active default: bf_num_stages=1, bb_num_stages=0")
+    print(
+        "  Active default: bf_num_stages=1, bb_num_stages=0, "
+        "bwd TMA/warp specialization disabled"
+    )
 
 
 def _reverse_patch(path: Path, patch_file: Path) -> bool:
