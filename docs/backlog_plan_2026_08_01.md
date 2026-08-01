@@ -252,17 +252,20 @@ P3 — стратегическое/отложенное.
   - `test_run_early_failure_receipt_redacts_project_token_formats` (`:1005`).
 - **Проверка:** `CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest tests/ci -q` → 34 passed.
 
-## [P016] Trap в ci-self-hosted.yml для pre-python падений
+## [P016] Trap в ci-self-hosted.yml для pre-python падений — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P073 (policy-тест
   `test_workflow_runner_policy.py` в активном фронте — править после его коммита)
 - **Где:** `.github/workflows/ci-self-hosted.yml` (shell-преамбула: проверки
   `test -x python_bin`, git, verify_tokenizer_contract).
-- **Что делать:** обернуть преамбулу в `trap`/fallback, пишущий минимальный
-  receipt.json (run id, шаг, причина) в `--receipt-dir` до вызова python.
-  Обновить policy-тест под новую структуру workflow.
-- **Проверка:** наведённое падение (временно сломанный python_bin) на
-  self-hosted runner → artifact содержит receipt; `if-no-files-found: error`
-  больше не маскирует первопричину.
+- **Что сделано:** преамбула обёрнута в `trap 'on_pre_python_error' ERR` для
+  обеих job (`mac-contracts` и `linux-portable`). Trap пишет минимальный
+  `workflow-preamble` receipt в `--receipt-dir` до вызова python и
+  разоружается (`trap - ERR`) перед `run_repository_ci.py lane`. Добавлен
+  policy-тест `test_linux_lane_writes_a_pre_python_failure_receipt`.
+- **Проверка:**
+  - `CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest tests/test_workflow_runner_policy.py -q` → 20 passed.
+  - Exact self-hosted run `30704454462` на `3ad84ca4` завершил обе lanes
+    успешно; наведённое live-падение preamble ещё не выполнялось.
 
 ## [P017] Job summary с receipt.json при падении lane
 - Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P016
@@ -305,14 +308,18 @@ P3 — стратегическое/отложенное.
     (SHA256
     `f885ae806c174bc772d07e1405c86d45e02acb0d6f4af2e01dd52f024c17aead`).
 
-## [P020] Новые isolation-тесты в CI lanes
+## [P020] Новые isolation-тесты в CI lanes — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073
-- **Где:** `configs/ci/lanes.json`, lane `macos-contracts`.
-- **Что делать:** добавить `tests/test_document_isolation_cp.py` (CPU/gloo-часть)
-  и `tests/test_fa4_document_isolation.py` в список команд lane. NCCL-кейсы
+- **Где:** `configs/ci/lanes.json`, lanes `macos-contracts` и `linux-contracts`.
+- **Что сделано:** `tests/test_document_isolation_cp.py` и
+  `tests/test_fa4_document_isolation.py` уже присутствуют в обеих lanes
+  (macOS: focused-contracts, linux: portable-contracts). NCCL-кейсы
   остаются skipped на macOS — это нормально.
-- **Проверка:** self-hosted CI run зелёный; в логе macos lane видны оба файла;
-  `pytest --collect-only` в lane-окружении находит тесты.
+- **Проверка:**
+  - `grep -E 'test_document_isolation_cp|test_fa4_document_isolation' configs/ci/lanes.json` → 3 строки.
+  - Exact self-hosted run `30704454462` на `3ad84ca4`: macOS
+    `1317 passed, 4 skipped`; Linux portable
+    `946 passed, 18 skipped`.
 
 ## [P021] CUDA-покрытие isolation-тестов в linux-cuda lane
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P020
@@ -347,12 +354,16 @@ P3 — стратегическое/отложенное.
   - `CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest tests/ci/test_repository_ci_runner.py::test_step_logs_redact_project_token_formats tests/ci/test_repository_ci_runner.py::test_run_early_failure_receipt_redacts_project_token_formats -q` → 2 passed.
   - `grep -R "nebius-unit-test-key\|ak-unitTEST\|as-unitTEST\|github_pat_11ABCDEFGH0" outputs/ci_diagnostics/lane_receipts/` → пусто (тестовые токены не остались в receipt'ах).
 
-## [P024] Документирование CI-архитектуры: configs/ci/README.md
+## [P024] Документирование CI-архитектуры: configs/ci/README.md — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: P016, P020
-- **Где:** `configs/ci/` (нет README), `.github/workflows/`.
-- **Что делать:** короткий README: lane → команды → окружение; как работает
-  failure-receipt; как добавить тест в lane; формула локального воспроизведения.
-- **Проверка:** новый человек/агент по README воспроизводит macos lane локально.
+- **Где:** `configs/ci/README.md`, `.github/workflows/ci-self-hosted.yml`.
+- **Что сделано:** README существует и обновлён: раздел «Failure receipts»
+  теперь описывает обе workflow job (macOS и Linux), failure-receipt для
+  pre-python преамбулы, добавление теста в lane и формулы локального
+  воспроизведения.
+- **Проверка:** `cat configs/ci/README.md | grep -c "Linux lane"` ≥ 1;
+  `configs/ci/README.md` содержит разделы «Receipts», «Failure receipts»,
+  «Adding a test to a lane», «Local reproduction».
 
 ---
 
@@ -436,14 +447,29 @@ P3 — стратегическое/отложенное.
 - **Проверка:** bundle проходит ту же валидацию, что v1 (контракт sidecar'ов,
   счётчики, SHA); запись в `docs/status/training_data_inventory.md` обоих репо.
 
-## [P033] Пересборка global_symbols.sqlite (0 байт)
+## [P033] Пересборка global_symbols.sqlite (0 байт) — IN PROGRESS
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
-- **Где:** `outputs/crossrepo/global_symbols.sqlite` (0 байт с 2026-06-26),
-  `scripts/crossrepo/build_global_symbol_index.py`.
-- **Что делать:** перезапустить сборку индекса символов base-библиотек;
-  разобраться, почему предыдущий прогон дал пустой файл (лог/код — fail-closed?).
-- **Проверка:** sqlite > 0 байт, `sqlite3 ... "select count(*) from symbols"`
-  разумное число; `export_base16k_sampler.py` больше не падает fail-closed.
+- **Где:** `outputs/crossrepo/global_symbols.sqlite`,
+  `scripts/crossrepo/build_global_symbol_index.py:_validate_symbol_identity_claims`
+  и `tools/clang_indexer/index_project.py:canonical_symbol_identity`.
+- **Что сделано:**
+  - Первый A1-прогон доказал рабочий parse/store для `abseil`:
+    `588 files`, `6110 funcs`, `49757 types`, `0 errors`; остальные A1 libs
+    остались `done=0`, поэтому этот SQLite не считается готовым.
+  - Исправлена потеря declaration `column` между clang records и SQLite;
+    schema поднята с v4 до v5, reader и reopen-валидация требуют тот же столбец.
+  - External-provider key при reopen теперь проверяется с сохранёнными
+    `provider`/`include_provenance`; добавлен реальный SQLite round-trip,
+    включая fail-closed проверку несовпавшего column.
+  - Временный extraction cache допустим только на время активной сборки и
+    удаляется после проверки итогового индекса.
+- **Что делать:** довести A1-прогон (`abseil,folly,openssl,boringssl,protobuf,
+  eigen,fmt,glib`) до `done=1` и ненулевого `count(*)` в `symbols`; затем A2
+  (`std,libc`) с `--per-lib-pass` / ограничением файлов.
+- **Проверка:**
+  - `sqlite3 outputs/crossrepo/global_symbols.sqlite "select lib, done, n_funcs, n_types from symbol_index_libs order by lib;"` — все A1 libs `done=1`.
+  - Закрыть/повторно открыть SQLite и проверить schema v5 без identity drift.
+  - `scripts/crossrepo/export_base16k_sampler.py` больше не падает fail-closed.
 
 ## [P034] base16k sampler smoke после P033
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P033
@@ -843,17 +869,22 @@ P3 — стратегическое/отложенное.
 Всё здесь зависит от P073 — коммита текущего грязного дерева (его делает
 владелец фронта после H200-валидации).
 
-## [P073] Разбить working tree фронта на коммиты
+## [P073] Разбить working tree фронта на коммиты — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: chore | Зависит от: — (железная
   валидация владельцем фронта)
 - **Где:** грязное дерево: `document_isolation.py`, `fa4_*`, три миксера,
   `STACK.lock`, `build-wheels.yml`, 4 новых файла + параллельные правки
   (`docker/Dockerfile*`, `tests/test_cppmega_mamba3_tp_mixer.py`,
   `tests/test_document_isolation.py`).
-- **Что делать:** 3–4 логических коммита: (1) CP/SP isolation + миксеры,
-  (2) FA4 mask_mod + тесты, (3) wheel patch pin + policy-тест,
-  (4) docker/прочее.
-- **Проверка:** self-hosted CI зелёный на каждом коммите; `git log` читается.
+- **Что сделано:** фронт приземлён в main; рабочее дерево больше не содержит
+  uncommitted изменений по document isolation/FA4/mamba patch. Текущие
+  незакоммиченные изменения относятся только к закрываемым в этом run
+  пунктам P016/P020/P024/P033.
+- **Проверка:**
+  - `git status --short` в `cppmega` не показывает файлы фронта
+    (`document_isolation.py`, `fa4_*`, `STACK.lock`, `build-wheels.yml`).
+  - `git log --oneline -10` содержит коммиты фронта, включая `P065` и
+    `P061`.
 
 ## [P074] Два пропущенных GPU-теста в Modal -k фильтр — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: bug | Зависит от: P073
@@ -882,23 +913,29 @@ P3 — стратегическое/отложенное.
 - **Проверка:** README docs/status по-прежнему называет его canonical — и это
   правда по содержимому.
 
-## [P077] Guard сигнатур приватного API Megatron
+## [P077] Guard сигнатур приватного API Megatron — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P073
-- **Где:** `cppmega/megatron/document_isolation.py` (импорт
-  `_redo/_undo_attention_load_balancing` из `megatron.core.ssm.mamba_context_parallel`).
-- **Что делать:** при patch-install/старте — `inspect.signature` assert на
-  ожидаемые сигнатуры с понятной ошибкой (версия Megatron запинена манифестом,
-  но drift возможен при смене пина).
-- **Проверка:** тест: подмена сигнатуры → понятный RuntimeError;
-  `pytest tests/test_document_isolation_cp.py -q` зелёный.
+- **Где:** `cppmega/megatron/document_isolation.py:407-478`
+  (`_assert_mamba_cp_signatures`), `tests/test_document_isolation.py:547-562`.
+- **Что сделано:** guard уже реализован: проверяет сигнатуры
+  `_redo_attention_load_balancing` и `_undo_attention_load_balancing` через
+  `inspect.signature`, включая имена параметров, типы и return annotation.
+  Тесты покрывают happy path и подмену сигнатуры.
+- **Проверка:**
+  - `.venv/bin/python -m pytest tests/test_document_isolation.py::test_mamba_cp_signature_guard_accepts_pinned_api tests/test_document_isolation.py::test_mamba_cp_signature_guard_rejects_changed_api -q` → 2 passed.
+  - `pytest tests/test_document_isolation_cp.py -q` зелёный.
 
-## [P078] Задокументировать контракт id(tensor) в _received_document_ids
+## [P078] Задокументировать контракт id(tensor) в _received_document_ids — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P073
-- **Где:** `cppmega/megatron/document_isolation.py:924,958` (ключ по
-  `id(tensor)` — сломается при `.contiguous()`/копии в Megatron).
-- **Что делать:** docstring/комментарий с контрактом «тот же объект между
-  p2p и set_input_tensor» + тест, ловящий копию тензора.
-- **Проверка:** тест зелёный; контракт читается в коде.
+- **Где:** `cppmega/megatron/document_isolation.py:16-26`, `:1254`, `:1296-1301`
+  (`_received_document_ids` и lookup в `isolated_set_input_tensor`).
+- **Что сделано:** контракт уже задокументирован: docstring/комментарии
+  объясняют, что ключ — exact tensor object identity, и любой `.clone()`,
+  `.detach()` или не-contiguous `.contiguous()` копия меняет `id()` и ломает
+  lookup. Поведение покрыто тестами document isolation.
+- **Проверка:**
+  - `rg -n "exact tensor object identity\|id(tensor)" cppmega/megatron/document_isolation.py` → есть совпадения.
+  - `pytest tests/test_document_isolation_cp.py tests/test_document_isolation.py -q` → зелёный.
 
 ## [P079] Nebius DEFAULT_DOCKER_IMAGE bump на beta23
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P075
