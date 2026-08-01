@@ -151,6 +151,34 @@ def validate_complete_wheel_set(
     return expected
 
 
+def validate_mamba_overlay_state(
+    installed_hashes: dict[str, str],
+    expected_installed_hashes: dict[str, str],
+    *,
+    backup_hash: str | None,
+    expected_backup_hash: str,
+    stage2_applied: bool,
+    stage2_absent: bool,
+    gqa_applied: bool,
+    gqa_absent: bool,
+) -> None:
+    if (
+        installed_hashes != expected_installed_hashes
+        or backup_hash != expected_backup_hash
+        or not stage2_applied
+        or stage2_absent
+        or not gqa_applied
+        or gqa_absent
+    ):
+        raise RuntimeError(
+            "image-built Mamba overlay mismatch: "
+            f"installed={installed_hashes!r}, backup_hash={backup_hash!r}, "
+            f"stage2_applied={stage2_applied}, "
+            f"stage2_absent={stage2_absent}, gqa_applied={gqa_applied}, "
+            f"gqa_absent={gqa_absent}"
+        )
+
+
 def junit_counts(path: Path) -> dict[str, int | bool]:
     if not path.is_file():
         return {

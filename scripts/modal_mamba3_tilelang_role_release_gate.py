@@ -83,6 +83,7 @@ sha256_path = _INTEGRITY.sha256_path
 untracked_shadowable_files = _INTEGRITY.untracked_shadowable_files
 validate_complete_wheel_set = _INTEGRITY.validate_complete_wheel_set
 validate_exact_junit = _INTEGRITY.validate_exact_junit
+validate_mamba_overlay_state = _INTEGRITY.validate_mamba_overlay_state
 validate_source_manifest = _INTEGRITY.validate_source_manifest
 verify_wheel_record_payloads = _INTEGRITY.verify_wheel_record_payloads
 wheel_distribution_name = _INTEGRITY.wheel_distribution_name
@@ -215,7 +216,7 @@ _EXPECTED_MAMBA_INITIAL_SHA256 = {
 }
 _EXPECTED_MAMBA_AFTER_SHA256 = {
     "mamba3_mimo_bwd.py": (
-        "9b1662c53c31c2387a88cd63abdbfd9da6efba8008812f84356d2419a285d423"
+        "51dab809a47bd33a9b610725599dff956187edd70cae1518618f1ef31115d320"
     ),
     "mamba3_mimo_bwd_varlen.py": _EXPECTED_MAMBA_INITIAL_SHA256[
         "mamba3_mimo_bwd_varlen.py"
@@ -777,21 +778,16 @@ def run_release_gate() -> dict[str, Any]:
         stage2_absent = stage2._is_stage2_patch_absent()
         gqa_applied = gqa._is_gqa_bwd_patch_applied()
         gqa_absent = gqa._is_gqa_bwd_patch_absent()
-        if (
-            installed_hashes != _EXPECTED_MAMBA_AFTER_SHA256
-            or backup_hash != _EXPECTED_MAMBA_INITIAL_SHA256["mamba3_mimo_bwd.py"]
-            or not stage2_applied
-            or stage2_absent
-            or not gqa_applied
-            or gqa_absent
-        ):
-            raise RuntimeError(
-                "image-built Mamba overlay mismatch: "
-                f"installed={installed_hashes!r}, backup_hash={backup_hash!r}, "
-                f"stage2_applied={stage2_applied}, "
-                f"stage2_absent={stage2_absent}, gqa_applied={gqa_applied}, "
-                f"gqa_absent={gqa_absent}"
-            )
+        validate_mamba_overlay_state(
+            installed_hashes,
+            _EXPECTED_MAMBA_AFTER_SHA256,
+            backup_hash=backup_hash,
+            expected_backup_hash=_EXPECTED_MAMBA_INITIAL_SHA256["mamba3_mimo_bwd.py"],
+            stage2_applied=stage2_applied,
+            stage2_absent=stage2_absent,
+            gqa_applied=gqa_applied,
+            gqa_absent=gqa_absent,
+        )
         return {
             "installed_paths": {
                 name: str(path) for name, path in installed_paths.items()

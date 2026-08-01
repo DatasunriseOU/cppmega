@@ -26,6 +26,7 @@ non-TMA copies remain useful, while ``bf_num_stages=1`` and
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import shutil
@@ -61,6 +62,8 @@ _PATCHED_MARKERS = {
         "T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
         "i_h_qk, :], k_frag, disable_tma=True)"
     ),
+    "bf_q_biased_shared": "T.copy(q_frag, q_shared)",
+    "bf_k_biased_shared": "T.copy(k_frag, k_shared)",
     "bwd_tma_disabled": "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True",
     "bwd_ws_disabled": "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True",
 }
@@ -117,59 +120,204 @@ def _has_partial_stage2_markers(text: str) -> bool:
 
 def _validate_patched(path: Path) -> None:
     text = path.read_text()
-    missing = [name for name, marker in _PATCHED_MARKERS.items() if marker not in text]
-    if missing:
-        raise RuntimeError(
-            f"{path}: patched validation failed, missing markers {missing}"
-        )
-    bwd_fwd_start = text.find("def mamba_mimo_bwd_fwd(")
-    bwd_bwd_start = text.find("def mamba_mimo_bwd_bwd(", bwd_fwd_start + 1)
-    if bwd_fwd_start < 0 or bwd_bwd_start < 0:
-        raise RuntimeError(f"{path}: could not isolate the bwd_fwd kernel source")
-    bwd_fwd = text[bwd_fwd_start:bwd_bwd_start]
-    unsafe_shared_loads = (
-        (
-            "q_shared",
-            "T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
-            "i_h_qk, :], q_shared)",
-        ),
-        (
-            "k_shared",
-            "T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, "
-            "i_h_qk, :], k_shared)",
-        ),
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise RuntimeError(f"{path}: patched source is not valid Python") from exc
+
+    def exact_function(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+        matches = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(f"{path}: expected exactly one {name} definition")
+        return matches[0]
+
+    bwd_fwd = exact_function("mamba_mimo_bwd_fwd")
+    bwd_bwd = exact_function("mamba_mimo_bwd_bwd")
+    combined = exact_function("mamba_mimo_bwd_combined")
+    positional_args = [*combined.args.posonlyargs, *combined.args.args]
+    positional_defaults = [
+        *([None] * (len(positional_args) - len(combined.args.defaults))),
+        *combined.args.defaults,
+    ]
+    defaults_by_name = {
+        arg.arg: default
+        for arg, default in zip(positional_args, positional_defaults, strict=True)
+    }
+    defaults_by_name.update(
+        {
+            arg.arg: default
+            for arg, default in zip(
+                combined.args.kwonlyargs,
+                combined.args.kw_defaults,
+                strict=True,
+            )
+        }
     )
+    expected_stage_defaults = {"bf_num_stages": 1, "bb_num_stages": 0}
+    observed_stage_defaults = {
+        name: (
+            default.value
+            if isinstance(default, ast.Constant) and type(default.value) is int
+            else None
+        )
+        for name, expected in expected_stage_defaults.items()
+        if (default := defaults_by_name.get(name)) is not None
+    }
+    if observed_stage_defaults != expected_stage_defaults:
+        raise RuntimeError(
+            f"{path}: backward stage defaults must stay exact; "
+            f"observed={observed_stage_defaults}, "
+            f"expected={expected_stage_defaults}"
+        )
+
+    def copy_signature(
+        node: ast.AST,
+    ) -> tuple[str | None, str | None, bool] | None:
+        if (
+            not isinstance(node, ast.Call)
+            or ast.unparse(node.func) != "T.copy"
+            or len(node.args) < 2
+        ):
+            return None
+        source = node.args[0]
+        while isinstance(source, (ast.Attribute, ast.Subscript)):
+            source = source.value
+        destination = node.args[1]
+        while isinstance(destination, (ast.Attribute, ast.Subscript)):
+            destination = destination.value
+        disable_tma = any(
+            keyword.arg == "disable_tma"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+        return (
+            source.id if isinstance(source, ast.Name) else None,
+            destination.id if isinstance(destination, ast.Name) else None,
+            disable_tma,
+        )
+
+    bwd_fwd_copies = [
+        signature
+        for node in ast.walk(bwd_fwd)
+        if (signature := copy_signature(node)) is not None
+    ]
+    shared_write_counts = {
+        f"{name}_shared": sum(
+            source == f"{name}_frag" and destination == f"{name}_shared"
+            for source, destination, _ in bwd_fwd_copies
+        )
+        for name in ("q", "k")
+    }
+    invalid_shared_write_counts = {
+        buffer_name: count
+        for buffer_name, count in shared_write_counts.items()
+        if count != 1
+    }
+    if invalid_shared_write_counts:
+        raise RuntimeError(
+            f"{path}: bwd_fwd must have exactly one biased fragment-to-shared "
+            f"write for each Q/K buffer; counts={invalid_shared_write_counts}"
+        )
+    direct_fragment_loads = {
+        f"{name}_frag": [
+            disable_tma
+            for source, destination, disable_tma in bwd_fwd_copies
+            if source == name.upper() and destination == f"{name}_frag"
+        ]
+        for name in ("q", "k")
+    }
+    invalid_direct_fragment_loads = {
+        fragment_name: values
+        for fragment_name, values in direct_fragment_loads.items()
+        if values != [True]
+    }
+    if invalid_direct_fragment_loads:
+        raise RuntimeError(
+            f"{path}: bwd_fwd must have exactly one direct global-to-fragment "
+            f"load with disable_tma=True for each Q/K buffer; "
+            f"observed={invalid_direct_fragment_loads}"
+        )
     overlapping = [
-        buffer_name for buffer_name, marker in unsafe_shared_loads if marker in bwd_fwd
+        f"{name}_shared"
+        for name in ("q", "k")
+        if any(
+            source == name.upper() and destination == f"{name}_shared"
+            for source, destination, _ in bwd_fwd_copies
+        )
     ]
     if overlapping:
         raise RuntimeError(
             f"{path}: bwd_fwd has overlapping raw and biased shared writes for "
             f"{overlapping}; raw Q/K must load directly into fragments"
         )
-    if "bb_num_stages=1" in text:
+    missing = [name for name, marker in _PATCHED_MARKERS.items() if marker not in text]
+    if missing:
         raise RuntimeError(
-            f"{path}: rollback guard tripped - found bb_num_stages=1. "
-            "The production candidate must stay bf=1,bb=0."
+            f"{path}: patched validation failed, missing markers {missing}"
         )
-    tma_disabled_count = text.count("tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True")
-    ws_disabled_count = text.count(
-        "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True"
+
+    required_pass_configs = (
+        "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER",
+        "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED",
     )
-    if tma_disabled_count < 2 or ws_disabled_count < 2:
+    invalid_pass_configs: dict[str, dict[str, list[object]]] = {}
+    for function in (bwd_fwd, bwd_bwd):
+        jit_decorators = [
+            decorator
+            for decorator in function.decorator_list
+            if isinstance(decorator, ast.Call)
+            and ast.unparse(decorator.func) == "tilelang.jit"
+        ]
+        pass_config_nodes = [
+            keyword.value
+            for decorator in jit_decorators
+            for keyword in decorator.keywords
+            if keyword.arg == "pass_configs"
+        ]
+        observed: dict[str, list[object]] = {}
+        if len(pass_config_nodes) == 1 and isinstance(pass_config_nodes[0], ast.Dict):
+            for key, value in zip(
+                pass_config_nodes[0].keys,
+                pass_config_nodes[0].values,
+                strict=True,
+            ):
+                if key is None:
+                    continue
+                key_name = ast.unparse(key)
+                if key_name in required_pass_configs:
+                    observed.setdefault(key_name, []).append(
+                        (
+                            value.value
+                            if isinstance(value, ast.Constant)
+                            and type(value.value) is bool
+                            else None
+                        )
+                    )
+        invalid = {
+            key: observed.get(key, [])
+            for key in required_pass_configs
+            if observed.get(key) != [True]
+        }
+        if len(jit_decorators) != 1 or invalid:
+            invalid_pass_configs[function.name] = invalid
+    if invalid_pass_configs:
         raise RuntimeError(
-            f"{path}: both backward kernels must keep TMA lowering and warp "
-            "specialization disabled; "
-            f"tma_disabled={tma_disabled_count}, ws_disabled={ws_disabled_count}"
+            f"{path}: both backward kernels must keep exact TMA lowering and "
+            f"warp specialization disable pass configs; "
+            f"observed={invalid_pass_configs}"
         )
-    if (
-        "tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False" in text
-        or "tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False" in text
-    ):
-        raise RuntimeError(
-            f"{path}: unsafe backward TMA/warp-specialization enable marker found"
-        )
-    disable_tma_count = text.count("disable_tma=True")
+
+    disable_tma_count = sum(
+        bool(signature[2])
+        for node in ast.walk(tree)
+        if (signature := copy_signature(node)) is not None
+    )
     if disable_tma_count < 10:
         raise RuntimeError(
             f"{path}: expected targeted per-copy disable_tma guards, "
