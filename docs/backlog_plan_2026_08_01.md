@@ -538,15 +538,17 @@ P3 — стратегическое/отложенное.
 
 ## [P040] Data release checklist (воспроизводимый статус) — DONE
 - Репо: both | Приоритет: P2 | Тип: chore | Зависит от: P025
-- **Где:** `cppmega/docs/data_release_checklist.md` + ссылка в
-  `cppmega/docs/status/README.md`.
+- **Где:** `docs/data_release_checklist.md` + ссылки в
+  `docs/status/README.md` и `docs/status/training_data_inventory.md` обоих
+  репозиториев.
 - **Что сделано:** чеклист из 5 блокеров inventory с командами проверки каждого
   и combined single-command gate. Текущий прогон честно показывает 4 открытых
   блокера (Python aux mixed, PR not eligible, CI not ready, sealed bundle not
   ready); DirectXTK case-fold collision resolved.
 - **Проверка:**
-  - `cat docs/data_release_checklist.md` — 6 разделов + combined command.
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python scripts/report_training_data_status.py --config configs/training_data_status.json --jobs 4 && .venv/bin/python - <<'PY` ... `PY` — выводит список открытых блокеров.
+  - Выполнить пять `jq -e` gate-команд и combined gate из
+    `docs/data_release_checklist.md`; текущий результат: gate 1 проходит,
+    gates 2–5 не проходят, существующий sealed-bundle gate проходит.
 
 ---
 
@@ -881,21 +883,25 @@ P3 — стратегическое/отложенное.
   - `rg -n "Atomic publication|RoPE-only|Graph-route parity|Side-channel preservation|staged partial port" docs/mtr005_megatron_dcp_to_mlx.md` — разделы присутствуют.
   - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_convert_megatron_dense500m_torchdist_to_mlx.py -q` — 20 passed.
 
-## [P072] Машиночитаемый индекс сконвертированных чекпоинтов — DONE
-- Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P062
-- **Где:** `scripts/generate_mlx_converted_index.py`,
-  `outputs/checkpoints/mlx_converted/index.json`,
-  `tests/test_mlx_converted_index.py`.
+## [P072] Машиночитаемый индекс сконвертированных чекпоинтов — PARTIAL
+- Репо: both | Приоритет: P3 | Тип: task | Зависит от: P062
+- **Где:** `cppmega.mlx/scripts/generate_mlx_converted_index.py`,
+  `cppmega.mlx/tests/test_mlx_converted_index.py`,
+  `cppmega/outputs/checkpoints/mlx_converted/index.json`.
 - **Что сделано:** добавлен генератор индекса, который сканирует
   `outputs/checkpoints/mlx_converted/`, читает каждый `model.json`, записывает
   `id → path, source_checkpoint, schema, dtype, weights_sha256, has_logit_parity,
-  has_publish_receipt, rope_only` и статус (`v4_ready` / `v1_superseded`).
-  Старые чекпоинты отмечены как `v1_superseded`; после P062 генератор
-  перезапускается и обновляет статусы.
+  has_publish_receipt, rope_only` и fail-closed статус `ready` / `superseded`.
+  Publish receipt принимается только при совпадении SHA с физическими весами;
+  запись индекса атомарна. Текущий индекс v2 содержит 7 записей: ready 0,
+  superseded 7; SHA-256 индекса
+  `20e0180d679a87d9b5b348e3330779e64431eec5638f1542bf1a79b2d3e4cf7f`.
+- **Что осталось:** выполнить P062 и научить eval-скрипты выбирать checkpoint
+  по id из индекса. До этого исходный контракт P072 не закрыт.
 - **Проверка:**
-  - `ls outputs/checkpoints/mlx_converted/index.json` — файл существует.
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_mlx_converted_index.py -q` → 5 passed.
-  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python scripts/generate_mlx_converted_index.py` — `count` равен числу поддиректорий.
+  - `cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/test_mlx_converted_index.py -q` → 2 passed.
+  - `jq '{schema,count,ready,superseded}' /Volumes/external/sources/cppmega/outputs/checkpoints/mlx_converted/index.json`
+    → schema v2, count 7, ready 0, superseded 7.
 
 ---
 

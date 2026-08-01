@@ -118,5 +118,5 @@ CPPMEGA_MANIFEST=$(jq -er '.datasets.sealed_megatron.manifest' "$CPPMEGA_STATUS"
 test -s "$CPPMEGA_MANIFEST"
 ```
 
-At the time this checklist was introduced, gates 1-5 correctly failed and the
-existing sealed-bundle gate passed. Re-run the commands for current truth.
+At the time this checklist was introduced, gate 1 passed, gates 2-5 failed, and
+the existing sealed-bundle gate passed. Re-run the commands for current truth.
