@@ -350,3 +350,72 @@ NAM56R). Does NOT block H200 or B200 — those are the production targets per
 Production goes to H200 / B200"). Recommend: use GB10 for BF16 smoke only,
 run FP8 on bench3 H200 per the existing FP8 path matrix.
 
+---
+
+## Import-time DeprecationWarnings from torch and megatron-core (test-suite triage P011)
+
+- **Packages**: `torch` (2.x, `torch/jit/_script.py:365`),
+  `megatron-core` (`megatron/core/inference/contexts/__init__.py:9`)
+- **Status**: Present upstream as of 2026-08-01; both are self-acknowledged
+  deprecations emitted by the dependencies themselves
+- **Severity**: Cosmetic — only relevant when running pytest with
+  `-W error::DeprecationWarning`
+
+### Bug
+
+Two `DeprecationWarning`s fire while importing the Megatron-LM test manifest,
+before any cppmega test code runs:
+
+1. `torch.jit.script_method is deprecated. Please switch to torch.compile or
+   torch.export.` — emitted from `torch/jit/_script.py:365` because torch's
+   own `torch/utils/mkldnn.py` still decorates `MkldnnLinear` with
+   `@torch.jit.script_method`. Triggered via the
+   `torch.fx.experimental.optimization` import chain pulled in by Megatron.
+
+2. `The following imports from dynamic_context.py will be removed in this
+   file in megatron-core 0.14...` — Megatron's own notice about re-exports in
+   `megatron/core/inference/contexts/__init__.py:9` (cyclic-import
+   workaround); scheduled for removal in megatron-core 0.14.
+
+Both warnings-as-errors abort `conftest.py`'s Megatron bootstrap with a
+misleading "cppmega tests require a real Megatron-LM import" RuntimeError,
+because `_bootstrap_real_megatron()` wraps the import in a broad
+`except Exception`.
+
+### Workaround
+
+Run the strict-warning triage with exact-module ignore filters (pytest `-W`
+and `PYTHONWARNINGS` match the module name literally with an end anchor, so
+prefix filters like `torch` do NOT work):
+
+```bash
+.venv/bin/python -m pytest tests/test_document_isolation_cp.py \
+    tests/test_fa4_document_isolation.py tests/test_document_isolation.py \
+    tests/test_cppmega_mamba3_tp_mixer.py -q \
+    -W error::DeprecationWarning \
+    -W "ignore::DeprecationWarning:torch.jit._script" \
+    -W "ignore::DeprecationWarning:megatron.core.inference.contexts"
+```
+
+Verified green 2026-08-01: 30 passed, 7 skipped. Zero DeprecationWarnings
+originate from cppmega's own code in these files.
+
+### Impact on cppmega
+
+**None** — no cppmega source triggers a DeprecationWarning in the document
+isolation / FA4 / Mamba3 TP mixer test files. Remaining warnings in the
+summary are informational UserWarnings from Megatron about optional
+dependencies not being installed (Transformer Engine, Apex, absl-py) and one
+Megatron `full scope is deprecated` UserWarning from
+`megatron/core/transformer/transformer_config.py:1934` — all foreign,
+all benign for local CPU test runs.
+
+### Upstream next step
+
+For (1): fixed whenever torch removes the deprecated decorator from
+`torch/utils/mkldnn.py` (tracked by pytorch internally; no action for us).
+For (2): resolved when the pinned Megatron-LM manifest moves to
+megatron-core >= 0.14, which drops the deprecated re-exports. Re-run the
+command above after the next manifest bump and drop the ignore filters once
+upstream stops emitting.
+
