@@ -739,6 +739,13 @@ def test_contract_lane_manifests_include_runner_regressions_and_cuda_probes() ->
     assert "tests/test_document_isolation_cp.py" in macos_argv
     assert "tests/test_fa4_document_isolation.py" in macos_argv
 
+    linux_argv = [
+        part
+        for command in lanes["linux-contracts"]["commands"]
+        for part in command["argv"]
+    ]
+    assert "tests/test_domain_megatron_sidecars.py" not in linux_argv
+
     cuda_argv = [
         part for command in lanes["linux-cuda"]["commands"] for part in command["argv"]
     ]

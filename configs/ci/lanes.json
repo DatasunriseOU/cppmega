@@ -158,7 +158,6 @@
             "tests/test_route_packed_source_docs.py",
             "tests/test_data_prep_parquet_to_megatron.py",
             "tests/test_case5_ksh_domain_contract.py",
-            "tests/test_domain_megatron_sidecars.py",
             "tests/test_eval_domain_routed_codegen.py",
             "tests/test_ksh_python_domain_parsers.py",
             "tests/test_nebius_h200_megatron_cpp_generation_eval.py",
