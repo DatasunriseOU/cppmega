@@ -1,0 +1,84 @@
+{
+  "date": "2026-08-01",
+  "commit": "80ced74c0527c497af5b1c45640f33c800d9e919",
+  "platform": "Darwin arm64 (macOS, no CUDA)",
+  "python": "3.13.12",
+  "torch": "2.13.0",
+  "command": ".venv/bin/python -m pytest tests/ -q -rf -p no:cacheprovider",
+  "total": 2669,
+  "passed": 2486,
+  "failed": 12,
+  "skipped": 171,
+  "duration_s": 289.17,
+  "notes": "Full suite completes locally in ~5 min; no hangs, no split run needed. All 12 failures are pre-existing environment/fixture gaps (missing sibling checkouts, unset parity env vars, under-provisioned cppmega.mlx venv, stale pinned Megatron checkout). None are caused by the 2026-08-01 audit commits; every failing test file was last modified 2026-07-15..2026-07-28, before this audit round. An intermediate run on 06f063ec showed a transient 13th failure that disappeared at 80ced74c after the parallel fp8 test fix.",
+  "failures": [
+    {
+      "nodeid": "tests/test_case3_case4_identity_index_contracts.py::test_mlx_emits_the_shared_integrity_version",
+      "reason": "FileNotFoundError: sibling checkout /Volumes/external/sources/cppmega_mlx_pr_integration_20260718 does not exist",
+      "classification": "pre-existing environment (missing sibling mlx checkout)"
+    },
+    {
+      "nodeid": "tests/test_case4_identity_parity.py::test_root_payload_matches_current_mlx_payload_contract",
+      "reason": "test pytest.fails by design without explicit CPPMEGA_MLX_REFERENCE_ROOT and CPPMEGA_MLX_REFERENCE_COMMIT",
+      "classification": "pre-existing environment (cross-repo parity env vars unset)"
+    },
+    {
+      "nodeid": "tests/test_dsa_indexer_fused_patch.py::test_real_pinned_dsa_topk_emits_selector_receipt",
+      "reason": "subprocess runs /Volumes/external/sources/.venvs/cppmega.mlx/bin/python which has no megatron module: ModuleNotFoundError: No module named 'megatron'",
+      "classification": "pre-existing environment (cppmega.mlx venv lacks Megatron manifest)"
+    },
+    {
+      "nodeid": "tests/test_dsa_indexer_fused_patch.py::test_real_pinned_dsa_topk_applies_graph_before_mask_and_selection",
+      "reason": "same as above: cppmega.mlx venv python has no megatron module",
+      "classification": "pre-existing environment (cppmega.mlx venv lacks Megatron manifest)"
+    },
+    {
+      "nodeid": "tests/test_dsa_indexer_fused_patch.py::test_real_pinned_fused_dsa_edge_changes_selection_total_loss_and_gradients",
+      "reason": "pinned checkout /Volumes/external/sources/Megatron-LM-test-e40feed4 lacks megatron.core.models.hybrid, required by document_isolation patch (committed active front 811973b7/27f77825)",
+      "classification": "pre-existing environment (pinned Megatron checkout older than document-isolation front)"
+    },
+    {
+      "nodeid": "tests/test_graph_recipe.py::test_stage1_graph_recipe_matches_mlx_peer",
+      "reason": "test pytest.fails by design without explicit CPPMEGA_RECIPE_PARITY_PEER_ROOT and CPPMEGA_RECIPE_PARITY_PEER_COMMIT",
+      "classification": "pre-existing environment (recipe parity env vars unset)"
+    },
+    {
+      "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[auto]",
+      "reason": "ModuleNotFoundError: cppmega_mlx.nn._tilelang.m2rnn exists only in sibling repo /Volumes/external/sources/cppmega.mlx, not importable from this venv",
+      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+    },
+    {
+      "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[engine]",
+      "reason": "same as above: cppmega_mlx.nn._tilelang.m2rnn not importable",
+      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+    },
+    {
+      "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[shim]",
+      "reason": "same as above: cppmega_mlx.nn._tilelang.m2rnn not importable",
+      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+    },
+    {
+      "nodeid": "tests/test_m2rnn_path_b_engine.py::test_engine_mode_does_not_break_module_import[engine_with_msl_extraction]",
+      "reason": "same as above: cppmega_mlx.nn._tilelang.m2rnn not importable",
+      "classification": "pre-existing environment (sibling cppmega.mlx package not on path)"
+    },
+    {
+      "nodeid": "tests/test_recipe_artifact_parity.py::test_mlx_generated_objective_artifact_is_root_loadable_and_recipe_bound",
+      "reason": "test pytest.fails by design without explicit CPPMEGA_RECIPE_PARITY_PEER_ROOT and CPPMEGA_RECIPE_PARITY_PEER_COMMIT",
+      "classification": "pre-existing environment (artifact parity env vars unset)"
+    },
+    {
+      "nodeid": "tests/test_root_data_entrypoints.py::test_root_source_entrypoint_writes_schema_v2_manifest",
+      "reason": "fixture copies only scripts/, cppmega/, tools/clang_indexer/ into the temp checkout, but scripts/streaming_reindex.py defaults --source-quarantine-manifest to <root>/configs/source_quarantine_manifest.json (since f1c9acc9, 2026-07-28) and hard-errors when it is missing",
+      "classification": "pre-existing repo defect (test fixture does not copy configs/), not macOS-specific, not from this audit round"
+    }
+  ],
+  "notable_skips": [
+    "GPU-gated CUDA suites: test_fa4_h200_parity (10), test_fa4_cute_jit_compile, test_m2rnn_triton (19), test_m2rnn_pararnn*, test_quantized_muon_momentum (15), test_grouped_mxfp8_gemm (4), test_sparse_mla_ops, test_mxfp8_transpose_emit_ext, test_mamba3_psiv_cache",
+    "transformer_engine not installed: test_fp8_activations_te (4), test_mxfp8_probe_helpers (5), test_mxfp8_sidecar_lifecycle, test_sparse_mla_te_fp8_extract (3)",
+    "mamba_ssm not installed: test_nam56r_noconv_spec (3), test_noconv_mamba_mixer (4), test_mamba3_te_mixer",
+    "sibling cppmega_mlx._tilelang modules not importable: test_mamba3_path_b_engine, test_mamba3_path_c_engine (4), test_sparse_mla_path_c_engine (5), parts of test_m2rnn_path_b_engine",
+    "flashinfer CUTLASS SM120/SM121 backend unavailable: test_flashinfer_mxfp8_gemm (2)",
+    "misc: two-rank NCCL unavailable (test_structure_dataset_patch_bridge), liger_kernel CUDA arch gate (test_mtp_liger_ce, 4), cppmega_fp8_shim MXFP8 dense wrapper not installed (2), Phase B not implemented (1)"
+  ]
+}
