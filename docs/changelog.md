@@ -1,5 +1,28 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-01: Global symbol index v5 and base16k export smoke
+
+Rebuilt the A1 global symbol index from nine base libraries: all nine
+per-library passes finished with zero errors, producing a 580 MiB schema-v5
+SQLite with 213,777 symbols and 197,435 canonical identity records. Reopen
+validation preserved declaration columns and external-provider provenance.
+The 482 MiB extraction cache was removed after validation.
+
+The first real base16k export exposed that sampler documents omitted the
+mandatory symbol-identity schema marker and collision registry. The shared
+root fix is mirrored in `cppmega` and `cppmega.mlx`: each sampled function now
+carries its canonical key/ID both in the collision registry and across its
+dense symbol sidecar. The corrected end-to-end smoke emitted 12 documents into
+five 16,384-token ZSTD rows with 69,942 valid tokens; all 25 dense token-aligned
+sidecars have exactly 16,384 values per row, every row has non-zero symbol IDs,
+schema metadata binds symbol identity v3, and dedup records exactly four keys
+with three claims each. The durable Parquet receipt is
+`/Volumes/external/cppmega_data/receipts/global-symbol-index-v5-3704d0aa/base16k-smoke-v4/parquet/16384/base16k_smoke_v4.parquet`
+(SHA256
+`844eb792cff7f8015945843b6e76945aba2a215ba7af3e204e9c8218b7bcb9d2`).
+A2 indexing for `std`/`libc` and the production-sized base16k export remain
+pending.
+
 ## 2026-08-01: Source-conveyor terminal failure closure
 
 Classified all 42 terminal source-conveyor failures: 34 deterministic defects

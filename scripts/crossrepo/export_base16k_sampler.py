@@ -38,6 +38,10 @@ if str(REPO_ROOT / "tools" / "clang_indexer") not in sys.path:
 
 import streaming_reindex as sr  # noqa: E402
 from streaming_reindex_commits import recompress_zstd_max  # noqa: E402
+from cppmega.data.symbol_identity import (  # noqa: E402
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+)
 from cppmega.tokenizer.cpp_tokenizer import load_cppmega_tokenizer  # noqa: E402
 from dedup_store import DedupStore  # noqa: E402
 
@@ -74,6 +78,8 @@ class BaseSymbol:
     token_est: int
     body_len: int
     text: str
+    symbol_id: int
+    symbol_key: str
 
 
 def _connect_symbol_index(path: Path) -> sqlite3.Connection:
@@ -108,7 +114,7 @@ def load_candidate_symbols(
             params.extend(libs)
         sql = (
             "SELECT qname, base_lib, base_repo, kind, sym_type, file, line, "
-            "token_est, body_len, text "
+            "token_est, body_len, text, symbol_id, symbol_key "
             "FROM symbols WHERE "
             + " AND ".join(where)
         )
@@ -128,6 +134,8 @@ def load_candidate_symbols(
             token_est=int(r["token_est"]),
             body_len=int(r["body_len"]),
             text=str(r["text"]),
+            symbol_id=int(r["symbol_id"], 16),
+            symbol_key=str(r["symbol_key"]),
         )
         for r in rows
     ]
@@ -156,6 +164,10 @@ def _base_doc(symbol: BaseSymbol, *, repeat_index: int, token_count: int) -> dic
         "line": symbol.line,
         "repeat_index": repeat_index,
     }]
+    identity_record = {
+        "symbol_id": int(symbol.symbol_id),
+        "symbol_key": symbol.symbol_key,
+    }
     return {
         "text": text,
         "source_text": text,
@@ -170,15 +182,18 @@ def _base_doc(symbol: BaseSymbol, *, repeat_index: int, token_count: int) -> dic
             "kind": int(symbol.kind),
             "dep_level": 0,
             "name": symbol.qname.split("::")[-1],
+            "symbol_id": int(symbol.symbol_id),
         }],
         "call_edges": [],
         "type_edges": [],
         "ast_depth": [],
         "sibling_index": [],
         "ast_node_type": [],
-        "symbol_ids": [],
+        "symbol_ids": [int(symbol.symbol_id)] * len(text),
         "call_targets": [],
         "type_refs": [],
+        "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: [identity_record],
         "def_use": [],
         "repo": symbol.base_repo,
         "filepath": symbol.file,

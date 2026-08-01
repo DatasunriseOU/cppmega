@@ -166,6 +166,44 @@ assert conveyor.Manifest is reindex.Manifest is commits.Manifest
     assert completed.returncode == 0, completed.stderr
 
 
+def test_base16k_doc_carries_symbol_identity_contract() -> None:
+    from cppmega.data.symbol_identity import (
+        SYMBOL_IDENTITIES_COLUMN,
+        SYMBOL_IDENTITY_SCHEMA_VERSION,
+        compute_symbol_id,
+    )
+    from scripts.crossrepo.export_base16k_sampler import BaseSymbol, _base_doc
+
+    symbol_key = (
+        "repo_file_location:project=boostorg/boost;file=boost/base.hpp;"
+        "line=10;column=0;kind=func;qname=boost::base_fn"
+    )
+    symbol_id = compute_symbol_id(symbol_key)
+    doc = _base_doc(
+        BaseSymbol(
+            qname="boost::base_fn",
+            base_lib="boost",
+            base_repo="boostorg/boost",
+            kind=2,
+            sym_type="func",
+            file="boost/base.hpp",
+            line=10,
+            token_est=8,
+            body_len=19,
+            text="int base_fn() { }",
+            symbol_id=symbol_id,
+            symbol_key=symbol_key,
+        ),
+        repeat_index=0,
+        token_count=8,
+    )
+
+    assert doc["symbol_identity_schema_version"] == SYMBOL_IDENTITY_SCHEMA_VERSION
+    assert doc[SYMBOL_IDENTITIES_COLUMN] == [{"symbol_id": symbol_id, "symbol_key": symbol_key}]
+    assert doc["chunk_boundaries"][0]["symbol_id"] == symbol_id
+    assert doc["symbol_ids"] == [symbol_id] * len(doc["text"])
+
+
 def test_portable_source_pipeline_has_no_mlx_or_sibling_imports() -> None:
     missing = [str(path.relative_to(REPO_ROOT)) for path in PORTABLE_PATHS if not path.is_file()]
     assert missing == [], f"missing portable production files: {missing}"

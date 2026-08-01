@@ -447,35 +447,43 @@ P3 — стратегическое/отложенное.
 - **Проверка:** bundle проходит ту же валидацию, что v1 (контракт sidecar'ов,
   счётчики, SHA); запись в `docs/status/training_data_inventory.md` обоих репо.
 
-## [P033] Пересборка global_symbols.sqlite (0 байт) — IN PROGRESS
+## [P033] Пересборка global_symbols.sqlite (0 байт) — A1 DONE / A2 PENDING
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: —
 - **Где:** `outputs/crossrepo/global_symbols.sqlite`,
   `scripts/crossrepo/build_global_symbol_index.py:_validate_symbol_identity_claims`
   и `tools/clang_indexer/index_project.py:canonical_symbol_identity`.
 - **Что сделано:**
-  - Первый A1-прогон доказал рабочий parse/store для `abseil`:
-    `588 files`, `6110 funcs`, `49757 types`, `0 errors`; остальные A1 libs
-    остались `done=0`, поэтому этот SQLite не считается готовым.
+  - Все девять A1-проходов (`abseil,boost,folly,openssl,boringssl,protobuf,
+    eigen,fmt,glib`) завершены: `9/9 done`, `0 errors`; schema-v5 SQLite
+    занимает `580 MiB`, содержит `213777 symbols` и `197435`
+    identity-записей.
   - Исправлена потеря declaration `column` между clang records и SQLite;
     schema поднята с v4 до v5, reader и reopen-валидация требуют тот же столбец.
   - External-provider key при reopen теперь проверяется с сохранёнными
     `provider`/`include_provenance`; добавлен реальный SQLite round-trip,
     включая fail-closed проверку несовпавшего column.
-  - Временный extraction cache допустим только на время активной сборки и
-    удаляется после проверки итогового индекса.
-- **Что делать:** довести A1-прогон (`abseil,folly,openssl,boringssl,protobuf,
-  eigen,fmt,glib`) до `done=1` и ненулевого `count(*)` в `symbols`; затем A2
-  (`std,libc`) с `--per-lib-pass` / ограничением файлов.
+  - Reopen-валидация и настоящий base16k smoke прошли; временный `482 MiB`
+    extraction cache после проверки удалён.
+- **Что делать:** выполнить A2 (`std,libc`) с `--per-lib-pass` / ограничением
+  файлов.
 - **Проверка:**
   - `sqlite3 outputs/crossrepo/global_symbols.sqlite "select lib, done, n_funcs, n_types from symbol_index_libs order by lib;"` — все A1 libs `done=1`.
   - Закрыть/повторно открыть SQLite и проверить schema v5 без identity drift.
   - `scripts/crossrepo/export_base16k_sampler.py` больше не падает fail-closed.
 
-## [P034] base16k sampler smoke после P033
+## [P034] base16k sampler smoke после P033 — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: P033
 - **Где:** `scripts/crossrepo/export_base16k_sampler.py`.
-- **Что делать:** прогнать сэмпл-экспорт; сохранить receipt.
-- **Проверка:** receipt с числом сэмплов; выборка проходит schema-валидацию.
+- **Что сделано:** исправлен общий контракт `_base_doc` в `cppmega` и
+  `cppmega.mlx`: каждый документ теперь несёт symbol identity schema v3 и
+  канонический key/ID функции в collision registry и плотном symbol sidecar.
+- **Проверка:** end-to-end smoke (`global_symbols.sqlite → tokenizer →
+  materialize → best-fit pack → ZSTD`) дал `12 docs`, `5 rows`,
+  `69942 valid tokens`; все 25 плотных sidecar-колонок выровнены на `16384`,
+  в каждой row есть ненулевые `token_symbol_ids`,
+  dedup содержит `4 keys × 3 claims`. Parquet:
+  `/Volumes/external/cppmega_data/receipts/global-symbol-index-v5-3704d0aa/base16k-smoke-v4/parquet/16384/base16k_smoke_v4.parquet`,
+  SHA256 `844eb792cff7f8015945843b6e76945aba2a215ba7af3e204e9c8218b7bcb9d2`.
 
 ## [P035] Staleness-алерт для training_data_status watcher — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: —
