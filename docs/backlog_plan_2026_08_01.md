@@ -322,14 +322,20 @@ P3 — стратегическое/отложенное.
 - **Проверка:** тест зелёный; переформатирование workflow без смены смысла
   не ломает тест.
 
-## [P023] Failure-receipt: секреты-редакция под тестом на реальных паттернах
+## [P023] Failure-receipt: секреты-редакция под тестом на реальных паттернах — DONE
 - Репо: cppmega | Приоритет: P3 | Тип: task | Зависит от: P015
-- **Где:** `scripts/ci/repository_runner.py` (`_write_early_failure_receipt`
-  редактирует секреты), `tests/ci/test_repository_ci_runner.py`.
-- **Что делать:** добавить тесты на реальные форматы токенов проекта
-  (GitHub PAT, Nebius, Modal) — что они не протекают в receipt/лог.
-- **Проверка:** новые тесты зелёные; ручной grep по сгенерированному receipt
-  не находит тестовых токенов.
+- **Где:** `scripts/ci/repository_runner.py:496-527` (`_Redactor`),
+  `tests/ci/test_repository_ci_runner.py:963-1038`.
+- **Что сделано:** тесты на реальные форматы токенов уже добавлены:
+  - `test_step_logs_redact_project_token_formats` (`:970`) — проверяет, что
+    `run_step` не протаскивает в лог GitHub classic PAT (`ghp_...`),
+    fine-grained PAT (`github_pat_...`), Nebius API key и Modal token id/secret.
+  - `test_run_early_failure_receipt_redacts_project_token_formats` (`:1005`) —
+    проверяет, что `_write_early_failure_receipt` редуцирует те же форматы в
+    `orchestration.json` и `orchestrator-failure.log`.
+- **Проверка:**
+  - `CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest tests/ci/test_repository_ci_runner.py::test_step_logs_redact_project_token_formats tests/ci/test_repository_ci_runner.py::test_run_early_failure_receipt_redacts_project_token_formats -q` → 2 passed.
+  - `grep -R "nebius-unit-test-key\|ak-unitTEST\|as-unitTEST\|github_pat_11ABCDEFGH0" outputs/ci_diagnostics/lane_receipts/` → пусто (тестовые токены не остались в receipt'ах).
 
 ## [P024] Документирование CI-архитектуры: configs/ci/README.md
 - Репо: cppmega | Приоритет: P3 | Тип: chore | Зависит от: P016, P020
