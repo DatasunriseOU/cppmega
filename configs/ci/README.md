@@ -98,3 +98,77 @@ the same before/after check to the source worktree.
 Exit code `0` means the selected dry-run or lanes passed, `1` means a lane or
 provenance check failed, and `2` means configuration or required preflight
 blocked dispatch.
+
+## Lanes
+
+`lanes.json` declares the lanes that `.github/workflows/ci-self-hosted.yml`
+delegates to. The workflow jobs only verify checkout identity and the
+tokenizer contract, then hand off to `run_repository_ci.py lane` with
+`--expected-source-commit`/`--expected-source-tree` source binding.
+
+- `macos-contracts` (darwin/arm64, no CUDA, no test profile): interpreter
+  comes from `CPPMEGA_CI_PYTHON` or the pinned default venv, with
+  `MEGATRON_LM_REPO` exported by the workflow. Commands:
+  `focused-contracts` (focused pytest selection), `frozen-domain-eval`,
+  `tokenizer-contract`, `source-whitespace`.
+- `linux-contracts` (linux/x86_64, no CUDA, `portable-data` test profile):
+  `actions/setup-python` 3.13 plus `pytest numpy pyarrow tokenizers boto3
+  zstandard`. Commands: `portable-contracts` (allowlisted pytest selection),
+  `frozen-domain-eval`, `tokenizer-contract`, `source-whitespace`.
+- `linux-cuda` (linux/x86_64, CUDA required, modules `torch`, `triton`,
+  `megatron.core`, `mamba_ssm`): `cuda-contracts` plus `source-whitespace`.
+
+## Failure receipts
+
+Every lane writes `<receipt-dir>/receipt.json` and per-command logs, and the
+workflow uploads that directory with `if-no-files-found: error`. Three layers
+keep the root cause visible when something fails before the lane finishes:
+
+1. A fatal error inside the orchestrator (unknown lane id, unreadable lane
+   config, unexpected exception) is caught by `_write_early_failure_receipt`
+   in `scripts/ci/repository_runner.py`, which writes a minimal
+   `orchestrator`-stage receipt and exits `2`.
+2. The macOS workflow job wraps its pre-python preamble (interpreter check,
+   checkout identity, tokenizer contract) in a bash `ERR` trap that writes a
+   minimal `workflow-preamble` receipt into the same directory before
+   exiting, so a broken interpreter or checkout no longer surfaces as a bare
+   artifact-upload error (incident: run 30638778832). The trap is disarmed
+   right before the orchestrator runs so it never overwrites lane receipts.
+3. A dedicated `if: failure()` step appends `receipt.json` to
+   `$GITHUB_STEP_SUMMARY`, so the failure reason is readable in the job
+   summary without downloading the artifact.
+
+## Adding a test to a lane
+
+1. Add the test path to the lane's pytest `argv` in `configs/ci/lanes.json`
+   (both `macos-contracts` and `linux-contracts` when the test is portable).
+2. If the test must run under the `portable-data` profile, add it to
+   `conftest._PORTABLE_TEST_ALLOWLIST`; the profile refuses anything outside
+   that list.
+3. Keep `tests/test_workflow_runner_policy.py` in sync — it pins the
+   workflow/lane wiring and fails when the structure drifts.
+
+## Local reproduction
+
+Run the same pytest selection a lane runs, from the repository root:
+
+```bash
+.venv/bin/python -m pytest <test files> -q
+```
+
+For the `portable-data` profile (`linux-contracts`):
+
+```bash
+CPPMEGA_TEST_PROFILE=portable-data .venv/bin/python -m pytest <test files> -q
+```
+
+To exercise the full lane runner locally, including preflight and receipts:
+
+```bash
+.venv/bin/python scripts/ci/run_repository_ci.py lane \
+  --lanes-config configs/ci/lanes.json \
+  --lane macos-contracts \
+  --repo-root "$PWD" \
+  --python .venv/bin/python \
+  --receipt-dir outputs/ci_diagnostics/repository-ci
+```

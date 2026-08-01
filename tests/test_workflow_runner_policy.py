@@ -146,6 +146,38 @@ def test_macos_workflow_does_not_expand_an_empty_array_under_bash_3() -> None:
     assert workflow.count('--mlx-root "${CPPMEGA_MLX_REFERENCE_ROOT}"') == 1
 
 
+def test_macos_lane_writes_a_pre_python_failure_receipt() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
+        encoding="utf-8"
+    )
+    jobs = {
+        match.group("name"): match.group("body")
+        for match in JOB_BLOCK.finditer(workflow.partition("\njobs:\n")[2])
+    }
+    macos = jobs["mac-contracts"]
+
+    assert "set -eEuo pipefail" in macos
+    assert "trap 'on_pre_python_error' ERR" in macos
+    assert '"failure_stage": "workflow-preamble"' in macos
+    assert 'pre_python_step="python_bin is executable"' in macos
+    assert 'pre_python_step="verify tokenizer contract' in macos
+    # the trap is disarmed before the orchestrator writes its own receipts
+    assert macos.rindex("trap - ERR") < macos.index(
+        "scripts/ci/run_repository_ci.py lane"
+    )
+
+    summary_step = re.search(
+        r"(?ms)^      - name: Surface macOS lane failure receipt in job summary\n"
+        r"(?P<body>.*?)(?=^      - name:|\Z)",
+        macos,
+    )
+    assert summary_step is not None
+    summary_body = summary_step.group("body")
+    assert "if: failure()" in summary_body
+    assert "GITHUB_STEP_SUMMARY" in summary_body
+    assert 'cat "${receipt}"' in summary_body
+
+
 def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
         encoding="utf-8"
@@ -280,7 +312,22 @@ def test_mamba_wheel_build_applies_the_pinned_gqa_backward_patch() -> None:
     assert "Verify Mamba wheel contains the pinned GQA backward patch" in workflow
     assert "wheel_bytes != source_bytes" in workflow
     assert "F.softplus((dd_dt + self.dt_bias).to(torch.float32))" in workflow
-    assert workflow.count('"elif H % G == 0:"') == 2
+    verify_step = re.search(
+        r"(?ms)^      - name: Verify Mamba wheel contains the pinned GQA "
+        r"backward patch\n(?P<body>.*?)(?=^      - name:|\Z)",
+        workflow,
+    )
+    assert verify_step is not None
+    verify_body = verify_step.group("body")
+    for module in ("mamba3_mimo_bwd.py", "mamba3_mimo_bwd_varlen.py"):
+        marker = re.compile(
+            r'"mamba_ssm/ops/tilelang/mamba3/'
+            + re.escape(module)
+            + r'":\s*"elif H % G == 0:"'
+        )
+        assert marker.search(verify_body), (
+            f"verify step must pin the GQA marker for {module}"
+        )
 
 
 def test_assembled_images_import_the_patched_mamba_runtime() -> None:

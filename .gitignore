@@ -64,6 +64,7 @@ outputs/megatron_ready/h200_fp8_recompute_debug_1024_train.json
 .qoder/sessions/d*
 .qoder/scheduled_tasks.lock
 outputs/ci_diagnostics/*
+!outputs/ci_diagnostics/README.md
 reports/chatgpt/*
 outputs/source_cache/*
 outputs/source_cache/code/test_make_lib/vector.c
