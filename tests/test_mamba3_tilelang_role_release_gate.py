@@ -3,6 +3,7 @@ import base64
 import hashlib
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +13,7 @@ from cppmega.megatron.release_gate_integrity import (
     sha256_path,
     validate_complete_wheel_set,
     validate_exact_junit,
+    validate_mamba_overlay_state,
     validate_source_manifest,
     verify_wheel_record_payloads,
 )
@@ -157,6 +159,69 @@ def test_complete_wheel_set_rejects_mismatched_release_manifest():
             expected,
             ("tilelang", "apache_tvm_ffi"),
         )
+
+
+def test_release_gate_accepts_exact_new_mamba_overlay_and_rejects_old_hash():
+    initial_bwd = "980dadcec29cdd318c51c1660697d54b5a7d3311d2b681b4a68b31e7d21e64b9"
+    old_bwd = "9b1662c53c31c2387a88cd63abdbfd9da6efba8008812f84356d2419a285d423"
+    new_bwd = "51dab809a47bd33a9b610725599dff956187edd70cae1518618f1ef31115d320"
+    varlen = "2229d2b7770ef7867ec61a6971efa7ec3e8e2fc2c47c73b42b9c3bf0fe5995a6"
+    expected = {
+        "mamba3_mimo_bwd.py": new_bwd,
+        "mamba3_mimo_bwd_varlen.py": varlen,
+    }
+    exact_state = {
+        "backup_hash": initial_bwd,
+        "expected_backup_hash": initial_bwd,
+        "stage2_applied": True,
+        "stage2_absent": False,
+        "gqa_applied": True,
+        "gqa_absent": False,
+    }
+
+    harness = _HARNESS.read_text()
+    assert new_bwd in harness
+    assert old_bwd not in harness
+    validate_mamba_overlay_state(expected, expected, **exact_state)
+
+    old_installed = dict(expected)
+    old_installed["mamba3_mimo_bwd.py"] = old_bwd
+    with pytest.raises(RuntimeError, match="image-built Mamba overlay mismatch"):
+        validate_mamba_overlay_state(old_installed, expected, **exact_state)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backup_hash", "0" * 64),
+        ("stage2_applied", False),
+        ("stage2_absent", True),
+        ("gqa_applied", False),
+        ("gqa_absent", True),
+    ],
+)
+def test_release_gate_rejects_non_exact_mamba_overlay_state(field, value):
+    expected = {
+        "mamba3_mimo_bwd.py": (
+            "51dab809a47bd33a9b610725599dff956187edd70cae1518618f1ef31115d320"
+        ),
+        "mamba3_mimo_bwd_varlen.py": (
+            "2229d2b7770ef7867ec61a6971efa7ec3e8e2fc2c47c73b42b9c3bf0fe5995a6"
+        ),
+    }
+    initial_bwd = "980dadcec29cdd318c51c1660697d54b5a7d3311d2b681b4a68b31e7d21e64b9"
+    state: dict[str, Any] = {
+        "backup_hash": initial_bwd,
+        "expected_backup_hash": initial_bwd,
+        "stage2_applied": True,
+        "stage2_absent": False,
+        "gqa_applied": True,
+        "gqa_absent": False,
+    }
+    state[field] = value
+
+    with pytest.raises(RuntimeError, match="image-built Mamba overlay mismatch"):
+        validate_mamba_overlay_state(expected, expected, **state)
 
 
 def test_exact_prerequisite_junit_rejects_failure_and_digest_drift(

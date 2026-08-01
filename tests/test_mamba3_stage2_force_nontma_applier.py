@@ -6,14 +6,41 @@ from cppmega.megatron.upstream_patches import (
 
 
 def _patched_text() -> str:
+    body_markers = [
+        f"    {marker}"
+        for name, marker in applier._PATCHED_MARKERS.items()
+        if name
+        not in (
+            "bf_default",
+            "bb_default",
+            "bwd_tma_disabled",
+            "bwd_ws_disabled",
+        )
+    ]
+    pass_configs = [
+        "@tilelang.jit(",
+        "    pass_configs={",
+        ("        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,"),
+        ("        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,"),
+        "    },",
+        ")",
+    ]
     return "\n".join(
         [
+            *pass_configs,
             "def mamba_mimo_bwd_fwd():",
-            *applier._PATCHED_MARKERS.values(),
-            applier._PATCHED_MARKERS["bwd_tma_disabled"],
-            applier._PATCHED_MARKERS["bwd_ws_disabled"],
-            *["disable_tma=True"] * 10,
+            *body_markers,
+            *[
+                f"    T.copy(src_{index}, dst_{index}, disable_tma=True)"
+                for index in range(8)
+            ],
+            *pass_configs,
             "def mamba_mimo_bwd_bwd():",
+            "    pass",
+            "def mamba_mimo_bwd_combined(",
+            "    bf_num_stages=1,",
+            "    bb_num_stages=0,",
+            "):",
             "    pass",
         ]
     )
@@ -133,9 +160,19 @@ def test_stage2_validator_rejects_unsafe_bwd_pass_configs(tmp_path):
     kernel = tmp_path / "mamba3_mimo_bwd.py"
     text = _patched_text().replace(
         applier._PATCHED_MARKERS["bwd_tma_disabled"],
-        "",
+        f"# {applier._PATCHED_MARKERS['bwd_tma_disabled']}",
         1,
     )
+    kernel.write_text(text)
+
+    with pytest.raises(RuntimeError, match="both backward kernels"):
+        applier._validate_patched(kernel)
+
+
+def test_stage2_validator_rejects_integer_pass_config_spoof(tmp_path):
+    kernel = tmp_path / "mamba3_mimo_bwd.py"
+    marker = applier._PATCHED_MARKERS["bwd_tma_disabled"]
+    text = _patched_text().replace(marker, marker.replace("True", "1"), 1)
     kernel.write_text(text)
 
     with pytest.raises(RuntimeError, match="both backward kernels"):
@@ -145,15 +182,107 @@ def test_stage2_validator_rejects_unsafe_bwd_pass_configs(tmp_path):
 def test_stage2_validator_rejects_overlapping_bwd_fwd_q_write(tmp_path):
     kernel = tmp_path / "mamba3_mimo_bwd.py"
     text = _patched_text().replace(
-        "def mamba_mimo_bwd_bwd():",
+        applier._PATCHED_MARKERS["bf_q_biased_shared"],
         (
-            "T.copy(Q[i_b, "
+            "T.copy(\n"
+            "        Q[i_b, "
             "fused_chunk_start:fused_chunk_start+fused_chunk_size, "
-            "i_h_qk, :], q_shared)\n"
-            "def mamba_mimo_bwd_bwd():"
+            "i_h_qk, :],\n"
+            "        q_shared,\n"
+            "    )\n"
+            f"    {applier._PATCHED_MARKERS['bf_q_biased_shared']}"
         ),
+        1,
     )
     kernel.write_text(text)
 
     with pytest.raises(RuntimeError, match="overlapping raw and biased shared writes"):
+        applier._validate_patched(kernel)
+
+
+@pytest.mark.parametrize(
+    ("marker_name", "replacement"),
+    [
+        ("bf_q_biased_shared", ""),
+        (
+            "bf_q_biased_shared",
+            "\n    ".join([applier._PATCHED_MARKERS["bf_q_biased_shared"]] * 2),
+        ),
+        ("bf_k_biased_shared", ""),
+        (
+            "bf_k_biased_shared",
+            "\n    ".join([applier._PATCHED_MARKERS["bf_k_biased_shared"]] * 2),
+        ),
+    ],
+)
+def test_stage2_validator_rejects_missing_or_duplicate_biased_shared_write(
+    tmp_path, marker_name, replacement
+):
+    kernel = tmp_path / "mamba3_mimo_bwd.py"
+    text = _patched_text().replace(
+        applier._PATCHED_MARKERS[marker_name],
+        replacement,
+        1,
+    )
+    kernel.write_text(text)
+
+    with pytest.raises(
+        RuntimeError,
+        match="exactly one biased fragment-to-shared write",
+    ):
+        applier._validate_patched(kernel)
+
+
+@pytest.mark.parametrize(
+    ("marker_name", "replacement"),
+    [
+        ("bf_q_direct_fragment", ""),
+        (
+            "bf_q_direct_fragment",
+            "\n    ".join([applier._PATCHED_MARKERS["bf_q_direct_fragment"]] * 2),
+        ),
+        ("bf_k_direct_fragment", ""),
+        (
+            "bf_k_direct_fragment",
+            "\n    ".join([applier._PATCHED_MARKERS["bf_k_direct_fragment"]] * 2),
+        ),
+    ],
+)
+def test_stage2_validator_rejects_missing_or_duplicate_direct_fragment_load(
+    tmp_path, marker_name, replacement
+):
+    kernel = tmp_path / "mamba3_mimo_bwd.py"
+    text = _patched_text().replace(
+        applier._PATCHED_MARKERS[marker_name],
+        replacement,
+        1,
+    )
+    kernel.write_text(text)
+
+    with pytest.raises(
+        RuntimeError,
+        match="exactly one direct global-to-fragment load",
+    ):
+        applier._validate_patched(kernel)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected", "unsafe"),
+    [
+        ("bf_num_stages", 1, 0),
+        ("bb_num_stages", 0, 1),
+    ],
+)
+def test_stage2_validator_reads_actual_stage_defaults_not_comments(
+    tmp_path, name, expected, unsafe
+):
+    kernel = tmp_path / "mamba3_mimo_bwd.py"
+    text = _patched_text().replace(
+        f"{name}={expected},",
+        f"{name}={unsafe},  # {name}={expected}",
+        1,
+    )
+    kernel.write_text(text)
+
+    with pytest.raises(RuntimeError, match="backward stage defaults must stay exact"):
         applier._validate_patched(kernel)
