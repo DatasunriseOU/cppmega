@@ -22,6 +22,7 @@ GHCR_TAG = os.environ.get("GHCR_TAG", "latest")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:1")
 MEGATRON_ROOT = "/opt/megatron-lm"
+PYTEST_TARGET = os.environ.get("CPPMEGA_MODAL_PYTEST_TARGET", "tests/")
 PYTEST_ARGS = os.environ.get(
     "CPPMEGA_MODAL_PYTEST_ARGS",
     "-q --tb=short -n 4 --ignore=tests/test_mamba3_wgmma_wave10_copy_integration.py "
@@ -32,6 +33,24 @@ PYTEST_ARGS = os.environ.get(
     "--ignore=tests/test_mamba3_wgmma_wave9_copy_probe.py",
 )
 
+_MLX_ROOT = _REPO_ROOT.parent / "cppmega.mlx"
+_MLX_REMOTE_ROOT = "/opt/cppmega-mlx"
+
+
+def _local_mlx_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_MLX_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
+
+
+LOCAL_MLX_SHA = _local_mlx_sha()
+
 
 def _local_git_sha() -> str:
     try:
@@ -41,7 +60,7 @@ def _local_git_sha() -> str:
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - importing this launcher must survive missing git
         return "unknown"
 
 
@@ -58,6 +77,10 @@ def _image() -> modal.Image:
             "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
             "WANDB_MODE": "disabled",
             "MEGATRON_LM_REPO": MEGATRON_ROOT,
+            # Remote module re-import sees no local env; carry the locally
+            # selected pytest args so the container runs the same selection.
+            "CPPMEGA_MODAL_PYTEST_ARGS": PYTEST_ARGS,
+            "CPPMEGA_GHCR_REF": GHCR_REF,
             "CPPMEGA_MEGATRON_COMMIT": os.environ.get(
                 "CPPMEGA_MEGATRON_COMMIT", "980211ae"
             ),
@@ -118,11 +141,15 @@ def run_tests() -> dict[str, Any]:
         "returncode": proc.returncode,
         "megatron_head": megatron_head,
         "gpu": GPU_SPEC,
+        "pytest_args": PYTEST_ARGS,
+        "ghcr_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
         "stdout_tail": "\n".join(proc.stdout.splitlines()[-60:]),
         "stderr_tail": "\n".join(proc.stderr.splitlines()[-30:]),
     }
     pathlib.Path("/results").mkdir(parents=True, exist_ok=True)
     pathlib.Path(RESULTS_PATH).write_text(_json.dumps(result, indent=2))
+    pathlib.Path("/results/stdout_full.txt").write_text(proc.stdout)
+    pathlib.Path("/results/stderr_full.txt").write_text(proc.stderr)
     results_vol.commit()
     return result
 
