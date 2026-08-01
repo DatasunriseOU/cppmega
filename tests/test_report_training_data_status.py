@@ -13,7 +13,9 @@ from scripts.report_training_data_status import (
     HEARTBEAT_SCHEMA,
     STATUS_SCHEMA,
     _sha256,
+    _utc_now,
     _without_volatile,
+    build_status,
     check_heartbeat,
     collect_live_source,
     collect_freshness,
@@ -399,3 +401,163 @@ def test_publish_status_writes_heartbeat_and_check_detects_staleness(
     )
     assert stale["stale"] is True
     assert stale["age_seconds"] == 3600
+
+
+def _minimal_config(tmp_path: Path) -> dict[str, object]:
+    return {
+        "schema": "cppmega_training_data_status_config_v1",
+        "batch_size": 192,
+        "output_dir": str(tmp_path / "out"),
+        "source": {
+            "root": str(tmp_path / "source"),
+            "completion_receipt": str(tmp_path / "done.json"),
+            "launch_receipt": str(tmp_path / "launch.json"),
+        },
+        "sealed_megatron": {"manifest": str(tmp_path / "sealed.json")},
+        "validation_bundle": {"manifest": str(tmp_path / "validation.json")},
+        "pr": {
+            "completion_receipt": str(tmp_path / "pr_completion.json"),
+            "gap_completion_receipt": str(tmp_path / "pr_gap.json"),
+            "export_launch_receipt": str(tmp_path / "pr_launch.json"),
+            "export_cancellation_receipt": str(tmp_path / "pr_cancel.json"),
+            "quarantine_receipt": str(tmp_path / "pr_quarantine.json"),
+        },
+        "ci": {
+            "progress_receipts": [str(tmp_path / "ci_progress.json")],
+            "legacy_parquet_root": str(tmp_path / "ci_legacy"),
+        },
+    }
+
+
+def _write_minimal_config_files(tmp_path: Path) -> None:
+    (tmp_path / "done.json").write_text(
+        json.dumps(
+            {
+                "code_revision": {"git_commit": "a" * 40},
+                "done": {},
+                "failed": {},
+                "source_repo_list": {"mapping_count": 0, "sha256": "source-list"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "launch.json").write_text(
+        json.dumps(
+            {
+                "schema": "cppmega.canonical_source_launch_v1",
+                "expected_repository_count": 0,
+                "inputs": {"archive_inventory_receipt": {"repository_count": 0}},
+                "outputs": {
+                    "conveyor_manifest": str(tmp_path / "done.json"),
+                    "run_root": str(tmp_path / "source"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in (
+        "pr_completion.json",
+        "pr_gap.json",
+        "pr_launch.json",
+        "pr_cancel.json",
+        "pr_quarantine.json",
+    ):
+        (tmp_path / name).write_text(json.dumps({"status": "verified"}), encoding="utf-8")
+    (tmp_path / "pr_launch.json").write_text(
+        json.dumps({"status": "verified", "output_root": str(tmp_path / "pr_out")}),
+        encoding="utf-8",
+    )
+    (tmp_path / "ci_progress.json").write_text(
+        json.dumps(
+            {
+                "schema": "cppmega.ci_stream_progress_v1",
+                "generated_at": _utc_now(),
+                "inventory": {},
+                "fetch": {"occurrence_tokens": 0},
+                "content_store": {
+                    "counters": {"exact_unique_payload_tokens": 0}
+                },
+                "token_accounting": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "sealed.json").write_text(
+        json.dumps({"schema": "cppmega.megatron_bundle_v1", "bundles": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "validation.json").write_text(
+        json.dumps({"schema": "cppmega.megatron_bundle_v1", "bundles": []}),
+        encoding="utf-8",
+    )
+
+
+def test_build_status_includes_heartbeat_freshness_when_path_provided(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _write_minimal_config_files(tmp_path)
+    config = _minimal_config(tmp_path)
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_live_source",
+        lambda _s, **_: {"state": "packed_unsealed", "release_ready": False},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_megatron_bundle",
+        lambda _m, **_: {"state": "sealed_megatron", "release_ready": True},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_pr_status",
+        lambda _p: {"state": "verified_store_not_materialized"},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_ci_status",
+        lambda _c: {"state": "cas_staged_not_exported"},
+    )
+
+    heartbeat = tmp_path / "heartbeat.json"
+    heartbeat.write_text(
+        json.dumps(
+            {
+                "schema": HEARTBEAT_SCHEMA,
+                "pid": 12345,
+                "recorded_at": datetime.fromtimestamp(time.time() - 7200)
+                .astimezone()
+                .isoformat(),
+                "status_sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = build_status(
+        config, jobs=1, stale_minutes=30.0, heartbeat_path=heartbeat
+    )
+    assert "heartbeat" in status["freshness"]
+    assert status["freshness"]["heartbeat"]["stale"] is True
+    assert status["freshness"]["heartbeat"]["pid"] == 12345
+
+
+def test_build_status_omits_heartbeat_when_path_not_provided(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _write_minimal_config_files(tmp_path)
+    config = _minimal_config(tmp_path)
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_live_source",
+        lambda _s, **_: {"state": "packed_unsealed", "release_ready": False},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_megatron_bundle",
+        lambda _m, **_: {"state": "sealed_megatron", "release_ready": True},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_pr_status",
+        lambda _p: {"state": "verified_store_not_materialized"},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_ci_status",
+        lambda _c: {"state": "cas_staged_not_exported"},
+    )
+
+    status = build_status(config, jobs=1, stale_minutes=30.0)
+    assert "heartbeat" not in status["freshness"]

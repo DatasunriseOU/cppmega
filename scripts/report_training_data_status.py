@@ -1327,6 +1327,7 @@ def build_status(
     *,
     jobs: int,
     stale_minutes: float,
+    heartbeat_path: Path | None = None,
 ) -> dict[str, object]:
     _validate_config(config)
     batch_size = int(config["batch_size"])
@@ -1377,7 +1378,13 @@ def build_status(
             "ci": ci,
         },
     }
-    status["freshness"] = collect_freshness(config, stale_minutes=stale_minutes)
+    freshness = collect_freshness(config, stale_minutes=stale_minutes)
+    if heartbeat_path is not None:
+        freshness["heartbeat"] = check_heartbeat(
+            heartbeat_path,
+            stale_after_seconds=stale_minutes * 60.0,
+        )
+    status["freshness"] = freshness
     status["status_sha256"] = _sha256(_without_volatile(status))
     return status
 
@@ -1687,7 +1694,10 @@ def main() -> int:
     output_dir = args.output_dir or Path(str(config["output_dir"]))
     while True:
         status = build_status(
-            config, jobs=args.jobs, stale_minutes=args.stale_minutes
+            config,
+            jobs=args.jobs,
+            stale_minutes=args.stale_minutes,
+            heartbeat_path=output_dir / "heartbeat.json",
         )
         paths = publish_status(status, output_dir)
         stale_upstreams = status["freshness"]["stale"]
@@ -1699,6 +1709,21 @@ def main() -> int:
                         "generated_at": status["generated_at"],
                         "stale_minutes": args.stale_minutes,
                         "stale": stale_upstreams,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        heartbeat_info = status["freshness"].get("heartbeat")
+        if heartbeat_info and heartbeat_info.get("stale"):
+            print(
+                json.dumps(
+                    {
+                        "warning": "stale_watcher_heartbeat",
+                        "generated_at": status["generated_at"],
+                        "stale_minutes": args.stale_minutes,
+                        "heartbeat": heartbeat_info,
                     },
                     sort_keys=True,
                 ),
