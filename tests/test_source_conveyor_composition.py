@@ -718,6 +718,71 @@ def test_source_composition_rejects_input_artifact_mutation(
         )
 
 
+def test_source_composition_accepts_hash_identical_relocated_repo_list(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    first_launch = json.loads(
+        Path(plan["runs"][0]["launch_receipt"]).read_text(encoding="utf-8")
+    )
+    original_repo_list = Path(first_launch["inputs"]["repo_list"]["path"])
+    relocated_repo_list = tmp_path / "relocated" / original_repo_list.name
+    relocated_repo_list.parent.mkdir()
+    relocated_repo_list.write_bytes(original_repo_list.read_bytes())
+
+    for run in plan["runs"]:
+        launch_path = Path(run["launch_receipt"])
+        exit_path = Path(run["exit_receipt"])
+        launch = json.loads(launch_path.read_text(encoding="utf-8"))
+        launch["inputs"]["repo_list"]["path"] = str(relocated_repo_list)
+        repo_list_index = launch["command"].index("--repo-list") + 1
+        launch["command"][repo_list_index] = str(relocated_repo_list)
+        _write_json(launch_path, launch)
+        exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+        exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+        _write_json(exit_path, exit_receipt)
+
+    original_repo_list.unlink()
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+
+    assert composition.receipt["status"] == "complete"
+
+
+def test_source_composition_rejects_source_archive_command_drift(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    launch_path = Path(plan["runs"][0]["launch_receipt"])
+    exit_path = Path(plan["runs"][0]["exit_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["command"].extend(
+        ["--source-archive", "/different/source.tar.zst"]
+    )
+    _write_json(launch_path, launch)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(
+        ValueError,
+        match="source archive command path drifted",
+    ):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
 def test_source_composition_rejects_duplicate_shard_within_run(
     tmp_path: Path,
 ) -> None:
