@@ -97,6 +97,39 @@ def test_python_fstring_edges_anchor_to_tokenizable_content(
     assert len(tokenized["token_domain_edges"]) == len(enriched["domain_edges"])
 
 
+@pytest.mark.parametrize("line_ending", ("\r", "\r\n"))
+def test_python_edges_with_universal_newlines_anchor_to_tokens(
+    tokenizer,
+    line_ending: str,
+) -> None:
+    source = line_ending.join(
+        (
+            "# exercise Python universal-newline coordinates",
+            "print(repr('value'))",
+            "",
+        )
+    )
+    enriched = parse_domain_document(
+        "tests/basics/string_cr_conversion.py",
+        source,
+    ).to_enriched_document()
+
+    assert enriched["domain_edges"]
+    assert all(
+        not source[int(edge[endpoint])].isspace()
+        for edge in enriched["domain_edges"]
+        for endpoint in ("from_char", "to_char")
+    )
+
+    tokenized = materialize_tokenized_enriched_batch(
+        [enriched],
+        tokenizer,
+        num_threads=1,
+    )[0]
+
+    assert len(tokenized["token_domain_edges"]) == len(enriched["domain_edges"])
+
+
 def test_multiline_embedded_sql_span_uses_first_and_last_overlapping_tokens(
     tokenizer,
 ) -> None:

@@ -30,7 +30,15 @@ _SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 def _line_starts(text: str) -> list[int]:
     starts = [0]
-    starts.extend(index + 1 for index, char in enumerate(text) if char == "\n")
+    index = 0
+    while index < len(text):
+        if text[index] == "\r":
+            if index + 1 < len(text) and text[index + 1] == "\n":
+                index += 1
+            starts.append(index + 1)
+        elif text[index] == "\n":
+            starts.append(index + 1)
+        index += 1
     return starts
 
 
@@ -56,7 +64,7 @@ def _tokenize_source(
     token_infos: list[tokenize.TokenInfo] = []
     error: str | None = None
     try:
-        for info in tokenize.generate_tokens(io.StringIO(text).readline):
+        for info in tokenize.generate_tokens(io.StringIO(text, newline="").readline):
             if info.type in _SKIPPED_TOKEN_TYPES:
                 continue
             if info.type == tokenize.ERRORTOKEN and info.string.isspace():
