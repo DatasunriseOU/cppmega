@@ -9,6 +9,11 @@ Runs only H100 component shapes. The script compares:
 It also records allocator/reserved-memory deltas and can wrap targeted
 stage2 split-kernel timing loops in NVTX ranges or CUDA profiler API windows
 so later nsys/ncu runs can reuse the same entry point.
+
+Image note: images from ghcr tag 459a574 onward ship mamba_ssm with the
+stage2 force-nonTMA layout already applied. There the installed baseline IS
+the stage2 layout, the stage2 patch step is skipped as already satisfied,
+and the meaningful comparison is baseline(=stage2) vs wave32_vectorized_diag.
 """
 # ruff: noqa: E402
 
@@ -23,14 +28,19 @@ from typing import Any
 
 import modal
 
+from cppmega.megatron.gate_result_contract import require_successful_steps
+
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 
 APP_NAME = "cppmega-wave32-lane-b-h100"
 RESULTS_VOL = "cppmega-mamba3-benchmarks"
 BENCH_DIR = "/benchmarks/mamba3_wave32_lane_b_h100"
 GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/datasunriseou/cppmega")
-GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
+# 785c3fd was deleted from GHCR; 459a574 is the current fa3/fa4 image (P091).
+GHCR_TAG = os.environ.get("GHCR_TAG", "459a574")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
+# H100 and H200 are both sm90; override for H200 reruns (e.g. wave32 r7).
+_GPU = os.environ.get("CPPMEGA_LANE_B_GPU", "H100")
 
 
 def _image() -> modal.Image:
@@ -72,6 +82,7 @@ from mamba_ssm.ops.triton.mamba3.mamba3_mimo_utils import compute_dacs_segsum_tr
 
 PATCH_PATH = pathlib.Path("/opt/cppmega/upstream_prs/examples/13_tilelang_floormod_dbz/mamba3_bwd_stage2_force_nontma.patch")
 from cppmega.megatron.upstream_patches import apply_mamba3_bwd_bwd_vectorized_patches as vectorized_diag
+from cppmega.megatron.upstream_patches import apply_mamba3_stage2_force_nontma_patches as stage2_patches
 
 def _mamba_bwd_path():
     spec = importlib.util.find_spec("mamba_ssm.ops.tilelang.mamba3")
@@ -85,6 +96,13 @@ def _mamba_bwd_path():
 
 def _apply_stage2_patch(src, dst):
     shutil.copy2(src, dst)
+    # Newer images (ghcr 459a574+) ship mamba_ssm with the stage2
+    # force-nonTMA layout already applied, so the .patch hunks no longer
+    # match (r7 on 459a574: 21/24 hunks FAILED). Treat an already-patched
+    # source as satisfied instead of failing; the vectorized-diag patch
+    # anchors on the stage2 layout either way.
+    if stage2_patches._is_patched(dst.read_text()):
+        return
     proc = subprocess.run(
         ["patch", "--ignore-whitespace", "-p4", str(dst)],
         input=PATCH_PATH.read_bytes(),
@@ -413,7 +431,7 @@ if __name__ == "__main__":
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu=_GPU,
     timeout=3600,
     volumes={"/vol": results_vol},
 )
@@ -454,6 +472,10 @@ def run_bench(
     mark(f"applier_noop_done rc={no_op.returncode}")
     gated_env = child_env.copy()
     gated_env["CPPMEGA_MAMBA3_BWD_BWD_VECTORIZED_DIAG"] = "1"
+    # r5 failed here: the applier refuses to touch the installed mamba_ssm
+    # without the explicit mutation flag. Allow it, then roll back below so
+    # the bench baseline still starts from the pristine installed source.
+    gated_env["MAMBA3_BWD_BWD_VECTORIZED_DIAG_ALLOW_FILE_MUTATION"] = "1"
     mark("applier_gated_start")
     gated = subprocess.run(
         ["python", "-m", "cppmega.megatron.upstream_patches.apply_mamba3_bwd_bwd_vectorized_patches"],
@@ -463,6 +485,39 @@ def run_bench(
         check=False,
     )
     mark(f"applier_gated_done rc={gated.returncode}")
+
+    rollback_env = child_env.copy()
+    rollback_env["CPPMEGA_MAMBA3_BWD_BWD_VECTORIZED_DIAG_ROLLBACK"] = "1"
+    mark("applier_rollback_start")
+    rollback = subprocess.run(
+        ["python", "-m", "cppmega.megatron.upstream_patches.apply_mamba3_bwd_bwd_vectorized_patches"],
+        env=rollback_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    mark(f"applier_rollback_done rc={rollback.returncode}")
+    applier_returncodes = {
+        "noop": no_op.returncode,
+        "gated": gated.returncode,
+        "rollback": rollback.returncode,
+    }
+    try:
+        require_successful_steps(applier_returncodes)
+    except RuntimeError as exc:
+        result = {
+            "run_id": run_id,
+            "status": "APPLIER_FAILED",
+            "applier_returncodes": applier_returncodes,
+            "applier_noop": no_op.stdout + no_op.stderr,
+            "applier_gated": gated.stdout + gated.stderr,
+            "applier_rollback": rollback.stdout + rollback.stderr,
+        }
+        (out_dir / "report.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True)
+        )
+        results_vol.commit()
+        raise RuntimeError(f"{exc}; artifacts={out_dir}") from exc
 
     bench_file = out_dir / "bench_driver.py"
     bench_file.write_text(_BENCH_CODE)
@@ -479,6 +534,7 @@ def run_bench(
 
     (out_dir / "applier_noop.txt").write_text(no_op.stdout + no_op.stderr)
     (out_dir / "applier_gated.txt").write_text(gated.stdout + gated.stderr)
+    (out_dir / "applier_rollback.txt").write_text(rollback.stdout + rollback.stderr)
     (out_dir / "stdout.txt").write_text(proc.stdout)
     (out_dir / "stderr.txt").write_text(proc.stderr)
 
@@ -486,8 +542,10 @@ def run_bench(
         result = {
             "run_id": run_id,
             "returncode": proc.returncode,
+            "applier_returncodes": applier_returncodes,
             "applier_noop": no_op.stdout + no_op.stderr,
             "applier_gated": gated.stdout + gated.stderr,
+            "applier_rollback": rollback.stdout + rollback.stderr,
             "stdout_tail": proc.stdout[-4000:],
             "stderr_tail": proc.stderr[-4000:],
         }
@@ -496,8 +554,10 @@ def run_bench(
         result = {
             "run_id": run_id,
             "returncode": proc.returncode,
+            "applier_returncodes": applier_returncodes,
             "applier_noop": no_op.stdout + no_op.stderr,
             "applier_gated": gated.stdout + gated.stderr,
+            "applier_rollback": rollback.stdout + rollback.stderr,
             "report": parsed,
         }
     (out_dir / "report.json").write_text(json.dumps(result, indent=2, sort_keys=True))
@@ -505,7 +565,7 @@ def run_bench(
     return result
 
 
-@app.function(image=image, gpu="H100", timeout=600)
+@app.function(image=image, gpu=_GPU, timeout=600)
 def verify_applier_mutation() -> dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONPATH"] = "/opt/cppmega:/opt/megatron-lm"

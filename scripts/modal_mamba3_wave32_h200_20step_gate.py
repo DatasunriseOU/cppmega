@@ -33,6 +33,8 @@ from typing import Any
 
 import modal
 
+from cppmega.megatron.gate_result_contract import require_variant_rows
+
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 
 APP_NAME = "cppmega-wave32-h200-20step-gate"
@@ -462,7 +464,14 @@ def _write_workdir(workdir: pathlib.Path) -> None:
         "from cppmega.megatron.mamba_builder import cppmega_mamba_builder as mamba_builder\n"
     )
     (workdir / "model_provider.py").write_text(
-        "from megatron.training import get_args\n"
+        "from megatron.training import get_args, print_rank_0\n"
+        "def count_parameters_in_layer(model, layer_name):\n"
+        "    num_params = 0\n"
+        "    for name, param in model.named_parameters():\n"
+        "        if layer_name in name:\n"
+        "            num_params += param.numel()\n"
+        "            print_rank_0(f' - {name}: {param.numel()}')\n"
+        "    return num_params\n"
         "def model_provider(model_builder, pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):\n"
         "    args = get_args()\n"
         "    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)\n"
@@ -1231,6 +1240,7 @@ def gate(
         _write_summary(out_dir, result)
         (out_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         results_vol.commit()
+        require_variant_rows(result)
         return result
     dataset = _resolve_dataset()
 
@@ -1313,6 +1323,7 @@ def gate(
         result["final_kernel"] = _kernel_status(env)
         _write_summary(out_dir, result)
         results_vol.commit()
+    require_variant_rows(result)
     return result
 
 

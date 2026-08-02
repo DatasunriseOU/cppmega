@@ -199,3 +199,98 @@ kernel execution, Transformer Engine imports, distributed forward/backward
 finiteness, archive transport, checkpoint restore, or resource cleanup. Those
 claims require the corresponding remote receipts. A process that exists without
 advancing receipts or logs is not evidence of a healthy run.
+
+## 6. Curriculum memory envelopes (graph-routes stack)
+
+Measured on one Nebius H200 SXM (143771 MiB visible) in run
+`cppmega-h200-graphroutes-1782831200` with the production graph-routes
+configuration: `CPPMEGA_STRUCTURE_ENABLED=1`, `CPPMEGA_GRAPH_ROUTES_ENABLED=1`,
+`CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=1`, FP8 tensorwise,
+`--recompute-granularity selective --recompute-modules mlp`, and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. These envelopes do not
+transfer to the dense noconv lane: the same stage-3 shape (seq 4096, batch 48)
+fit in 111056 MiB without the dense graph attention bias
+(`cppmega-h200-curriculum-resume2-1782783207`) and OOMed with it.
+
+Evidence per stage (`outputs/nebius/cppmega-h200-graphroutes-1782831200/`;
+torch peaks from the `CPPMEGA_CUDA_PEAK` lines, sampled peaks from the 1 s
+`nvidia-smi` CSVs, status from `summary.log`):
+
+| stage | seq | global bs | micro bs | result | torch peak alloc (GiB) | torch peak reserved (GiB) | nvidia-smi peak (MiB) |
+|-------|-----|-----------|----------|--------|------------------------|---------------------------|-----------------------|
+| 1 | 1024 | 192 | 192 | OK | 113.090 | 115.152 | 120410 |
+| 2 | 2048 | 96 | 96 | OK | 122.101 | 123.408 | 128866 |
+| 3 | 4096 | 48 | 48 | FAIL (OOM) | 135.371 | 136.477 | 141016 |
+| 3 | 4096 | 40 | 40 | OK | 125.114 | 126.924 | 132472 |
+| 4 | 8192 | 20 | 20 | FAIL (OOM) | 126.741 | 127.787 | 129028 |
+| 4 | 8192 | 16 | 16 | FAIL (OOM) | 116.964 | 117.672 | 122212 |
+| 4 | 8192 | 16 | 4 | OK | 45.559 | 46.119 | 49722 |
+| 5 | 16384 | 8 | 2 | OK | 68.155 | 68.662 | 72812 |
+
+Near the boundary trust the torch peak and the stage result, not the sampled
+`nvidia-smi` peak: both flat stage-4 OOMs show sampled peaks below the passing
+stage-2 run, because the fatal transient (an `expandable_segments` mapping
+failure with under 21 MiB free of 139.8 GiB mapped) falls between 1 s samples.
+All three OOMs hit inside the first iteration, about 30 s into the stage.
+
+Safe envelopes (validated end-to-end in the cited run):
+
+| stage | seq | global bs | micro bs | torch peak reserved (GiB) | headroom to 140.4 GiB total |
+|-------|-----|-----------|----------|---------------------------|-----------------------------|
+| 1 | 1024 | 192 | 192 | 115.2 | ~25 GiB |
+| 2 | 2048 | 96 | 96 | 123.4 | ~17 GiB |
+| 3 | 4096 | 40 | 40 | 126.9 | ~13 GiB |
+| 4 | 8192 | 16 | 4 | 46.1 | ~94 GiB |
+| 5 | 16384 | 8 | 2 | 68.7 | ~72 GiB |
+
+Rules of thumb:
+
+- Keep torch peak allocated at or below ~127 GiB. The largest observed pass is
+  126.9 GiB reserved (stage 3, batch 40); OOM manifests at 136.5 GiB reserved.
+- Flat mode (global bs == micro bs) is proven only for seq <= 4096. At
+  seq >= 8192 micro-batch so that micro tokens per step (micro bs x seq) stay
+  at or below 32768; flat seq 8192 OOMs even at batch 16 (131072 tokens per
+  step).
+- At a fixed token budget per step the peak grows with sequence length under
+  the dense graph attention bias (113.1 -> 122.1 -> 135.4 GiB allocated for
+  196608 tokens per step at seq 1024/2048/4096). Never extrapolate envelopes
+  across sequence lengths from token counts alone.
+
+Reproducing the measurement: the curriculum launcher
+`scripts/nebius_h200_megatron_cpp_world_curriculum.py` emits, per stage, a 1 s
+`nvidia-smi` CSV (`stage_*_*.nvsmi.csv`), a `CPPMEGA_NVIDIA_SMI_PEAK` line, a
+`CPPMEGA_CUDA_PEAK` torch allocated/reserved line in the stage log, and a
+`CPPMEGA_CURRICULUM_STAGE_RESULT` status in `summary.log`. Validate the plan
+with `--dry-run` first (section 3 pattern), then use the live leader path of
+section 4. Explicit `--stage` prefixes must be declared in
+`$CASE6_BUNDLE/manifest.json` under `bucket_results` with `bucket` equal to
+the stage sequence length.
+
+Boundary verification is PENDING; no GPU time has been spent on it. Because
+every observed OOM occurs in the first iteration, a short-iteration probe is a
+valid envelope test. Exact command for the two open boundaries (stage 3
+between batch 40 and 48, stage 4 between micro 4 and 16), run from
+`$CASE6_ROOT` with the section 1 environment:
+
+```bash
+PREFIX_4096="$CASE6_BUNDLE/$("$CASE6_PYTHON" -c 'import json,sys; m=json.load(open(sys.argv[1])); print(next(r["prefix"] for r in m["bucket_results"] if int(r["bucket"])==4096))' "$CASE6_BUNDLE/manifest.json")"
+PREFIX_8192="$CASE6_BUNDLE/$("$CASE6_PYTHON" -c 'import json,sys; m=json.load(open(sys.argv[1])); print(next(r["prefix"] for r in m["bucket_results"] if int(r["bucket"])==8192))' "$CASE6_BUNDLE/manifest.json")"
+
+MEGATRON_LM_REPO="$MEGATRON_LM_REPO" "$CASE6_PYTHON" \
+  scripts/nebius_h200_megatron_cpp_world_curriculum.py \
+  --bundle-root "$CASE6_BUNDLE" \
+  --docker-image "$CPPMEGA_IMAGE" \
+  --ssh-host-key-file "$NEBIUS_SSH_HOST_KEY_FILE" \
+  --ssh-host-key-fingerprint "$NEBIUS_SSH_HOST_KEY_FINGERPRINT" \
+  --no-ghcr-auth \
+  --stage "4096=44=10=$PREFIX_4096" \
+  --stage "8192=16=8=10=$PREFIX_8192"
+```
+
+Both probes run in one instance; the second stage warm-starts model weights
+from the first stage checkpoint, which is acceptable for a memory probe. Ten
+iterations per stage is enough: the OOM signature appears in iteration 1 and a
+few extra iterations prove stability past warmup. Pass/fail closes the
+envelope: stage 3 shrinks to batch 44 or stays at 40; stage 4 grows to micro 8
+or stays at 4. An optional stage-5 headroom probe can be appended as
+`--stage "16384=8=4=10=$PREFIX_16384"` with the corresponding manifest lookup.

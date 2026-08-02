@@ -1,0 +1,1 @@
+  SKIP CPPMEGA_MAMBA3_BWD_BWD_VECTORIZED_DIAG is not set to vectorized_diag

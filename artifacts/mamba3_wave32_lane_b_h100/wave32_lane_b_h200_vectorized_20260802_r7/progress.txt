@@ -1,0 +1,9 @@
+1785631943.409 start
+1785631944.044 applier_noop_start
+1785631944.891 applier_noop_done rc=0
+1785631945.794 applier_gated_start
+1785631961.383 applier_gated_done rc=0
+1785631962.082 applier_rollback_start
+1785631972.513 applier_rollback_done rc=0
+1785631973.115 bench_start
+1785631983.717 bench_done rc=1

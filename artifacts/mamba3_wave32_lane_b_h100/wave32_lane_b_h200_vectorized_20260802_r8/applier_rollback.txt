@@ -1,0 +1,5 @@
+[mamba3_stage2_force_nontma] local_rank=0 rank=? mutating file
+Mamba3 bwd kernel path: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+  DONE restored backup: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py.cppmega_bwd_bwd_vectorized_diag.bak
+/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]

@@ -1113,13 +1113,21 @@ P3 — стратегическое/отложенное.
 - **Проверка:** 20/20 итераций без краша; RESULTS.md обновлён с датой и коммитом
   форка.
 
-## [P087] Изоляция процессов для back-to-back mxfp8 прогонов
+## [P087] Изоляция процессов для back-to-back mxfp8 прогонов — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P086
 - **Где:** `runs/mxfp8_profile_compare/RESULTS.md:209-216` (cuBLAS internal
   error при back-to-back в одном процессе).
-- **Что делать:** раннер compare — subprocess per config.
-- **Проверка:** полный compare (bf16+mxfp8, b4+b16) в одном вызове раннера без
-  cuBLAS ошибок.
+- **Что сделано:** python-драйвер `runs/mxfp8_profile_compare/run_compare.py`
+  запускает каждую конфигурацию (bf16 / mxfp8_gemm_ready / mxfp8_legacy на
+  b4 + bf16 / mxfp8_gemm_ready на b16, всего 5) отдельным subprocess со
+  своим окружением и fail-fast по первому non-zero exit; `run_compare.sh` /
+  `run_batch16.sh` — тонкие обёртки (`--suite b4|b16|all`). RESULTS.md
+  обновлён (methodology note + команды запуска).
+- **Проверка:** `tests/test_mxfp8_profile_compare_driver.py` (4 теста с fake
+  runner: process-isolation по PID/логам, fail-fast, b16-сюита, отказ
+  unknown config) — passed локально. Полный GPU-прогон матрицы на GB10 —
+  pending verify: `python3 runs/mxfp8_profile_compare/run_compare.py
+  --suite all` на GB10.
 
 ## [P088] fp8_amax CUDA-путь: контрольный прогон — DONE
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: — (CUDA-хост)
@@ -1137,23 +1145,50 @@ P3 — стратегическое/отложенное.
   Receipt:
   `artifacts/fp8_amax_h200/p088_20260802T001217Z/receipt.json`.
 
-## [P089] wave32 lane_b: перезапуск с env-флагом
+## [P089] wave32 lane_b: перезапуск с env-флагом — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: — (H100/H200)
 - **Где:** `artifacts/mamba3_wave32_lane_b_h100/` (r5: applier отказался
   мутировать без `MAMBA3_BWD_BWD_VECTORIZED_DIAG_ALLOW_FILE_MUTATION=1`;
   r6 умер на bench — выводы невалидны).
-- **Что делать:** перезапустить с флагом, довести r6 до конца.
-- **Проверка:** `report.json` с применённым gated-вариантом; вердикт по
-  lane_b (оставить/откатить) зафиксирован в summary.md.
+- **Что сделано:** харнесс `scripts/modal_mamba3_wave32_lane_b_h100.py`
+  исправлен (gated-прогон applier'а с
+  `MAMBA3_BWD_BWD_VECTORIZED_DIAG_ALLOW_FILE_MUTATION=1`, явный
+  rollback-прогон, GPU параметризуется `CPPMEGA_LANE_B_GPU`,
+  `_apply_stage2_patch` принимает pre-patched installed source как
+  satisfied, любой non-zero noop/apply/rollback теперь fail-closed).
+  r7 (H200, образ `459a574`) вскрыл image drift: `785c3fd`
+  удалён из `datasunriseou/cppmega`, тот же образ найден как
+  `ghcr.io/jewelmusicee/cppmega:785c3fd`. r8 (H200, тот же бит-в-бит
+  образ, что у r5) — полный успех: `applier_gated` rc=0,
+  `applier_rollback` rc=0, bench rc=0, baseline не контаминирован
+  (`wave32_vectorized_diag=false`).
+- **Проверка:** `artifacts/mamba3_wave32_lane_b_h100/wave32_lane_b_h200_vectorized_20260802_r8/report.json`
+  (returncode 0, gated-вариант применён и откачен). Вердикт зафиксирован
+  в `artifacts/mamba3_wave32_lane_b_h100/summary.md`: **не включать,
+  lane закрыт** — численно верен (max_abs ≤ 2.57e-06), но `bwd_bwd`
+  стабильно на ~13–16 % медленнее stage2_current на H100 и H200 при
+  нулевом выигрыше по памяти; в репозитории откатывать нечего (патч
+  жил только в одноразовых контейнерах, applier остаётся env-gated).
 
-## [P090] grouped_head_reduce: оптимизировать или закрыть
+## [P090] grouped_head_reduce: оптимизировать или закрыть — DONE (closed as dead end)
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: — (H100/H200)
 - **Где:** `artifacts/mamba3_wave32_grouped_head_reduce_h100/` (численно ок,
   Triton в 10–160× медленнее torch).
-- **Что делать:** решение: CUDA-ядро (оптимизация) или закрыть как тупик с
-  вердикт-доком (численность уже доказана).
-- **Проверка:** либо bench в пределах 2× от torch, либо summary.md с вердиктом
-  «closed as dead end» и ссылкой на замену.
+- **Что сделано:** вердикт-док
+  `artifacts/mamba3_wave32_grouped_head_reduce_h100/summary.md`: **closed as
+  dead end**, дальнейшей Triton/CUDA-работы по этой редукции нет. Обоснование:
+  op — чистый streaming reduce без reuse; torch уже держит ~2.6 TB/s (~80 %
+  пика HBM3 H100), идеальное ядро дало бы ≤1.26×; Triton-кандидат
+  launch/occupancy-bound (2.9–253 GiB/s, почти flat ~4.1 ms на диапазоне
+  128× по размеру входа) — до 2× от torch нужно ускорение в 5–450×.
+  Численность Triton-пути доказана (max_abs ≤ 3.6e-07, bf16-шум). Замена —
+  действующий production torch-путь `reduce_grouped_heads_torch`
+  (`cppmega/megatron/mamba3_grouped_head_reduce.py:44`, view+sum).
+- **Проверка:** bench-числа summary сверены 1:1 с
+  `wave32_grouped_head_reduce_h100_final_20260430/report.json` (slowdown
+  164×/19.8×/10.5× на smoke/half_seq/fullish). CUDA-ядро не реализовывалось
+  (negative expected value); GPU-verify не требуется — закрыто по анализу
+  существующего receipt.
 
 ## [P091] GHCR-образ: добавить fa3/fa4 — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P073 (образ собирается
@@ -1179,20 +1214,46 @@ P3 — стратегическое/отложенное.
   в fallback-диагностике.
 - **Проверка:** непустой summary; 20 шагов без NaN; квитанция в artifacts.
 
-## [P093] Gate-harness: fail-loud при пустом summary
+## [P093] Gate-harness: fail-loud при пустом summary — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P092
 - **Где:** gate-харнесс `fa3_prod_gate_v2` (пустой summary «прошёл» молча).
-- **Что делать:** харнесс падает с ошибкой, если summary пуст/нет строк.
-- **Проверка:** наведённый пустой прогон → exit != 0 с понятным сообщением.
+- **Что сделано:** H200 gate после сохранения артефактов вызывает единый
+  `require_variant_rows`; ноль строк, `None` или malformed `variants` дают
+  remote exception и non-zero local exit.
+- **Проверка:** исторический receipt
+  `wave32_h200_fa3_prod_gate_v2_20260430` с
+  `IMAGE_BACKEND_BLOCKED`/0 rows отвергается регрессией; непустой receipt
+  принимается.
 
-## [P094] Nebius curriculum: памятные конверты стадий
+## [P094] Nebius curriculum: памятные конверты стадий — DOCS DONE / GPU PROBE PENDING
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: — (H200)
 - **Где:** `outputs/nebius/cppmega-h200-graphroutes-1782831200/` (stage3 bs48
   и stage4 bs20/16 OOM; пик 141 GiB).
-- **Что делать:** профилирование пика по стадиям; задокументировать безопасные
-  конверты (bs × seq) в runbook.
-- **Проверка:** таблица конвертов в runbook; повторный прогон stage3/4 на
-  граничных bs без OOM.
+- **Что сделано:** секция 6 «Curriculum memory envelopes (graph-routes stack)»
+  в `docs/case6_nebius_h200_runbook.md:203-296` — evidence-таблица по всем
+  восьми стадиям (torch peak alloc/reserved из `CPPMEGA_CUDA_PEAK`, пики из
+  1 s `nvidia-smi` CSV, статусы из `summary.log`), таблица безопасных
+  конвертов (stage1 seq1024×bs192 flat … stage5 seq16384 gbs8/mbs2), правила
+  (потолок ~127 GiB torch allocated; flat только при seq ≤ 4096;
+  micro bs × seq ≤ 32768 при seq ≥ 8192; конверты не экстраполировать по
+  токенам между seq), способ воспроизведения замера и pending-команда
+  boundary probe. Все числа сверены с артефактами 1:1; OOM-сигнатура
+  (`expandable_segments` mapping failure, alloc 20 GiB, total 139.80 GiB)
+  подтверждена в логах stage3 bs48 / stage4 bs20 / stage4 bs16; noconv-контроль
+  (seq4096 bs48 уместился в 111056 MiB, OK) подтверждён по
+  `cppmega-h200-curriculum-resume2-1782783207/summary.log`. Verify-команда
+  проверена против CLI `scripts/nebius_h200_megatron_cpp_world_curriculum.py`:
+  `_parse_stage` принимает оба формата stage-спеки, все флаги команды
+  существуют.
+- **Что осталось (PENDING, H200):** граничный прогон stage3 bs44 и stage4
+  gbs16/mbs8 по 10 итераций — точная команда в конце секции 6 runbook
+  («Boundary verification»); по результату конверт stage3 сужается до 44 или
+  остаётся 40, stage4 расширяется до micro 8 или остаётся 4.
+- **Проверка:**
+  - `.venv/bin/python -m pytest tests/test_nebius_h200_megatron_cpp_world_curriculum.py -q` → 19 passed.
+  - Сверка таблицы: `awk` по `stage_*.nvsmi.csv` (колонка memory.used) и grep
+    `CPPMEGA_CUDA_PEAK` по stage-логам → совпадение с таблицей runbook 1:1.
+  - Повторный прогон stage3/4 на граничных bs без OOM — pending (нет GPU).
 
 ## [P095] M4 Max vs GB10 parity
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: P058

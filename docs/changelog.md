@@ -1,5 +1,26 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: Wave32 receipts and fail-closed profiling harnesses
+
+P087 now runs the unchanged five-config MXFP8 comparison matrix in a fresh
+subprocess per config and stops on the first failure; the full GB10 rerun is
+still pending. P093 rejects a Wave32 gate receipt unless `variants` is a
+non-empty list, so the historical `IMAGE_BACKEND_BLOCKED` header-only summary
+can no longer exit successfully. The lane-b harness also records and rejects
+any failed noop/apply/rollback subprocess before benchmarking.
+
+The H200 lane-b rerun is numerically correct but keeps the vectorized-diagonal
+candidate disabled: its target backward kernel is 13–16% slower than the
+stage2 baseline on both H100 and H200 with no memory saving. P090 is closed as
+a dead end because the existing torch grouped-head reduction already reaches
+about 2.6 TB/s while the Triton candidate is 10.5–164× slower. Durable reports
+and verdicts live under `artifacts/mamba3_wave32_lane_b_h100/` and
+`artifacts/mamba3_wave32_grouped_head_reduce_h100/`.
+
+P094 documents the measured graph-routes memory envelopes in the CASE6
+runbook. The boundary probes at seq4096 batch44 and seq8192 micro-batch8 remain
+pending and are not presented as validated envelopes.
+
 ## 2026-08-02: P088 FP8 amax CUDA path proven on H200
 
 The cross-repository FP8 amax/quantize gate now runs one exact pytest target

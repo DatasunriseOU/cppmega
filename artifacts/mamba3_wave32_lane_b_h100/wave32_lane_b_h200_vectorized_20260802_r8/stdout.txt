@@ -1,0 +1,648 @@
+2026-08-02 00:56:36  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_fwd_kernel` with `out_idx=[]`
+2026-08-02 00:56:49  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_fwd_kernel`
+2026-08-02 00:56:51  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_bwd_kernel` with `out_idx=[]`
+2026-08-02 00:57:31  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_bwd_kernel`
+2026-08-02 00:57:35  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_fwd_kernel` with `out_idx=[]`
+2026-08-02 00:57:50  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_fwd_kernel`
+2026-08-02 00:57:52  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_bwd_kernel` with `out_idx=[]`
+2026-08-02 00:58:31  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_bwd_kernel`
+2026-08-02 00:58:33  [TileLang:tilelang.cache.kernel_cache:WARNING]: Found kernel 'mamba_mimo_bwd_fwd_kernel' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-08-02 00:58:33  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_bwd_kernel` with `out_idx=[]`
+2026-08-02 00:59:11  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_bwd_kernel`
+2026-08-02 00:59:13  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_fwd_kernel` with `out_idx=[]`
+2026-08-02 00:59:26  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_fwd_kernel`
+2026-08-02 00:59:28  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_bwd_kernel` with `out_idx=[]`
+2026-08-02 01:00:09  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_bwd_kernel`
+2026-08-02 01:00:11  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_fwd_kernel` with `out_idx=[]`
+2026-08-02 01:00:25  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_fwd_kernel`
+2026-08-02 01:00:27  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_bwd_kernel` with `out_idx=[]`
+2026-08-02 01:01:08  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_bwd_kernel`
+2026-08-02 01:01:10  [TileLang:tilelang.cache.kernel_cache:WARNING]: Found kernel 'mamba_mimo_bwd_fwd_kernel' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-08-02 01:01:10  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `mamba_mimo_bwd_bwd_kernel` with `out_idx=[]`
+2026-08-02 01:01:50  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `mamba_mimo_bwd_bwd_kernel`
+{
+  "capability": [
+    9,
+    0
+  ],
+  "cuda_version": "13.2",
+  "device_count": 1,
+  "gpu_name": "NVIDIA H200",
+  "installed_mamba3_bwd": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py",
+  "patch_path": "/opt/cppmega/upstream_prs/examples/13_tilelang_floormod_dbz/mamba3_bwd_stage2_force_nontma.patch",
+  "profile_cuda": "0",
+  "profile_nvtx": "0",
+  "profile_target": "wave32_vectorized_diag",
+  "shapes": [
+    {
+      "bench": {
+        "baseline": {
+          "bwd_bwd_ms": 0.08310800045728683,
+          "bwd_fwd_ms": 0.03696800023317337,
+          "chain_ms": 0.44934800267219543,
+          "cuda_profile_enabled": false,
+          "end_mem_mib_delta": 0.23583984375,
+          "end_reserved_mib_delta": 0.0,
+          "free_mem_mib_delta": 0.0,
+          "nvtx_enabled": false,
+          "output_count": 14,
+          "peak_mem_mib_delta": 1.2109375,
+          "peak_reserved_mib_delta": 0.0,
+          "profile_target": [
+            "wave32_vectorized_diag"
+          ],
+          "profile_targeted": false,
+          "profiler_events": [],
+          "total_mem_consistent": true,
+          "total_mem_mib": 143156.0625
+        },
+        "stage2_current": {
+          "bwd_bwd_ms": 0.08300799876451492,
+          "bwd_fwd_ms": 0.03813600167632103,
+          "chain_ms": 0.4463120102882385,
+          "cuda_profile_enabled": false,
+          "end_mem_mib_delta": 0.23583984375,
+          "end_reserved_mib_delta": 0.0,
+          "free_mem_mib_delta": 0.0,
+          "nvtx_enabled": false,
+          "output_count": 14,
+          "peak_mem_mib_delta": 1.2109375,
+          "peak_reserved_mib_delta": 0.0,
+          "profile_target": [
+            "wave32_vectorized_diag"
+          ],
+          "profile_targeted": false,
+          "profiler_events": [],
+          "total_mem_consistent": true,
+          "total_mem_mib": 143156.0625
+        },
+        "wave32_vectorized_diag": {
+          "bwd_bwd_ms": 0.09379199892282486,
+          "bwd_fwd_ms": 0.037751998752355576,
+          "chain_ms": 0.3759559988975525,
+          "cuda_profile_enabled": false,
+          "end_mem_mib_delta": 0.23583984375,
+          "end_reserved_mib_delta": 0.0,
+          "free_mem_mib_delta": 0.0,
+          "nvtx_enabled": false,
+          "output_count": 14,
+          "peak_mem_mib_delta": 1.2109375,
+          "peak_reserved_mib_delta": 0.0,
+          "profile_target": [
+            "wave32_vectorized_diag"
+          ],
+          "profile_targeted": true,
+          "profiler_events": [],
+          "total_mem_consistent": true,
+          "total_mem_mib": 143156.0625
+        }
+      },
+      "diffs": {
+        "stage2_current_vs_baseline": [
+          {
+            "idx": 0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 1,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 2,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 3,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 4,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 5,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 6,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 7,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 8,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 9,
+            "skipped": true
+          },
+          {
+            "idx": 10,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 11,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 12,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 13,
+            "skipped": true
+          }
+        ],
+        "wave32_vs_baseline": [
+          {
+            "idx": 0,
+            "max_abs": 1.1920928955078125e-07,
+            "mean_abs": 3.4288873962395883e-09
+          },
+          {
+            "idx": 1,
+            "max_abs": 2.384185791015625e-07,
+            "mean_abs": 3.6083740440062684e-09
+          },
+          {
+            "idx": 2,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 3,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 4,
+            "max_abs": 1.823793354560621e-06,
+            "mean_abs": 3.0897078318048443e-07
+          },
+          {
+            "idx": 5,
+            "max_abs": 2.9802322387695312e-08,
+            "mean_abs": 6.72525146683256e-10
+          },
+          {
+            "idx": 6,
+            "max_abs": 4.76837158203125e-07,
+            "mean_abs": 3.9685119190835394e-08
+          },
+          {
+            "idx": 7,
+            "max_abs": 4.76837158203125e-07,
+            "mean_abs": 3.5738594306167215e-08
+          },
+          {
+            "idx": 8,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 9,
+            "skipped": true
+          },
+          {
+            "idx": 10,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 11,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 12,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 13,
+            "skipped": true
+          }
+        ],
+        "wave32_vs_stage2_current": [
+          {
+            "idx": 0,
+            "max_abs": 1.1920928955078125e-07,
+            "mean_abs": 3.4288873962395883e-09
+          },
+          {
+            "idx": 1,
+            "max_abs": 2.384185791015625e-07,
+            "mean_abs": 3.6083740440062684e-09
+          },
+          {
+            "idx": 2,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 3,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 4,
+            "max_abs": 1.823793354560621e-06,
+            "mean_abs": 3.0897078318048443e-07
+          },
+          {
+            "idx": 5,
+            "max_abs": 2.9802322387695312e-08,
+            "mean_abs": 6.72525146683256e-10
+          },
+          {
+            "idx": 6,
+            "max_abs": 4.76837158203125e-07,
+            "mean_abs": 3.9685119190835394e-08
+          },
+          {
+            "idx": 7,
+            "max_abs": 4.76837158203125e-07,
+            "mean_abs": 3.5738594306167215e-08
+          },
+          {
+            "idx": 8,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 9,
+            "skipped": true
+          },
+          {
+            "idx": 10,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 11,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 12,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 13,
+            "skipped": true
+          }
+        ]
+      },
+      "shape": {
+        "B": 1,
+        "G": 1,
+        "H": 4,
+        "N": 64,
+        "P": 64,
+        "R": 4,
+        "S": 128,
+        "chunk_size": 16,
+        "name": "smoke",
+        "seed": 1
+      }
+    },
+    {
+      "bench": {
+        "baseline": {
+          "bwd_bwd_ms": 0.3158400058746338,
+          "bwd_fwd_ms": 0.13270799815654755,
+          "chain_ms": 0.5830320119857788,
+          "cuda_profile_enabled": false,
+          "end_mem_mib_delta": 2.60205078125,
+          "end_reserved_mib_delta": 38.0,
+          "free_mem_mib_delta": -38.0,
+          "nvtx_enabled": false,
+          "output_count": 14,
+          "peak_mem_mib_delta": 33.04052734375,
+          "peak_reserved_mib_delta": 38.0,
+          "profile_target": [
+            "wave32_vectorized_diag"
+          ],
+          "profile_targeted": false,
+          "profiler_events": [],
+          "total_mem_consistent": true,
+          "total_mem_mib": 143156.0625
+        },
+        "stage2_current": {
+          "bwd_bwd_ms": 0.31501200795173645,
+          "bwd_fwd_ms": 0.1367879956960678,
+          "chain_ms": 0.665116012096405,
+          "cuda_profile_enabled": false,
+          "end_mem_mib_delta": 2.60205078125,
+          "end_reserved_mib_delta": 42.0,
+          "free_mem_mib_delta": -42.0,
+          "nvtx_enabled": false,
+          "output_count": 14,
+          "peak_mem_mib_delta": 33.04052734375,
+          "peak_reserved_mib_delta": 42.0,
+          "profile_target": [
+            "wave32_vectorized_diag"
+          ],
+          "profile_targeted": false,
+          "profiler_events": [],
+          "total_mem_consistent": true,
+          "total_mem_mib": 143156.0625
+        },
+        "wave32_vectorized_diag": {
+          "bwd_bwd_ms": 0.3646480143070221,
+          "bwd_fwd_ms": 0.13662800192832947,
+          "chain_ms": 0.6439719796180725,
+          "cuda_profile_enabled": false,
+          "end_mem_mib_delta": 2.60205078125,
+          "end_reserved_mib_delta": 42.0,
+          "free_mem_mib_delta": -42.0,
+          "nvtx_enabled": false,
+          "output_count": 14,
+          "peak_mem_mib_delta": 33.04052734375,
+          "peak_reserved_mib_delta": 42.0,
+          "profile_target": [
+            "wave32_vectorized_diag"
+          ],
+          "profile_targeted": true,
+          "profiler_events": [],
+          "total_mem_consistent": true,
+          "total_mem_mib": 143156.0625
+        }
+      },
+      "diffs": {
+        "stage2_current_vs_baseline": [
+          {
+            "idx": 0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 1,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 2,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 3,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 4,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 5,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 6,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 7,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 8,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 9,
+            "skipped": true
+          },
+          {
+            "idx": 10,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 11,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 12,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 13,
+            "skipped": true
+          }
+        ],
+        "wave32_vs_baseline": [
+          {
+            "idx": 0,
+            "max_abs": 2.384185791015625e-07,
+            "mean_abs": 6.835842114583102e-09
+          },
+          {
+            "idx": 1,
+            "max_abs": 2.384185791015625e-07,
+            "mean_abs": 6.683647413296967e-09
+          },
+          {
+            "idx": 2,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 3,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 4,
+            "max_abs": 2.5690533220767975e-06,
+            "mean_abs": 3.1089376761883614e-07
+          },
+          {
+            "idx": 5,
+            "max_abs": 1.1920928955078125e-07,
+            "mean_abs": 1.1903640295685136e-09
+          },
+          {
+            "idx": 6,
+            "max_abs": 1.9073486328125e-06,
+            "mean_abs": 1.076609805750195e-07
+          },
+          {
+            "idx": 7,
+            "max_abs": 1.9073486328125e-06,
+            "mean_abs": 1.2529289961094037e-07
+          },
+          {
+            "idx": 8,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 9,
+            "skipped": true
+          },
+          {
+            "idx": 10,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 11,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 12,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 13,
+            "skipped": true
+          }
+        ],
+        "wave32_vs_stage2_current": [
+          {
+            "idx": 0,
+            "max_abs": 2.384185791015625e-07,
+            "mean_abs": 6.835842114583102e-09
+          },
+          {
+            "idx": 1,
+            "max_abs": 2.384185791015625e-07,
+            "mean_abs": 6.683647413296967e-09
+          },
+          {
+            "idx": 2,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 3,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 4,
+            "max_abs": 2.5690533220767975e-06,
+            "mean_abs": 3.1089376761883614e-07
+          },
+          {
+            "idx": 5,
+            "max_abs": 1.1920928955078125e-07,
+            "mean_abs": 1.1903640295685136e-09
+          },
+          {
+            "idx": 6,
+            "max_abs": 1.9073486328125e-06,
+            "mean_abs": 1.076609805750195e-07
+          },
+          {
+            "idx": 7,
+            "max_abs": 1.9073486328125e-06,
+            "mean_abs": 1.2529289961094037e-07
+          },
+          {
+            "idx": 8,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 9,
+            "skipped": true
+          },
+          {
+            "idx": 10,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 11,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 12,
+            "max_abs": 0.0,
+            "mean_abs": 0.0
+          },
+          {
+            "idx": 13,
+            "skipped": true
+          }
+        ]
+      },
+      "shape": {
+        "B": 2,
+        "G": 1,
+        "H": 8,
+        "N": 64,
+        "P": 64,
+        "R": 4,
+        "S": 512,
+        "chunk_size": 16,
+        "name": "representative",
+        "seed": 2
+      }
+    }
+  ],
+  "torch_version": "2.13.0.dev20260426+cu132",
+  "variants": {
+    "baseline": {
+      "bb_num_stages_0": true,
+      "bf_num_stages_1": false,
+      "disable_tma_count": 0,
+      "dqk_diag_shared_alloc": false,
+      "dqk_from_diag_shared_alloc": true,
+      "path": "/tmp/wave32_lane_b_h100_zkyvy15f/mamba3_mimo_bwd_baseline.py",
+      "shared_vector_staging_count": 8,
+      "wave32_vectorized_diag": false
+    },
+    "stage2_current": {
+      "bb_num_stages_0": true,
+      "bf_num_stages_1": true,
+      "disable_tma_count": 13,
+      "dqk_diag_shared_alloc": false,
+      "dqk_from_diag_shared_alloc": true,
+      "path": "/tmp/wave32_lane_b_h100_zkyvy15f/mamba3_mimo_bwd_stage2_current.py",
+      "shared_vector_staging_count": 8,
+      "wave32_vectorized_diag": false
+    },
+    "wave32_vectorized_diag": {
+      "bb_num_stages_0": true,
+      "bf_num_stages_1": true,
+      "disable_tma_count": 13,
+      "dqk_diag_shared_alloc": true,
+      "dqk_from_diag_shared_alloc": false,
+      "path": "/tmp/wave32_lane_b_h100_zkyvy15f/mamba3_mimo_bwd_wave32_vectorized_diag.py",
+      "shared_vector_staging_count": 8,
+      "wave32_vectorized_diag": true
+    }
+  },
+  "vectorized_diag_env_flag": "CPPMEGA_MAMBA3_BWD_BWD_VECTORIZED_DIAG"
+}

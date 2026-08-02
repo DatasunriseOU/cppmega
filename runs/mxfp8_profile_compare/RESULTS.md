@@ -194,15 +194,19 @@ Re-built `libtransformer_engine.so` from the cppmega TE fork.
 
 ```bash
 cd /home/dave/source/cppmega
-# batch=4 (correctness/debug):
+# full matrix (three existing b4 configs + two b16 configs), isolated and fail-fast:
+python3 runs/mxfp8_profile_compare/run_compare.py --suite all
+# batch=4 only (correctness/debug):
 ./runs/mxfp8_profile_compare/run_compare.sh
-# batch=16 (compute-density comparison):
+# batch=16 only (compute-density comparison):
 ./runs/mxfp8_profile_compare/run_batch16.sh
 ```
 
 Logs land in `runs/mxfp8_profile_compare/profile_<name>_<timestamp>.log` plus a
-matching `.nvsmi.log` (latter is `[N/A]` on GB10 — see note above).  The script
-runs each config sequentially; if one crashes the others still run.
+matching `.nvsmi.log` (latter is `[N/A]` on GB10 — see note above).  Since
+P087 the python driver runs each config in its own subprocess and aborts
+fail-fast on the first non-zero exit (the shell runner previously continued
+after failures).
 
 ## Methodology note
 
@@ -211,6 +215,9 @@ Earlier attempts ran all three configs in the same process tree.
 internal operation failed` when run *immediately after* the bf16 run — likely
 GPU memory fragmentation or stale TileLang JIT state across the boundary.
 Running it in isolation (one process per config) reproduced 20/20 cleanly,
-which is what the table above reflects.  If you re-run the full sweep,
-expect the back-to-back cuBLAS error to be possible; a clean process boundary
-is the workaround until the cause is tracked down.
+which is what the table above reflects.  P087 makes the process boundary
+structural: `run_compare.py` spawns every config as a separate subprocess
+with a fresh environment and aborts fail-fast on the first non-zero exit, so
+a full-matrix run (`--suite all`) no longer shares CUDA context, cuBLAS
+handles or JIT caches between configs.  GPU re-verification of the full
+matrix on GB10 is still pending.
