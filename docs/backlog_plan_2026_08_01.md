@@ -1121,14 +1121,21 @@ P3 — стратегическое/отложенное.
 - **Проверка:** полный compare (bf16+mxfp8, b4+b16) в одном вызове раннера без
   cuBLAS ошибок.
 
-## [P088] fp8_amax CUDA-путь: контрольный прогон
+## [P088] fp8_amax CUDA-путь: контрольный прогон — DONE
 - Репо: mlx | Приоритет: P2 | Тип: task | Зависит от: — (CUDA-хост)
-- **Где:** `cppmega/tests/test_fp8_amax_tilelang.py` (18 тестов + Triton-parity
-  skip на macOS), `mlx/cppmega_mlx/nn/_tilelang/fp8_amax.py`.
-- **Что делать:** прогнать на CUDA-хосте: Metal-обход (двухстадийный amax,
-  uint8 encode) не должен затрагивать CUDA-ветку (atomic path).
-- **Проверка:** все тесты зелёные включая Triton-parity; receipt приложен к
-  issue.
+- **Где:** `cppmega/tests/test_fp8_amax_tilelang.py` (20 тестов),
+  `mlx/cppmega_mlx/nn/_tilelang/fp8_amax.py`.
+- **Что сделано:** Modal runner запускает точный target, монтирует только
+  source package sibling-репо, фиксирует оба commit SHA и исключает caches /
+  Apple native build products. MLX и TileLang package roots переведены на
+  существующий lazy-export pattern; concurrent compile test выбирает реальный
+  CUDA/Metal target вместо hard-coded Metal.
+- **Проверка:** Modal H200 `ap-gmSWDA6gM6iOsQccu6V4tR`: 20 passed, 0 failed,
+  0 skipped, 87.86 s, включая Triton parity; `cppmega@63bd5783`,
+  `cppmega.mlx@98aabe60`, image digest
+  `sha256:75d183277b3389d3e7af1056d460070dc2060f0526ada612a285b9712fd7a218`.
+  Receipt:
+  `artifacts/fp8_amax_h200/p088_20260802T001217Z/receipt.json`.
 
 ## [P089] wave32 lane_b: перезапуск с env-флагом
 - Репо: cppmega | Приоритет: P2 | Тип: task | Зависит от: — (H100/H200)

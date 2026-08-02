@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "task": "P088",
+  "status": "passed",
+  "modal": {
+    "app_id": "ap-gmSWDA6gM6iOsQccu6V4tR",
+    "url": "https://modal.com/apps/jewelmusic/main/ap-gmSWDA6gM6iOsQccu6V4tR",
+    "created_at": "2026-08-02T00:12:17Z",
+    "stopped_at": "2026-08-02T00:15:17Z",
+    "state": "stopped"
+  },
+  "runtime": {
+    "gpu": "H200:1",
+    "image_ref": "ghcr.io/datasunriseou/cppmega:459a574",
+    "image_digest": "sha256:75d183277b3389d3e7af1056d460070dc2060f0526ada612a285b9712fd7a218",
+    "megatron_head": "ba7b5ebce12af60627a80985792a1449ce45f46c"
+  },
+  "source": {
+    "cppmega_commit": "63bd57831ca4d6b636c93509ff1aac3d736c9157",
+    "cppmega_mlx_commit": "98aabe60c3966e389acc4f2092879d7dc457c376"
+  },
+  "pytest": {
+    "target": "tests/test_fp8_amax_tilelang.py",
+    "args": "-q --tb=short -rs",
+    "returncode": 0,
+    "passed": 20,
+    "failed": 0,
+    "skipped": 0,
+    "warnings": 20,
+    "duration_seconds": 87.86
+  },
+  "modal_volume_receipts": {
+    "volume": "cppmega-test-results",
+    "result_json_sha256": "7658a609d872b98e3b948ec085478112f5d1413ce54b620a633911d417e8cc73",
+    "result_json_bytes": 2929,
+    "stdout_full_sha256": "6ac98a789c0b1a64eb47084b6f184f715905a5a108fd26bad597fa412d5053ec",
+    "stdout_full_bytes": 2477,
+    "stderr_full_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_full_bytes": 0
+  }
+}

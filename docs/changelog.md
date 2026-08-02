@@ -1,5 +1,28 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: P088 FP8 amax CUDA path proven on H200
+
+The cross-repository FP8 amax/quantize gate now runs one exact pytest target
+against a source-only `cppmega.mlx` overlay and records both repository commits,
+the GHCR image, full-log hashes, and the selected test arguments. Python caches
+and native Apple build products are excluded from the Modal mounts; the
+245 GiB local `cppmega.mlx/outputs` tree is never scanned or uploaded.
+
+`cppmega.mlx` package exports now use the repository's existing lazy-import
+pattern, so the portable Torch/TileLang FP8 module does not import Apple MLX on
+Linux. MLX-backed symbols still import their real implementation on access and
+fail normally when that runtime is absent. The concurrent compile regression
+also selects the active CUDA or Metal lowering target instead of hard-coding
+Metal.
+
+The final Modal H200 run passed **20/20 tests** in 87.86 seconds, including
+Triton parity and concurrent amax/quantize compilation, on
+`cppmega@63bd57831ca4d6b636c93509ff1aac3d736c9157`,
+`cppmega.mlx@98aabe60c3966e389acc4f2092879d7dc457c376`, and
+`ghcr.io/datasunriseou/cppmega@sha256:75d183277b3389d3e7af1056d460070dc2060f0526ada612a285b9712fd7a218`.
+The durable receipt is
+`artifacts/fp8_amax_h200/p088_20260802T001217Z/receipt.json`.
+
 ## 2026-08-01: Pinned Megatron subprocess isolation
 
 The two remaining DSA subprocess cases now reuse the existing exact-source
