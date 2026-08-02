@@ -55,6 +55,11 @@ from einops import rearrange
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
+from cppmega.megatron.document_isolation import (
+    _validate_model_parallel_topology,
+    map_sharded_sequence_by_document,
+)
+
 
 # ---------------------------------------------------------------------------
 # Mamba3 feature helpers
@@ -384,9 +389,9 @@ class NoConvMambaMixer(MegatronModule):
       - Sequence parallelism (the input arrives seq-partitioned)
       - ``TransformerConfig`` knobs (``mamba_state_dim``, ``mamba_head_dim``, etc.)
 
-    It does NOT support context parallelism (CP > 1) because the upstream CP
-    implementation is tightly coupled to the conv1d weight layout.
-    Use ``cp_size == 1``.
+    Packed-document state is isolated after the TP-sharded input projection.
+    Context-parallel sequences are restored around the stateful scan and
+    returned to Megatron's local zigzag layout before the output projection.
 
     Args:
         config: Megatron ``TransformerConfig``.
@@ -447,6 +452,15 @@ class NoConvMambaMixer(MegatronModule):
 
         assert pg_collection is not None, "pg_collection must be provided"
         self.pg_collection = pg_collection
+        tp_group = getattr(pg_collection, "tp", None)
+        cp_group = getattr(pg_collection, "cp", None)
+        _validate_model_parallel_topology(
+            config,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            component=type(self).__name__,
+        )
+        self.context_parallel_group = cp_group
 
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
@@ -608,8 +622,20 @@ class NoConvMambaMixer(MegatronModule):
         # in_proj: (seq, batch, hidden) -> (seq, batch, proj_dim)
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        # Training path: use mamba_chunk_scan_combined directly (no conv)
-        y = self._ssm_noconv(zxBCdt)
+        # ColumnParallelLinear owns Megatron's TP sequence-parallel all-gather,
+        # so zxBCdt is sequence-complete for this CP rank while its final
+        # dimension remains TP-sharded. Do not gather it over TP a second time:
+        # map_sharded_sequence_by_document only needs the CP axis here.
+        #
+        # The helper validates zxBCdt against the global document sidecar before
+        # running the stateful scan. A changed upstream linear contract therefore
+        # fails closed instead of scanning a local sequence shard.
+        y = map_sharded_sequence_by_document(
+            zxBCdt,
+            self._ssm_noconv,
+            context_parallel_group=self.context_parallel_group,
+            pad_to=self.chunk_size,
+        )
 
         out, out_bias = self.out_proj(y)
         return out, out_bias
