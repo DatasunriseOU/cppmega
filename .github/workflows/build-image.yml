@@ -37,6 +37,37 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_sha || github.sha }}
 
+      - name: Bind exact source tree
+        id: source
+        env:
+          SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib
+          import json
+          from pathlib import Path
+          import subprocess
+
+          paths = subprocess.check_output(
+              ["git", "ls-files", "-z"],
+          ).decode().rstrip("\0").split("\0")
+          manifest = {
+              path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+              for path in paths
+              if path
+          }
+          payload = json.dumps(
+              manifest, sort_keys=True, separators=(",", ":")
+          ).encode()
+          print(f"manifest_sha256={hashlib.sha256(payload).hexdigest()}")
+          print(f"manifest_file_count={len(manifest)}")
+          PY
+
       - name: Verify persistent runner capacity
         shell: bash
         run: |
@@ -145,6 +176,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CPPMEGA_SOURCE_SHA=${{ steps.source.outputs.sha }}
+            CPPMEGA_SOURCE_TREE=${{ steps.source.outputs.tree }}
+            CPPMEGA_SOURCE_MANIFEST_SHA256=${{ steps.source.outputs.manifest_sha256 }}
+            CPPMEGA_SOURCE_MANIFEST_FILE_COUNT=${{ steps.source.outputs.manifest_file_count }}
           cache-from: |
             type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: |

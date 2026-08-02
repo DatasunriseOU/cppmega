@@ -461,8 +461,23 @@ def test_image_build_binds_triggering_source_and_wheel_release() -> None:
         REPO_ROOT / ".github" / "workflows" / "build-image.yml"
     ).read_text(encoding="utf-8")
 
-    assert workflow.count("github.event.workflow_run.head_sha") == 2
-    assert workflow.count("inputs.source_sha") == 2
+    assert workflow.count("github.event.workflow_run.head_sha") == 3
+    assert workflow.count("inputs.source_sha") == 3
+    assert 'test "$(git rev-parse HEAD)" = "$SOURCE_SHA"' in workflow
+    assert 'test -z "$(git status --porcelain=v1 --untracked-files=all)"' in workflow
+    for build_arg in (
+        "CPPMEGA_SOURCE_SHA=${{ steps.source.outputs.sha }}",
+        "CPPMEGA_SOURCE_TREE=${{ steps.source.outputs.tree }}",
+        (
+            "CPPMEGA_SOURCE_MANIFEST_SHA256="
+            "${{ steps.source.outputs.manifest_sha256 }}"
+        ),
+        (
+            "CPPMEGA_SOURCE_MANIFEST_FILE_COUNT="
+            "${{ steps.source.outputs.manifest_file_count }}"
+        ),
+    ):
+        assert build_arg in workflow
     assert 'TAG="wheels-${SOURCE_SHA}"' in workflow
     assert "inputs.wheels_tag" not in workflow
     assert "git/ref/tags/${TAG}" in workflow
