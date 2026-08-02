@@ -522,12 +522,72 @@ def _write_content_store_ci_export(
     return manifest_path
 
 
-def test_ci_objective_source_manifest_reuses_receipt_allowlist_and_freezes_seed(
+def _write_repaired_ci_snapshot(
+    receipt_path: Path,
+    *,
+    snapshot_root: Path,
+) -> Path:
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    records: list[dict[str, object]] = []
+    for artifact in receipt["artifacts"]:
+        if artifact["kind"] != "case5_parquet":
+            continue
+        relative = Path(artifact["path"])
+        source = receipt_path.parent / relative
+        target = snapshot_root / "ci" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table = pq.read_table(source)
+        if artifact["split"] == "train":
+            table = table.replace_schema_metadata({b"boundary-repaired": b"true"})
+        pq.write_table(
+            table,
+            target,
+            compression="zstd",
+            compression_level=9,
+        )
+        snapshot_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        boundary_repaired = (
+            target.stat().st_size != artifact["byte_size"]
+            or snapshot_sha256 != artifact["sha256"]
+        )
+        records.append(
+            {
+                "kind": "ci",
+                "bucket": artifact["bucket"],
+                "snapshot": f"ci/{relative.as_posix()}",
+                "size": target.stat().st_size,
+                "rows": artifact["rows"],
+                "source_sha256": artifact["sha256"],
+                "snapshot_sha256": snapshot_sha256,
+                "boundary_repaired": boundary_repaired,
+            }
+        )
+    repaired = {
+        "schema": "cppmega_repaired_parquet_snapshot_v1",
+        "created_at": "2026-08-02T00:00:00+00:00",
+        "source_manifest_sha256": "1" * 64,
+        "file_count": len(records),
+        "changed_files": sum(
+            int(record["boundary_repaired"]) for record in records
+        ),
+        "files": records,
+    }
+    repaired_path = snapshot_root / "repaired_manifest.json"
+    repaired_path.write_text(json.dumps(repaired), encoding="utf-8")
+    return repaired_path
+
+
+def test_ci_objective_source_manifest_uses_repaired_train_shards_only(
     tmp_path: Path,
 ) -> None:
-    ci_root = tmp_path / "ci"
-    receipt_path = _write_content_store_ci_export(ci_root)
-    seed_root = tmp_path / "seed"
+    original_ci_root = tmp_path / "original-ci"
+    receipt_path = _write_content_store_ci_export(original_ci_root)
+    snapshot_root = tmp_path / "snapshot"
+    repaired_manifest_path = _write_repaired_ci_snapshot(
+        receipt_path,
+        snapshot_root=snapshot_root,
+    )
+    seed_root = snapshot_root
     code = seed_root / "code" / "1024" / "code.parquet"
     commit = seed_root / "commits" / "1024" / "commit.parquet"
     for path in (code, commit):
@@ -535,8 +595,9 @@ def test_ci_objective_source_manifest_reuses_receipt_allowlist_and_freezes_seed(
         pq.write_table(pa.table({"value": [1]}), path, compression="zstd")
 
     manifest = objective_manifest.build_source_pool_manifest(
-        ci_root=ci_root,
+        ci_root=snapshot_root / "ci",
         ci_receipt_path=receipt_path,
+        repaired_manifest_path=repaired_manifest_path,
         objective_seed_root=seed_root,
         seed_globs=("code/1024/*.parquet", "commits/1024/*.parquet"),
         buckets=builder.DEFAULT_BUCKETS,
@@ -549,16 +610,57 @@ def test_ci_objective_source_manifest_reuses_receipt_allowlist_and_freezes_seed(
     assert [
         record["path"] for record in manifest["objective_seed"]["files"]
     ] == ["code/1024/code.parquet", "commits/1024/commit.parquet"]
-    assert [
-        record["path"]
-        for record in manifest["primary_ci"]["files_by_sequence_length"]["1024"]
-    ] == [
-        "1024/ci-case5-train-1024-000000.parquet",
-        "1024/ci-case5-validation-1024-000001.parquet",
+    primary = manifest["primary_ci"]["files_by_sequence_length"]["1024"]
+    assert [record["path"] for record in primary] == [
+        "1024/ci-case5-train-1024-000000.parquet"
     ]
+    repaired_train = (
+        snapshot_root / "ci/1024/ci-case5-train-1024-000000.parquet"
+    )
+    original_train = (
+        original_ci_root / "1024/ci-case5-train-1024-000000.parquet"
+    )
+    assert primary[0]["size_bytes"] == repaired_train.stat().st_size
+    assert primary[0]["sha256"] == hashlib.sha256(
+        repaired_train.read_bytes()
+    ).hexdigest()
+    assert primary[0]["sha256"] != hashlib.sha256(
+        original_train.read_bytes()
+    ).hexdigest()
     completion = manifest["ci_export"]["source_completion"]
     assert completion["status"] == "complete"
     assert "production_complete" not in completion
+
+
+def test_ci_objective_source_manifest_rejects_repaired_byte_drift(
+    tmp_path: Path,
+) -> None:
+    original_ci_root = tmp_path / "original-ci"
+    receipt_path = _write_content_store_ci_export(original_ci_root)
+    snapshot_root = tmp_path / "snapshot"
+    repaired_manifest_path = _write_repaired_ci_snapshot(
+        receipt_path,
+        snapshot_root=snapshot_root,
+    )
+    train = snapshot_root / "ci/1024/ci-case5-train-1024-000000.parquet"
+    table = pq.read_table(train).replace_schema_metadata(
+        {b"boundary-repaired": b"drifted"}
+    )
+    pq.write_table(table, train, compression="zstd", compression_level=9)
+    seed = snapshot_root / "code/1024/code.parquet"
+    seed.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [1]}), seed, compression="zstd")
+
+    with pytest.raises(RuntimeError, match="snapshot bytes drifted"):
+        objective_manifest.build_source_pool_manifest(
+            ci_root=snapshot_root / "ci",
+            ci_receipt_path=receipt_path,
+            repaired_manifest_path=repaired_manifest_path,
+            objective_seed_root=snapshot_root,
+            seed_globs=("code/1024/*.parquet",),
+            buckets=builder.DEFAULT_BUCKETS,
+            producer={"script": "fixture"},
+        )
 
 
 def _write_pr_export(
@@ -1822,7 +1924,11 @@ def _two_pool_source_binding_v2(
     seed_kind: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
     pool_specs = (
-        ("primary_ci", "1024/ci.parquet", b"ci"),
+        (
+            "primary_ci",
+            "1024/ci-case5-train-1024-000000.parquet",
+            b"ci",
+        ),
         ("objective_seed", f"{seed_kind}/1024/seed.parquet", b"seed"),
     )
     pools: dict[str, dict[str, object]] = {}
@@ -1876,6 +1982,16 @@ def _two_pool_source_binding_v2(
                 "rows": record["rows"],
             }
         )
+    repaired_files.append(
+        {
+            "kind": "ci",
+            "bucket": 1024,
+            "snapshot": "ci/1024/ci-case5-validation-1024-000001.parquet",
+            "size": 1,
+            "snapshot_sha256": hashlib.sha256(b"validation").hexdigest(),
+            "rows": 1,
+        }
+    )
     return (
         {
             "schema": "cppmega_objective_source_snapshot_v2",
@@ -1923,7 +2039,7 @@ def _write_two_pool_objective_artifact(
                 primary_record
                 if bucket == 1024
                 else {
-                    "path": f"{bucket}/ci.parquet",
+                    "path": f"{bucket}/ci-case5-train-{bucket}-000000.parquet",
                     "rows": 1,
                     "size_bytes": 1,
                     "sha256": hashlib.sha256(
@@ -2045,7 +2161,10 @@ def test_builder_rejects_two_pool_source_snapshot_v2_drift(
     objective_artifact, repaired_snapshot = _write_two_pool_objective_artifact(
         tmp_path, seed_kind="code"
     )
-    repaired_snapshot["files"][0][field] = value
+    seed_record = next(
+        record for record in repaired_snapshot["files"] if record["kind"] == "code"
+    )
+    seed_record[field] = value
 
     with pytest.raises(RuntimeError, match="do not match repaired snapshot"):
         _validate_objective_source_binding(
@@ -2061,6 +2180,29 @@ def test_builder_rejects_two_pool_ci_seed_kind(tmp_path: Path) -> None:
     )
 
     with pytest.raises(RuntimeError, match="source path is not canonical"):
+        _validate_objective_source_binding(
+            objective_artifact_path=objective_artifact,
+            repaired_snapshot_manifest=repaired_snapshot,
+            bucket=1024,
+        )
+
+
+def test_builder_rejects_unknown_two_pool_ci_split(tmp_path: Path) -> None:
+    objective_artifact, repaired_snapshot = _write_two_pool_objective_artifact(
+        tmp_path, seed_kind="code"
+    )
+    repaired_snapshot["files"].append(
+        {
+            "kind": "ci",
+            "bucket": 1024,
+            "snapshot": "ci/1024/ci-case5-dev-1024-000002.parquet",
+            "size": 1,
+            "snapshot_sha256": hashlib.sha256(b"dev").hexdigest(),
+            "rows": 1,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="CI snapshot path is not canonical"):
         _validate_objective_source_binding(
             objective_artifact_path=objective_artifact,
             repaired_snapshot_manifest=repaired_snapshot,

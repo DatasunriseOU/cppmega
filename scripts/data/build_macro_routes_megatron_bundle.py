@@ -2352,19 +2352,39 @@ def _validate_objective_source_binding(
     repaired_files = repaired_snapshot_manifest.get("files")
     if not isinstance(repaired_files, list):
         raise RuntimeError("repaired snapshot manifest has no files list")
-    snapshot_records = [
-        {
-            "kind": str(record["kind"]),
-            "bucket": int(record["bucket"]),
-            "path": str(record["snapshot"]),
-            "size": int(record["size"]),
-            "sha256": str(record["snapshot_sha256"]),
-            "rows": int(record["rows"]),
-        }
-        for record in repaired_files
-        if isinstance(record, dict) and int(record.get("bucket", -1)) == bucket
-    ]
     if binding.get("schema") == "cppmega_objective_source_snapshot_v2":
+        objective_paths = {str(record["path"]) for record in objective_records}
+        snapshot_records: list[dict[str, object]] = []
+        for record in repaired_files:
+            if not isinstance(record, dict) or int(record.get("bucket", -1)) != bucket:
+                continue
+            kind = str(record["kind"])
+            snapshot = str(record["snapshot"])
+            if kind == "ci":
+                match = re.fullmatch(
+                    rf"ci/{bucket}/ci-case5-(train|validation|test)-"
+                    rf"{bucket}-[0-9]{{6}}\.parquet",
+                    snapshot,
+                )
+                if match is None:
+                    raise RuntimeError(
+                        f"bucket {bucket}: repaired CI snapshot path is not canonical: "
+                        f"{snapshot}"
+                    )
+                if match.group(1) != "train":
+                    continue
+            elif snapshot not in objective_paths:
+                continue
+            snapshot_records.append(
+                {
+                    "kind": kind,
+                    "bucket": int(record["bucket"]),
+                    "path": snapshot,
+                    "size": int(record["size"]),
+                    "sha256": str(record["snapshot_sha256"]),
+                    "rows": int(record["rows"]),
+                }
+            )
         objective_records.sort(key=lambda record: str(record["path"]))
         snapshot_records.sort(key=lambda record: str(record["path"]))
         if len({str(record["path"]) for record in objective_records}) != len(
@@ -2374,6 +2394,19 @@ def _validate_objective_source_binding(
                 f"bucket {bucket}: two-pool objective sources contain duplicate "
                 "canonical snapshot paths"
             )
+    else:
+        snapshot_records = [
+            {
+                "kind": str(record["kind"]),
+                "bucket": int(record["bucket"]),
+                "path": str(record["snapshot"]),
+                "size": int(record["size"]),
+                "sha256": str(record["snapshot_sha256"]),
+                "rows": int(record["rows"]),
+            }
+            for record in repaired_files
+            if isinstance(record, dict) and int(record.get("bucket", -1)) == bucket
+        ]
     if objective_records != snapshot_records:
         mismatch_index = next(
             (
