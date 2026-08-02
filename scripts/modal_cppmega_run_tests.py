@@ -108,7 +108,7 @@ def _image() -> modal.Image:
             copy=True,
             ignore=_MLX_OVERLAY_IGNORE,
         )
-    img = img.pip_install("pytest", "pytest-xdist", "hypothesis", "pyarrow", "mlx[cuda]")
+    img = img.pip_install("pytest", "pytest-xdist", "hypothesis", "pyarrow")
     img = (
         img.add_local_dir(
             str(_REPO_ROOT / "cppmega"),
