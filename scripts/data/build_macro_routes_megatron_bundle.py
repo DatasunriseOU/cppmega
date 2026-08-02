@@ -2285,14 +2285,53 @@ def _validate_objective_source_binding(
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    files = binding["files"]
     objective_records: list[dict[str, object]] = []
-    for record in files:
-        relative = Path(str(record["path"]))
+    source_records: list[tuple[dict[str, object], Path, set[str]]] = []
+    if binding.get("schema") == "cppmega_objective_source_snapshot_v2":
+        pools = binding["pools"]
+        primary_records = pools["primary_ci"]["files"]
+        seed_records = pools["objective_seed"]["files"]
+        for record in primary_records:
+            source_relative = Path(str(record["path"]))
+            if (
+                source_relative.is_absolute()
+                or len(source_relative.parts) != 2
+                or source_relative.parts[0] != str(bucket)
+                or source_relative.name in {"", ".", ".."}
+                or str(record["path"]) != source_relative.as_posix()
+            ):
+                raise RuntimeError(
+                    f"bucket {bucket}: primary CI objective source path is not "
+                    f"canonical: {source_relative}"
+                )
+            source_records.append(
+                (record, Path("ci") / source_relative, {"ci"})
+            )
+        for record in seed_records:
+            seed_relative = Path(str(record["path"]))
+            if str(record["path"]) != seed_relative.as_posix():
+                raise RuntimeError(
+                    f"bucket {bucket}: objective seed source path is not "
+                    f"canonical: {record['path']}"
+                )
+            source_records.append(
+                (record, seed_relative, {"code", "commits", "pr"})
+            )
+    else:
+        source_records = [
+            (
+                record,
+                Path(str(record["path"])),
+                {"code", "commits", "ci", "pr"},
+            )
+            for record in binding["files"]
+        ]
+
+    for record, relative, allowed_kinds in source_records:
         if (
             relative.is_absolute()
             or len(relative.parts) != 3
-            or relative.parts[0] not in {"code", "commits", "ci", "pr"}
+            or relative.parts[0] not in allowed_kinds
             or relative.parts[1] != str(bucket)
             or relative.name in {"", ".", ".."}
         ):
@@ -2325,6 +2364,16 @@ def _validate_objective_source_binding(
         for record in repaired_files
         if isinstance(record, dict) and int(record.get("bucket", -1)) == bucket
     ]
+    if binding.get("schema") == "cppmega_objective_source_snapshot_v2":
+        objective_records.sort(key=lambda record: str(record["path"]))
+        snapshot_records.sort(key=lambda record: str(record["path"]))
+        if len({str(record["path"]) for record in objective_records}) != len(
+            objective_records
+        ):
+            raise RuntimeError(
+                f"bucket {bucket}: two-pool objective sources contain duplicate "
+                "canonical snapshot paths"
+            )
     if objective_records != snapshot_records:
         mismatch_index = next(
             (

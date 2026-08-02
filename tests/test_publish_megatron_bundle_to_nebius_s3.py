@@ -146,6 +146,51 @@ def _bounded_v2_source_snapshot() -> dict[str, object]:
     return source_snapshot
 
 
+def _two_pool_source_snapshot_v2() -> dict[str, object]:
+    pools: dict[str, dict[str, object]] = {}
+    for name, path, payload in (
+        ("primary_ci", "1024/ci.parquet", b"ci"),
+        ("objective_seed", "code/1024/code.parquet", b"code"),
+    ):
+        pool = _bounded_v2_source_snapshot()
+        record = pool["files"][0]
+        assert isinstance(record, dict)
+        record.update(
+            {
+                "path": path,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        pool["artifact_set_sha256"] = publisher._artifact_set_sha256(
+            [
+                {
+                    "path": path,
+                    "size": len(payload),
+                    "sha256": record["sha256"],
+                }
+            ]
+        )
+        pools[name] = pool
+    return {
+        "schema": "cppmega_objective_source_snapshot_v2",
+        "sequence_length": 1024,
+        "algorithm": "alternate_primary_seed_v1",
+        "pool_order": ["primary_ci", "objective_seed"],
+        "source_pool_manifest": {
+            "path": "objective_source_pool_manifest.json",
+            "size_bytes": 17,
+            "sha256": "a" * 64,
+        },
+        "ci_export_receipt": {
+            "path": "ci_export_receipt.json",
+            "size_bytes": 19,
+            "sha256": "b" * 64,
+        },
+        "pools": pools,
+    }
+
+
 def _malform_bounded_v2_sampling(
     sampling: dict[str, object], malformation: str
 ) -> None:
@@ -1047,6 +1092,77 @@ def test_publisher_accepts_exact_bounded_v2_sampling_contract():
     publisher._validate_objective_source_summary(summary, bucket=1024)
 
     assert summary["sampling"] == _bounded_v2_sampling()
+
+
+def test_publisher_accepts_two_pool_source_snapshot_v2():
+    source_snapshot = _two_pool_source_snapshot_v2()
+
+    summary = publisher._objective_source_snapshot_summary(
+        source_snapshot, bucket=1024
+    )
+    publisher._validate_objective_source_summary(summary, bucket=1024)
+
+    assert summary["schema"] == "cppmega_objective_source_snapshot_v2"
+    assert summary["pool_order"] == ["primary_ci", "objective_seed"]
+    assert summary["source_pool_manifest"] == source_snapshot[
+        "source_pool_manifest"
+    ]
+    assert set(summary["pools"]) == {"primary_ci", "objective_seed"}
+    assert all(
+        pool["schema"] == "cppmega_objective_source_snapshot_v1"
+        for pool in summary["pools"].values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("sequence_length", 1024.0),
+        ("algorithm", "primary_then_seed_v1"),
+        ("pool_order", ["objective_seed", "primary_ci"]),
+        (
+            "source_pool_manifest",
+            {
+                "path": "../objective_source_pool_manifest.json",
+                "size_bytes": 17,
+                "sha256": "a" * 64,
+            },
+        ),
+        ("pools", {"primary_ci": _bounded_v2_source_snapshot()}),
+    ),
+)
+def test_publisher_rejects_two_pool_source_snapshot_v2_drift(field, value):
+    source_snapshot = _two_pool_source_snapshot_v2()
+    source_snapshot[field] = value
+
+    with pytest.raises(ValueError, match="objective source_snapshot"):
+        publisher._objective_source_snapshot_summary(source_snapshot, bucket=1024)
+
+
+def test_publisher_rejects_two_pool_source_summary_drift():
+    summary = publisher._objective_source_snapshot_summary(
+        _two_pool_source_snapshot_v2(), bucket=1024
+    )
+    summary["ci_export_receipt"]["sha256"] = "not-a-sha256"
+
+    with pytest.raises(ValueError, match="descriptor drifted"):
+        publisher._validate_objective_source_summary(summary, bucket=1024)
+
+
+def test_publisher_delegates_two_pool_members_to_v1_validator():
+    source_snapshot = _two_pool_source_snapshot_v2()
+    source_snapshot["pools"]["primary_ci"]["unexpected"] = True
+
+    with pytest.raises(ValueError, match="objective source_snapshot is invalid"):
+        publisher._objective_source_snapshot_summary(source_snapshot, bucket=1024)
+
+
+def test_publisher_rejects_nested_two_pool_snapshot():
+    source_snapshot = _two_pool_source_snapshot_v2()
+    source_snapshot["pools"]["primary_ci"] = _two_pool_source_snapshot_v2()
+
+    with pytest.raises(ValueError, match="source_snapshot pools are invalid"):
+        publisher._objective_source_snapshot_summary(source_snapshot, bucket=1024)
 
 
 def test_publisher_validates_seeded_shard_cursor_permutation():

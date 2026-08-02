@@ -1723,6 +1723,75 @@ def _objective_source_snapshot_summary(
 ) -> dict[str, object]:
     if not isinstance(source_snapshot, dict):
         raise ValueError(f"bucket {bucket} objective source_snapshot is missing")
+    if source_snapshot.get("schema") == "cppmega_objective_source_snapshot_v2":
+        expected_keys = {
+            "schema",
+            "sequence_length",
+            "algorithm",
+            "pool_order",
+            "source_pool_manifest",
+            "ci_export_receipt",
+            "pools",
+        }
+        if set(source_snapshot) != expected_keys:
+            raise ValueError(f"bucket {bucket} objective source_snapshot is invalid")
+        if (
+            not _is_plain_int(source_snapshot["sequence_length"])
+            or source_snapshot["sequence_length"] != bucket
+            or source_snapshot["algorithm"] != "alternate_primary_seed_v1"
+            or source_snapshot["pool_order"] != ["primary_ci", "objective_seed"]
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective source_snapshot pool schedule drifted"
+            )
+        descriptors: dict[str, dict[str, object]] = {}
+        for field, expected_path in (
+            ("source_pool_manifest", "objective_source_pool_manifest.json"),
+            ("ci_export_receipt", "ci_export_receipt.json"),
+        ):
+            descriptor = source_snapshot[field]
+            if (
+                not isinstance(descriptor, dict)
+                or set(descriptor) != {"path", "size_bytes", "sha256"}
+                or descriptor.get("path") != expected_path
+                or not _is_plain_int(descriptor.get("size_bytes"))
+                or int(descriptor["size_bytes"]) < 1
+                or not isinstance(descriptor.get("sha256"), str)
+                or not SHA256_RE.fullmatch(descriptor["sha256"])
+            ):
+                raise ValueError(
+                    f"bucket {bucket} objective source_snapshot {field} is invalid"
+                )
+            descriptors[field] = dict(descriptor)
+        pools = source_snapshot["pools"]
+        if not isinstance(pools, dict) or set(pools) != {
+            "primary_ci",
+            "objective_seed",
+        }:
+            raise ValueError(
+                f"bucket {bucket} objective source_snapshot pools are invalid"
+            )
+        if any(
+            not isinstance(pools[name], dict)
+            or pools[name].get("schema")
+            != "cppmega_objective_source_snapshot_v1"
+            for name in ("primary_ci", "objective_seed")
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective source_snapshot pools are invalid"
+            )
+        pool_summaries = {
+            name: _objective_source_snapshot_summary(pools[name], bucket=bucket)
+            for name in ("primary_ci", "objective_seed")
+        }
+        return {
+            "schema": source_snapshot["schema"],
+            "sequence_length": bucket,
+            "algorithm": source_snapshot["algorithm"],
+            "pool_order": list(source_snapshot["pool_order"]),
+            **descriptors,
+            "pools": pool_summaries,
+        }
     expected_keys = {
         "schema",
         "sequence_length",
@@ -1811,6 +1880,66 @@ def _objective_source_snapshot_summary(
 
 
 def _validate_objective_source_summary(summary: object, *, bucket: int) -> None:
+    if (
+        isinstance(summary, dict)
+        and summary.get("schema") == "cppmega_objective_source_snapshot_v2"
+    ):
+        expected_keys = {
+            "schema",
+            "sequence_length",
+            "algorithm",
+            "pool_order",
+            "source_pool_manifest",
+            "ci_export_receipt",
+            "pools",
+        }
+        if (
+            set(summary) != expected_keys
+            or not _is_plain_int(summary.get("sequence_length"))
+            or summary.get("sequence_length") != bucket
+            or summary.get("algorithm") != "alternate_primary_seed_v1"
+            or summary.get("pool_order") != ["primary_ci", "objective_seed"]
+        ):
+            raise ValueError(
+                f"bundle objective source_snapshot descriptor is invalid for {bucket}"
+            )
+        for field, expected_path in (
+            ("source_pool_manifest", "objective_source_pool_manifest.json"),
+            ("ci_export_receipt", "ci_export_receipt.json"),
+        ):
+            descriptor = summary.get(field)
+            if (
+                not isinstance(descriptor, dict)
+                or set(descriptor) != {"path", "size_bytes", "sha256"}
+                or descriptor.get("path") != expected_path
+                or not _is_plain_int(descriptor.get("size_bytes"))
+                or int(descriptor["size_bytes"]) < 1
+                or not isinstance(descriptor.get("sha256"), str)
+                or not SHA256_RE.fullmatch(descriptor["sha256"])
+            ):
+                raise ValueError(
+                    f"bundle objective source_snapshot descriptor drifted for {bucket}"
+                )
+        pools = summary.get("pools")
+        if not isinstance(pools, dict) or set(pools) != {
+            "primary_ci",
+            "objective_seed",
+        }:
+            raise ValueError(
+                f"bundle objective source_snapshot descriptor drifted for {bucket}"
+            )
+        if any(
+            not isinstance(pools[name], dict)
+            or pools[name].get("schema")
+            != "cppmega_objective_source_snapshot_v1"
+            for name in ("primary_ci", "objective_seed")
+        ):
+            raise ValueError(
+                f"bundle objective source_snapshot descriptor drifted for {bucket}"
+            )
+        for name in ("primary_ci", "objective_seed"):
+            _validate_objective_source_summary(pools[name], bucket=bucket)
+        return
     if not isinstance(summary, dict) or set(summary) != {
         "schema",
         "artifact_set_sha256",

@@ -31,6 +31,7 @@ from scripts.ci_source_binding_projection import (
 )
 import scripts.data.build_macro_routes_megatron_bundle as builder
 import scripts.data.prepare_ci_objective_source_manifest as objective_manifest
+import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 from scripts.canonical_parquet_ledger import CanonicalParquetLedgerWriter
 from scripts.data.build_macro_routes_megatron_bundle import (
     BUNDLE_KNOWN_LIMITATIONS,
@@ -53,6 +54,10 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _verify_local_cppmega_revision,
     _validate_objective_source_binding,
     _write_repaired_snapshot_manifest,
+)
+from tests.test_megatron_objective_contract import (
+    _valid_contract,
+    _write_materialization_artifact,
 )
 
 _CI_PRODUCER_COMMIT = "c" * 40
@@ -1813,6 +1818,179 @@ def _bounded_v2_source_binding() -> tuple[dict[str, object], dict[str, object]]:
     return source_snapshot, repaired_snapshot
 
 
+def _two_pool_source_binding_v2(
+    seed_kind: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    pool_specs = (
+        ("primary_ci", "1024/ci.parquet", b"ci"),
+        ("objective_seed", f"{seed_kind}/1024/seed.parquet", b"seed"),
+    )
+    pools: dict[str, dict[str, object]] = {}
+    repaired_files: list[dict[str, object]] = []
+    for name, path, payload in pool_specs:
+        record = {
+            "path": path,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "rows": 2,
+        }
+        digest = _artifact_set_sha256(
+            [
+                {
+                    "path": path,
+                    "size": record["size_bytes"],
+                    "sha256": record["sha256"],
+                }
+            ]
+        )
+        pools[name] = {
+            "schema": "cppmega_objective_source_snapshot_v1",
+            "sequence_length": 1024,
+            "file_count": 1,
+            "row_count": 2,
+            "files": [record],
+            "sampling": {
+                **_bounded_v2_sampling(),
+                "requested_samples": 3,
+                "full_passes": 1,
+                "tail_rows": 1,
+                "min_row_reuse": 1,
+                "max_row_reuse": 2,
+                "final_cursor": publisher._objective_sampling_v2_final_cursor(
+                    seed=31,
+                    requested_samples=3,
+                    record_batch_rows=2,
+                    row_group_rows=((2,),),
+                ),
+            },
+            "artifact_set_sha256": digest,
+        }
+        canonical = f"ci/{path}" if name == "primary_ci" else path
+        repaired_files.append(
+            {
+                "kind": "ci" if name == "primary_ci" else seed_kind,
+                "bucket": 1024,
+                "snapshot": canonical,
+                "size": record["size_bytes"],
+                "snapshot_sha256": record["sha256"],
+                "rows": record["rows"],
+            }
+        )
+    return (
+        {
+            "schema": "cppmega_objective_source_snapshot_v2",
+            "sequence_length": 1024,
+            "algorithm": "alternate_primary_seed_v1",
+            "pool_order": ["primary_ci", "objective_seed"],
+            "source_pool_manifest": {
+                "path": "objective_source_pool_manifest.json",
+                "size_bytes": 17,
+                "sha256": "a" * 64,
+            },
+            "ci_export_receipt": {
+                "path": "ci_export_receipt.json",
+                "size_bytes": 19,
+                "sha256": "b" * 64,
+            },
+            "pools": pools,
+        },
+        {"files": list(reversed(repaired_files))},
+    )
+
+
+def _write_two_pool_objective_artifact(
+    tmp_path: Path, *, seed_kind: str
+) -> tuple[Path, dict[str, object]]:
+    source_snapshot, repaired_snapshot = _two_pool_source_binding_v2(seed_kind)
+    pools = source_snapshot["pools"]
+    primary_record = pools["primary_ci"]["files"][0]
+    seed_record = pools["objective_seed"]["files"][0]
+
+    ci_receipt = {
+        "schema": "cppmega_ci_content_store_case5_export_v2",
+        "status": "complete",
+    }
+    ci_receipt_path = tmp_path / "ci_export_receipt.json"
+    ci_receipt_path.write_text(json.dumps(ci_receipt), encoding="utf-8")
+    ci_receipt_sha256 = hashlib.sha256(ci_receipt_path.read_bytes()).hexdigest()
+    source_completion = {
+        "schema": ci_receipt["schema"],
+        "status": "complete",
+    }
+    primary_by_bucket = {
+        str(bucket): [
+            (
+                primary_record
+                if bucket == 1024
+                else {
+                    "path": f"{bucket}/ci.parquet",
+                    "rows": 1,
+                    "size_bytes": 1,
+                    "sha256": hashlib.sha256(
+                        f"ci:{bucket}".encode("ascii")
+                    ).hexdigest(),
+                }
+            )
+        ]
+        for bucket in (1024, 2048, 4096, 8192, 16384)
+    }
+    source_pool_manifest = {
+        "schema": "cppmega_ci_objective_pool_manifest_v1",
+        "algorithm": "alternate_primary_seed_v1",
+        "sequence_lengths": [1024, 2048, 4096, 8192, 16384],
+        "ci_export": {
+            "path": "export_receipt.json",
+            "sha256": ci_receipt_sha256,
+            "schema": ci_receipt["schema"],
+            "status": "complete",
+            "source_completion": source_completion,
+        },
+        "primary_ci": {"files_by_sequence_length": primary_by_bucket},
+        "objective_seed": {"files": [seed_record]},
+        "producer": {
+            "repository": "cppmega",
+            "git_commit": "c" * 40,
+            "script": "scripts/data/prepare_ci_objective_source_manifest.py",
+            "script_sha256": "d" * 64,
+        },
+    }
+    source_pool_manifest_path = tmp_path / "objective_source_pool_manifest.json"
+    source_pool_manifest_path.write_text(
+        json.dumps(source_pool_manifest), encoding="utf-8"
+    )
+    source_snapshot["source_pool_manifest"].update(
+        {
+            "size_bytes": source_pool_manifest_path.stat().st_size,
+            "sha256": hashlib.sha256(
+                source_pool_manifest_path.read_bytes()
+            ).hexdigest(),
+        }
+    )
+    source_snapshot["ci_export_receipt"].update(
+        {
+            "size_bytes": ci_receipt_path.stat().st_size,
+            "sha256": ci_receipt_sha256,
+        }
+    )
+
+    contract = _valid_contract()
+    contract["source_snapshot"] = source_snapshot
+    cursor = contract["source_selection"]["resume"]["last_yielded_cursor"]
+    cursor.update(
+        {
+            "pool_index": 1,
+            "pool_source_index": 2,
+            "primary_rows_yielded": 3,
+            "objective_seed_rows_yielded": 3,
+            "next_pool_index": 0,
+        }
+    )
+    return (
+        _write_materialization_artifact(tmp_path, contract=contract),
+        repaired_snapshot,
+    )
+
+
 def test_builder_accepts_exact_bounded_v2_sampling_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1832,6 +2010,62 @@ def test_builder_accepts_exact_bounded_v2_sampling_contract(
     )
 
     assert result["sampling"] == _bounded_v2_sampling()
+
+
+@pytest.mark.parametrize("seed_kind", ("code", "commits", "pr"))
+def test_builder_accepts_two_pool_source_snapshot_v2(
+    tmp_path: Path, seed_kind: str
+) -> None:
+    objective_artifact, repaired_snapshot = _write_two_pool_objective_artifact(
+        tmp_path, seed_kind=seed_kind
+    )
+
+    result = _validate_objective_source_binding(
+        objective_artifact_path=objective_artifact,
+        repaired_snapshot_manifest=repaired_snapshot,
+        bucket=1024,
+    )
+
+    assert result["schema"] == "cppmega_objective_source_snapshot_v2"
+    assert set(result["pools"]) == {"primary_ci", "objective_seed"}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("snapshot_sha256", "0" * 64),
+        ("size", 99),
+        ("rows", 99),
+        ("snapshot", "code/1024/other.parquet"),
+    ),
+)
+def test_builder_rejects_two_pool_source_snapshot_v2_drift(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    objective_artifact, repaired_snapshot = _write_two_pool_objective_artifact(
+        tmp_path, seed_kind="code"
+    )
+    repaired_snapshot["files"][0][field] = value
+
+    with pytest.raises(RuntimeError, match="do not match repaired snapshot"):
+        _validate_objective_source_binding(
+            objective_artifact_path=objective_artifact,
+            repaired_snapshot_manifest=repaired_snapshot,
+            bucket=1024,
+        )
+
+
+def test_builder_rejects_two_pool_ci_seed_kind(tmp_path: Path) -> None:
+    objective_artifact, repaired_snapshot = _write_two_pool_objective_artifact(
+        tmp_path, seed_kind="ci"
+    )
+
+    with pytest.raises(RuntimeError, match="source path is not canonical"):
+        _validate_objective_source_binding(
+            objective_artifact_path=objective_artifact,
+            repaired_snapshot_manifest=repaired_snapshot,
+            bucket=1024,
+        )
 
 
 @pytest.mark.parametrize(
