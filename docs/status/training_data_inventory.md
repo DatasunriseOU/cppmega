@@ -51,6 +51,10 @@ five minutes as a macOS LaunchAgent and restarts it after an unexpected exit.
   explicit canonical-union receipt.
 - CI store-local exact-dedup counters are an upper bound until cross-store
   canonical union/global dedup completes.
+- A frozen threshold snapshot is reported separately from its overlapping live
+  source store; the two counters are never added.
+- After CASE5 export, only `ci-case5-train-*` audit counts are ready tokens;
+  validation and test splits remain visible but excluded from that total.
 - SQLite/CAS records are staged data, not training-ready tokens.
 - Quarantine, smoke, validation, and legacy Parquet are reported but never
   included in production-ready totals.
@@ -70,6 +74,10 @@ The first canonical publication was generated on 2026-07-31:
 The two source rows overlap and have no valid combined total. The live values
 change as the conveyor promotes new repositories; cite `current.json`, not the
 baseline table, for present-tense counts.
+
+The frozen CI threshold snapshot contains exactly 61,311,228,208 store-local
+unique payload tokens. They remain staged, with zero ready tokens, until its
+final `case5/export_receipt.json` passes the existing CASE5 receipt validator.
 
 ## Current Blockers
 

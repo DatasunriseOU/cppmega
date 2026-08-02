@@ -25,6 +25,7 @@
       "/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260422_20260721/fetch.progress.json",
       "/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260721_20260730/fetch.progress.json"
     ],
+    "frozen_case5_root": "/Volumes/external/cppmega_data/ci_threshold_recent_storelocal_20b_20260801",
     "legacy_parquet_root": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_ci_20260726_152207-28057_ci"
   }
 }

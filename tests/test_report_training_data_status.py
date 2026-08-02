@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -12,6 +13,7 @@ import pyarrow.parquet as pq
 from scripts.report_training_data_status import (
     HEARTBEAT_SCHEMA,
     STATUS_SCHEMA,
+    _collect_frozen_ci_case5,
     _sha256,
     _utc_now,
     _without_volatile,
@@ -43,6 +45,217 @@ def _write_parquet(path: Path) -> None:
         }
     )
     pq.write_table(table, path, compression="zstd")
+
+
+def _write_frozen_ci_receipts(
+    root: Path,
+    source: Path,
+    *,
+    parser_script_sha256: str = "6" * 64,
+) -> tuple[Path, dict[str, object], dict[str, object], dict[str, object]]:
+    root.mkdir(exist_ok=True)
+    source.mkdir(exist_ok=True)
+    tokenizer_path = root / "tokenizer.json"
+    tokenizer_path.write_text("{}", encoding="utf-8")
+    tokenizer_sha256 = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
+    tokenizer = {
+        "artifact_sha256": tokenizer_sha256,
+        "tokenizer_contract_sha256": "1" * 64,
+    }
+    store = {
+        "schema": "cppmega_ci_content_store_receipt_v1",
+        "status": "complete",
+        "verification": {"ok": True},
+        "exact_unique_payload_tokens": 61_311_228_208,
+        "counters": {"exact_unique_payload_tokens": 61_311_228_208},
+        "policy_sha256": "b" * 64,
+        "sqlite_schema_sha256": "c" * 64,
+        "sqlite_logical_sha256": "d" * 64,
+        "logical_content_set_sha256": "2" * 64,
+        "logical_token_sequence_set_sha256": "3" * 64,
+        "occurrence_set_sha256": "4" * 64,
+    }
+    summary = {
+        "attempt_statuses": {"done": 1},
+        "sidecar_set_sha256": "5" * 64,
+    }
+    settings = {
+        "tokenizer_contract": json.dumps(tokenizer),
+        "tokenizer_fingerprint": "fingerprint",
+        "parser_script_sha256": parser_script_sha256,
+    }
+    fetch = {
+        "schema": "cppmega_ci_stream_fetch_receipt_v3",
+        "completed_at": "2026-08-02T08:08:49Z",
+        "content_store_receipt": store,
+        "fetch_state": summary,
+        "frozen_fetch_state": {
+            "artifact": {"sha256": "7" * 64},
+            "schema": "cppmega_ci_stream_fetch_v4",
+            "sqlite_schema_sha256": "a" * 64,
+            "sqlite_logical_sha256": "8" * 64,
+            "settings": settings,
+            "summary": summary,
+            "sidecar_set_sha256": summary["sidecar_set_sha256"],
+        },
+        "tokenizer_contract": tokenizer,
+        "tokenizer_fingerprint": settings["tokenizer_fingerprint"],
+    }
+    cut = {
+        "schema": "cppmega_ci_threshold_cow_cut_receipt_v1",
+        "status": "complete",
+        "cut": {
+            "snapshot_root": str(root),
+            "source_root": str(source),
+            "source_code_commit": "9" * 40,
+        },
+        "semantics": {
+            "scope": "store-local-threshold-snapshot",
+            "cross_store_global_dedup": False,
+            "exhaustive_complete": False,
+            "production_complete": False,
+        },
+        "tokenizer": {
+            "path": str(tokenizer_path),
+            "sha256": tokenizer_sha256,
+        },
+    }
+    for path, value in (
+        (root / "threshold_cut.receipt.json", cut),
+        (root / "fetch.receipt.json", fetch),
+        (root / "store.receipt.json", store),
+    ):
+        path.write_text(json.dumps(value), encoding="utf-8")
+    return source / "fetch.progress.json", tokenizer, store, fetch
+
+
+def test_frozen_ci_threshold_is_staged_until_export_receipt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "frozen"
+    progress, _tokenizer, _store, _fetch = _write_frozen_ci_receipts(
+        root, tmp_path / "live"
+    )
+
+    result = _collect_frozen_ci_case5(root, progress_paths=[progress])
+
+    assert result["staged_exact_unique_payload_tokens"] == 61_311_228_208
+    assert result["ready_valid_tokens"] == 0
+    assert result["ready_trained_tokens"] == 0
+    assert result["export"] is None
+    assert result["overlaps_progress_receipts"] == [str(progress)]
+
+    status = _minimal_status(sha="a" * 64, live_tokens=15)
+    ci = status["datasets"]["ci"]
+    ci["frozen_case5_snapshot"] = result
+    ci["token_accounting"].update(
+        {
+            "frozen_snapshot_exact_unique_payload_tokens": 61_311_228_208,
+            "ready_valid_tokens": 0,
+            "ready_trained_tokens": 0,
+        }
+    )
+    paths = publish_status(status, tmp_path / "status")
+    changelog = json.loads(paths["changelog"].read_text(encoding="utf-8"))
+    assert changelog["summary"]["ci"]["frozen_case5_snapshot"]["export"] is None
+
+
+def test_frozen_ci_ready_tokens_include_only_train_split(
+    tmp_path: Path,
+) -> None:
+    from tests.test_build_macro_routes_megatron_bundle import (
+        _write_content_store_ci_export,
+    )
+
+    root = tmp_path / "frozen"
+    export_path = _write_content_store_ci_export(root / "case5")
+    export = json.loads(export_path.read_text(encoding="utf-8"))
+    parser_sha256 = export["input_fetch_state"]["settings"][
+        "parser_script_sha256"
+    ]
+    progress, tokenizer, store, fetch = _write_frozen_ci_receipts(
+        root,
+        tmp_path / "live",
+        parser_script_sha256=parser_sha256,
+    )
+
+    input_store = export["input_store"]
+    input_store["receipt_sha256"] = hashlib.sha256(
+        (root / "store.receipt.json").read_bytes()
+    ).hexdigest()
+    for name in (
+        "policy_sha256",
+        "sqlite_schema_sha256",
+        "sqlite_logical_sha256",
+        "logical_content_set_sha256",
+        "logical_token_sequence_set_sha256",
+        "occurrence_set_sha256",
+    ):
+        input_store[name] = store[name]
+    export["occurrence_metadata"]["input_occurrence_set_sha256"] = store[
+        "occurrence_set_sha256"
+    ]
+    frozen_fetch = fetch["frozen_fetch_state"]
+    export["input_fetch_state"].update(
+        {
+            name: frozen_fetch[name]
+            for name in (
+                "schema",
+                "artifact",
+                "sqlite_schema_sha256",
+                "sqlite_logical_sha256",
+                "sidecar_set_sha256",
+            )
+        }
+    )
+    export["tokenizer"] = {"contract": tokenizer}
+    export_path.write_text(json.dumps(export), encoding="utf-8")
+
+    result = _collect_frozen_ci_case5(root, progress_paths=[progress])
+
+    assert result["ready_valid_tokens"] == 31_739
+    assert result["ready_trained_tokens"] == 31_734
+    assert result["ready_valid_tokens"] == result["export"]["splits"]["train"][
+        "valid_tokens"
+    ]
+    assert result["ready_valid_tokens"] != result["export"]["all_split_counts"][
+        "valid_tokens"
+    ]
+    assert result["export"]["splits"]["validation"]["valid_tokens"] == 31_734
+    zero_counts = {
+        "files": 0,
+        "rows": 0,
+        "bytes": 0,
+        "capacity_tokens": 0,
+        "valid_tokens": 0,
+        "trained_tokens": 0,
+    }
+    assert set(result["export"]["splits"]) == {"train", "validation", "test"}
+    assert all(
+        set(counts) == set(zero_counts)
+        for counts in result["export"]["splits"].values()
+    )
+    assert result["export"]["splits"]["test"] == zero_counts
+    assert result["export"]["buckets"]["1024"]["splits"]["train"][
+        "valid_tokens"
+    ] == 1_023
+    assert result["export"]["buckets"]["1024"]["splits"]["validation"][
+        "valid_tokens"
+    ] == 1_022
+    assert set(result["export"]["buckets"]) == {
+        "1024",
+        "2048",
+        "4096",
+        "8192",
+        "16384",
+    }
+    for bucket in result["export"]["buckets"].values():
+        assert set(bucket["splits"]) == {"train", "validation", "test"}
+        assert all(
+            set(counts) == set(zero_counts)
+            for counts in bucket["splits"].values()
+        )
+        assert bucket["splits"]["test"] == zero_counts
 
 
 def test_parquet_snapshot_counts_batches_schema_and_logical_routes(

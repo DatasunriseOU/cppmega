@@ -1068,6 +1068,244 @@ def collect_pr_status(config: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _collect_frozen_ci_case5(
+    root: Path,
+    *,
+    progress_paths: Iterable[Path],
+) -> dict[str, object]:
+    cut_path = root / "threshold_cut.receipt.json"
+    fetch_path = root / "fetch.receipt.json"
+    store_path = root / "store.receipt.json"
+    export_path = root / "case5" / "export_receipt.json"
+    cut, fetch, store = (
+        _read_json(path) for path in (cut_path, fetch_path, store_path)
+    )
+    cut_binding = cut["cut"]
+    semantics = cut["semantics"]
+    frozen = fetch["frozen_fetch_state"]
+    summary = fetch["fetch_state"]
+    settings = frozen["settings"]
+    tokenizer = fetch["tokenizer_contract"]
+    exact_tokens = int(store["exact_unique_payload_tokens"])
+    tokenizer_sha256 = hashlib.sha256(
+        (root / "tokenizer.json").read_bytes()
+    ).hexdigest()
+    if (
+        cut["schema"] != "cppmega_ci_threshold_cow_cut_receipt_v1"
+        or cut["status"] != "complete"
+        or Path(str(cut_binding["snapshot_root"])).resolve() != root.resolve()
+        or semantics.get("scope") != "store-local-threshold-snapshot"
+        or semantics.get("cross_store_global_dedup") is not False
+        or fetch["schema"] != "cppmega_ci_stream_fetch_receipt_v3"
+        or fetch["content_store_receipt"] != store
+        or store["schema"] != "cppmega_ci_content_store_receipt_v1"
+        or store["status"] != "complete"
+        or store["verification"].get("ok") is not True
+        or int(store["counters"]["exact_unique_payload_tokens"]) != exact_tokens
+        or cut["tokenizer"]["sha256"] != tokenizer_sha256
+        or tokenizer["artifact_sha256"] != tokenizer_sha256
+        or json.loads(settings["tokenizer_contract"]) != tokenizer
+        or settings["tokenizer_fingerprint"] != fetch["tokenizer_fingerprint"]
+        or frozen["summary"] != summary
+        or frozen["sidecar_set_sha256"] != summary["sidecar_set_sha256"]
+    ):
+        raise ValueError(f"{root}: frozen CI receipt binding differs")
+
+    source_progress = (
+        Path(str(cut_binding["source_root"])) / "fetch.progress.json"
+    ).resolve()
+    result: dict[str, object] = {
+        "state": "cas_staged_not_exported",
+        "training_readable": False,
+        "release_ready": False,
+        "root": str(root),
+        "staged_exact_unique_payload_tokens": exact_tokens,
+        "ready_payload_tokens": 0,
+        "ready_valid_tokens": 0,
+        "ready_trained_tokens": 0,
+        "overlaps_progress_receipts": [
+            str(path) for path in progress_paths if path.resolve() == source_progress
+        ],
+        "completion": {
+            "cut": {"status": cut["status"], **semantics},
+            "fetch": {
+                "schema": fetch["schema"],
+                "completed_at": fetch["completed_at"],
+                "attempt_statuses": summary["attempt_statuses"],
+            },
+            "export": None,
+        },
+        "tokenizer": dict(tokenizer),
+        "sidecar_set_sha256": summary["sidecar_set_sha256"],
+        "lineage": {
+            "cut": {
+                key: cut_binding[key]
+                for key in ("source_root", "source_code_commit")
+            },
+            "store_receipt_sha256": hashlib.sha256(store_path.read_bytes()).hexdigest(),
+            "store": {
+                key: store[key]
+                for key in (
+                    "logical_content_set_sha256",
+                    "logical_token_sequence_set_sha256",
+                    "occurrence_set_sha256",
+                )
+            },
+            "fetch": {
+                key: frozen[key]
+                for key in (
+                    "schema",
+                    "artifact",
+                    "sqlite_schema_sha256",
+                    "sqlite_logical_sha256",
+                    "sidecar_set_sha256",
+                )
+            },
+            "parser_script_sha256": settings["parser_script_sha256"],
+        },
+        "export": None,
+    }
+    if not export_path.is_file():
+        return result
+
+    from scripts.data.build_macro_routes_megatron_bundle import (
+        _load_ci_manifest_allowlist,
+    )
+
+    _allowed, normalized = _load_ci_manifest_allowlist(
+        export_path,
+        root / "case5",
+        TARGET_LENGTHS,
+        cppmega_mlx_commit="unused-for-content-store-export",
+        cppmega_mlx_tree_sha256="unused-for-content-store-export",
+    )
+    export = _read_json(export_path)
+    if (
+        export["input_store"]["receipt_sha256"]
+        != result["lineage"]["store_receipt_sha256"]
+        or any(
+            export["input_store"][name] != store[name]
+            for name in (
+                "policy_sha256",
+                "sqlite_schema_sha256",
+                "sqlite_logical_sha256",
+                "logical_content_set_sha256",
+                "logical_token_sequence_set_sha256",
+                "occurrence_set_sha256",
+            )
+        )
+        or export["input_fetch_state"]["artifact"]["sha256"]
+        != frozen["artifact"]["sha256"]
+        or any(
+            export["input_fetch_state"][name] != frozen[name]
+            for name in (
+                "schema",
+                "sqlite_schema_sha256",
+                "sqlite_logical_sha256",
+                "sidecar_set_sha256",
+            )
+        )
+        or export["tokenizer"]["contract"] != tokenizer
+    ):
+        raise ValueError(f"{export_path}: frozen export lineage differs")
+
+    audits = {item["path"]: item for item in export["validation"]["case5_audit"]}
+    split_names = ("train", "validation", "test")
+    zero_counts = {
+        "files": 0,
+        "rows": 0,
+        "bytes": 0,
+        "capacity_tokens": 0,
+        "valid_tokens": 0,
+        "trained_tokens": 0,
+    }
+    split_counts = {
+        split: Counter(zero_counts) for split in split_names
+    }
+    buckets = {
+        str(bucket): {
+            "total": Counter(zero_counts),
+            "splits": {
+                split: Counter(zero_counts) for split in split_names
+            },
+        }
+        for bucket in TARGET_LENGTHS
+    }
+    for artifact in export["artifacts"]:
+        if artifact["kind"] != "case5_parquet":
+            continue
+        audit = audits[artifact["path"]]
+        counts = Counter(
+            files=1,
+            rows=int(artifact["rows"]),
+            bytes=int(artifact["byte_size"]),
+            capacity_tokens=int(audit["capacity_tokens"]),
+            valid_tokens=int(audit["valid_tokens"]),
+            trained_tokens=int(audit["trained_tokens"]),
+        )
+        split = str(artifact["split"])
+        split_counts[split].update(counts)
+        bucket = buckets[str(artifact["bucket"])]
+        bucket["total"].update(counts)
+        bucket["splits"][split].update(counts)
+    train_counts = split_counts["train"]
+    result.update(
+        {
+            "state": "case5_parquet_staged_nonproduction",
+            "training_readable": True,
+            "ready_payload_tokens": None,
+            "ready_valid_tokens": int(train_counts["valid_tokens"]),
+            "ready_trained_tokens": int(train_counts["trained_tokens"]),
+            "completion": {
+                **result["completion"],
+                "export": normalized["source_completion"],
+            },
+            "lineage": {
+                **result["lineage"],
+                "export": {
+                    "source_binding": normalized["source_binding"],
+                    "parser_generation_policy": export[
+                        "parser_generation_policy"
+                    ],
+                    "source_binding_projection": export[
+                        "source_binding_projection"
+                    ],
+                },
+            },
+            "export": {
+                "receipt": str(export_path),
+                "receipt_sha256": normalized["sha256"],
+                "schema": normalized["schema"],
+                "all_split_counts": export["counts"],
+                "artifacts": {
+                    "files": len(export["artifacts"]),
+                    "bytes": sum(
+                        int(item["byte_size"]) for item in export["artifacts"]
+                    ),
+                    "receipt_records_sha256": _sha256(export["artifacts"]),
+                },
+                "splits": {
+                    key: dict(value)
+                    for key, value in sorted(split_counts.items())
+                },
+                "buckets": {
+                    key: {
+                        **dict(value["total"]),
+                        "splits": {
+                            split: dict(counts)
+                            for split, counts in sorted(
+                                value["splits"].items()
+                            )
+                        },
+                    }
+                    for key, value in sorted(buckets.items())
+                },
+            },
+        }
+    )
+    return result
+
+
 def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
     _require_keys(
         config,
@@ -1151,6 +1389,14 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
             }
         )
 
+    frozen = (
+        _collect_frozen_ci_case5(
+            Path(str(config["frozen_case5_root"])),
+            progress_paths=progress_paths,
+        )
+        if config.get("frozen_case5_root")
+        else None
+    )
     legacy_root = Path(str(config["legacy_parquet_root"]))
     legacy = scan_parquet_snapshot(
         legacy_root,
@@ -1159,25 +1405,54 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
         classify_documents=True,
     )
     legacy_manifest = _read_json(legacy_root / "manifest.json")
+    frozen_exported = bool(frozen and frozen["export"])
+    blockers = [
+        "inventory fetch is not exhaustive",
+        "cross-store canonical union/global dedup has not run",
+    ]
+    blockers.append(
+        (
+            "frozen threshold CASE5 export is non-production and live stores "
+            "remain unexported"
+        )
+        if frozen_exported
+        else "frozen threshold primary-scope CASE5 export has not completed"
+    )
     return {
-        "state": "cas_staged_not_exported",
-        "training_readable": False,
+        "state": (
+            "case5_parquet_plus_live_cas_staged"
+            if frozen_exported
+            else "cas_staged_not_exported"
+        ),
+        "training_readable": frozen_exported,
         "release_ready": False,
-        "blockers": [
-            "inventory fetch is not exhaustive",
-            "cross-store canonical union/global dedup has not run",
-            "primary-scope five-bucket Parquet export has not run",
-        ],
+        "blockers": blockers,
         "stores": stores,
+        "frozen_case5_snapshot": frozen,
         "token_accounting": {
             "store_local_unique_upper_bound": store_unique_upper_bound,
+            "frozen_snapshot_exact_unique_payload_tokens": (
+                frozen["staged_exact_unique_payload_tokens"] if frozen else None
+            ),
+            "combined_live_and_frozen_unique_payload_tokens": None,
+            "combined_live_and_frozen_reason": (
+                "the frozen threshold snapshot overlaps its live source store "
+                "and is reported separately"
+            ),
             "global_unique_payload_tokens": None,
             "global_unique_reason": (
                 "store-local exact counters may overlap across intervals"
             ),
             "occurrence_payload_tokens": occurrence_tokens,
-            "ready_valid_tokens": 0,
-            "ready_trained_tokens": 0,
+            "ready_payload_tokens": (
+                frozen["ready_payload_tokens"] if frozen else 0
+            ),
+            "ready_valid_tokens": (
+                frozen["ready_valid_tokens"] if frozen else 0
+            ),
+            "ready_trained_tokens": (
+                frozen["ready_trained_tokens"] if frozen else 0
+            ),
         },
         "sidecars": {
             "training_schema": "cppmega_ci_chunk_training_sidecars_v2",
@@ -1431,6 +1706,10 @@ def render_markdown(status: Mapping[str, object]) -> str:
     sealed = datasets["sealed_megatron"]
     pr = datasets["pr_mr"]
     ci = datasets["ci"]
+    ci_tokens = ci["token_accounting"]
+    frozen_ci_tokens = ci_tokens.get(
+        "frozen_snapshot_exact_unique_payload_tokens"
+    ) or 0
     lines = [
         "# Current Training-Data Status",
         "",
@@ -1461,7 +1740,9 @@ def render_markdown(status: Mapping[str, object]) -> str:
             f"{str(pr['release_ready']).lower()} |"
         ),
         (
-            f"| CI | {ci['state']} | 0 | 0 | "
+            f"| CI | {ci['state']} | "
+            f"{_int(ci_tokens.get('ready_valid_tokens', 0))} | "
+            f"{_int(ci_tokens.get('ready_trained_tokens', 0))} | "
             f"{str(ci['release_ready']).lower()} |"
         ),
         "",
@@ -1508,9 +1789,16 @@ def render_markdown(status: Mapping[str, object]) -> str:
             "## CI",
             "",
             (
-                "Store-local exact unique upper bound: "
-                f"{_int(ci['token_accounting']['store_local_unique_upper_bound'])}; "
-                "eligible packed Parquet tokens: 0."
+                "Live-store local exact unique upper bound: "
+                f"{_int(ci_tokens['store_local_unique_upper_bound'])}; "
+                "the frozen threshold snapshot is not added to it."
+            ),
+            (
+                "Frozen threshold exact unique payload tokens: "
+                f"{_int(frozen_ci_tokens)}; "
+                "eligible packed Parquet valid/trained tokens: "
+                f"{_int(ci_tokens.get('ready_valid_tokens', 0))}/"
+                f"{_int(ci_tokens.get('ready_trained_tokens', 0))}."
             ),
             "",
             "Legacy 1,855-job sample:",
@@ -1575,8 +1863,14 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
             "store_local_unique_upper_bound": ci["token_accounting"][
                 "store_local_unique_upper_bound"
             ],
-            "ready_tokens": 0,
+            "ready_valid_tokens": ci["token_accounting"].get(
+                "ready_valid_tokens", 0
+            ),
+            "ready_trained_tokens": ci["token_accounting"].get(
+                "ready_trained_tokens", 0
+            ),
             "legacy_sample_valid_tokens": legacy["valid_tokens"],
+            "frozen_case5_snapshot": ci.get("frozen_case5_snapshot"),
             "stores": [
                 {
                     "interval": store["interval"],
