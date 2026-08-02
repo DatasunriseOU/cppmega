@@ -359,7 +359,6 @@ class NAM56RNeMoRecipe:
         # --- training hyperparameters ---
         args.extend([
             "--attention-dropout", "0.0",
-            "--hidden-dropout", "0.0",
             "--micro-batch-size", str(self.micro_batch_size),
             "--global-batch-size", str(self.global_batch_size),
             "--train-iters", str(self.train_iters),

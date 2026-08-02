@@ -65,8 +65,6 @@ def build_megatron_args_bundle(
     args: list[str] = [
         "--attention-dropout",
         "0.0",
-        "--hidden-dropout",
-        "0.0",
     ]
     notes: list[str] = []
 

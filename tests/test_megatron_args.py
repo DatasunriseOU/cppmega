@@ -26,7 +26,7 @@ def test_megatron_args_bundle_emits_native_mla_mtp_fim_moe_dsa_flags():
     assert "--experimental-attention-variant" in bundle.args
     assert bundle.args[bundle.args.index("--experimental-attention-variant") + 1] == "dsa"
     assert bundle.args[bundle.args.index("--attention-dropout") + 1] == "0.0"
-    assert bundle.args[bundle.args.index("--hidden-dropout") + 1] == "0.0"
+    assert "--hidden-dropout" not in bundle.args
     # NOTE: ``--dsa-indexer-dtype`` is intentionally NOT emitted as a CLI flag;
     # Megatron's argparser does not register it. The dtype selection happens
     # via the ``CPPMEGA_DSA_INDEXER_DTYPE`` env var read by ``cppmega_mimo_shim``.
