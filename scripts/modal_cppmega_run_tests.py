@@ -35,6 +35,14 @@ PYTEST_ARGS = os.environ.get(
 
 _MLX_ROOT = _REPO_ROOT.parent / "cppmega.mlx"
 _MLX_REMOTE_ROOT = "/opt/cppmega-mlx"
+_PYTHON_CACHE_IGNORE = ("**/__pycache__/**", "**/*.pyc", "**/*.pyo")
+_MLX_OVERLAY_IGNORE = (
+    *_PYTHON_CACHE_IGNORE,
+    "training/native_optim/_build/**",
+    "training/native_optim/*.so",
+    "training/native_optim/*.dylib",
+    "training/native_optim/*.metallib",
+)
 
 
 def _local_mlx_sha() -> str:
@@ -45,7 +53,7 @@ def _local_mlx_sha() -> str:
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - the optional sibling checkout may be absent
         return ""
 
 
@@ -80,21 +88,70 @@ def _image() -> modal.Image:
             # Remote module re-import sees no local env; carry the locally
             # selected pytest args so the container runs the same selection.
             "CPPMEGA_MODAL_PYTEST_ARGS": PYTEST_ARGS,
+            "CPPMEGA_MODAL_PYTEST_TARGET": PYTEST_TARGET,
             "CPPMEGA_GHCR_REF": GHCR_REF,
+            "CPPMEGA_SOURCE_COMMIT": LOCAL_GIT_SHA,
             "CPPMEGA_MEGATRON_COMMIT": os.environ.get(
                 "CPPMEGA_MEGATRON_COMMIT", "980211ae"
             ),
         }
     )
+    if _MLX_ROOT.is_dir() and LOCAL_MLX_SHA:
+        img = img.env(
+            {
+                "CPPMEGA_MLX_REFERENCE_ROOT": _MLX_REMOTE_ROOT,
+                "CPPMEGA_MLX_REFERENCE_COMMIT": LOCAL_MLX_SHA,
+            }
+        ).add_local_dir(
+            str(_MLX_ROOT / "cppmega_mlx"),
+            remote_path=f"{_MLX_REMOTE_ROOT}/cppmega_mlx",
+            copy=True,
+            ignore=_MLX_OVERLAY_IGNORE,
+        )
     img = img.pip_install("pytest", "pytest-xdist", "hypothesis", "pyarrow")
     img = (
-        img.add_local_dir(str(_REPO_ROOT / "cppmega"), remote_path="/opt/cppmega/cppmega", copy=True)
-        .add_local_dir(str(_REPO_ROOT / "tests"), remote_path="/opt/cppmega/tests", copy=True)
-        .add_local_dir(str(_REPO_ROOT / "scripts"), remote_path="/opt/cppmega/scripts", copy=True)
-        .add_local_dir(str(_REPO_ROOT / "tools"), remote_path="/opt/cppmega/tools", copy=True)
-        .add_local_dir(str(_REPO_ROOT / "configs"), remote_path="/opt/cppmega/configs", copy=True)
-        .add_local_dir(str(_REPO_ROOT / "data"), remote_path="/opt/cppmega/data", copy=True)
-        .add_local_dir(str(_REPO_ROOT / "upstream_prs"), remote_path="/opt/cppmega/upstream_prs", copy=True)
+        img.add_local_dir(
+            str(_REPO_ROOT / "cppmega"),
+            remote_path="/opt/cppmega/cppmega",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
+        .add_local_dir(
+            str(_REPO_ROOT / "tests"),
+            remote_path="/opt/cppmega/tests",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
+        .add_local_dir(
+            str(_REPO_ROOT / "scripts"),
+            remote_path="/opt/cppmega/scripts",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
+        .add_local_dir(
+            str(_REPO_ROOT / "tools"),
+            remote_path="/opt/cppmega/tools",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
+        .add_local_dir(
+            str(_REPO_ROOT / "configs"),
+            remote_path="/opt/cppmega/configs",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
+        .add_local_dir(
+            str(_REPO_ROOT / "data"),
+            remote_path="/opt/cppmega/data",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
+        .add_local_dir(
+            str(_REPO_ROOT / "upstream_prs"),
+            remote_path="/opt/cppmega/upstream_prs",
+            copy=True,
+            ignore=_PYTHON_CACHE_IGNORE,
+        )
         .add_local_file(str(_REPO_ROOT / "conftest.py"), remote_path="/opt/cppmega/conftest.py")
         .add_local_file(str(_REPO_ROOT / "pyproject.toml"), remote_path="/opt/cppmega/pyproject.toml")
     )
@@ -127,7 +184,7 @@ def run_tests() -> dict[str, Any]:
         env=env, capture_output=True, check=False,
     )
 
-    cmd = [sys.executable, "-m", "pytest", "tests/"] + PYTEST_ARGS.split()
+    cmd = [sys.executable, "-m", "pytest", PYTEST_TARGET] + PYTEST_ARGS.split()
     proc = sp.run(
         cmd,
         cwd="/opt/cppmega",
@@ -142,7 +199,10 @@ def run_tests() -> dict[str, Any]:
         "megatron_head": megatron_head,
         "gpu": GPU_SPEC,
         "pytest_args": PYTEST_ARGS,
+        "pytest_target": PYTEST_TARGET,
         "ghcr_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
+        "source_commit": os.environ.get("CPPMEGA_SOURCE_COMMIT", LOCAL_GIT_SHA),
+        "mlx_reference_commit": os.environ.get("CPPMEGA_MLX_REFERENCE_COMMIT", ""),
         "stdout_tail": "\n".join(proc.stdout.splitlines()[-60:]),
         "stderr_tail": "\n".join(proc.stderr.splitlines()[-30:]),
     }
