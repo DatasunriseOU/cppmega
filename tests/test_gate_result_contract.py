@@ -89,12 +89,11 @@ def test_complete_finite_training_receipt_is_accepted() -> None:
                     "metrics": {
                         **_training_variant("baseline")["metrics"],
                         "grad_norms": [float("nan")],
-                        "nonfinite_grad_norm_count": 1,
                     },
                 }
             ],
             ("baseline",),
-            "nonfinite_grad_norm_count=1",
+            "non-finite grad_norms",
         ),
         (
             [
@@ -118,5 +117,22 @@ def test_incomplete_or_nonfinite_training_receipt_is_rejected(
         require_successful_training_variants(
             {"variants": variants},
             expected_variants=expected_variants,
+            minimum_steps=20,
+        )
+
+
+def test_duplicate_training_variant_cannot_overwrite_failure() -> None:
+    with pytest.raises(RuntimeError, match="baseline: duplicate"):
+        require_successful_training_variants(
+            {
+                "variants": [
+                    {
+                        **_training_variant("baseline"),
+                        "run": {"status": "failed", "returncode": 1},
+                    },
+                    _training_variant("baseline"),
+                ]
+            },
+            expected_variants=("baseline",),
             minimum_steps=20,
         )
