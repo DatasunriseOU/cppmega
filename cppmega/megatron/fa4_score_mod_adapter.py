@@ -1545,14 +1545,6 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
                 "materialization."
             )
 
-        # Sequence parallel remains unsupported; context parallel is handled above.
-        if self.config is not None:
-            if getattr(self.config, "sequence_parallel", False):
-                raise RuntimeError(
-                    "FA4 chunk-native score_mod does not support "
-                    "sequence_parallel"
-                )
-
         self._log_first_use()
 
         # --- Resolve causal from attn_mask_type (Megatron ABI) ---
@@ -1572,6 +1564,20 @@ class CppMegaFA4ScoreModAttention(torch.nn.Module):
         bias_state: ChunkNativeGraphBias | None = None
         if isinstance(attention_bias, ChunkNativeGraphBias):
             bias_state = attention_bias
+            expected_q_shape = (batch_size, seqlen_q)
+            expected_k_shape = (batch_size, seqlen_k)
+            if tuple(bias_state.token_to_chunk_q.shape) != expected_q_shape:
+                raise ValueError(
+                    "FA4 graph-bias query geometry "
+                    f"{tuple(bias_state.token_to_chunk_q.shape)} does not match "
+                    f"actual Q geometry {expected_q_shape}"
+                )
+            if tuple(bias_state.token_to_chunk_k.shape) != expected_k_shape:
+                raise ValueError(
+                    "FA4 graph-bias key geometry "
+                    f"{tuple(bias_state.token_to_chunk_k.shape)} does not match "
+                    f"actual K geometry {expected_k_shape}"
+                )
         elif attention_bias is not None:
             raise TypeError(
                 f"attention_bias must be None or ChunkNativeGraphBias, got "

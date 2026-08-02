@@ -12,7 +12,11 @@ from cppmega.megatron.fa4_graph_attention import (
     FA4GraphRouteAux,
     CppMegaFA4DotProductAttention,
 )
-from cppmega.megatron.fa4_score_mod_adapter import _build_document_mask_aux
+from cppmega.megatron.fa4_score_mod_adapter import (
+    CppMegaFA4ScoreModAttention,
+    _build_document_mask_aux,
+    build_chunk_native_graph_bias,
+)
 from cppmega.megatron.structure_dataset_patch import (
     _get_current_structure_batch,
     _set_current_structure_batch,
@@ -85,6 +89,36 @@ def test_single_document_keeps_native_fa4_fast_path() -> None:
         )
 
     assert built is None
+
+
+def test_score_mod_rejects_bias_that_does_not_match_actual_qk() -> None:
+    """A changed upstream SP gather contract must fail before the FA4 import."""
+    attention = CppMegaFA4ScoreModAttention(
+        num_attention_heads=2,
+        head_dim=4,
+        causal=True,
+    )
+    bias = build_chunk_native_graph_bias(
+        {
+            "graph_call_edges": torch.tensor([[[0, 0]]], dtype=torch.long),
+            "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+            "graph_chunk_starts": torch.tensor([[0]], dtype=torch.long),
+            "graph_chunk_ends": torch.tensor([[4]], dtype=torch.long),
+            "graph_chunk_counts": torch.tensor([1], dtype=torch.long),
+        },
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        beta=1.0,
+    )
+    q = torch.randn(8, 1, 2, 4)
+    k = torch.randn(8, 1, 2, 4)
+    v = torch.randn(8, 1, 2, 4)
+
+    with pytest.raises(ValueError, match="actual Q geometry"):
+        attention(q, k, v, attention_bias=bias)
 
 
 def test_legacy_graph_route_aux_fails_closed_for_packed_documents() -> None:

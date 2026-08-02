@@ -251,6 +251,16 @@ def test_fa4_context_parallel_bias_uses_global_document_geometry():
         assert tuple(bias.token_to_chunk_q.shape) == (1, 8)
         assert tuple(bias.token_to_chunk_k.shape) == (1, 8)
 
+        with pytest.raises(
+            NotImplementedError,
+            match="sequence/context-parallel.*incremental decode",
+        ):
+            _graph_attention_bias_for_layer(
+                layer,
+                torch.zeros(4, 1, 8),
+                inference_context=object(),
+            )
+
         _set_current_structure_batch(
             {**structure_batch, "document_ids": torch.tensor([[1, 1, 2, 2]])}
         )
@@ -271,6 +281,90 @@ def test_fa4_context_parallel_bias_uses_global_document_geometry():
         with pytest.raises(RuntimeError, match="only FA4"):
             _graph_attention_bias_for_layer(
                 dense_layer,
+                torch.zeros(4, 1, 8),
+            )
+    finally:
+        _set_current_structure_batch(None)
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_fa4_sequence_parallel_bias_uses_global_document_geometry():
+    class FakeGroup:
+        def size(self):
+            return 2
+
+    config = SimpleNamespace(
+        attention_dropout=0.0,
+        context_parallel_size=1,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+    pg_collection = SimpleNamespace(tp=FakeGroup(), cp=None)
+    core_attention = CppMegaFA4ScoreModAttention(
+        config=config,
+        layer_number=1,
+        pg_collection=pg_collection,
+    )
+    layer = SimpleNamespace(
+        self_attention=SimpleNamespace(
+            core_attention=core_attention,
+            pg_collection=pg_collection,
+        ),
+        config=config,
+    )
+    structure_batch = {
+        "document_ids": torch.tensor([[1, 1, 2, 2, 2, 2, 3, 3]]),
+        "graph_call_edges": torch.tensor([[[0, 1]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 2, 6]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[2, 6, 8]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([3], dtype=torch.long),
+    }
+    environment_names = (
+        "CPPMEGA_GRAPH_ROUTES_ENABLED",
+        "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS",
+        "CPPMEGA_FA4_SCORE_MOD",
+        "CPPMEGA_GRAPH_BIAS_BETA",
+    )
+    previous = {name: os.environ.get(name) for name in environment_names}
+    os.environ.update(
+        {
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "1",
+            "CPPMEGA_FA4_SCORE_MOD": "1",
+            "CPPMEGA_GRAPH_BIAS_BETA": "1",
+        }
+    )
+    _set_current_structure_batch(structure_batch)
+    try:
+        bias = _graph_attention_bias_for_layer(
+            layer,
+            torch.zeros(4, 1, 8),
+        )
+        assert isinstance(bias, ChunkNativeGraphBias)
+        assert tuple(bias.token_to_chunk_q.shape) == (1, 8)
+        assert tuple(bias.token_to_chunk_k.shape) == (1, 8)
+
+        with pytest.raises(
+            NotImplementedError,
+            match="sequence/context-parallel.*incremental decode",
+        ):
+            _graph_attention_bias_for_layer(
+                layer,
+                torch.zeros(4, 1, 8),
+                inference_context=object(),
+            )
+
+        _set_current_structure_batch(
+            {**structure_batch, "document_ids": torch.tensor([[1, 1, 2, 2]])}
+        )
+        with pytest.raises(ValueError, match="global sequence"):
+            _graph_attention_bias_for_layer(
+                layer,
                 torch.zeros(4, 1, 8),
             )
     finally:

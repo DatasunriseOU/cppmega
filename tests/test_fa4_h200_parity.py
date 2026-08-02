@@ -27,6 +27,7 @@ Design doc: docs/fa4_parity_test_design.md
 
 from __future__ import annotations
 
+import json
 import math
 import multiprocessing
 import os
@@ -74,7 +75,9 @@ from cppmega.megatron.fa4_score_mod_adapter import (
     _make_graph_score_mod_bwd,
 )
 from cppmega.megatron.graph_route_attention_bias_patch import (
+    _graph_attention_bias_for_layer,
     build_dense_graph_attention_bias_from_structure_batch,
+    invalidate_bias_cache,
 )
 from cppmega.megatron.structure_dataset_patch import (
     _get_current_structure_batch,
@@ -540,6 +543,543 @@ def _fa4_context_parallel_worker(
             torch.distributed.destroy_process_group()
 
 
+def _local_tp_cp_sequence(
+    tensor: torch.Tensor,
+    *,
+    tp_rank: int,
+    tp_size: int,
+    cp_rank: int,
+    cp_size: int,
+) -> torch.Tensor:
+    """Apply Megatron's CP zigzag shard, then its contiguous TP/SP shard."""
+    local = tensor
+    if cp_size > 1:
+        from megatron.core.ssm.mamba_context_parallel import (
+            _redo_attention_load_balancing,
+        )
+
+        local = _redo_attention_load_balancing(
+            local,
+            cp_size,
+            packed_seq_params=None,
+        ).chunk(cp_size, dim=0)[cp_rank]
+    if tp_size > 1:
+        local = local.chunk(tp_size, dim=0)[tp_rank]
+    return local.contiguous()
+
+
+def _fa4_tp_sp_worker(
+    rank: int,
+    world_size: int,
+    cp_size: int,
+    init_method: str,
+    results,
+) -> None:
+    """Exercise the production TE QKV/FA4/TE projection SP+CP composition."""
+    parallel_state = None
+    try:
+        import inspect
+        import json
+        from importlib import metadata
+
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        torch.distributed.init_process_group(
+            "nccl",
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=300),
+        )
+
+        from flash_attn.cute.interface import flash_attn_func
+        from megatron.core import parallel_state
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.tensor_parallel.random import (
+            model_parallel_cuda_manual_seed,
+        )
+        from megatron.core.transformer.attention import (
+            SelfAttention,
+            SelfAttentionSubmodules,
+        )
+        from megatron.core.transformer.enums import AttnMaskType
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        tp_size = 2
+        if world_size != tp_size * cp_size:
+            raise RuntimeError(
+                f"world_size={world_size} != tp_size*cp_size={tp_size * cp_size}"
+            )
+        device_name = torch.cuda.get_device_name(rank)
+        if "H200" not in device_name:
+            raise RuntimeError(f"expected H200 on rank {rank}, got {device_name!r}")
+        if metadata.version("flash-attn-4") != "4.0.0b23":
+            raise RuntimeError(
+                "FA4 SP/CP gate requires flash-attn-4==4.0.0b23, got "
+                f"{metadata.version('flash-attn-4')}"
+            )
+
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        model_parallel_cuda_manual_seed(0xFA423)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp", "pp"],
+        )
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
+        actual_tp_size = torch.distributed.get_world_size(tp_group)
+        tp_rank = torch.distributed.get_rank(tp_group)
+        actual_cp_size = (
+            1
+            if cp_group is None
+            else torch.distributed.get_world_size(cp_group)
+        )
+        cp_rank = (
+            0
+            if cp_group is None
+            else torch.distributed.get_rank(cp_group)
+        )
+        if (actual_tp_size, actual_cp_size) != (tp_size, cp_size):
+            raise RuntimeError(
+                "unexpected process mesh: "
+                f"actual TPxCP={actual_tp_size}x{actual_cp_size}, "
+                f"expected {tp_size}x{cp_size}"
+            )
+
+        for name, value in (
+            ("CPPMEGA_STRUCTURE_ENABLED", "1"),
+            ("CPPMEGA_GRAPH_ROUTES_ENABLED", "1"),
+            ("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1"),
+            ("CPPMEGA_FA4_SCORE_MOD", "1"),
+            ("CPPMEGA_GRAPH_BIAS_BETA", str(BETA)),
+        ):
+            os.environ[name] = value
+
+        hidden_size = H * D
+
+        def config(*, sequence_parallel: bool, context_parallel_size: int):
+            return TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=H,
+                num_query_groups=H,
+                ffn_hidden_size=4 * hidden_size,
+                tensor_model_parallel_size=tp_size,
+                pipeline_model_parallel_size=1,
+                context_parallel_size=context_parallel_size,
+                sequence_parallel=sequence_parallel,
+                attention_dropout=0.0,
+                params_dtype=torch.bfloat16,
+                bf16=True,
+                add_bias_linear=False,
+                use_cpu_initialization=False,
+            )
+
+        submodules = SelfAttentionSubmodules(
+            linear_qkv=TELayerNormColumnParallelLinear,
+            core_attention=CppMegaFA4ScoreModAttention,
+            linear_proj=TERowParallelLinear,
+        )
+        reference_config = config(
+            sequence_parallel=False,
+            context_parallel_size=1,
+        )
+        reference_pgs = ProcessGroupCollection(
+            tp=tp_group,
+            cp=None,
+            pp=pg_collection.pp,
+        )
+        torch.manual_seed(0xFA424)
+        torch.cuda.manual_seed_all(0xFA424)
+        reference_attention = SelfAttention(
+            config=reference_config,
+            submodules=submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=reference_pgs,
+        ).to(device)
+        reference_attention.train()
+
+        # CP ranks are replicas of the same TP partition. Keep their local
+        # parameters bit-identical before comparing CP-sharded gradients.
+        if cp_size > 1:
+            cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
+            for parameter in reference_attention.parameters():
+                torch.distributed.broadcast(
+                    parameter.data,
+                    src=cp_ranks[0],
+                    group=cp_group,
+                )
+
+        test_config = config(
+            sequence_parallel=True,
+            context_parallel_size=cp_size,
+        )
+        test_attention = SelfAttention(
+            config=test_config,
+            submodules=submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=pg_collection,
+        ).to(device)
+        test_attention.load_state_dict(reference_attention.state_dict())
+        test_attention.train()
+
+        torch.manual_seed(0xFA425)
+        global_hidden = torch.randn(
+            S,
+            1,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        torch.distributed.broadcast(global_hidden, src=0)
+        document_ids = torch.tensor(
+            [[1] * (S // 2) + [2] * (S // 2)],
+            device=device,
+            dtype=torch.int32,
+        )
+        structure_batch = _parity_structure_batch()
+        structure_batch["document_ids"] = document_ids
+        position_ids = torch.arange(S, device=device).view(S, 1, 1)
+        local_positions = _local_tp_cp_sequence(
+            position_ids,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        ).flatten()
+        local_document_ids = document_ids[0].index_select(0, local_positions)
+
+        reference_input = global_hidden.detach().clone().requires_grad_(True)
+        local_input = (
+            _local_tp_cp_sequence(
+                global_hidden,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+
+        # Exercise the real TE fused QKV projection independently so the
+        # receipt records its actual sequence shape before CP gather.
+        with torch.no_grad():
+            projected_q, projected_k, projected_v = (
+                test_attention.get_query_key_value_tensors(local_input.detach())
+            )
+        expected_projected_length = S // cp_size
+        for name, projected in (
+            ("Q", projected_q),
+            ("K", projected_k),
+            ("V", projected_v),
+        ):
+            if projected.shape[0] != expected_projected_length:
+                raise RuntimeError(
+                    f"TE sequence-parallel {name} length={projected.shape[0]}, "
+                    f"expected CP-local length={expected_projected_length}"
+                )
+
+        invalidate_bias_cache()
+        layer = SimpleNamespace(
+            config=test_config,
+            self_attention=test_attention,
+        )
+        with _structure_batch(structure_batch):
+            bias_state = _graph_attention_bias_for_layer(layer, local_input)
+            if not isinstance(bias_state, ChunkNativeGraphBias):
+                raise RuntimeError(
+                    f"expected ChunkNativeGraphBias, got {type(bias_state).__name__}"
+                )
+            reference_output, _ = reference_attention(
+                reference_input,
+                None,
+                attention_bias=bias_state,
+            )
+            local_output, _ = test_attention(
+                local_input,
+                None,
+                attention_bias=bias_state,
+            )
+
+        expected_local_output = _local_tp_cp_sequence(
+            reference_output.detach(),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+        torch.testing.assert_close(
+            local_output,
+            expected_local_output,
+            atol=3e-2,
+            rtol=5e-2,
+        )
+
+        torch.manual_seed(0xFA426)
+        output_probe = torch.randn_like(reference_output)
+        torch.distributed.broadcast(output_probe, src=0)
+        local_probe = _local_tp_cp_sequence(
+            output_probe,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+        (reference_output * output_probe).sum().backward()
+        (local_output * local_probe).sum().backward()
+        if reference_input.grad is None or local_input.grad is None:
+            raise RuntimeError("FA4 SP/CP input gradient is missing")
+        expected_local_input_grad = _local_tp_cp_sequence(
+            reference_input.grad,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+        torch.testing.assert_close(
+            local_input.grad,
+            expected_local_input_grad,
+            atol=8e-2,
+            rtol=1e-1,
+        )
+
+        reference_parameters = dict(reference_attention.named_parameters())
+        max_parameter_grad_diff = torch.zeros((), device=device)
+        finalized_sequence_parallel_parameters = []
+        for name, parameter in test_attention.named_parameters():
+            reference_parameter = reference_parameters[name]
+            if parameter.grad is None or reference_parameter.grad is None:
+                raise RuntimeError(f"missing parameter gradient for {name}")
+            actual_grad = parameter.grad.detach().clone()
+            if getattr(parameter, "sequence_parallel", False):
+                torch.distributed.all_reduce(actual_grad, group=tp_group)
+                finalized_sequence_parallel_parameters.append(name)
+            if cp_size > 1:
+                torch.distributed.all_reduce(actual_grad, group=cp_group)
+            torch.testing.assert_close(
+                actual_grad,
+                reference_parameter.grad,
+                atol=8e-2,
+                rtol=1e-1,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
+            max_parameter_grad_diff = torch.maximum(
+                max_parameter_grad_diff,
+                (actual_grad.float() - reference_parameter.grad.float()).abs().max()
+            )
+
+        # A perturbation confined to document 1 must not change any document
+        # 2 output, through the complete TP/SP(+CP) production module.
+        perturbed_global = global_hidden.detach().clone()
+        feature_perturbation = torch.linspace(
+            -16,
+            16,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        ).view(1, 1, hidden_size)
+        perturbed_global[: S // 2].add_(feature_perturbation)
+        perturbed_local = _local_tp_cp_sequence(
+            perturbed_global,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+        with torch.no_grad(), _structure_batch(structure_batch):
+            perturbed_output, _ = test_attention(
+                perturbed_local,
+                None,
+                attention_bias=bias_state,
+            )
+        document_two = local_document_ids == 2
+        local_leakage = torch.zeros((), device=device)
+        if document_two.any():
+            local_leakage = (
+                perturbed_output[document_two].float()
+                - local_output.detach()[document_two].float()
+            ).abs().max()
+        torch.distributed.all_reduce(
+            local_leakage,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if local_leakage.item() != 0:
+            raise AssertionError(
+                f"packed-document forward leakage={local_leakage.item()}"
+            )
+        local_own_document_delta = torch.zeros((), device=device)
+        document_one = local_document_ids == 1
+        if document_one.any():
+            local_own_document_delta = (
+                perturbed_output[document_one].float()
+                - local_output.detach()[document_one].float()
+            ).abs().max()
+        torch.distributed.all_reduce(
+            local_own_document_delta,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if local_own_document_delta.item() <= 0:
+            raise AssertionError(
+                "feature-varying document-1 perturbation did not change its "
+                "own output"
+            )
+
+        # Backpropagate only from document 2 and demand exactly zero gradient
+        # in document 1 while proving the ordinary gradient path stays live.
+        test_attention.zero_grad(set_to_none=True)
+        cross_input = (
+            _local_tp_cp_sequence(
+                global_hidden,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+        with _structure_batch(structure_batch):
+            cross_output, _ = test_attention(
+                cross_input,
+                None,
+                attention_bias=bias_state,
+            )
+        cross_probe = torch.randn_like(cross_output)
+        cross_probe[local_document_ids != 2] = 0
+        (cross_output * cross_probe).sum().backward()
+        if cross_input.grad is None:
+            raise RuntimeError("FA4 SP/CP isolation gradient is missing")
+        local_cross_grad = torch.zeros((), device=device)
+        if document_one.any():
+            local_cross_grad = cross_input.grad[document_one].abs().max()
+        torch.distributed.all_reduce(
+            local_cross_grad,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if local_cross_grad.item() != 0:
+            raise AssertionError(
+                f"packed-document cross gradient={local_cross_grad.item()}"
+            )
+
+        ordinary_grad_l1 = cross_input.grad[document_two].float().abs().sum()
+        torch.distributed.all_reduce(ordinary_grad_l1)
+        if ordinary_grad_l1.item() <= 0:
+            raise AssertionError("ordinary document-2 input gradient is zero")
+        live_parameter_grads = {}
+        for suffix in ("linear_qkv.weight", "linear_proj.weight"):
+            matches = [
+                parameter.grad
+                for name, parameter in test_attention.named_parameters()
+                if name.endswith(suffix)
+            ]
+            if len(matches) != 1 or matches[0] is None:
+                raise RuntimeError(f"missing unique live gradient for {suffix}")
+            grad_l1 = matches[0].float().abs().sum()
+            torch.distributed.all_reduce(grad_l1)
+            if grad_l1.item() <= 0:
+                raise AssertionError(f"ordinary {suffix} gradient is zero")
+            live_parameter_grads[suffix] = grad_l1.item()
+
+        forward_diff = (
+            local_output.float() - expected_local_output.float()
+        ).abs().max()
+        input_grad_diff = (
+            local_input.grad.float() - expected_local_input_grad.float()
+        ).abs().max()
+        for metric in (forward_diff, input_grad_diff, max_parameter_grad_diff):
+            torch.distributed.all_reduce(
+                metric,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+        diagnostic = {
+            "backend_distribution": "flash-attn-4",
+            "backend_version": metadata.version("flash-attn-4"),
+            "backend_callable_file": inspect.getfile(flash_attn_func),
+            "device": device_name,
+            "global_rank": rank,
+            "world_size": world_size,
+            "tp_rank": tp_rank,
+            "tp_size": actual_tp_size,
+            "cp_rank": cp_rank,
+            "cp_size": actual_cp_size,
+            "global_hidden_shape": list(global_hidden.shape),
+            "local_hidden_shape": list(local_input.shape),
+            "projected_q_shape_before_cp_gather": list(projected_q.shape),
+            "graph_bias_q_shape": list(bias_state.token_to_chunk_q.shape),
+            "local_output_shape": list(local_output.shape),
+            "forward_max_abs": forward_diff.item(),
+            "input_grad_max_abs": input_grad_diff.item(),
+            "parameter_grad_max_abs": max_parameter_grad_diff.item(),
+            "finalized_sequence_parallel_parameters": (
+                finalized_sequence_parallel_parameters
+            ),
+            "forward_cross_document_leakage_max": local_leakage.item(),
+            "own_document_output_delta_max": local_own_document_delta.item(),
+            "cross_document_input_grad_max": local_cross_grad.item(),
+            "ordinary_input_grad_l1": ordinary_grad_l1.item(),
+            "ordinary_parameter_grad_l1": live_parameter_grads,
+        }
+        torch.distributed.barrier()
+        results.put(("ok", rank, diagnostic))
+    except Exception:
+        results.put(("error", rank, traceback.format_exc()))
+        raise
+    finally:
+        _set_current_structure_batch(None)
+        if parallel_state is not None:
+            try:
+                parallel_state.destroy_model_parallel()
+            except Exception:
+                pass
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def _run_fa4_tp_sp_world(
+    *,
+    cp_size: int,
+    init_method: str,
+) -> None:
+    tp_size = 2
+    world_size = tp_size * cp_size
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_fa4_tp_sp_worker,
+            args=(rank, world_size, cp_size, init_method, results),
+        )
+        for rank in range(world_size)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=600)
+    messages = [results.get(timeout=10) for _ in range(world_size)]
+    assert all(process.exitcode == 0 for process in processes), messages
+    assert sorted((message[0], message[1]) for message in messages) == [
+        ("ok", rank) for rank in range(world_size)
+    ]
+    for _, _, diagnostic in sorted(messages, key=lambda message: message[1]):
+        print(
+            "CPPMEGA_FA4_SP_CP_DIAGNOSTIC "
+            + json.dumps(diagnostic, sort_keys=True),
+            flush=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Parity test class
 # ---------------------------------------------------------------------------
@@ -808,6 +1348,30 @@ class TestFA4H200Parity:
         messages = [results.get(timeout=5) for _ in range(2)]
         assert all(process.exitcode == 0 for process in processes), messages
         assert sorted(messages) == [("ok", 0), ("ok", 1)]
+
+    def test_sequence_parallel_tp2_production_forward_backward_isolation(
+        self,
+        tmp_path,
+    ):
+        """Real TE TP2/SP QKV and projection preserve packed-document isolation."""
+        if torch.cuda.device_count() < 2:
+            pytest.skip("FA4 TP2/SP parity requires two H200 devices")
+        _run_fa4_tp_sp_world(
+            cp_size=1,
+            init_method=f"file://{tmp_path / 'fa4-tp2-sp-init'}",
+        )
+
+    def test_cartesian_tp2_cp2_production_forward_backward_isolation(
+        self,
+        tmp_path,
+    ):
+        """Real TP2/SP + CP2 zigzag composition is isolated and reference-exact."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("FA4 Cartesian TP2/SP+CP2 parity requires four H200 devices")
+        _run_fa4_tp_sp_world(
+            cp_size=2,
+            init_method=f"file://{tmp_path / 'fa4-tp2-sp-cp2-init'}",
+        )
 
     def test_document_mask_only_partial_tile_forward_backward_parity(self):
         """Exact mask handles short unaligned documents and a partial tile."""
@@ -1244,14 +1808,19 @@ class TestBiasEquivalenceCPU:
 # Modal entrypoint (run as: modal run tests/test_fa4_h200_parity.py)
 # ---------------------------------------------------------------------------
 
-# The candidate override is mandatory for release evidence; the historical
-# digest remains only so CPU collection does not require Modal credentials.
+# The immutable base and the overlaid checkout have separate provenance. A
+# development overlay must never masquerade as an image built from its HEAD.
 _GHCR_IMAGE_DIGEST = os.environ.get(
     "CPPMEGA_CANDIDATE_IMAGE_DIGEST",
-    "sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc",
+    "sha256:ff03c4faff1513878bcae31437b018323a2297668eb728f9c45bb838d1275a0c",
+)
+_BASE_IMAGE_CPPMEGA_SHA = os.environ.get(
+    "CPPMEGA_BASE_IMAGE_CPPMEGA_SHA",
+    "ce8d41e99b24f805aaa5aa6bbfbe0d565ba693fd",
 )
 _CANDIDATE_CPPMEGA_SHA = os.environ.get("CPPMEGA_CANDIDATE_CPPMEGA_SHA", "")
-_EXPECTED_H200_TEST_COUNT = 12
+_EXPECTED_H200_TEST_COUNT = 14
+_EXPECTED_SP_CP_DIAGNOSTIC_COUNT = 6
 
 
 def _modal_image():
@@ -1264,21 +1833,36 @@ def _modal_image():
     _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
     if re.fullmatch(r"sha256:[0-9a-f]{64}", _GHCR_IMAGE_DIGEST) is None:
         raise RuntimeError("CPPMEGA_CANDIDATE_IMAGE_DIGEST must be an OCI digest")
-    if _CANDIDATE_CPPMEGA_SHA:
-        if re.fullmatch(r"[0-9a-f]{40}", _CANDIDATE_CPPMEGA_SHA) is None:
-            raise RuntimeError(
-                "CPPMEGA_CANDIDATE_CPPMEGA_SHA must be a full commit SHA"
-            )
-        local_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=_REPO_ROOT,
-            text=True,
-        ).strip()
-        if local_sha != _CANDIDATE_CPPMEGA_SHA:
-            raise RuntimeError(
-                "FA4 parity source/image candidate mismatch: "
-                f"local={local_sha} candidate={_CANDIDATE_CPPMEGA_SHA}"
-            )
+    if re.fullmatch(r"[0-9a-f]{40}", _BASE_IMAGE_CPPMEGA_SHA) is None:
+        raise RuntimeError(
+            "CPPMEGA_BASE_IMAGE_CPPMEGA_SHA must be a full commit SHA"
+        )
+    if re.fullmatch(r"[0-9a-f]{40}", _CANDIDATE_CPPMEGA_SHA) is None:
+        raise RuntimeError(
+            "CPPMEGA_CANDIDATE_CPPMEGA_SHA is required and must be a full "
+            "overlay checkout commit SHA"
+        )
+    local_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=_REPO_ROOT,
+        text=True,
+    ).strip()
+    if local_sha != _CANDIDATE_CPPMEGA_SHA:
+        raise RuntimeError(
+            "FA4 parity overlay checkout mismatch: "
+            f"local={local_sha} candidate={_CANDIDATE_CPPMEGA_SHA}"
+        )
+    local_status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=_REPO_ROOT,
+        text=True,
+    ).strip()
+    if local_status:
+        overlay_mode = "development-dirty"
+    elif _CANDIDATE_CPPMEGA_SHA == _BASE_IMAGE_CPPMEGA_SHA:
+        overlay_mode = "release-clean"
+    else:
+        overlay_mode = "development-clean"
     GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/datasunriseou/cppmega")
     GHCR_REF = f"{GHCR_REPO}@{_GHCR_IMAGE_DIGEST}"
 
@@ -1289,7 +1873,9 @@ def _modal_image():
     ).env(
         {
             "CPPMEGA_MEGATRON_COMMIT": ("ba7b5ebce12af60627a80985792a1449ce45f46c"),
+            "CPPMEGA_BASE_IMAGE_CPPMEGA_SHA": _BASE_IMAGE_CPPMEGA_SHA,
             "CPPMEGA_CANDIDATE_CPPMEGA_SHA": _CANDIDATE_CPPMEGA_SHA,
+            "CPPMEGA_SOURCE_OVERLAY_MODE": overlay_mode,
             "CPPMEGA_SOURCE_IMAGE_REF": GHCR_REF,
             "MEGATRON_LM_REPO": "/opt/megatron-lm",
             "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
@@ -1313,6 +1899,16 @@ def _modal_image():
             remote_path="/opt/cppmega/tests/test_fa4_h200_parity.py",
         )
         .add_local_file(
+            str(_REPO_ROOT / "tests" / "test_fa4_document_isolation.py"),
+            remote_path="/opt/cppmega/tests/test_fa4_document_isolation.py",
+        )
+        .add_local_file(
+            str(_REPO_ROOT / "tests" / "test_graph_route_attention_bias_patch.py"),
+            remote_path=(
+                "/opt/cppmega/tests/test_graph_route_attention_bias_patch.py"
+            ),
+        )
+        .add_local_file(
             str(_REPO_ROOT / "pyproject.toml"),
             remote_path="/opt/cppmega/pyproject.toml",
         )
@@ -1330,7 +1926,7 @@ if _modal is not None:
     import pathlib as _pathlib
     import subprocess as _subprocess
 
-    _MODAL_GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:2")
+    _MODAL_GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:4")
     _modal_app = _modal.App("cppmega-fa4-parity")
     _results_vol = _modal.Volume.from_name(
         "cppmega-test-results", create_if_missing=True
@@ -1343,7 +1939,7 @@ if _modal is not None:
             else None
         ),
         gpu=_MODAL_GPU_SPEC,
-        timeout=600,
+        timeout=1200,
         volumes={"/results": _results_vol},
     )
     def run_parity() -> dict:
@@ -1363,6 +1959,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import sys
 from pathlib import Path
 import subprocess
@@ -1409,12 +2006,24 @@ source_paths = (
     Path("/opt/cppmega/cppmega/megatron/document_isolation.py"),
     Path("/opt/cppmega/cppmega/megatron/fa4_graph_attention.py"),
     Path("/opt/cppmega/cppmega/megatron/fa4_score_mod_adapter.py"),
+    Path("/opt/cppmega/cppmega/megatron/graph_route_attention_bias_patch.py"),
+    Path("/opt/cppmega/cppmega/megatron/structure_dataset_patch.py"),
     Path("/opt/cppmega/tests/test_fa4_h200_parity.py"),
+    Path("/opt/cppmega/tests/test_fa4_document_isolation.py"),
+    Path("/opt/cppmega/tests/test_graph_route_attention_bias_patch.py"),
 )
 image_source = json.loads(Path("/opt/cppmega-image-source.json").read_text())
+base_image_sha = os.environ["CPPMEGA_BASE_IMAGE_CPPMEGA_SHA"]
 candidate_sha = os.environ["CPPMEGA_CANDIDATE_CPPMEGA_SHA"]
-if candidate_sha:
-    assert image_source["cppmega_sha"] == candidate_sha, image_source
+overlay_mode = os.environ["CPPMEGA_SOURCE_OVERLAY_MODE"]
+assert re.fullmatch(r"[0-9a-f]{40}", base_image_sha), base_image_sha
+assert re.fullmatch(r"[0-9a-f]{40}", candidate_sha), candidate_sha
+assert overlay_mode in {
+    "development-dirty",
+    "development-clean",
+    "release-clean",
+}, overlay_mode
+assert image_source["cppmega_sha"] == base_image_sha, image_source
 megatron_commit = subprocess.check_output(
     ["git", "-C", "/opt/megatron-lm", "rev-parse", "HEAD"],
     text=True,
@@ -1430,6 +2039,12 @@ print(json.dumps({
     "cuda_total_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
     "source_image_ref": os.environ["CPPMEGA_SOURCE_IMAGE_REF"],
     "image_source": image_source,
+    "base_image_cppmega_sha": base_image_sha,
+    "source_overlay_checkout_sha": candidate_sha,
+    "source_overlay_mode": overlay_mode,
+    "release_bound": (
+        overlay_mode == "release-clean" and candidate_sha == base_image_sha
+    ),
     "pip_check": pip_check.stdout.strip(),
     "megatron_commit": megatron_commit,
     "source_files_sha256": {
@@ -1454,6 +2069,15 @@ print(json.dumps({
                     "exact_pass": False,
                     "expected_test_count": _EXPECTED_H200_TEST_COUNT,
                     "gpu": _MODAL_GPU_SPEC,
+                    "base_image_cppmega_sha": os.environ[
+                        "CPPMEGA_BASE_IMAGE_CPPMEGA_SHA"
+                    ],
+                    "source_overlay_checkout_sha": os.environ[
+                        "CPPMEGA_CANDIDATE_CPPMEGA_SHA"
+                    ],
+                    "source_overlay_mode": os.environ[
+                        "CPPMEGA_SOURCE_OVERLAY_MODE"
+                    ],
                     "probe_stdout": probe.stdout,
                     "probe_stderr_tail": "\n".join(probe.stderr.splitlines()[-80:]),
                 }
@@ -1461,7 +2085,6 @@ print(json.dumps({
         stack = _json.loads(probe.stdout.splitlines()[-1])
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0,1"
         env["CPPMEGA_FA4_MAX_RARE_PER_ROW"] = "8"
         command = [
             sys.executable,
@@ -1482,7 +2105,7 @@ print(json.dumps({
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=500,
+                timeout=1100,
             )
             returncode = proc.returncode
             stdout = proc.stdout
@@ -1516,6 +2139,94 @@ print(json.dumps({
                     for name in ("tests", "failures", "errors", "skipped")
                 },
             }
+        diagnostic_marker = "CPPMEGA_FA4_SP_CP_DIAGNOSTIC "
+        sp_cp_diagnostics = []
+        diagnostic_errors = []
+        for line in stdout.splitlines():
+            if diagnostic_marker not in line:
+                continue
+            payload = line.split(diagnostic_marker, 1)[1].strip()
+            try:
+                sp_cp_diagnostics.append(_json.loads(payload))
+            except _json.JSONDecodeError as exc:
+                diagnostic_errors.append(f"{exc}: {payload}")
+
+        expected_topology = {
+            (1, 2, 0, 0, 0),
+            (1, 2, 1, 1, 0),
+            (2, 4, 0, 0, 0),
+            (2, 4, 1, 1, 0),
+            (2, 4, 2, 0, 1),
+            (2, 4, 3, 1, 1),
+        }
+        actual_topology = {
+            (
+                int(record.get("cp_size", -1)),
+                int(record.get("world_size", -1)),
+                int(record.get("global_rank", -1)),
+                int(record.get("tp_rank", -1)),
+                int(record.get("cp_rank", -1)),
+            )
+            for record in sp_cp_diagnostics
+        }
+        if actual_topology != expected_topology:
+            diagnostic_errors.append(
+                "unexpected TP/CP diagnostics topology: "
+                f"{sorted(actual_topology)}"
+            )
+        for record in sp_cp_diagnostics:
+            if record.get("backend_version") != "4.0.0b23":
+                diagnostic_errors.append(
+                    f"wrong FA4 backend record: {record.get('backend_version')}"
+                )
+            cp_record_size = int(record.get("cp_size", -1))
+            if cp_record_size not in (1, 2):
+                diagnostic_errors.append(
+                    f"unexpected diagnostic CP size: {cp_record_size}"
+                )
+                continue
+            expected_local_length = S // (2 * cp_record_size)
+            expected_projected_length = S // cp_record_size
+            expected_shapes = {
+                "global_hidden_shape": [S, 1, H * D],
+                "local_hidden_shape": [expected_local_length, 1, H * D],
+                "projected_q_shape_before_cp_gather": [
+                    expected_projected_length,
+                    1,
+                    H // 2,
+                    D,
+                ],
+                "graph_bias_q_shape": [1, S],
+                "local_output_shape": [expected_local_length, 1, H * D],
+            }
+            for name, expected_shape in expected_shapes.items():
+                if record.get(name) != expected_shape:
+                    diagnostic_errors.append(
+                        f"{name}={record.get(name)} expected {expected_shape}"
+                    )
+            for metric in (
+                "forward_cross_document_leakage_max",
+                "cross_document_input_grad_max",
+            ):
+                if float(record.get(metric, float("nan"))) != 0:
+                    diagnostic_errors.append(
+                        f"{metric} is not exact zero: {record.get(metric)}"
+                    )
+            for metric in (
+                "own_document_output_delta_max",
+                "ordinary_input_grad_l1",
+            ):
+                if float(record.get(metric, 0)) <= 0:
+                    diagnostic_errors.append(
+                        f"{metric} is not positive: {record.get(metric)}"
+                    )
+            live_gradients = record.get("ordinary_parameter_grad_l1", {})
+            for name in ("linear_qkv.weight", "linear_proj.weight"):
+                if float(live_gradients.get(name, 0)) <= 0:
+                    diagnostic_errors.append(
+                        f"{name} gradient is not positive: "
+                        f"{live_gradients.get(name)}"
+                    )
         exact_pass = (
             returncode == 0
             and junit["present"]
@@ -1523,18 +2234,24 @@ print(json.dumps({
             and junit["failures"] == 0
             and junit["errors"] == 0
             and junit["skipped"] == 0
+            and stack["cuda_device_count"] == 4
+            and len(sp_cp_diagnostics) == _EXPECTED_SP_CP_DIAGNOSTIC_COUNT
+            and not diagnostic_errors
         )
         probe_mask = _make_document_causal_mask_mod(0, 1, causal=True)
         result = {
             "returncode": returncode,
             "exact_pass": exact_pass,
             "expected_test_count": _EXPECTED_H200_TEST_COUNT,
+            "expected_sp_cp_diagnostic_count": _EXPECTED_SP_CP_DIAGNOSTIC_COUNT,
             "junit": junit,
             "gpu": _MODAL_GPU_SPEC,
             **stack,
             "document_mask_mod_signature": str(inspect.signature(probe_mask)),
             "pytest_command": command,
             "max_rare_per_row": int(env["CPPMEGA_FA4_MAX_RARE_PER_ROW"]),
+            "sp_cp_diagnostics": sp_cp_diagnostics,
+            "sp_cp_diagnostic_errors": diagnostic_errors,
             "stdout_tail": "\n".join(stdout.splitlines()[-80:]),
             "stderr_tail": "\n".join(stderr.splitlines()[-30:]),
         }
@@ -1548,6 +2265,22 @@ print(json.dumps({
             raise RuntimeError(
                 "release evidence requires CPPMEGA_CANDIDATE_CPPMEGA_SHA "
                 "and CPPMEGA_CANDIDATE_IMAGE_DIGEST"
+            )
+        if _CANDIDATE_CPPMEGA_SHA != _BASE_IMAGE_CPPMEGA_SHA:
+            raise RuntimeError(
+                "release evidence requires the immutable image source and "
+                "clean overlay checkout to name the same cppmega commit"
+            )
+        repository_root = _pathlib.Path(__file__).resolve().parents[1]
+        local_status = _subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=repository_root,
+            text=True,
+        ).strip()
+        if local_status:
+            raise RuntimeError(
+                "release evidence requires a clean overlay checkout; "
+                f"dirty paths:\n{local_status}"
             )
         result = run_parity.remote()
         print(_json.dumps(result, indent=2))
