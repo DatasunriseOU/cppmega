@@ -29,7 +29,7 @@ def test_candidate_tilelang_sha_is_bound_across_release_surfaces():
     harness = _HARNESS.read_text()
     changelog = (_ROOT / "docs/changelog.md").read_text()
 
-    assert workflow.count(_CANDIDATE_TILELANG_SHA) == 1
+    assert workflow.count(_CANDIDATE_TILELANG_SHA) == 2
     assert f"ref: {_CANDIDATE_TILELANG_SHA}" in stack
     assert f'_CANDIDATE_TILELANG_SHA = "{_CANDIDATE_TILELANG_SHA}"' in harness
     assert f"`{_CANDIDATE_TILELANG_SHA}`" in changelog
@@ -362,6 +362,7 @@ def test_image_build_binds_full_source_receipt_to_docker_args():
 
 def test_release_gate_keeps_ordered_read_only_h200_contract():
     harness = _HARNESS.read_text()
+    workflow = (_ROOT / ".github/workflows/build-wheels.yml").read_text()
 
     for required_env in (
         "CPPMEGA_CANDIDATE_CPPMEGA_SHA",
@@ -382,6 +383,10 @@ def test_release_gate_keeps_ordered_read_only_h200_contract():
     assert "write_receipt(receipt, progress_path)" in harness
     assert harness.count("write_receipt(receipt, progress_path, _RESULT_PATH)") == 2
     assert "_DURABLE_JUNIT_PATH" not in harness
+    assert "_BASE_SOURCE_SHA = _CANDIDATE_CPPMEGA_SHA" in harness
+    assert '"cppmega_ref": "main"' in harness
+    assert "Write exact release manifest" in workflow
+    assert "wheels/CANDIDATE_MANIFEST.json" in workflow
     assert 'receipt["gpu_health_before_test"]' in harness
     assert "isinstance(exc, subprocess.TimeoutExpired)" in harness
     assert ".add_local_file(\n            str(_LOCAL_STAGE2_PATCH)" not in harness

@@ -96,7 +96,7 @@ _CANDIDATE_CPPMEGA_SHA = _required_env(
 _CANDIDATE_TILELANG_SHA = "de8bb88cc382b0e78bc804244f79c4be8cc9e75f"
 _CANDIDATE_TVM_SHA = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
 _CANDIDATE_TVM_FFI_SHA = "521efeb30bfd9e4946b248b3d76e6391028233a3"
-_BASE_SOURCE_SHA = "dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39"
+_BASE_SOURCE_SHA = _CANDIDATE_CPPMEGA_SHA
 _MEGATRON_COMMIT = "ba7b5ebce12af60627a80985792a1449ce45f46c"
 _RELEASE_TAG = f"wheels-{_CANDIDATE_CPPMEGA_SHA}"
 _RELEASE_MANIFEST_SHA256 = _required_env(
@@ -627,7 +627,7 @@ def run_release_gate() -> dict[str, Any]:
             )
         manifest = json.loads(path.read_text())
         expected_candidate = {
-            "cppmega_ref": "candidate/tilelang-role-3dff66ef",
+            "cppmega_ref": "main",
             "cppmega_sha": _CANDIDATE_CPPMEGA_SHA,
             "tilelang_sha": _CANDIDATE_TILELANG_SHA,
             "tvm_ffi_sha": _CANDIDATE_TVM_FFI_SHA,

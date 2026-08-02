@@ -433,8 +433,10 @@ def test_wheel_and_image_sources_are_content_addressed() -> None:
     assert re.search(
         r"^  cuda_image: \S+@sha256:[0-9a-f]{64}$", stack, re.MULTILINE
     )
-    assert "sha256sum *.whl > SHA256SUMS" in wheel_workflow
-    assert "wheels/SHA256SUMS --clobber" in wheel_workflow
+    assert "sha256sum *.whl | LC_ALL=C sort -k2 > SHA256SUMS" in wheel_workflow
+    assert "wheels/SHA256SUMS \\" in wheel_workflow
+    assert "wheels/CANDIDATE_MANIFEST.json \\" in wheel_workflow
+    assert "--clobber" in wheel_workflow
     assert 'echo "tag=${{ github.sha }}"' in wheel_workflow
     assert '--target "${{ github.sha }}"' in wheel_workflow
     assert '"$tag_sha" != "${{ github.sha }}"' in wheel_workflow

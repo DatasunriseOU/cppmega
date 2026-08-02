@@ -8,7 +8,9 @@ fix and adds fail-closed dependent shared-RMW planning, stable first-use layout
 source ordering, and exact owner-thread compatibility for fragment writes.
 The vendored TVM and tvm-ffi pins remain unchanged. This source still requires
 the rebuilt immutable release and ordered H200 `one` → `r2` → `r4` gate before
-training promotion.
+training promotion. The full release now publishes an exact checksum manifest
+that binds all nine wheels, the source commit, and the TileLang/TVM/tvm-ffi
+revisions consumed by that gate.
 
 ## 2026-08-02: FA2 pinned to the TE 2.16 compatibility ceiling
 

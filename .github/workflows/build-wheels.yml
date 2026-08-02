@@ -732,6 +732,7 @@ jobs:
       - name: Verify required wheels
         run: |
           set -euo pipefail
+          shopt -s nullglob
           required=(
             'transformer_engine-*.whl'
             'flash_attn-*.whl'
@@ -745,18 +746,87 @@ jobs:
           )
           for pattern in "${required[@]}"; do
             matches=(wheels/$pattern)
-            if [[ ! -e "${matches[0]}" ]]; then
-              echo "::error::missing required wheel asset: $pattern"
+            if (( ${#matches[@]} != 1 )); then
+              echo "::error::expected exactly one wheel asset for $pattern, found ${#matches[@]}"
               ls -lh wheels/ || true
               exit 1
             fi
           done
+          all_wheels=(wheels/*.whl)
+          if (( ${#all_wheels[@]} != ${#required[@]} )); then
+            echo "::error::release contains unexpected wheel assets"
+            printf '%s\n' "${all_wheels[@]}"
+            exit 1
+          fi
 
       - name: Write wheel checksums
         run: |
           set -euo pipefail
-          (cd wheels && sha256sum *.whl > SHA256SUMS)
+          (cd wheels && sha256sum *.whl | LC_ALL=C sort -k2 > SHA256SUMS)
           (cd wheels && sha256sum -c SHA256SUMS)
+
+      - name: Write exact release manifest
+        env:
+          CPPMEGA_SHA: ${{ github.sha }}
+          TILELANG_SHA: de8bb88cc382b0e78bc804244f79c4be8cc9e75f
+          TVM_SHA: e25ca6ae50beee0e907b1e5ed32949879caddde1
+          TVM_FFI_SHA: 521efeb30bfd9e4946b248b3d76e6391028233a3
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          wheel_dir = Path("wheels")
+          checksums = {}
+          for line in (wheel_dir / "SHA256SUMS").read_text().splitlines():
+              digest, filename = line.split(maxsplit=1)
+              checksums[filename] = digest
+          tilelang = [name for name in checksums if name.startswith("tilelang-")]
+          tvm_ffi = [
+              name for name in checksums if name.startswith("apache_tvm_ffi-")
+          ]
+          if len(tilelang) != 1 or len(tvm_ffi) != 1:
+              raise SystemExit(
+                  "release manifest expected one TileLang/tvm-ffi pair: "
+                  f"tilelang={tilelang!r} tvm_ffi={tvm_ffi!r}"
+              )
+          source_sha = os.environ["CPPMEGA_SHA"]
+          manifest = {
+              "schema_version": 1,
+              "candidate": {
+                  "cppmega_ref": os.environ["GITHUB_REF_NAME"],
+                  "cppmega_sha": source_sha,
+                  "tilelang_sha": os.environ["TILELANG_SHA"],
+                  "tvm_sha": os.environ["TVM_SHA"],
+                  "tvm_ffi_sha": os.environ["TVM_FFI_SHA"],
+              },
+              "base_release": {
+                  "tag": f"wheels-{source_sha}",
+                  "source_sha": source_sha,
+              },
+              "github_run": {
+                  "id": os.environ["GITHUB_RUN_ID"],
+                  "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                  "url": (
+                      f"{os.environ['GITHUB_SERVER_URL']}/"
+                      f"{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                      f"{os.environ['GITHUB_RUN_ID']}"
+                  ),
+              },
+              "candidate_wheels": {
+                  tilelang[0]: checksums[tilelang[0]],
+                  tvm_ffi[0]: checksums[tvm_ffi[0]],
+              },
+              "complete_wheel_set": checksums,
+          }
+          (wheel_dir / "CANDIDATE_MANIFEST.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+          python3 -m json.tool wheels/CANDIDATE_MANIFEST.json >/dev/null
+          sha256sum wheels/CANDIDATE_MANIFEST.json
 
       - name: Create / update Release
         env:
@@ -777,4 +847,8 @@ jobs:
             echo "::error::wheel release tag $TAG is not bound to ${{ github.sha }}"
             exit 1
           fi
-          gh release upload "$TAG" wheels/*.whl wheels/SHA256SUMS --clobber
+          gh release upload "$TAG" \
+            wheels/*.whl \
+            wheels/SHA256SUMS \
+            wheels/CANDIDATE_MANIFEST.json \
+            --clobber
