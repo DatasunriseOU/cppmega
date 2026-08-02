@@ -793,7 +793,7 @@ def validate_stack_compatibility(
     if missing:
         raise RuntimeError(f"required H200 extension imports are missing: {missing}")
     runtime_versions = {}
-    for key in ("apache_tvm_ffi", "flash_attn_4"):
+    for key in ("apache_tvm_ffi", "flash_attn_4", "quack_kernels"):
         entry = runtime_pypi.get(key)
         if not isinstance(entry, dict):
             raise RuntimeError(  # noqa: TRY004
@@ -852,6 +852,7 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
         runtime_distribution_versions={
             "apache_tvm_ffi": metadata.version("apache-tvm-ffi"),
             "flash_attn_4": metadata.version("flash-attn-4"),
+            "quack_kernels": metadata.version("quack-kernels"),
         },
         imported_modules=modules,
     )

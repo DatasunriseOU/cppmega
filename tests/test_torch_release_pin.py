@@ -31,6 +31,7 @@ def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
 
     assert 'package: "apache-tvm-ffi==0.1.13.post5"' in stack
     assert 'package: "flash-attn-4[cu13]==4.0.0b23"' in stack
+    assert 'package: "quack-kernels==0.5.3"' in stack
     for path, version_check in (
         (
             "scripts/modal_build_tilelang_beta23.py",
@@ -55,7 +56,15 @@ def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
         assert "apache-tvm-ffi==0.1.13" in dockerfile, path
         assert "metadata.version('apache-tvm-ffi') == '0.1.13.post5'" in dockerfile
         assert "metadata.version('flash-attn-4') == '4.0.0b23'" in dockerfile
+        assert "metadata.version('nvidia-cutlass-dsl') == '4.6.0.dev0'" in dockerfile
+        assert "metadata.version('quack-kernels') == '0.5.3'" in dockerfile
         assert '"flash-attn-4[cu13]==4.0.0b23"' in dockerfile, path
+        assert '"quack-kernels==0.5.3"' in dockerfile, path
+        assert (
+            "not any(path.startswith('flash_attn/cute/') for path in fa2_files)"
+            in dockerfile
+        ), path
+        assert "'flash_attn/cute/utils.py' in fa4_files" in dockerfile, path
         assert '"flash-attn-4[cu13]==4.0.0b19"' not in dockerfile, path
 
 
@@ -63,11 +72,16 @@ def test_te216_fa2_pin_stays_within_the_supported_range() -> None:
     commit = "060c9188beec3a8b62b33a3bfa6d5d2d44975fab"
     stack = _read("STACK.lock")
     workflow = _read(".github/workflows/build-wheels.yml")
+    patch = _read("upstream_prs/flash_attn_setup_sm120f.patch")
 
     assert f"    ref: {commit}\n    patch: upstream_prs/flash_attn_setup_sm120f.patch" in stack
     assert "    version: 2.8.3" in stack
     assert f"            ref: {commit}" in workflow
     assert workflow.count(f"ref: {commit}") == 1
+    assert '"flash_attn.cute",' in patch
+    assert '"flash_attn.cute.*",' in patch
+    assert "Verify FA2 wheel excludes FA4 namespace" in workflow
+    assert 'name.startswith("flash_attn/cute/")' in workflow
     assert (
         'metadata.version(\\"flash-attn\\") == \\"2.8.3\\"'
         in _read("scripts/modal_cppmega_base.py")

@@ -1,9 +1,13 @@
 From: cppmega
-Subject: setup.py: emit sm_120f code for CUDA >= 12.9
+Subject: setup.py: emit sm_120f code and keep FA4 out of the FA2 wheel
 
 Upstream emits arch=compute_120,code=sm_120. CUDA 12.9+ ships PTX/SASS for
 sm_120f (Blackwell consumer) which is what GB10 / B40 / RTX5090 actually
 need. Keep the legacy sm_120 path for CUDA 12.8.
+
+The upstream package discovery also includes flash_attn.cute. cppmega installs
+flash-attn-4 separately, so exclude that namespace from the FA2 wheel instead
+of overwriting FA4 beta23 with the older bundled CuTe sources.
 
 --- a/setup.py
 +++ b/setup.py
@@ -19,3 +23,12 @@ need. Keep the legacy sm_120 path for CUDA 12.8.
 
      # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
      # torch._C._GLIBCXX_USE_CXX11_ABI
+@@ -535,6 +538,8 @@ setup(
+             "docs",
+             "benchmarks",
+             "flash_attn.egg-info",
++            "flash_attn.cute",
++            "flash_attn.cute.*",
+         )
+     ),
+     author="Tri Dao",

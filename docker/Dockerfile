@@ -61,11 +61,12 @@ RUN python -m pip install --extra-index-url ${TORCH_INDEX} \
 
 # --- FA4 CuTe DSL runtime (Python-only, JIT-compiled kernels) ---------------
 # FA4 is intentionally separate from the flash_attn wheel. The flash-attn-4
-# package owns the flash_attn.cute namespace and pins the compatible
-# nvidia-cutlass-dsl[cu13] / quack-kernels dependency stack.
+# package owns the flash_attn.cute namespace and pins CUTLASS 4.6.0.dev0.
+# Keep quack exact because beta23 only declares a lower bound.
 RUN python -m pip install --no-cache-dir --pre \
         --extra-index-url https://pypi.nvidia.com \
-        "flash-attn-4[cu13]==4.0.0b23"
+        "flash-attn-4[cu13]==4.0.0b23" \
+        "quack-kernels==0.5.3"
 
 # --- prebuilt wheels (this layer changes whenever any wheel is rebuilt) -----
 COPY wheels/ /tmp/wheels/
@@ -127,11 +128,17 @@ ENV CUDA_HOME=/usr/local/cuda \
 # Smoke-import to fail fast on ABI mismatches at build time.
 # Note: flash_attn ships FA2 kernels, flash_attn_3 is the separate FA3 Hopper
 # package, and flash-attn-4 owns flash_attn.cute for CuTe DSL kernels.
-RUN python -c "\
+RUN python -m pip check && python -c "\
 from importlib import metadata; \
 assert metadata.version('apache-tvm-ffi') == '0.1.13.post5'; \
 assert metadata.version('flash-attn') == '2.8.3'; \
 assert metadata.version('flash-attn-4') == '4.0.0b23'; \
+assert metadata.version('nvidia-cutlass-dsl') == '4.6.0.dev0'; \
+assert metadata.version('quack-kernels') == '0.5.3'; \
+fa2_files = {str(path) for path in metadata.distribution('flash-attn').files or ()}; \
+fa4_files = {str(path) for path in metadata.distribution('flash-attn-4').files or ()}; \
+assert not any(path.startswith('flash_attn/cute/') for path in fa2_files); \
+assert 'flash_attn/cute/utils.py' in fa4_files; \
 import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \
 import transformer_engine.pytorch; \

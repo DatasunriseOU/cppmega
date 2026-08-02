@@ -1,5 +1,16 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: FA2 no longer overwrites the FA4 beta23 namespace
+
+The released FA2 wheel unexpectedly bundled `flash_attn.cute`; because local
+wheels install after `flash-attn-4`, its older `cute.core.ThrMma` annotations
+overwrote the beta23 sources and broke the immutable image import smoke. The
+existing upstream patch now excludes `flash_attn.cute` and its descendants,
+and the wheel workflow rejects any FA2 artifact that still contains that
+namespace. The final image also runs `pip check`, verifies FA2/FA4 RECORD
+ownership, and pins the beta23-compatible `quack-kernels==0.5.3`; FA4 remains
+on its own exact CUTLASS 4.6.0.dev0 dependency contract.
+
 ## 2026-08-02: Linux contract tests use runner tmpfs
 
 The self-hosted Linux lane now places per-run Python temporary files in an

@@ -559,11 +559,10 @@ jobs:
           # kvcache path (inference-only), so a runtime check is fine.
           sed -i 's|run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);|TORCH_CHECK(false, "flash_attn splitkv path disabled in cppmega CI build");|' \
               csrc/flash_attn/flash_api.cpp
-          # 4) Keep FA4 out of this wheel. Upstream excludes flash_attn.cute
-          # because FA4 ships as the separate flash-attn-4 package with its
-          # own nvidia-cutlass-dsl/quack dependency contract. Forcing cute into
-          # flash-attn produced an import surface that looked present but
-          # failed at runtime against modern CUTLASS Python.
+          # 4) The repository patch excludes flash_attn.cute because FA4 ships
+          # as the separate flash-attn-4 package with its own CUTLASS/quack
+          # dependency contract. Otherwise this wheel overwrites beta23 with
+          # the older bundled CuTe sources when the image installs local wheels.
           echo "HEADDIM_SWITCH restricted to {64,128}; splitkv stubbed; survivors:"
           grep '_sm80\.cu' setup.py | sed 's/^/  /'
 
@@ -597,6 +596,29 @@ jobs:
       - name: List wheels
         if: success()
         run: ls -lh wheels/
+
+      - name: Verify FA2 wheel excludes FA4 namespace
+        if: success() && matrix.name == 'flash_attn'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("wheels").glob("flash_attn-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one FA2 wheel, found {wheels!r}")
+          with ZipFile(wheels[0]) as archive:
+              leaked = sorted(
+                  name
+                  for name in archive.namelist()
+                  if name.startswith("flash_attn/cute/")
+              )
+          if leaked:
+              raise SystemExit(
+                  "FA2 wheel overwrites the separately installed FA4 namespace: "
+                  f"{leaked!r}"
+              )
+          PY
 
       - name: Smoke TileLang wheel linkage and import
         if: success() && matrix.name == 'tilelang'

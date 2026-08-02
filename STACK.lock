@@ -155,11 +155,16 @@ runtime_pypi:
 
   flash_attn_4:
     # FA4 CuTe DSL package. This installs the flash_attn.cute namespace and
-    # matching nvidia-cutlass-dsl[cu13] / quack-kernels runtime dependencies.
+    # pins nvidia-cutlass-dsl[cu13]==4.6.0.dev0. Keep quack explicit below:
+    # beta23 only declares a lower bound, so leaving it to the resolver makes
+    # an otherwise identical image rebuild mutable.
     # H100/H200 training uses FA3; FA4 is kept for the B200/GB10 CuTe path and
     # for cppmega's cute_dsl_mimo modules.
     package: "flash-attn-4[cu13]==4.0.0b23"
     extra_index_url: https://pypi.nvidia.com
+
+  quack_kernels:
+    package: "quack-kernels==0.5.3"
 
 # Repos cloned at runtime in the final image (not built as wheels).
 sources:
