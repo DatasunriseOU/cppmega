@@ -891,9 +891,6 @@ def _build_train_cmd(
             "transformer_engine",
             "--cuda-graph-scope",
             "attn",
-            "mamba",
-            "moe_router",
-            "moe_preprocess",
             "--cuda-graph-warmup-steps",
             "3",
         ]

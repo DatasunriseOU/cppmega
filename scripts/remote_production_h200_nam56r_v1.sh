@@ -119,7 +119,7 @@ DSA_LOSS_COEFF="${DSA_LOSS_COEFF:-0.001}"
 # Variant overrides
 # ---------------------------------------------------------------------------
 EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act"
-CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
+CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn --cuda-graph-warmup-steps 3"
 USE_PIPE_PATTERN=1
 
 case "${VARIANT}" in
