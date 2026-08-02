@@ -1348,7 +1348,7 @@ if _modal is not None:
     )
 
     @_modal_app.function(
-        image=_modal_image(),
+        image=_modal_image() if _modal.is_local() else None,
         gpu=_MODAL_GPU_SPEC,
         timeout=600,
         volumes={"/results": _results_vol},
