@@ -10,7 +10,6 @@ Real data is used only if it is already present on the volume. Otherwise the
 app creates an indexed Megatron dataset under /vol/mock_data and labels the
 run as synthetic_full_shape_mock_data in every result artifact.
 """
-# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -302,7 +301,7 @@ def _run_streaming(
                 pass
             rc = proc.wait(timeout=10)
             status = "timeout"
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
@@ -346,7 +345,7 @@ def _module_probe(name: str) -> dict[str, Any]:
         row["version"] = getattr(mod, "__version__", None)
         row["has_flash_attn_func"] = hasattr(mod, "flash_attn_func")
         row["has_flash_attn_varlen_func"] = hasattr(mod, "flash_attn_varlen_func")
-    except Exception as exc:  # pragma: no cover - runs inside Modal image.
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover - native import probe.
         row["error"] = repr(exc)
     return row
 
@@ -362,7 +361,7 @@ def _backend_policy_for_probe(probe: dict[str, Any]) -> dict[str, Any]:
             "blocked_reason": None if probe.get("fa3_usable") else "FA3_MISSING_OR_UNUSABLE",
         }
     if any(cap[0] >= 10 or cap == [12, 0] or cap == [12, 1] for cap in capabilities) or re.search(
-        r"\b(B200|B300|GB10)\b", names, re.I
+        r"\b(B200|B300|GB10)\b", names, re.IGNORECASE
     ):
         return {
             "family": "blackwell",
@@ -649,16 +648,19 @@ def _resolve_dataset() -> dict[str, Any]:
             if path.exists():
                 discovered.append(str(path))
     for data_path, tokenizer in candidates:
-        if pathlib.Path(data_path + ".idx").exists() and pathlib.Path(data_path + ".bin").exists():
-            if pathlib.Path(tokenizer, "tokenizer.json").exists():
-                return {
-                    "kind": "production_real_data",
-                    "data_path": data_path,
-                    "tokenizer": tokenizer,
-                    "note": "real Megatron indexed dataset and HF tokenizer found on Modal volume",
-                    "checked_candidates": [f"{data} :: {tok}" for data, tok in candidates],
-                    "discovered_existing_volume_paths": discovered,
-                }
+        if (
+            pathlib.Path(data_path + ".idx").exists()
+            and pathlib.Path(data_path + ".bin").exists()
+            and pathlib.Path(tokenizer, "tokenizer.json").exists()
+        ):
+            return {
+                "kind": "production_real_data",
+                "data_path": data_path,
+                "tokenizer": tokenizer,
+                "note": "real Megatron indexed dataset and HF tokenizer found on Modal volume",
+                "checked_candidates": [f"{data} :: {tok}" for data, tok in candidates],
+                "discovered_existing_volume_paths": discovered,
+            }
 
     data_prefix = "/vol/mock_data/clang_semantic_4k_v10_train"
     tokenizer = "/vol/mock_tokenizer"
@@ -941,7 +943,7 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
     text = log_path.read_text(errors="replace") if log_path.exists() else ""
     elapsed_ms = [
         float(m.group(1))
-        for m in re.finditer(r"elapsed time per iteration \(ms\):\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+        for m in re.finditer(r"elapsed time per iteration \(ms\):\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
     ]
     warm_elapsed_ms_excl_first = elapsed_ms[1:] if len(elapsed_ms) > 1 else []
     warm_elapsed_ms_excl_first3 = elapsed_ms[3:] if len(elapsed_ms) > 3 else []
@@ -950,7 +952,7 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
         r"(?:tokens/sec|tok/sec|tokens per second|tokens/s)[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)",
         r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/sec|tok/sec|tokens per second|tokens/s)",
     ):
-        tok_sec_values.extend(float(m.group(1)) for m in re.finditer(pattern, text, re.I))
+        tok_sec_values.extend(float(m.group(1)) for m in re.finditer(pattern, text, re.IGNORECASE))
     computed_tok_sec = None
     if elapsed_ms:
         computed_tok_sec = tokens_per_iter / (elapsed_ms[-1] / 1000.0)
@@ -972,19 +974,19 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
     ]
     iterations = [int(m.group(1)) for m in re.finditer(r"iteration\s+([0-9]+)\s*/", text)]
     metric_float = r"([+-]?(?:nan|inf|infinity|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?))"
-    lm_losses = [_parse_metric_float(m.group(1)) for m in re.finditer(r"\blm loss:\s*" + metric_float, text, re.I)]
+    lm_losses = [_parse_metric_float(m.group(1)) for m in re.finditer(r"\blm loss:\s*" + metric_float, text, re.IGNORECASE)]
     mtp_losses = [
         _parse_metric_float(m.group(2))
-        for m in re.finditer(r"\b(mtp_[0-9]+ loss):\s*" + metric_float, text, re.I)
+        for m in re.finditer(r"\b(mtp_[0-9]+ loss):\s*" + metric_float, text, re.IGNORECASE)
     ]
-    grad_norms = [_parse_metric_float(m.group(1)) for m in re.finditer(r"\bgrad norm:\s*" + metric_float, text, re.I)]
+    grad_norms = [_parse_metric_float(m.group(1)) for m in re.finditer(r"\bgrad norm:\s*" + metric_float, text, re.IGNORECASE)]
     skipped_iterations = [
         int(m.group(1))
-        for m in re.finditer(r"number of skipped iterations:\s*([0-9]+)", text, re.I)
+        for m in re.finditer(r"number of skipped iterations:\s*([0-9]+)", text, re.IGNORECASE)
     ]
     nan_iterations = [
         int(m.group(1))
-        for m in re.finditer(r"number of nan iterations:\s*([0-9]+)", text, re.I)
+        for m in re.finditer(r"number of nan iterations:\s*([0-9]+)", text, re.IGNORECASE)
     ]
     import math
 
@@ -1010,23 +1012,23 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
     te_rejection_lines = [
         line
         for line in te_debug_lines
-        if re.search(r"(disable|reject|unavailable|not available|not supported|reason|no .*backend)", line, re.I)
+        if re.search(r"(disable|reject|unavailable|not available|not supported|reason|no .*backend)", line, re.IGNORECASE)
     ]
     te_selected_backend = None
     for line in te_debug_lines:
-        selected = re.search(r"Selected backend\s*=\s*([^,\n]+)", line, re.I)
+        selected = re.search(r"Selected backend\s*=\s*([^,\n]+)", line, re.IGNORECASE)
         if selected:
             te_selected_backend = selected.group(1).strip()
-        elif re.search(r"FusedAttention.*sub-backend|selected.*FusedAttention|using.*FusedAttention", line, re.I):
+        elif re.search(r"FusedAttention.*sub-backend|selected.*FusedAttention|using.*FusedAttention", line, re.IGNORECASE):
             te_selected_backend = "FusedAttention"
-        elif re.search(r"selected.*FlashAttention|using.*FlashAttention", line, re.I):
+        elif re.search(r"selected.*FlashAttention|using.*FlashAttention", line, re.IGNORECASE):
             te_selected_backend = "FlashAttention"
-        elif re.search(r"selected.*UnfusedDotProductAttention|using.*UnfusedDotProductAttention", line, re.I):
+        elif re.search(r"selected.*UnfusedDotProductAttention|using.*UnfusedDotProductAttention", line, re.IGNORECASE):
             te_selected_backend = "UnfusedDotProductAttention"
     mamba_backward_markers = [
         line
         for line in text.splitlines()
-        if re.search(r"(mamba3.*bwd|mamba.*backward|mamba_mimo_bwd|mamba3_mimo_bwd|tilelang.*mamba)", line, re.I)
+        if re.search(r"(mamba3.*bwd|mamba.*backward|mamba_mimo_bwd|mamba3_mimo_bwd|tilelang.*mamba)", line, re.IGNORECASE)
     ]
     return {
         "iterations_seen": max(iterations) if iterations else 0,
@@ -1152,12 +1154,12 @@ def backend_preflight(run_id: str = "") -> dict[str, Any]:
     retries=0,
 )
 def preflight(run_id: str = "") -> dict[str, Any]:
-    import torch
-    import transformer_engine
-    import transformer_engine.pytorch  # noqa: F401
     import flash_attn  # noqa: F401
     import mamba_ssm  # noqa: F401
     import tilelang
+    import torch
+    import transformer_engine
+    import transformer_engine.pytorch
 
     run_id = run_id or f"preflight_{_utc_stamp()}"
     out_dir = pathlib.Path("/vol") / BENCH_DIR.lstrip("/") / run_id
