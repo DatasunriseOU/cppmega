@@ -1206,13 +1206,18 @@ P3 — стратегическое/отложенное.
 - **Проверка:** `artifacts/mamba3_wave32_h200_20step_gate/backend_preflight_20260801T223952Z/backend_probe.json`:
   `fa3_usable: true`, `fa4_usable: true`, `image_ref: ghcr.io/datasunriseou/cppmega:459a574`.
 
-## [P092] wave32 20-step gate: перепрогон
+## [P092] wave32 20-step gate: перепрогон — DONE
 - Репо: cppmega | Приоритет: P1 | Тип: task | Зависит от: P091
-- **Где:** `artifacts/mamba3_wave32_h200_20step_gate/` (summary пустой,
-  fallback: 1 шаг ok, loss 11.41, grad norm = NaN).
-- **Что делать:** перепрогнать gate на новом образе; разобрать NaN grad norm
-  в fallback-диагностике.
-- **Проверка:** непустой summary; 20 шагов без NaN; квитанция в artifacts.
+- **Что сделано:** production-shape gate на Modal H200:2
+  (`ap-MiBp5enTZcZwBTBzU1Xki9`, source `df11195c`, image `ce8d41e`) явно
+  запускает `attention_dropout=0.0`, `hidden_dropout=0.0`, FA4 и стабильный
+  CUDA graph scope `attn`. TE выбрал `FlashAttention (4.0.0b23)` для обеих
+  веток; baseline и stage2-force-nontma прошли по 20 шагов и eval.
+- **Проверка:**
+  `artifacts/mamba3_wave32_h200_20step_gate/p092_dropout0_fa4_attn_cg_gate_df11195c_20260802/`:
+  непустой `summary.md`; обе строки `status=ok`, `steps seen=20`, конечные
+  loss/grad norm, `nan iters=0`; fail-closed contract повторно принял
+  `result.json` с двумя обязательными вариантами.
 
 ## [P093] Gate-harness: fail-loud при пустом summary — DONE
 - Репо: cppmega | Приоритет: P2 | Тип: bug | Зависит от: P092
