@@ -115,6 +115,15 @@ cache, or `jq` dependency. Verification after the whole 13-commit branch was
 merged into `main`: 237 focused cppmega tests and 35 MLX sibling regressions
 passed; the independent review also passed.
 
+## 2026-08-01: H200 release gate survives container rescheduling
+
+The exact release gate now requests 128 GiB of host memory and writes running,
+JUnit, and TVM debug artifacts under the current Modal task ID. The canonical
+attempt receipt is created only for a terminal pass or failure, so a
+platform-rescheduled input no longer rejects itself because an earlier
+container left a non-terminal receipt. Receipt and JUnit prerequisite checks
+remain fail-closed.
+
 ## 2026-08-01: Mamba3 backward TMA path restored to fail-closed
 
 The Stage2 patch now preserves

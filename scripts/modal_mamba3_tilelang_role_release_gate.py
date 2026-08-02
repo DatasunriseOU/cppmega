@@ -198,8 +198,6 @@ def _result_stem(phase: str) -> str:
 _RESULT_STEM = _result_stem(_PHASE)
 _RESULT_PATH = f"/results/{_RESULT_STEM}.json"
 _JUNIT_PATH = f"/tmp/{_RESULT_STEM}.xml"
-_DURABLE_JUNIT_PATH = f"/results/{_RESULT_STEM}-junit.xml"
-_DURABLE_DEBUG_ARCHIVE_PATH = f"/results/{_RESULT_STEM}-tvm-debug.tar.gz"
 _EXPECTED_TEST_COUNT = len(_SELECTED_TESTS)
 _GPU_SPEC = "H200:2"
 _STAGE2_PATCH_REL = (
@@ -480,6 +478,7 @@ results = modal.Volume.from_name("cppmega-test-results", create_if_missing=True)
 @app.function(
     image=_image() if modal.is_local() else None,
     gpu=_GPU_SPEC,
+    memory=131_072,
     timeout=3600,
     volumes={"/results": results},
 )
@@ -492,10 +491,21 @@ def run_release_gate() -> dict[str, Any]:
     import uuid
     from importlib import metadata
 
-    def write_receipt(receipt: dict[str, Any]) -> None:
-        path = pathlib.Path(_RESULT_PATH)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(receipt, indent=2, sort_keys=True))
+    task_id = os.environ.get("MODAL_TASK_ID", "")
+    if re.fullmatch(r"ta-[0-9A-Za-z]+", task_id) is None:
+        raise RuntimeError(f"invalid Modal task id: {task_id!r}")
+    progress_path = f"/results/{_RESULT_STEM}-{task_id}-running.json"
+    durable_junit_path = f"/results/{_RESULT_STEM}-{task_id}-junit.xml"
+    durable_debug_archive_path = f"/results/{_RESULT_STEM}-{task_id}-tvm-debug.tar.gz"
+
+    def write_receipt(receipt: dict[str, Any], *target_paths: str) -> None:
+        payload = json.dumps(receipt, indent=2, sort_keys=True)
+        for target_path in target_paths:
+            path = pathlib.Path(target_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(payload)
+            temporary.replace(path)
         results.commit()
 
     def persist_junit() -> dict[str, Any]:
@@ -504,15 +514,14 @@ def run_release_gate() -> dict[str, Any]:
             return {
                 "present": False,
                 "temporary_path": _JUNIT_PATH,
-                "durable_path": _DURABLE_JUNIT_PATH,
+                "durable_path": durable_junit_path,
             }
-        destination = pathlib.Path(_DURABLE_JUNIT_PATH)
+        destination = pathlib.Path(durable_junit_path)
         destination.write_bytes(source.read_bytes())
-        results.commit()
         return {
             "present": True,
             "temporary_path": _JUNIT_PATH,
-            "durable_path": _DURABLE_JUNIT_PATH,
+            "durable_path": durable_junit_path,
             "size_bytes": destination.stat().st_size,
             "sha256": sha256_path(destination),
         }
@@ -532,17 +541,16 @@ def run_release_gate() -> dict[str, Any]:
             return {
                 "present": False,
                 "source_root": str(root),
-                "durable_path": _DURABLE_DEBUG_ARCHIVE_PATH,
+                "durable_path": durable_debug_archive_path,
                 "files": [],
             }
-        destination = pathlib.Path(_DURABLE_DEBUG_ARCHIVE_PATH)
+        destination = pathlib.Path(durable_debug_archive_path)
         with tarfile.open(destination, "w:gz") as archive:
             archive.add(root, arcname=root.name, recursive=True)
-        results.commit()
         return {
             "present": True,
             "source_root": str(root),
-            "durable_path": _DURABLE_DEBUG_ARCHIVE_PATH,
+            "durable_path": durable_debug_archive_path,
             "size_bytes": destination.stat().st_size,
             "sha256": sha256_path(destination),
             "files": inventory,
@@ -997,22 +1005,39 @@ def run_release_gate() -> dict[str, Any]:
             expected_test_count = len(expected_tests)
             stem = _result_stem(phase)
             path = pathlib.Path(f"/results/{stem}.json")
-            junit_path = pathlib.Path(f"/results/{stem}-junit.xml")
-            if not path.is_file() or not junit_path.is_file():
+            if not path.is_file():
                 raise RuntimeError(
-                    "required prior phase receipt/JUnit is missing: "
-                    f"phase={phase}, receipt={path}, junit={junit_path}"
+                    "required prior phase receipt is missing: "
+                    f"phase={phase}, receipt={path}"
                 )
             prior = json.loads(path.read_text())
             junit_artifact = prior.get("junit_artifact")
             if (
                 not isinstance(junit_artifact, dict)
                 or junit_artifact.get("present") is not True
-                or junit_artifact.get("durable_path") != str(junit_path)
+                or not isinstance(junit_artifact.get("durable_path"), str)
             ):
                 raise RuntimeError(
                     "prior phase durable JUnit artifact contract mismatch: "
                     f"phase={phase}, artifact={junit_artifact!r}"
+                )
+            junit_path = pathlib.Path(junit_artifact["durable_path"])
+            if (
+                junit_path.parent != pathlib.Path("/results")
+                or re.fullmatch(
+                    rf"{re.escape(stem)}-ta-[0-9A-Za-z]+-junit\.xml",
+                    junit_path.name,
+                )
+                is None
+            ):
+                raise RuntimeError(
+                    "prior phase durable JUnit path contract mismatch: "
+                    f"phase={phase}, junit={junit_path}"
+                )
+            if not junit_path.is_file():
+                raise RuntimeError(
+                    "required prior phase JUnit is missing: "
+                    f"phase={phase}, junit={junit_path}"
                 )
             validated_junit = validate_exact_junit(
                 junit_path,
@@ -1127,22 +1152,14 @@ def run_release_gate() -> dict[str, Any]:
         return verify_phase_artifact(str(_PREREQUISITE_PHASE))
 
     started = time.time()
-    existing_outputs = [
-        path
-        for path in (
-            pathlib.Path(_RESULT_PATH),
-            pathlib.Path(_DURABLE_JUNIT_PATH),
-            pathlib.Path(_DURABLE_DEBUG_ARCHIVE_PATH),
-        )
-        if path.exists()
-    ]
-    if existing_outputs:
+    result_path = pathlib.Path(_RESULT_PATH)
+    if result_path.exists():
         raise RuntimeError(
             "refusing to overwrite an existing exact gate attempt; select a "
-            f"new CPPMEGA_H200_GATE_ATTEMPT: {existing_outputs!r}"
+            f"new CPPMEGA_H200_GATE_ATTEMPT: {[result_path]!r}"
         )
     receipt: dict[str, Any] = {
-        "schema_version": 7,
+        "schema_version": 8,
         "run_id": str(uuid.uuid4()),
         "attempt": f"release-{_CANDIDATE_CPPMEGA_SHA[:8]}-{_PHASE}-{_ATTEMPT}",
         "gate_kind": "release-image",
@@ -1150,7 +1167,8 @@ def run_release_gate() -> dict[str, Any]:
         "modal": {
             "function_call_id": modal.current_function_call_id(),
             "input_id": modal.current_input_id(),
-            "task_id": os.environ.get("MODAL_TASK_ID"),
+            "task_id": task_id,
+            "progress_path": progress_path,
         },
         "status": "running",
         "candidate": {
@@ -1209,7 +1227,7 @@ def run_release_gate() -> dict[str, Any]:
             ),
         },
     }
-    write_receipt(receipt)
+    write_receipt(receipt, progress_path)
     command = [
         sys.executable,
         "-m",
@@ -1424,7 +1442,7 @@ def run_release_gate() -> dict[str, Any]:
                 "elapsed_seconds": round(time.time() - started, 3),
             }
         )
-        write_receipt(receipt)
+        write_receipt(receipt, progress_path, _RESULT_PATH)
         raise RuntimeError(json.dumps(receipt, indent=2, sort_keys=True)) from exc
 
     receipt.update(
@@ -1433,7 +1451,7 @@ def run_release_gate() -> dict[str, Any]:
             "elapsed_seconds": round(time.time() - started, 3),
         }
     )
-    write_receipt(receipt)
+    write_receipt(receipt, progress_path, _RESULT_PATH)
     return receipt
 
 
