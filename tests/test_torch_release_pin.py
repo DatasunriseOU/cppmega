@@ -92,6 +92,24 @@ def test_te216_fa2_pin_stays_within_the_supported_range() -> None:
         ), path
 
 
+def test_te216_and_mamba_runtime_metadata_are_complete() -> None:
+    stack = _read("STACK.lock")
+    workflow = _read(".github/workflows/build-wheels.yml")
+    metadata_patch = _read("upstream_prs/mamba_setup_tilelang_019.patch")
+
+    for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
+        dockerfile = _read(path)
+        assert "importlib-metadata nvdlfw-inspect" in dockerfile, path
+        assert "python -m pip check" in dockerfile, path
+    assert "metadata_patch: upstream_prs/mamba_setup_tilelang_019.patch" in stack
+    assert (
+        "metadata_patch: upstream_prs/mamba_setup_tilelang_019.patch" in workflow
+    )
+    assert '-        "tilelang==0.1.8",' in metadata_patch
+    assert '+        "tilelang==0.1.9",' in metadata_patch
+    assert 'required_tilelang = "Requires-Dist: tilelang==0.1.9"' in workflow
+
+
 def test_fa4_h200_gate_exercises_visible_bias_and_is_not_mislabeled() -> None:
     source = _read("scripts/modal_fa4_beta23_parity.py")
 

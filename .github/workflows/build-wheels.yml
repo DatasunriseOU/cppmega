@@ -141,6 +141,7 @@ jobs:
             ref: 31f3d7baba69d0ccad1635ace1e477367899e408
             submodules: "false"
             patch: upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch
+            metadata_patch: upstream_prs/mamba_setup_tilelang_019.patch
             extra_env: "MAMBA_FORCE_BUILD=TRUE MAX_JOBS=1 NVCC_THREADS=2"
           - name: causal_conv1d
             repo: Dao-AILab/causal-conv1d
@@ -482,6 +483,15 @@ jobs:
             exit 1
           fi
 
+      - name: Align Mamba wheel with the pinned TileLang runtime
+        if: matrix.name == 'mamba_ssm'
+        run: |
+          set -euo pipefail
+          cd src
+          PATCH="$GITHUB_WORKSPACE/${{ matrix.metadata_patch }}"
+          git apply --check "$PATCH"
+          git apply --verbose "$PATCH"
+
       - name: Trim flash_attn FA2 kernel matrix
         # FA2 setup.py has no DISABLE_* knobs — kernel list is hardcoded as
         # 6 hdims × 2 dtypes (fp16/bf16) × 2 causal × 2 (fwd/bwd) = 48 .cu
@@ -704,6 +714,21 @@ jobs:
               ],
           }
           with zipfile.ZipFile(wheels[0]) as archive:
+              metadata_paths = [
+                  path
+                  for path in archive.namelist()
+                  if path.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_paths) != 1:
+                  raise SystemExit(
+                      f"expected one Mamba METADATA file, found {metadata_paths!r}"
+                  )
+              metadata = archive.read(metadata_paths[0]).decode().splitlines()
+              required_tilelang = "Requires-Dist: tilelang==0.1.9"
+              if required_tilelang not in metadata:
+                  raise SystemExit(
+                      f"{metadata_paths[0]} lacks {required_tilelang!r}"
+                  )
               for path, markers in required.items():
                   wheel_bytes = archive.read(path)
                   text = wheel_bytes.decode()

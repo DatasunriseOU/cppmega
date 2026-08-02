@@ -55,6 +55,7 @@ RUN python -m pip install --extra-index-url ${TORCH_INDEX} \
         huggingface_hub transformers tokenizers datasets accelerate \
         tensorboard wandb tqdm pytest \
         liger-kernel "z3-solver==4.15.4.0" \
+        importlib-metadata nvdlfw-inspect \
         onnx onnxscript \
         apache-tvm-ffi==0.1.13 \
         nvidia-nccl-cu13
