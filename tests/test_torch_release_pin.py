@@ -137,7 +137,9 @@ def test_fa4_h200_document_gate_uses_the_immutable_runtime_stack() -> None:
     assert "fix_cutlass_namespace.py" not in source
     assert "setup_commands" not in source
     assert "_wheels_vol" not in source
-    assert "image=_modal_image() if _modal.is_local() else None" in source
+    assert "_modal.is_local()" in source
+    assert 'os.environ.get("MODAL_IS_REMOTE") != "1"' in source
+    assert '"exact_pass": False' in source
     assert "return out.reshape_as(q)" in source
     assert "_EXPECTED_H200_TEST_COUNT = 12" in source
     assert "CPPMEGA_FA4_PARITY_FILTER" not in source

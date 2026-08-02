@@ -1337,7 +1337,11 @@ if _modal is not None:
     )
 
     @_modal_app.function(
-        image=_modal_image() if _modal.is_local() else None,
+        image=(
+            _modal_image()
+            if _modal.is_local() and os.environ.get("MODAL_IS_REMOTE") != "1"
+            else None
+        ),
         gpu=_MODAL_GPU_SPEC,
         timeout=600,
         volumes={"/results": _results_vol},
@@ -1447,6 +1451,8 @@ print(json.dumps({
             return finish(
                 {
                     "returncode": 2,
+                    "exact_pass": False,
+                    "expected_test_count": _EXPECTED_H200_TEST_COUNT,
                     "gpu": _MODAL_GPU_SPEC,
                     "probe_stdout": probe.stdout,
                     "probe_stderr_tail": "\n".join(probe.stderr.splitlines()[-80:]),
