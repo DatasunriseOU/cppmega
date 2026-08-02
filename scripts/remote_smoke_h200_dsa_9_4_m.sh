@@ -540,9 +540,9 @@ if [[ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" == alltoall* ]]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# CUDA graphs — full scope verified stable with lr warmup.
+# CUDA graphs — attention-only is the measured stable NAM56R scope.
 if [ -z "${CG_FLAGS+x}" ]; then
-  CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess"
+  CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn"
 elif [ "${CG_FLAGS}" = "NONE" ]; then
   CG_FLAGS=""
 fi
