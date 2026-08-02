@@ -1,6 +1,21 @@
 from cppmega.megatron.nam56r_layout import load_attention_layer_numbers, load_dsa_a_layer_ranks
 
 
+def test_selective_mamba_mixer_accepts_megatron_name_kwarg():
+    """core_v0.18.0 build_module propagates name= through the HybridStack chain."""
+    import inspect
+
+    from cppmega.megatron.nam56r_full_spec import (
+        CppMegaSelectiveAttentionLayer,
+        CppMegaSelectiveMambaMixer,
+    )
+
+    for cls in (CppMegaSelectiveMambaMixer, CppMegaSelectiveAttentionLayer):
+        params = inspect.signature(cls.__init__).parameters
+        assert "name" in params, cls.__name__
+        assert params["name"].default is None, cls.__name__
+
+
 def test_load_attention_layer_numbers_matches_nam56r_a_positions(monkeypatch):
     monkeypatch.setenv("CPPMEGA_NEM_PATTERN", "AEMEAEMEAEMR")
     monkeypatch.setenv("CPPMEGA_LAYER_DEPTH", "52")

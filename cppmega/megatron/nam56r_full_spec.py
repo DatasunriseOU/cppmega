@@ -103,8 +103,12 @@ class CppMegaSelectiveMambaMixer(nn.Module):
         pg_collection=None,
         pp_layer_offset: int = 0,
         r_layer_indices: Iterable[int] = (),
+        name: str | None = None,
     ) -> None:
         super().__init__()
+        # Megatron core_v0.18.0 build_module propagates ``name`` through the
+        # HybridStack instantiation chain; accept and ignore it here.
+        del name
         indices = frozenset(int(index) for index in r_layer_indices)
         layer_idx = 1 if layer_number is None else layer_number
         mamba3_cls = _select_mamba3_mixer_cls()
@@ -162,8 +166,12 @@ class CppMegaSelectiveAttentionLayer(TransformerLayer):
         is_mtp_layer: bool = False,
         dsa_a_layer_ranks: Iterable[int] = (),
         attention_layer_numbers: Iterable[int] = (),
+        name: str | None = None,
     ) -> None:
         del submodules
+        # Megatron core_v0.18.0 build_module propagates ``name`` through the
+        # HybridStack instantiation chain; accept and ignore it here.
+        del name
         dsa_a_layer_ranks = frozenset(int(x) for x in dsa_a_layer_ranks)
         attention_layer_numbers = tuple(int(x) for x in attention_layer_numbers)
         layer_idx = 1 if layer_number is None else int(layer_number)

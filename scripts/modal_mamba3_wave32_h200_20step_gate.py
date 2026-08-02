@@ -463,6 +463,12 @@ def _write_workdir(workdir: pathlib.Path) -> None:
     (workdir / "mamba_builders.py").write_text(
         "from cppmega.megatron.mamba_builder import cppmega_mamba_builder as mamba_builder\n"
     )
+    # core_v0.18.0's pretrain_hybrid.py imports `from hybrid_builders import
+    # hybrid_builder` and feeds it the factory named by --spec without calling
+    # it; shadow the module so the factory-aware cppmega builder is used.
+    (workdir / "hybrid_builders.py").write_text(
+        "from cppmega.megatron.mamba_builder import cppmega_mamba_builder as hybrid_builder\n"
+    )
     (workdir / "model_provider.py").write_text(
         "from megatron.training import get_args, print_rank_0\n"
         "def count_parameters_in_layer(model, layer_name):\n"
@@ -1243,6 +1249,14 @@ def gate(
         require_variant_rows(result)
         return result
     dataset = _resolve_dataset()
+    if dataset.get("kind") == "synthetic_full_shape_mock_data":
+        # Synthetic mock text carries no structure sidecars; the fail-closed
+        # structure embedding (cppmega/features/structure/embedding.py) would
+        # abort the run. Disable it and record the degraded coverage instead.
+        env["CPPMEGA_STRUCTURE_ENABLED"] = "0"
+        dataset["structure_embedding"] = (
+            "disabled: synthetic mock data has no structure sidecars"
+        )
 
     result: dict[str, Any] = {
         "run_id": run_id,
@@ -1359,6 +1373,14 @@ def debug_sweep(
     env["NVTE_DEBUG_LEVEL"] = "2"
     backend_probe = _backend_probe()
     dataset = _resolve_dataset()
+    if dataset.get("kind") == "synthetic_full_shape_mock_data":
+        # Synthetic mock text carries no structure sidecars; the fail-closed
+        # structure embedding (cppmega/features/structure/embedding.py) would
+        # abort the run. Disable it and record the degraded coverage instead.
+        env["CPPMEGA_STRUCTURE_ENABLED"] = "0"
+        dataset["structure_embedding"] = (
+            "disabled: synthetic mock data has no structure sidecars"
+        )
 
     result: dict[str, Any] = {
         "run_id": run_id,
