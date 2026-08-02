@@ -4,7 +4,6 @@ import json
 import re
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOSTED_RUNNER = re.compile(
     r"^\s*runs-on:\s*.*(?:ubuntu|macos|windows)-latest\s*$",
@@ -193,6 +192,10 @@ def test_linux_lane_writes_a_pre_python_failure_receipt() -> None:
     assert "trap 'on_pre_python_error' ERR" in linux
     assert '"schema_version": "cppmega.repository-ci.v1"' in linux
     assert '"failure_stage": "workflow-preamble"' in linux
+    assert 'pre_python_step="allocate tmpfs test workspace"' in linux
+    assert 'mktemp -d "/dev/shm/cppmega-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX"' in linux
+    assert 'trap \'rm -rf -- "${test_tmpdir}"\' EXIT' in linux
+    assert 'export TMPDIR="${test_tmpdir}"' in linux
     assert 'pre_python_step="checkout matches GITHUB_SHA"' in linux
     assert 'pre_python_step="verify tokenizer contract"' in linux
     # the trap is disarmed before the orchestrator writes its own receipts

@@ -131,6 +131,10 @@ jobs:
             exit "${exit_code}"
           }
           trap 'on_pre_python_error' ERR
+          pre_python_step="allocate tmpfs test workspace"
+          test_tmpdir="$(mktemp -d "/dev/shm/cppmega-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX")"
+          trap 'rm -rf -- "${test_tmpdir}"' EXIT
+          export TMPDIR="${test_tmpdir}"
           pre_python_step="checkout matches GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           pre_python_step="resolve expected source tree"

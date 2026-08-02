@@ -1,5 +1,12 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: Linux contract tests use runner tmpfs
+
+The self-hosted Linux lane now places per-run Python temporary files in an
+isolated `/dev/shm` directory and removes it on exit. This keeps SQLite-heavy
+stream merge tests off the Legion runner's contended NVMe while preserving
+durable lane receipts under `RUNNER_TEMP`.
+
 ## 2026-08-02: TileLang stable fragment-owner inference candidate
 
 The exact TileLang source is now
