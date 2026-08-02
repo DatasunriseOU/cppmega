@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "report": "fp8_amax_cuda_control_run_2026_08_02",
+  "timestamp": "2026-08-02T00:34:02.734831+00:00",
+  "image": "ghcr.io/datasunriseou/cppmega:459a574",
+  "gpu": "H200:1",
+  "megatron_head": "ba7b5ebce12af60627a80985792a1449ce45f46c",
+  "pytest_target": "tests/test_fp8_amax_tilelang.py",
+  "pytest_args": "-q --tb=short -rs",
+  "returncode": 0,
+  "summary": "20 passed, 20 warnings in 87.86s",
+  "note": "tests/test_fp8_amax_tilelang.py (18 + Triton-parity) on H200; mlx[cuda] overlay for cppmega_mlx import; Metal fallback path does not affect the CUDA atomic path."
+}
