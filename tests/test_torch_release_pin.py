@@ -104,6 +104,20 @@ def test_fa4_h200_gate_exercises_visible_bias_and_is_not_mislabeled() -> None:
     assert "test_megatron_training_step" not in source
 
 
+def test_fa4_h200_document_gate_uses_the_immutable_runtime_stack() -> None:
+    source = _read("tests/test_fa4_h200_parity.py")
+
+    assert "CPPMEGA_CANDIDATE_IMAGE_DIGEST" in source
+    assert "CPPMEGA_CANDIDATE_CPPMEGA_SHA" in source
+    assert "/opt/cppmega-image-source.json" in source
+    assert 'metadata.distribution("flash-attn")' in source
+    assert 'metadata.distribution("flash-attn-4")' in source
+    assert "[sys.executable, \"-m\", \"pip\", \"check\"]" in source
+    assert "fix_cutlass_namespace.py" not in source
+    assert "setup_commands" not in source
+    assert "_wheels_vol" not in source
+
+
 def test_h200_images_include_dependency_free_bundle_restore_runtime() -> None:
     for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
         dockerfile = _read(path)

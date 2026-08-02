@@ -30,6 +30,8 @@ from __future__ import annotations
 import math
 import multiprocessing
 import os
+import re
+import subprocess
 import sys
 import traceback
 from contextlib import contextmanager
@@ -1242,11 +1244,13 @@ class TestBiasEquivalenceCPU:
 # Modal entrypoint (run as: modal run tests/test_fa4_h200_parity.py)
 # ---------------------------------------------------------------------------
 
-# Direct OCI manifest built from
-# wheels-dbfe51e1b9173e8cc9550c6b269da2c8d20c7f39.
-_GHCR_IMAGE_DIGEST = (
-    "sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc"
+# The candidate override is mandatory for release evidence; the historical
+# digest remains only so CPU collection does not require Modal credentials.
+_GHCR_IMAGE_DIGEST = os.environ.get(
+    "CPPMEGA_CANDIDATE_IMAGE_DIGEST",
+    "sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc",
 )
+_CANDIDATE_CPPMEGA_SHA = os.environ.get("CPPMEGA_CANDIDATE_CPPMEGA_SHA", "")
 _DEFAULT_H200_TEST_FILTER = (
     "all_gradients_combined or "
     "context_parallel_global_document_forward_backward_parity or "
@@ -1265,6 +1269,23 @@ def _modal_image():
     import modal
 
     _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", _GHCR_IMAGE_DIGEST) is None:
+        raise RuntimeError("CPPMEGA_CANDIDATE_IMAGE_DIGEST must be an OCI digest")
+    if _CANDIDATE_CPPMEGA_SHA:
+        if re.fullmatch(r"[0-9a-f]{40}", _CANDIDATE_CPPMEGA_SHA) is None:
+            raise RuntimeError(
+                "CPPMEGA_CANDIDATE_CPPMEGA_SHA must be a full commit SHA"
+            )
+        local_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_REPO_ROOT,
+            text=True,
+        ).strip()
+        if local_sha != _CANDIDATE_CPPMEGA_SHA:
+            raise RuntimeError(
+                "FA4 parity source/image candidate mismatch: "
+                f"local={local_sha} candidate={_CANDIDATE_CPPMEGA_SHA}"
+            )
     GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/datasunriseou/cppmega")
     GHCR_REF = f"{GHCR_REPO}@{_GHCR_IMAGE_DIGEST}"
 
@@ -1279,18 +1300,13 @@ def _modal_image():
                 "CPPMEGA_FA4_PARITY_FILTER",
                 _DEFAULT_H200_TEST_FILTER,
             ),
+            "CPPMEGA_CANDIDATE_CPPMEGA_SHA": _CANDIDATE_CPPMEGA_SHA,
             "CPPMEGA_SOURCE_IMAGE_REF": GHCR_REF,
             "MEGATRON_LM_REPO": "/opt/megatron-lm",
             "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
             "WANDB_MODE": "disabled",
         }
     )
-    img = img.add_local_file(
-        str(_REPO_ROOT / "scripts" / "fix_cutlass_namespace.py"),
-        remote_path="/opt/fix_cutlass_namespace.py",
-        copy=True,
-    )
-    img = img.pip_install("pytest")
     img = (
         img.add_local_dir(
             str(_REPO_ROOT / "cppmega"),
@@ -1330,13 +1346,12 @@ if _modal is not None:
     _results_vol = _modal.Volume.from_name(
         "cppmega-test-results", create_if_missing=True
     )
-    _wheels_vol = _modal.Volume.from_name("cppmega-wheels").read_only()
 
     @_modal_app.function(
         image=_modal_image(),
         gpu=_MODAL_GPU_SPEC,
         timeout=600,
-        volumes={"/results": _results_vol, "/wheels": _wheels_vol},
+        volumes={"/results": _results_vol},
     )
     def run_parity() -> dict:
         import inspect
@@ -1350,81 +1365,12 @@ if _modal is not None:
             _results_vol.commit()
             return result
 
-        expected_wheels = (
-            "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl",
-            "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl",
-        )
-        wheel_paths: list[str] = []
-        for wheel_name in expected_wheels:
-            matches = list(_pathlib.Path("/wheels").rglob(wheel_name))
-            if len(matches) != 1:
-                return finish(
-                    {
-                        "returncode": 2,
-                        "gpu": _MODAL_GPU_SPEC,
-                        "setup_error": (
-                            f"expected one /wheels/{wheel_name}, found {matches}"
-                        ),
-                    }
-                )
-            wheel_paths.append(str(matches[0]))
-
-        setup_commands = [
-            [sys.executable, "/opt/fix_cutlass_namespace.py"],
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--pre",
-                "--no-cache-dir",
-                "--extra-index-url",
-                "https://pypi.nvidia.com",
-                "flash-attn-4[cu13]==4.0.0b23",
-            ],
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--force-reinstall",
-                "--no-deps",
-                *wheel_paths,
-            ],
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--force-reinstall",
-                "z3-solver==4.15.4.0",
-            ],
-        ]
-        setup_log: list[str] = []
-        for setup_command in setup_commands:
-            setup = _subprocess.run(
-                setup_command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=180,
-            )
-            setup_log.extend((setup.stdout + setup.stderr).splitlines()[-20:])
-            if setup.returncode != 0:
-                return finish(
-                    {
-                        "returncode": 2,
-                        "gpu": _MODAL_GPU_SPEC,
-                        "setup_command": setup_command,
-                        "setup_log_tail": setup_log[-80:],
-                    }
-                )
-
         probe_code = """
 import hashlib
 import inspect
 import json
 import os
+import sys
 from pathlib import Path
 import subprocess
 from importlib import metadata
@@ -1434,25 +1380,48 @@ import transformer_engine
 import tvm.ffi
 from flash_attn.cute.interface import flash_attn_func
 versions = {
+    "flash-attn": metadata.version("flash-attn"),
     "flash-attn-4": metadata.version("flash-attn-4"),
     "nvidia-cutlass-dsl": metadata.version("nvidia-cutlass-dsl"),
+    "quack-kernels": metadata.version("quack-kernels"),
     "apache-tvm-ffi": metadata.version("apache-tvm-ffi"),
     "tilelang": metadata.version("tilelang"),
     "z3-solver": metadata.version("z3-solver"),
     "transformer-engine": transformer_engine.__version__,
 }
+assert versions["flash-attn"] == "2.8.3", versions
 assert versions["flash-attn-4"] == "4.0.0b23", versions
 assert versions["nvidia-cutlass-dsl"] == "4.6.0.dev0", versions
+assert versions["quack-kernels"] == "0.5.3", versions
 assert versions["apache-tvm-ffi"] == "0.1.13.post5", versions
 assert versions["tilelang"] == "0.1.9", versions
 assert versions["z3-solver"] == "4.15.4.0", versions
 assert versions["transformer-engine"].startswith("2.16"), versions
+pip_check = subprocess.run(
+    [sys.executable, "-m", "pip", "check"],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+assert pip_check.returncode == 0, pip_check.stdout + pip_check.stderr
+fa2_files = {
+    str(path) for path in metadata.distribution("flash-attn").files or ()
+}
+fa4_files = {
+    str(path) for path in metadata.distribution("flash-attn-4").files or ()
+}
+assert not any(path.startswith("flash_attn/cute/") for path in fa2_files)
+assert "flash_attn/cute/utils.py" in fa4_files
 source_paths = (
     Path("/opt/cppmega/cppmega/megatron/document_isolation.py"),
     Path("/opt/cppmega/cppmega/megatron/fa4_graph_attention.py"),
     Path("/opt/cppmega/cppmega/megatron/fa4_score_mod_adapter.py"),
     Path("/opt/cppmega/tests/test_fa4_h200_parity.py"),
 )
+image_source = json.loads(Path("/opt/cppmega-image-source.json").read_text())
+candidate_sha = os.environ["CPPMEGA_CANDIDATE_CPPMEGA_SHA"]
+if candidate_sha:
+    assert image_source["cppmega_sha"] == candidate_sha, image_source
 megatron_commit = subprocess.check_output(
     ["git", "-C", "/opt/megatron-lm", "rev-parse", "HEAD"],
     text=True,
@@ -1467,6 +1436,8 @@ print(json.dumps({
     "cuda_capability": list(torch.cuda.get_device_capability(0)),
     "cuda_total_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
     "source_image_ref": os.environ["CPPMEGA_SOURCE_IMAGE_REF"],
+    "image_source": image_source,
+    "pip_check": pip_check.stdout.strip(),
     "megatron_commit": megatron_commit,
     "source_files_sha256": {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1488,7 +1459,6 @@ print(json.dumps({
                 {
                     "returncode": 2,
                     "gpu": _MODAL_GPU_SPEC,
-                    "setup_log_tail": setup_log[-80:],
                     "probe_stdout": probe.stdout,
                     "probe_stderr_tail": "\n".join(probe.stderr.splitlines()[-80:]),
                 }
@@ -1572,7 +1542,6 @@ print(json.dumps({
             "document_mask_mod_signature": str(inspect.signature(probe_mask)),
             "pytest_command": command,
             "max_rare_per_row": int(env["CPPMEGA_FA4_MAX_RARE_PER_ROW"]),
-            "setup_log_tail": setup_log[-80:],
             "stdout_tail": "\n".join(stdout.splitlines()[-80:]),
             "stderr_tail": "\n".join(stderr.splitlines()[-30:]),
         }
@@ -1580,6 +1549,13 @@ print(json.dumps({
 
     @_modal_app.local_entrypoint()
     def main() -> None:
+        if not _CANDIDATE_CPPMEGA_SHA or (
+            "CPPMEGA_CANDIDATE_IMAGE_DIGEST" not in os.environ
+        ):
+            raise RuntimeError(
+                "release evidence requires CPPMEGA_CANDIDATE_CPPMEGA_SHA "
+                "and CPPMEGA_CANDIDATE_IMAGE_DIGEST"
+            )
         result = run_parity.remote()
         print(_json.dumps(result, indent=2))
         if not result["exact_pass"]:

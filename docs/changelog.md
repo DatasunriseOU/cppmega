@@ -9,7 +9,10 @@ existing upstream patch now excludes `flash_attn.cute` and its descendants,
 and the wheel workflow rejects any FA2 artifact that still contains that
 namespace. The final image also runs `pip check`, verifies FA2/FA4 RECORD
 ownership, and pins the beta23-compatible `quack-kernels==0.5.3`; FA4 remains
-on its own exact CUTLASS 4.6.0.dev0 dependency contract.
+on its own exact CUTLASS 4.6.0.dev0 dependency contract. The five-case H200
+document/CP parity gate now consumes the immutable candidate digest directly
+and rejects source/image mismatches instead of purging and reinstalling the
+runtime stack before testing.
 
 ## 2026-08-02: Linux contract tests use runner tmpfs
 
