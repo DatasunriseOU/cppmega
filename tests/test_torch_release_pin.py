@@ -105,8 +105,11 @@ def test_te216_and_mamba_runtime_metadata_are_complete() -> None:
     assert (
         "metadata_patch: upstream_prs/mamba_setup_tilelang_019.patch" in workflow
     )
-    assert '-        "tilelang==0.1.8",' in metadata_patch
-    assert '+        "tilelang==0.1.9",' in metadata_patch
+    assert "diff --git a/pyproject.toml b/pyproject.toml" in metadata_patch
+    assert "diff --git a/setup.py b/setup.py" in metadata_patch
+    for indent in ("    ", "        "):
+        assert f'-{indent}"tilelang==0.1.8",' in metadata_patch
+        assert f'+{indent}"tilelang==0.1.9",' in metadata_patch
     assert 'required_tilelang = "Requires-Dist: tilelang==0.1.9"' in workflow
 
 

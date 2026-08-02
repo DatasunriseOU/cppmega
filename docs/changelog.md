@@ -4,10 +4,12 @@
 
 The final image now installs TransformerEngine's declared
 `importlib-metadata` and `nvdlfw-inspect` dependencies before the prebuilt
-wheel layer. The pinned Mamba source patch also updates its wheel metadata
-from upstream `tilelang==0.1.8` to the exact released fork version `0.1.9`;
-the wheel workflow rejects a Mamba artifact whose `Requires-Dist` contract
-does not match. `pip check` remains a mandatory image-build gate.
+wheel layer. The pinned Mamba source patch updates both the PEP 621
+`pyproject.toml` dependency that owns wheel metadata and the legacy
+`setup.py` fallback from upstream `tilelang==0.1.8` to the exact released
+fork version `0.1.9`; the wheel workflow rejects a Mamba artifact whose
+`Requires-Dist` contract does not match. `pip check` remains a mandatory
+image-build gate.
 
 ## 2026-08-02: FA2 no longer overwrites the FA4 beta23 namespace
 
