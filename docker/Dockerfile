@@ -100,6 +100,7 @@ ENV CUDA_HOME=/usr/local/cuda \
 RUN python -c "\
 from importlib import metadata; \
 assert metadata.version('apache-tvm-ffi') == '0.1.13.post5'; \
+assert metadata.version('flash-attn') == '2.8.3'; \
 assert metadata.version('flash-attn-4') == '4.0.0b23'; \
 import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \

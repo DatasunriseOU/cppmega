@@ -1,5 +1,13 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: FA2 pinned to the TE 2.16 compatibility ceiling
+
+The candidate H200 image exposed `flash-attn 2.8.4`; TransformerEngine 2.16
+accepts only `2.1.1` through `2.8.3` and therefore disabled its FA2 backend at
+import time. The FA2 source is now pinned to the upstream `v2.8.3` commit and
+the image builders require the matching distribution metadata. FA3 remains on
+its independent Hopper source commit and FA4 remains pinned to `4.0.0b23`.
+
 ## 2026-08-02: Wave32 receipts and fail-closed profiling harnesses
 
 P087 now runs the unchanged five-config MXFP8 comparison matrix in a fresh

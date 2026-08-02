@@ -129,6 +129,7 @@ def cppmega_base_image() -> modal.Image:
         "python -c 'import transformer_engine.pytorch as te; print(\"TE Linear ok:\", te.Linear)' && "
         "python -c 'from importlib import metadata; "
         "assert metadata.version(\"apache-tvm-ffi\") == \"0.1.13.post5\"; "
+        "assert metadata.version(\"flash-attn\") == \"2.8.3\"; "
         "assert metadata.version(\"flash-attn-4\") == \"4.0.0b23\"; "
         "import mamba_ssm, flash_attn, tilelang; "
         "print(\"mamba_ssm\", mamba_ssm.__version__, "

@@ -90,7 +90,7 @@ jobs:
             # this wheel build. GB10-specific sm_120f/121 fixes must live as
             # local patches in this repo if we re-enable that path.
             repo: Dao-AILab/flash-attention
-            ref: c75d019dea9d910312974417bc28f190dfdda6d9
+            ref: 060c9188beec3a8b62b33a3bfa6d5d2d44975fab
             submodules: "false"
             patch: upstream_prs/flash_attn_setup_sm120f.patch
             arch_override: "12.1"

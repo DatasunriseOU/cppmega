@@ -59,6 +59,25 @@ def test_fa4_beta23_and_tvm_ffi_runtime_pins_are_exact() -> None:
         assert '"flash-attn-4[cu13]==4.0.0b19"' not in dockerfile, path
 
 
+def test_te216_fa2_pin_stays_within_the_supported_range() -> None:
+    commit = "060c9188beec3a8b62b33a3bfa6d5d2d44975fab"
+    stack = _read("STACK.lock")
+    workflow = _read(".github/workflows/build-wheels.yml")
+
+    assert f"    ref: {commit}\n    patch: upstream_prs/flash_attn_setup_sm120f.patch" in stack
+    assert "    version: 2.8.3" in stack
+    assert f"            ref: {commit}" in workflow
+    assert workflow.count(f"ref: {commit}") == 1
+    assert (
+        'metadata.version(\\"flash-attn\\") == \\"2.8.3\\"'
+        in _read("scripts/modal_cppmega_base.py")
+    )
+    for path in ("docker/Dockerfile", "docker/Dockerfile.beta23"):
+        assert (
+            "metadata.version('flash-attn') == '2.8.3'" in _read(path)
+        ), path
+
+
 def test_fa4_h200_gate_exercises_visible_bias_and_is_not_mislabeled() -> None:
     source = _read("scripts/modal_fa4_beta23_parity.py")
 
