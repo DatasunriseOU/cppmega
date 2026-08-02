@@ -30,6 +30,7 @@ from scripts.nebius_h200_megatron_cpp_generation_eval import (
     parse_args,
     remote_generation_script,
     run_compile_gate,
+    validate_generation_receipt,
 )
 
 
@@ -42,6 +43,8 @@ V3_INDEXER_ROOT = Path(
     )
 )
 PROMPT_GRAPH_PROJECT_ID = "tests/case3-prompt-repo"
+MEGATRON_COMMIT = "b" * 40
+RUNTIME_IMAGE = "ghcr.io/datasunriseou/cppmega@sha256:" + "a" * 64
 
 
 class _OffsetTokenizer:
@@ -158,7 +161,8 @@ for loader in (_load_indexer, _load_data_indexer):
 
 def test_remote_generation_script_is_bash_parseable(tmp_path):
     script = remote_generation_script(
-        docker_image="ghcr.io/datasunriseou/cppmega:latest",
+        docker_image=RUNTIME_IMAGE,
+        megatron_commit=MEGATRON_COMMIT,
         seq_length=1024,
         max_new_tokens=64,
         temperature=0.0,
@@ -183,6 +187,8 @@ def test_remote_generation_script_is_bash_parseable(tmp_path):
     assert 'export CPPMEGA_PROMPT_GRAPH_MODE="repo"' in script
     assert 'export CPPMEGA_PROMPT_GRAPH_CACHE_DIR="/data/cppmega_h200_generation_results/prompt_graph_cache"' in script
     assert 'export CPPMEGA_CHECKPOINT_DIR="/data/cppmega_load_checkpoint"' in script
+    assert f"export CPPMEGA_RUNTIME_IMAGE_DIGEST={RUNTIME_IMAGE}" in script
+    assert f"export CPPMEGA_MEGATRON_COMMIT={MEGATRON_COMMIT}" in script
     assert 'export NVTE_DISABLE_NVRTC="1"' in script
     assert "pretrain_mamba.py" not in script
     subprocess.run(["bash", "-n", str(path)], check=True)
@@ -246,6 +252,8 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "pretrain_mamba" not in worker
     assert "apply_graph_route_attention_bias_patch()" in worker
     assert "apply_dsa_indexer_fused_patch()" in worker
+    assert '["git", "-C", "/opt/megatron-lm", "rev-parse", "HEAD"]' in worker
+    assert '"runtime_provenance": runtime_provenance' in worker
 
 
 def test_generation_worker_boundary_executes_restore_graph_and_receipt_contract():
@@ -753,6 +761,46 @@ def test_make_checkpoint_plain_tar_archives_checkpoint_without_gzip(tmp_path):
     assert "iter_0000006/metadata.json" not in names
 
 
+def test_generation_receipt_requires_exact_runtime_provenance():
+    receipt = {
+        "runtime_provenance": {
+            "runtime_image_digest": RUNTIME_IMAGE,
+            "megatron_commit": MEGATRON_COMMIT,
+        }
+    }
+
+    assert (
+        validate_generation_receipt(
+            receipt,
+            docker_image=RUNTIME_IMAGE,
+            megatron_commit=MEGATRON_COMMIT,
+        )
+        is receipt
+    )
+    with pytest.raises(RuntimeError, match="runtime provenance"):
+        validate_generation_receipt(
+            receipt,
+            docker_image=RUNTIME_IMAGE,
+            megatron_commit="c" * 40,
+        )
+    with pytest.raises(ValueError, match="immutable image digest"):
+        validate_generation_receipt(
+            receipt,
+            docker_image="ghcr.io/datasunriseou/cppmega:latest",
+            megatron_commit=MEGATRON_COMMIT,
+        )
+
+
+def test_generation_eval_reuses_strict_project_scp_transport():
+    source = (
+        ROOT / "scripts" / "nebius_h200_megatron_cpp_generation_eval.py"
+    ).read_text(encoding="utf-8")
+
+    assert "scp_base(args, ip)" in source
+    assert "StrictHostKeyChecking=no" not in source
+    assert "UserKnownHostsFile=/dev/null" not in source
+
+
 @pytest.mark.native_toolchain
 def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
     pubkey = tmp_path / "id_ed25519.pub"
@@ -780,6 +828,8 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
             str(prompts),
             "--max-new-tokens",
             "8",
+            "--megatron-commit",
+            MEGATRON_COMMIT,
             "--clang-indexer-root",
             str(V3_INDEXER_ROOT),
         ]

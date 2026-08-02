@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -35,14 +36,20 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     DEFAULT_SECURITY_GROUP_ID,
     DEFAULT_SUBNET_ID,
     DEFAULT_TOKENIZER_DIR,
+    SSH_HOST_KEY_ENV,
+    SSH_HOST_KEY_FILE_ENV,
+    SSH_HOST_KEY_FINGERPRINT_ENV,
     create_instance,
     default_ssh_key,
     make_ghcr_auth_tar,
     make_overlay_tar,
     run,
+    scp_base,
     ssh,
     ssh_base,
     stream_tar_to_remote,
+    validate_docker_image_digest,
+    validate_ssh_host_key_contract,
     wait_for_ip,
     wait_for_ssh,
 )
@@ -425,6 +432,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1112,6 +1120,21 @@ def main() -> int:
     checkpoint_dir = os.environ["CPPMEGA_CHECKPOINT_DIR"]
     tokenizer_dir = os.environ["CPPMEGA_TOKENIZER_DIR"]
     fp8_recipe = os.environ["CPPMEGA_FP8_RECIPE"]
+    runtime_image_digest = os.environ["CPPMEGA_RUNTIME_IMAGE_DIGEST"]
+    expected_megatron_commit = os.environ["CPPMEGA_MEGATRON_COMMIT"]
+    actual_megatron_commit = subprocess.check_output(
+        ["git", "-C", "/opt/megatron-lm", "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    if actual_megatron_commit != expected_megatron_commit:
+        raise RuntimeError(
+            "Megatron commit mismatch: "
+            f"expected {expected_megatron_commit}, observed {actual_megatron_commit}"
+        )
+    runtime_provenance = {
+        "runtime_image_digest": runtime_image_digest,
+        "megatron_commit": actual_megatron_commit,
+    }
     if prompt_graph_mode not in {"repo", "off"}:
         raise ValueError(f"unknown prompt graph mode {prompt_graph_mode!r}")
     if prompt_graph_mode == "repo":
@@ -1177,6 +1200,7 @@ def main() -> int:
     detail_path = out_dir / "generation_detail.jsonl"
     summary = {
         "checkpoint_iteration": int(iteration) if isinstance(iteration, int) else str(iteration),
+        "runtime_provenance": runtime_provenance,
         "prompt_mode": prompt_mode,
         "prompt_graph_mode": prompt_graph_mode,
         "max_new_tokens": max_new_tokens,
@@ -1349,6 +1373,7 @@ def main() -> int:
     (out_dir / "generation_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print("CPPMEGA_GENERATION_SUMMARY=" + json.dumps({
         "total": summary["total"],
+        "runtime_provenance": runtime_provenance,
         "cuda_peak_allocated_gib": summary["cuda_peak_allocated_gib"],
         "cuda_peak_reserved_gib": summary["cuda_peak_reserved_gib"],
     }, sort_keys=True), flush=True)
@@ -1363,6 +1388,7 @@ if __name__ == "__main__":
 def remote_generation_script(
     *,
     docker_image: str,
+    megatron_commit: str,
     seq_length: int,
     max_new_tokens: int,
     temperature: float,
@@ -1372,6 +1398,9 @@ def remote_generation_script(
     fp8_recipe: str,
     disable_nvrtc: bool,
 ) -> str:
+    validate_docker_image_digest(docker_image)
+    if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", megatron_commit):
+        raise ValueError("megatron_commit must be an exact lowercase Git SHA")
     if prompt_graph_mode not in {"repo", "off"}:
         raise ValueError(f"unsupported prompt graph mode {prompt_graph_mode!r}")
     graph_flag_default = 1 if prompt_graph_mode == "repo" else 0
@@ -1432,6 +1461,8 @@ def remote_generation_script(
         export CPPMEGA_FP8_RECIPE="{fp8_recipe}"
         export CPPMEGA_CHECKPOINT_DIR="/data/cppmega_load_checkpoint"
         export CPPMEGA_TOKENIZER_DIR="/data/cpp_tokenizer_hf"
+        export CPPMEGA_RUNTIME_IMAGE_DIGEST={shlex.quote(docker_image)}
+        export CPPMEGA_MEGATRON_COMMIT={shlex.quote(megatron_commit)}
         mkdir -p "$TRITON_CACHE_DIR" "$CPPMEGA_PROMPT_GRAPH_CACHE_DIR"
 
         eval "$(python -m cppmega.recipes.run_profiles shell h200_cpp_world_mini \
@@ -1477,6 +1508,24 @@ def run_compile_gate(cases: Path, completions: Path, report: Path, *, keep_workd
     return proc.returncode
 
 
+def validate_generation_receipt(
+    receipt: object,
+    *,
+    docker_image: str,
+    megatron_commit: str,
+) -> dict[str, object]:
+    expected = {
+        "runtime_image_digest": validate_docker_image_digest(docker_image),
+        "megatron_commit": megatron_commit,
+    }
+    if not isinstance(receipt, dict) or receipt.get("runtime_provenance") != expected:
+        raise RuntimeError(
+            "generation receipt runtime provenance does not match the requested "
+            "image digest and Megatron commit"
+        )
+    return receipt
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parent-id", default=os.environ.get("NEBIUS_PARENT_ID", DEFAULT_PARENT_ID))
@@ -1494,7 +1543,26 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssh-user", default="dave")
     parser.add_argument("--ssh-key", type=Path, default=default_ssh_key())
     parser.add_argument("--ssh-pubkey", type=Path, default=None)
+    parser.add_argument("--ssh-host-key", default=os.environ.get(SSH_HOST_KEY_ENV))
+    parser.add_argument(
+        "--ssh-host-key-file",
+        type=Path,
+        default=(
+            Path(os.environ[SSH_HOST_KEY_FILE_ENV])
+            if os.environ.get(SSH_HOST_KEY_FILE_ENV)
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--ssh-host-key-fingerprint",
+        default=os.environ.get(SSH_HOST_KEY_FINGERPRINT_ENV),
+    )
     parser.add_argument("--docker-image", default=DEFAULT_DOCKER_IMAGE)
+    parser.add_argument(
+        "--megatron-commit",
+        default=os.environ.get("CPPMEGA_MEGATRON_COMMIT"),
+        help="Exact Megatron-LM commit; defaults to CPPMEGA_MEGATRON_COMMIT.",
+    )
     parser.add_argument("--ghcr-user", default=None)
     parser.add_argument("--ghcr-token-file", type=Path, default=None)
     parser.add_argument("--no-ghcr-auth", action="store_true")
@@ -1537,6 +1605,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    validate_ssh_host_key_contract(args, required=not args.dry_run)
+    validate_docker_image_digest(args.docker_image)
+    if not isinstance(args.megatron_commit, str) or not re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
+    ):
+        raise ValueError(
+            "generation eval requires --megatron-commit or "
+            "CPPMEGA_MEGATRON_COMMIT with an exact lowercase Git SHA"
+        )
     if args.seq_length <= 0:
         raise ValueError("--seq-length must be positive")
     if args.max_new_tokens <= 0:
@@ -1562,6 +1639,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     script = remote_generation_script(
         docker_image=args.docker_image,
+        megatron_commit=args.megatron_commit,
         seq_length=args.seq_length,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -1577,6 +1655,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"cases={args.cases}")
         print(f"prompts={args.prompts}")
         print(f"prompt_graph_mode={args.prompt_graph_mode}")
+        print(f"docker_image={args.docker_image}")
+        print(f"megatron_commit={args.megatron_commit}")
         print(script[:5000])
         return 0
 
@@ -1584,6 +1664,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     out_dir = ROOT / "outputs" / "nebius" / args.instance_name
     try:
         with tempfile.TemporaryDirectory(prefix="cppmega-h200-generation-") as tmp:
+            args._nebius_ssh_known_hosts_dir = Path(tmp)
             tmp_path = Path(tmp)
             overlay_tar = tmp_path / "cppmega_overlay.tgz"
             tokenizer_tar = tmp_path / "cppmega_tokenizer.tgz"
@@ -1627,16 +1708,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 ssh(args, ip, "bash /data/run_cppmega_h200_generation.sh", timeout=args.remote_timeout_s)
             finally:
                 out_dir.mkdir(parents=True, exist_ok=True)
-                scp_cmd = [
-                    "scp",
-                    "-i",
-                    str(args.ssh_key),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
-                    "-o",
-                    "ConnectTimeout=15",
+                scp_cmd = scp_base(args, ip) + [
                     "-r",
                     f"{args.ssh_user}@{ip}:/data/cppmega_h200_generation_results/.",
                     str(out_dir),
@@ -1662,9 +1734,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
 
     completions = out_dir / "completions.jsonl"
+    generation_receipt_path = out_dir / "generation_summary.json"
     report = out_dir / "compile_report.json"
     if not completions.exists():
         raise FileNotFoundError(f"remote generation did not produce {completions}")
+    if not generation_receipt_path.is_file():
+        raise FileNotFoundError(
+            f"remote generation did not produce {generation_receipt_path}"
+        )
+    validate_generation_receipt(
+        json.loads(generation_receipt_path.read_text(encoding="utf-8")),
+        docker_image=args.docker_image,
+        megatron_commit=args.megatron_commit,
+    )
     compile_rc = run_compile_gate(args.cases, completions, report, keep_workdir=args.keep_workdir)
     if compile_rc != 0 and not args.allow_compile_fail:
         return compile_rc
