@@ -96,7 +96,7 @@ wheels:
       - apache_tvm_ffi-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at 11848a44 carries:
+    # DatasunriseOU/tilelang fork at de8bb88c carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
     #   - vendored TVM submodule bumped to DatasunriseOU/tvm@e25ca6ae, which includes
@@ -119,10 +119,12 @@ wheels:
     #   - vendored tvm-ffi is DatasunriseOU/tvm-ffi@521efeb3
     #     (v0.1.13.post5), matching both FA4's >=0.1.12 contract and the C++
     #     ABI used to link libtvm_runtime.so.
+    #   - bodyless Bind roles are classified before rewrite, dependent shared
+    #     RMW is planned fail-closed, and fragment owners are selected stably.
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: 11848a444a7578afe17e9261bd41fe10ac1723c7
+    ref: de8bb88cc382b0e78bc804244f79c4be8cc9e75f
     version: 0.1.9
     submodules: true
     build: |

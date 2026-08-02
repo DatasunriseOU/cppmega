@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.9 from DatasunriseOU/tilelang@11848a44 into the active
+# Install TileLang 0.1.9 from DatasunriseOU/tilelang@de8bb88c into the active
 # (or given) venv.
 #
 # Primary path: download the prebuilt x86_64 TileLang/tvm-ffi wheel pair.
@@ -28,7 +28,7 @@ set -euo pipefail
 
 WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl}"
 TVM_FFI_WHEEL_URL="${TVM_FFI_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-11848a444a7578afe17e9261bd41fe10ac1723c7}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-de8bb88cc382b0e78bc804244f79c4be8cc9e75f}"
 TVM_COMMIT="${TILELANG_TVM_COMMIT:-e25ca6ae50beee0e907b1e5ed32949879caddde1}"
 TVM_FFI_COMMIT="${TILELANG_TVM_FFI_COMMIT:-521efeb30bfd9e4946b248b3d76e6391028233a3}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"

@@ -1,5 +1,15 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: TileLang stable fragment-owner inference candidate
+
+The exact TileLang source is now
+`de8bb88cc382b0e78bc804244f79c4be8cc9e75f`. It retains the bodyless Bind-role
+fix and adds fail-closed dependent shared-RMW planning, stable first-use layout
+source ordering, and exact owner-thread compatibility for fragment writes.
+The vendored TVM and tvm-ffi pins remain unchanged. This source still requires
+the rebuilt immutable release and ordered H200 `one` → `r2` → `r4` gate before
+training promotion.
+
 ## 2026-08-02: FA2 pinned to the TE 2.16 compatibility ceiling
 
 The candidate H200 image exposed `flash-attn 2.8.4`; TransformerEngine 2.16

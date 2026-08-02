@@ -20,6 +20,19 @@ from cppmega.megatron.release_gate_integrity import (
 
 _ROOT = Path(__file__).resolve().parents[1]
 _HARNESS = _ROOT / "scripts/modal_mamba3_tilelang_role_release_gate.py"
+_CANDIDATE_TILELANG_SHA = "de8bb88cc382b0e78bc804244f79c4be8cc9e75f"
+
+
+def test_candidate_tilelang_sha_is_bound_across_release_surfaces():
+    workflow = (_ROOT / ".github/workflows/build-wheels.yml").read_text()
+    stack = (_ROOT / "STACK.lock").read_text()
+    harness = _HARNESS.read_text()
+    changelog = (_ROOT / "docs/changelog.md").read_text()
+
+    assert workflow.count(_CANDIDATE_TILELANG_SHA) == 1
+    assert f"ref: {_CANDIDATE_TILELANG_SHA}" in stack
+    assert f'_CANDIDATE_TILELANG_SHA = "{_CANDIDATE_TILELANG_SHA}"' in harness
+    assert f"`{_CANDIDATE_TILELANG_SHA}`" in changelog
 
 
 def _record_hash(payload: bytes) -> str:
