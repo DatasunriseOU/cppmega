@@ -208,7 +208,7 @@ def _te_reference_attention_forward(
         core_attention_bias_type="post_scale_bias",
         core_attention_bias=dense_bias,
     )
-    return out
+    return out.reshape_as(q)
 
 
 # ---------------------------------------------------------------------------
@@ -1251,14 +1251,7 @@ _GHCR_IMAGE_DIGEST = os.environ.get(
     "sha256:10dcebb221795e54f32954068b1c158b122d53bc170187b96489e554c4dbeacc",
 )
 _CANDIDATE_CPPMEGA_SHA = os.environ.get("CPPMEGA_CANDIDATE_CPPMEGA_SHA", "")
-_DEFAULT_H200_TEST_FILTER = (
-    "all_gradients_combined or "
-    "context_parallel_global_document_forward_backward_parity or "
-    "graph_route_aux_multi_document_forward_backward_parity or "
-    "document_mask_only_partial_tile_forward_backward_parity or "
-    "document_mask_rectangular_unaligned_decode_forward_backward_parity"
-)
-_EXPECTED_H200_TEST_COUNT = 5
+_EXPECTED_H200_TEST_COUNT = 12
 
 
 def _modal_image():
@@ -1296,10 +1289,6 @@ def _modal_image():
     ).env(
         {
             "CPPMEGA_MEGATRON_COMMIT": ("ba7b5ebce12af60627a80985792a1449ce45f46c"),
-            "CPPMEGA_FA4_PARITY_FILTER": os.environ.get(
-                "CPPMEGA_FA4_PARITY_FILTER",
-                _DEFAULT_H200_TEST_FILTER,
-            ),
             "CPPMEGA_CANDIDATE_CPPMEGA_SHA": _CANDIDATE_CPPMEGA_SHA,
             "CPPMEGA_SOURCE_IMAGE_REF": GHCR_REF,
             "MEGATRON_LM_REPO": "/opt/megatron-lm",
@@ -1478,8 +1467,6 @@ print(json.dumps({
             "--tb=short",
             "--disable-warnings",
             "--junitxml=/tmp/fa4-parity-junit.xml",
-            "-k",
-            env["CPPMEGA_FA4_PARITY_FILTER"],
         ]
         try:
             proc = _subprocess.run(
