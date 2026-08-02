@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.13 90 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 90 \
     && python3.13 -m ensurepip --upgrade \
+    && apt-get purge -y python3-cryptography \
     && rm -rf /var/lib/apt/lists/*
 
 # nvcc must be told to accept gcc-15 (CUDA 13.2 officially supports up to gcc-14).

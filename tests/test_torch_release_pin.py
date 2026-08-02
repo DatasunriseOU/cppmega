@@ -150,6 +150,11 @@ def test_h200_images_include_dependency_free_bundle_restore_runtime() -> None:
         dockerfile = _read(path)
         assert "        zstd \\" in dockerfile, path
         assert "awscli" not in dockerfile, path
+        assert (
+            dockerfile.index("python3.13 -m ensurepip --upgrade")
+            < dockerfile.index("apt-get purge -y python3-cryptography")
+            < dockerfile.index("rm -rf /var/lib/apt/lists/*")
+        ), path
 
 
 def test_executable_gpu_envs_do_not_pin_torch_nightlies() -> None:
