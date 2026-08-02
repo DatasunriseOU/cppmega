@@ -1,5 +1,26 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-02: two-pool data and Nebius generation fail closed
+
+The bundle builder and publisher now accept the receipt-bound
+`cppmega_objective_source_snapshot_v2` two-pool layout without weakening the
+existing v1 contract. Primary CI and objective-seed records are mapped back to
+the repaired snapshot and compared by canonical path, rows, size, and SHA-256;
+the publisher validates the nested pool schedules and descriptors before
+upload.
+
+The Nebius generation evaluator now rejects mutable container tags, requires
+an exact Megatron commit, verifies that commit inside the container, and binds
+both values into the generation receipt before the local compile gate runs.
+SCP reuses the existing pinned-host-key transport instead of disabling host-key
+verification.
+
+The current 20B-threshold CI CASE5 export remains **not training-ready**. Its
+first attempt failed before writing Parquet because the supervisor supplied an
+invalid legacy-parser authorization. Retry 2 was started from the same frozen
+source at `2026-08-02T13:58:23Z` with that flag omitted and the disk guard
+preserved; only a complete final export receipt may promote its tokens.
+
 ## 2026-08-02: release metadata matches the immutable runtime
 
 The final image now installs TransformerEngine's declared
