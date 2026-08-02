@@ -111,6 +111,7 @@ class TrainingProfile:
     train_iters: int = 10
     lr: str = "1e-4"
     min_lr: str = "1e-5"
+    hidden_dropout: float | None = None
 
     @property
     def tokens_per_step(self) -> int:
@@ -423,6 +424,7 @@ class RunProfile:
             moe_router_fusion=self.model.moe_router_fusion,
             enable_dsa=enable_feature_args,
             dsa_indexer_loss_coeff=self.model.dsa_indexer_loss_coeff,
+            hidden_dropout=self.training.hidden_dropout,
         )
         return bundle.to_shell_fragment()
 
@@ -528,7 +530,11 @@ def set_h200_dsa_9_4_m_profile(profile: RunProfile | None = None) -> RunProfile:
         pipeline_model_parallel_size=2,
         virtual_pipeline_model_parallel_size=2,
     )
-    profile.training = TrainingProfile(micro_batch_size=4, global_batch_size=64)
+    profile.training = TrainingProfile(
+        micro_batch_size=4,
+        global_batch_size=64,
+        hidden_dropout=0.0,
+    )
     profile.precision = PrecisionProfile(fp8_recipe="tensorwise")
     profile.optimizer = OptimizerProfile(local_ddp_disable_contiguous_grad_buffer=False)
     profile.runtime = RuntimePatchProfile(

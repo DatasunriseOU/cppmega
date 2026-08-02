@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from cppmega.recipes.nam56r_launch import build_nam56r_lite_main_pattern, get_custom_layer_indices
+from cppmega.recipes.nam56r_launch import (
+    build_nam56r_lite_main_pattern,
+    build_nam56r_megatron_native_args,
+    get_custom_layer_indices,
+)
+from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 
 
 def test_build_nam56r_lite_main_pattern_maps_r_to_mamba_and_adds_mtp_suffix():
@@ -15,6 +20,16 @@ def test_build_nam56r_lite_main_pattern_maps_r_to_mamba_and_adds_mtp_suffix():
 def test_get_custom_layer_indices_finds_r_layers_in_nam56r_reference_pattern():
     indices = get_custom_layer_indices(pattern="AEMEAEMEAEMR", depth=52, custom_symbols=("R",))
     assert indices == (12, 24, 36, 48)
+
+
+def test_nam56r_hidden_dropout_is_explicit_only_when_requested():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=13)
+
+    default = build_nam56r_megatron_native_args(plan=plan)
+    production = build_nam56r_megatron_native_args(plan=plan, hidden_dropout=0.0)
+
+    assert "--hidden-dropout" not in default.args
+    assert production.args[production.args.index("--hidden-dropout") + 1] == "0.0"
 
 
 def test_build_nam56r_lite_main_pattern_dsa_symbol():

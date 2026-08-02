@@ -30,6 +30,7 @@ def build_nam56r_megatron_native_args(
     dsa_indexer_dtype: str = "bf16",
     dsa_indexer_topk: int = 256,
     dsa_indexer_loss_coeff: float = 0.001,
+    hidden_dropout: float | None = None,
 ) -> MegatronArgsBundle:
     """Return the current native Megatron feature fragment for NAM-style lanes.
 
@@ -38,7 +39,7 @@ def build_nam56r_megatron_native_args(
     explicitly implemented.
     """
 
-    return build_megatron_args_bundle(
+    bundle = build_megatron_args_bundle(
         plan=plan,
         use_mla=enable_mla,
         use_mtp=enable_mtp,
@@ -55,6 +56,12 @@ def build_nam56r_megatron_native_args(
         dsa_indexer_dtype=dsa_indexer_dtype,
         dsa_indexer_topk=dsa_indexer_topk,
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+    )
+    if hidden_dropout is None:
+        return bundle
+    return MegatronArgsBundle(
+        args=(*bundle.args, "--hidden-dropout", str(hidden_dropout)),
+        custom_notes=bundle.custom_notes,
     )
 
 

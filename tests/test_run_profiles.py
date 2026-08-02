@@ -66,6 +66,7 @@ def test_h200_profile_renders_pipe_chunks_and_remote_native_overrides():
     assert env["CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND"] == "deepep"
     assert env["NVTE_FLASH_ATTN_V3"] == "0"
     assert env["NVTE_FLASH_ATTN_V4"] == "1"
+    assert "--hidden-dropout 0.0" in env["NATIVE_ARGS"]
     assert "--mtp-num-layers 2" in env["NATIVE_ARGS"]
     assert "--expert-model-parallel-size 4" in env["NATIVE_ARGS"]
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
@@ -117,6 +118,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_ATTN_BACKEND"] == "flash"
     assert env["NVTE_FLASH_ATTN_V3"] == "0"
     assert env["NVTE_FLASH_ATTN_V4"] == "1"
+    assert "--hidden-dropout" not in env["NATIVE_ARGS"]
     assert "CPPMEGA_EXTRA_PYTHONPATH" not in env
     assert "CPPMEGA_FLASH_ATTN_SOURCE_ROOT" not in env
     assert "CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT" not in env

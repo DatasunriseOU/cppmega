@@ -713,6 +713,7 @@ bundle = build_nam56r_megatron_native_args(
     enable_moe=True,
     enable_dsa=True,
     dsa_indexer_loss_coeff={dsa_loss_coeff},
+    hidden_dropout=0.0,
 )
 print("PATTERN", pattern)
 print("NATIVE_ARGS", bundle.to_shell_fragment())
