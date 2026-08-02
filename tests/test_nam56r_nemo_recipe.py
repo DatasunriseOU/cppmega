@@ -82,6 +82,8 @@ class TestRecipeArgs:
         assert "--attention-backend" in args
         idx = args.index("--attention-backend")
         assert args[idx + 1] == "flash"
+        assert args[args.index("--attention-dropout") + 1] == "0.0"
+        assert args[args.index("--hidden-dropout") + 1] == "0.0"
 
     def test_selective_recompute_without_cuda_graphs(self):
         """Selective recompute is enabled when CUDA graphs are off."""

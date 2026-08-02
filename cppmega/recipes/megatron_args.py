@@ -62,7 +62,12 @@ def build_megatron_args_bundle(
     dsa_indexer_loss_coeff: float = 0.001,
     dsa_indexer_dtype: str = "bf16",
 ) -> MegatronArgsBundle:
-    args: list[str] = []
+    args: list[str] = [
+        "--attention-dropout",
+        "0.0",
+        "--hidden-dropout",
+        "0.0",
+    ]
     notes: list[str] = []
 
     if use_mla:

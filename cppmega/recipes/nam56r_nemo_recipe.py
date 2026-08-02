@@ -16,7 +16,7 @@ All configs importable on macOS (no torch/megatron at import time).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from cppmega.megatron.deprecated_paths import require_deprecated_ack
@@ -358,6 +358,8 @@ class NAM56RNeMoRecipe:
 
         # --- training hyperparameters ---
         args.extend([
+            "--attention-dropout", "0.0",
+            "--hidden-dropout", "0.0",
             "--micro-batch-size", str(self.micro_batch_size),
             "--global-batch-size", str(self.global_batch_size),
             "--train-iters", str(self.train_iters),

@@ -64,6 +64,7 @@ jobs:
             repo: NVIDIA/TransformerEngine
             ref: 4220403e831d29e93868f7793693ea83f6b8b05b
             submodules: "true"
+            patch: upstream_prs/transformer_engine_fa_version_selectors.patch
             # MAX_JOBS=1 NVCC_THREADS=2 — without these, ninja saturates the
             # 4-core / 7 GB runner and the job gets cancelled at ~1h30m with
             # nothing useful in the logs. TE core CMake ignores

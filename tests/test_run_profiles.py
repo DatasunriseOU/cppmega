@@ -39,6 +39,8 @@ def test_h200_cpp_world_mini_is_megatron_dense_sidecar_lane():
     assert env["CPPMEGA_FP8_RECIPE"] == "off"
     assert env["CPPMEGA_ATTN_BACKEND"] == "auto"
     assert env["CPPMEGA_USE_FLASH_ATTN"] == "1"
+    assert "NVTE_FLASH_ATTN_V3" not in env
+    assert "NVTE_FLASH_ATTN_V4" not in env
     assert env["CPPMEGA_OPTIMIZER"] == "adam"
     assert env["CPPMEGA_MUON_SCALAR_OPTIMIZER"] == "adam"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM"] == "0"
@@ -62,6 +64,8 @@ def test_h200_profile_renders_pipe_chunks_and_remote_native_overrides():
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
     assert env["CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND"] == "deepep"
+    assert env["NVTE_FLASH_ATTN_V3"] == "0"
+    assert env["NVTE_FLASH_ATTN_V4"] == "1"
     assert "--mtp-num-layers 2" in env["NATIVE_ARGS"]
     assert "--expert-model-parallel-size 4" in env["NATIVE_ARGS"]
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
@@ -111,6 +115,8 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
     assert env["CPPMEGA_USE_FLASH_ATTN"] == "1"
     assert env["CPPMEGA_ATTN_BACKEND"] == "flash"
+    assert env["NVTE_FLASH_ATTN_V3"] == "0"
+    assert env["NVTE_FLASH_ATTN_V4"] == "1"
     assert "CPPMEGA_EXTRA_PYTHONPATH" not in env
     assert "CPPMEGA_FLASH_ATTN_SOURCE_ROOT" not in env
     assert "CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT" not in env

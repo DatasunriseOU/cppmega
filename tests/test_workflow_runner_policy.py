@@ -383,6 +383,7 @@ def test_assembled_images_import_the_patched_mamba_runtime() -> None:
 
 def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
     transformer_engine_commit = "4220403e831d29e93868f7793693ea83f6b8b05b"
+    fa_selector_patch = "upstream_prs/transformer_engine_fa_version_selectors.patch"
     workflow = (
         REPO_ROOT / ".github" / "workflows" / "build-wheels.yml"
     ).read_text(encoding="utf-8")
@@ -390,6 +391,9 @@ def test_transformer_engine_wheel_build_uses_upstream_arch_knob() -> None:
 
     assert f"ref: {transformer_engine_commit}" in workflow
     assert f"ref: {transformer_engine_commit}" in stack
+    assert f"patch: {fa_selector_patch}" in workflow
+    assert f"patch: {fa_selector_patch}" in stack
+    assert (REPO_ROOT / fa_selector_patch).is_file()
     assert "NVTE_CUDA_ARCHS='90;100;120'" in workflow
     assert " CUDAARCHS=" not in workflow
     assert (

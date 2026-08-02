@@ -33,7 +33,10 @@ from typing import Any
 
 import modal
 
-from cppmega.megatron.gate_result_contract import require_variant_rows
+from cppmega.megatron.gate_result_contract import (
+    require_successful_training_variants,
+    require_variant_rows,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 
@@ -48,9 +51,14 @@ GPU_SPEC = "H200:2"
 
 _CASES: dict[str, dict[str, Any]] = {
     "te_flash_full": {
-        "description": "Production-shape H100/H200 MLA path. Requires FA3; fallback TE FusedAttention is not production.",
+        "description": "Production-shape H100/H200 MLA path. NAM56R's 128/64 MLA heads require FA4; fallback TE FusedAttention is not production.",
         "attention_backend": "flash",
         "use_flash_attn": True,
+        "required_backend": "FA4",
+        "environment": {
+            "NVTE_FLASH_ATTN_V3": "0",
+            "NVTE_FLASH_ATTN_V4": "1",
+        },
         "seq_len": 4096,
         "cuda_graph": True,
         "production_throughput": True,
@@ -80,6 +88,11 @@ _CASES: dict[str, dict[str, Any]] = {
         "production_throughput": False,
     },
 }
+
+_TRAINING_VARIANTS = (
+    "grouped_head_bwd_baseline",
+    "grouped_head_bwd_stage2_force_nontma_bf1_bb0",
+)
 
 
 def _image() -> modal.Image:
@@ -414,7 +427,7 @@ def _backend_probe() -> dict[str, Any]:
         "device_count": device_count,
         "gpu_names": gpu_names,
         "device_capabilities": device_capabilities,
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "torch_cuda": torch.version.cuda,
         "transformer_engine_version": _dist_version("transformer-engine", "transformer_engine"),
         "flash_attn_distribution_version": _dist_version("flash-attn", "flash_attn"),
@@ -902,6 +915,7 @@ def _build_train_cmd(
         "tokens_per_iter": gbs * seq_len,
         "profile_mode": profile,
         "attention_backend": attention_backend,
+        "required_flash_backend": case.get("required_backend"),
         "use_flash_attn": use_flash_attn,
         "cuda_graph": cuda_graph,
     }
@@ -1167,7 +1181,7 @@ def preflight(run_id: str = "") -> dict[str, Any]:
         "backend_probe": _backend_probe(),
         "device_count": torch.cuda.device_count(),
         "gpu_names": gpu_names,
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "torch_cuda": torch.version.cuda,
         "transformer_engine": transformer_engine.__version__,
         "tilelang": getattr(tilelang, "__version__", None),
@@ -1211,13 +1225,20 @@ def gate(
     run_id = run_id or f"gate_{_utc_stamp()}"
     out_dir = pathlib.Path("/vol") / BENCH_DIR.lstrip("/") / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    case = _CASES[case_label]
     env = _base_env()
+    env.update(case.get("environment", {}))
     if profile:
         env.setdefault("NVTE_DEBUG", "1")
         env.setdefault("NVTE_DEBUG_LEVEL", "2")
     backend_probe = _backend_probe()
-    case = _CASES[case_label]
-    if case.get("production_throughput") and not backend_probe.get("policy", {}).get("production_usable"):
+    required_backend = case.get("required_backend")
+    required_backend_usable = (
+        backend_probe.get("fa4_usable")
+        if required_backend == "FA4"
+        else backend_probe.get("policy", {}).get("production_usable")
+    )
+    if case.get("production_throughput") and not required_backend_usable:
         result: dict[str, Any] = {
             "run_id": run_id,
             "image_ref": os.environ.get("CPPMEGA_GHCR_REF", GHCR_REF),
@@ -1238,8 +1259,13 @@ def gate(
             "variants": [],
             "blocker": {
                 "status": "IMAGE_BACKEND_BLOCKED",
-                "required_backend": backend_probe.get("policy", {}).get("production_required_backend"),
-                "reason": backend_probe.get("policy", {}).get("blocked_reason"),
+                "required_backend": required_backend
+                or backend_probe.get("policy", {}).get("production_required_backend"),
+                "reason": (
+                    f"{required_backend}_REQUIRED_BUT_UNAVAILABLE"
+                    if required_backend
+                    else backend_probe.get("policy", {}).get("blocked_reason")
+                ),
             },
             "profile_mode": profile,
         }
@@ -1269,6 +1295,7 @@ def gate(
         "variants": [],
         "preflight_kernel": _kernel_status(env),
         "profile_mode": profile,
+        "attention_environment": case.get("environment", {}),
     }
 
     result["grouped_head_applier_noop"] = _grouped_head_applier("noop", env)
@@ -1282,7 +1309,7 @@ def gate(
 
     stage2_candidate_started = False
     try:
-        for variant in ("grouped_head_bwd_baseline", "grouped_head_bwd_stage2_force_nontma_bf1_bb0"):
+        for variant in _TRAINING_VARIANTS:
             if variant == "grouped_head_bwd_stage2_force_nontma_bf1_bb0":
                 stage2_candidate_started = True
                 result["grouped_head_applier_rollback_before_stage2"] = _grouped_head_applier("rollback", env)
@@ -1338,6 +1365,11 @@ def gate(
         _write_summary(out_dir, result)
         results_vol.commit()
     require_variant_rows(result)
+    require_successful_training_variants(
+        result,
+        expected_variants=_TRAINING_VARIANTS,
+        minimum_steps=train_iters,
+    )
     return result
 
 

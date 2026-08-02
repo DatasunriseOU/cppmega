@@ -18,6 +18,8 @@ wheels:
   transformer_engine:
     repo: NVIDIA/TransformerEngine
     ref: 4220403e831d29e93868f7793693ea83f6b8b05b
+    # Backport of merged upstream NVIDIA/TransformerEngine#3204.
+    patch: upstream_prs/transformer_engine_fa_version_selectors.patch
     version: 2.16
     build: |
       NVTE_FRAMEWORK=pytorch \

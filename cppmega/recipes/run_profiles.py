@@ -383,6 +383,8 @@ class RunProfile:
     def native_args_fragment(self) -> str:
         """Return the Megatron-native feature fragment derived from this profile."""
 
+        if self.model.dense:
+            return ""
         if (
             self.model.moe_token_dispatcher_type == "flex"
             and self.model.moe_expert_model_parallel_size <= 1
@@ -886,6 +888,15 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] = (
             profile.runtime.transformer_engine_source or ""
         )
+    if (
+        not profile.model.dense
+        and profile.precision.use_flash_attention
+        and profile.precision.attention_backend == "flash"
+    ):
+        # TE prefers FA3 on Hopper before checking NAM56R's unequal 128/64 MLA
+        # heads. FA3 rejects that shape; FA4 supports it.
+        env["NVTE_FLASH_ATTN_V3"] = "0"
+        env["NVTE_FLASH_ATTN_V4"] = "1"
     if profile.runtime.noconv_mamba_chunk_size is not None:
         env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] = str(
             _validate_noconv_mamba_chunk_size(profile.runtime.noconv_mamba_chunk_size)
