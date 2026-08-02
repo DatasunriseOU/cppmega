@@ -373,9 +373,13 @@ def test_release_gate_keeps_ordered_read_only_h200_contract():
     assert '"prerequisite_phase": "r2"' in harness
     assert "verify_phase_artifact(str(prerequisite_phase))" in harness
     assert "validated_junit = validate_exact_junit(" in harness
+    assert 'junit_artifact.get("durable_path")' in harness
     assert 'prior.get("prerequisite") != actual_prerequisite' in harness
     assert '"modal_derived_image_stage2_mutated": False' in harness
     assert "refusing to overwrite an existing exact gate attempt" in harness
+    assert "write_receipt(receipt, progress_path)" in harness
+    assert harness.count("write_receipt(receipt, progress_path, _RESULT_PATH)") == 2
+    assert "_DURABLE_JUNIT_PATH" not in harness
     assert 'receipt["gpu_health_before_test"]' in harness
     assert "isinstance(exc, subprocess.TimeoutExpired)" in harness
     assert ".add_local_file(\n            str(_LOCAL_STAGE2_PATCH)" not in harness
@@ -398,5 +402,9 @@ def test_release_gate_remote_hydration_never_assembles_local_image():
     image_keyword = next(
         keyword for keyword in function_decorator.keywords if keyword.arg == "image"
     )
+    memory_keyword = next(
+        keyword for keyword in function_decorator.keywords if keyword.arg == "memory"
+    )
 
     assert ast.unparse(image_keyword.value) == "_image() if modal.is_local() else None"
+    assert ast.literal_eval(memory_keyword.value) == 131_072
