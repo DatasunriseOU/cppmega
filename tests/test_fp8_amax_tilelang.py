@@ -411,10 +411,9 @@ def test_wave9_concurrent_amax_compile():
     ``_amax_kernel_for`` and ``_quantize_kernel_for`` so the build path
     is single-threaded even when callers compile concurrently.
 
-    The test does not require Metal / CUDA to be available because it
-    exercises the *build* (PrimFunc construction + lower) path, not the
-    runtime launch. Skips only when ``tilelang_supports`` reports the
-    build path is unreachable for the host.
+    The test uses the host's reachable TileLang target because it exercises
+    the *build* (PrimFunc construction + lower) path, not a runtime launch.
+    It skips when neither CUDA nor Metal lowering is reachable.
     """
 
     import threading
@@ -426,9 +425,10 @@ def test_wave9_concurrent_amax_compile():
     from cppmega_mlx.nn._tilelang.fp8_amax import (  # noqa: E402
         _amax_kernel_for,
         _quantize_kernel_for,
+        _resolve_target,
     )
 
-    target = "metal"
+    target = _resolve_target(device)
     combos = [
         (256, "float16"),
         (1024, "float16"),
