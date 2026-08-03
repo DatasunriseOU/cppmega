@@ -1,43 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
-import signal
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
-from types import SimpleNamespace
-from typing import Any, Mapping, cast
 import zlib
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from scripts import ci_stream_inventory as ci_inventory
-from scripts.ci_content_store import CIContentStore
-from scripts.ci_content_store import _sqlite_schema_sha256
+from scripts.canonical_parquet_ledger import iter_canonical_parquet_ledger
+from scripts.ci_content_store import CIContentStore, _sqlite_schema_sha256
 from scripts.ci_fetch_state_migration import (
     CURRENT_V4_SQLITE_SCHEMA_SHA256,
     LEGACY_FETCH_STATE_SCHEMA,
     LEGACY_V3_SQLITE_SCHEMA_SHA256,
 )
-from scripts.ci_stream_fetch import (
-    CIStreamFetcher,
-    COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
-    COMPLETION_MODE_THRESHOLD,
-    EXHAUSTIVE_DISCOVERY_SCHEMA,
-    RECEIPT_SCHEMA as FETCH_RECEIPT_SCHEMA,
-    ExhaustiveInventoryBinding,
-    ExactTokenizer,
-    FetchState,
-    _STATE_SCHEMA,
-    _script_sha256 as _current_fetcher_script_sha256,
-    exhaustive_discovery_sidecar_path,
-)
-from scripts.ci_stream_receipts import finalize_fetch_receipts
 from scripts.ci_log_sidecars import _repo_source_binding
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
@@ -45,52 +33,77 @@ from scripts.ci_source_binding_projection import (
     SOURCE_BINDING_PROJECTION_SCHEMA,
     target_parser_script_sha256,
 )
-from scripts.canonical_parquet_ledger import iter_canonical_parquet_ledger
-from scripts.clone_ci_stream_union_for_resume import (
-    CloneError,
-    _snapshot_tree,
-    clone_union_for_resume,
-)
-from scripts.ci_stream_receipts import (
-    ReceiptFinalizationError,
-    verify_continuation_seed_inclusion,
-)
-from scripts.ci_stream_inventory import (
-    METADATA_ENCODING,
-    SCHEMA_VERSION as INVENTORY_SCHEMA,
-    _SCHEMA_SQL as INVENTORY_SQL,
-    _hash_lines,
-    InventoryDB,
-)
 from scripts.ci_source_sidecars import (
     SourceSidecarStore,
     extract_binding_inventory,
     materialize_inventory,
     verify_binding_inventory,
 )
+from scripts.ci_stream_fetch import (
+    _STATE_SCHEMA,
+    COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+    COMPLETION_MODE_THRESHOLD,
+    EXHAUSTIVE_DISCOVERY_SCHEMA,
+    CIStreamFetcher,
+    ExactTokenizer,
+    ExhaustiveInventoryBinding,
+    FetchState,
+    exhaustive_discovery_sidecar_path,
+)
+from scripts.ci_stream_fetch import (
+    RECEIPT_SCHEMA as FETCH_RECEIPT_SCHEMA,
+)
+from scripts.ci_stream_fetch import (
+    _script_sha256 as _current_fetcher_script_sha256,
+)
+from scripts.ci_stream_inventory import (
+    _SCHEMA_SQL as INVENTORY_SQL,
+)
+from scripts.ci_stream_inventory import (
+    METADATA_ENCODING,
+    InventoryDB,
+    _hash_lines,
+)
+from scripts.ci_stream_inventory import (
+    SCHEMA_VERSION as INVENTORY_SCHEMA,
+)
+from scripts.ci_stream_receipts import (
+    ReceiptFinalizationError,
+    finalize_fetch_receipts,
+    verify_continuation_seed_inclusion,
+)
+from scripts.clone_ci_stream_union_for_resume import (
+    CloneError,
+    _snapshot_tree,
+    clone_union_for_resume,
+)
 from scripts.data.build_macro_routes_megatron_bundle import (
     _load_ci_manifest_allowlist,
 )
 from scripts.export_ci_content_store_case5 import (
+    PRODUCTION_EXPORT_SCHEMA,
+    ExportError,
     FrozenFetchState,
     FrozenStore,
     _fetch_state_logical_digest,
+    export_store,
 )
-from scripts.export_ci_content_store_case5 import ExportError, export_store
 from scripts.merge_ci_stream_shards import (
-    MANIFEST_SCHEMA,
-    JOURNAL_SCHEMA,
-    LEGACY_JOURNAL_SCHEMA,
-    LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256,
-    MIGRATION_MODE,
-    MIGRATION_SCHEMA,
-    PRODUCTION_MANIFEST_SCHEMA,
-    MergeError,
-    MergePaused,
-    TIME_SHARD_INVENTORY_SCHEMA,
     _INVENTORY_RUN_COLUMNS,
     _JOURNAL_SQL,
     _TIME_SHARD_SQL,
+    COMPOSITE_INVENTORY_BINDING_SCHEMA,
+    JOURNAL_SCHEMA,
+    LEGACY_JOURNAL_SCHEMA,
+    LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256,
+    MANIFEST_SCHEMA,
+    MIGRATION_MODE,
+    MIGRATION_SCHEMA,
+    PRODUCTION_MANIFEST_SCHEMA,
+    PRODUCTION_MERGE_RECEIPT_SCHEMA,
+    TIME_SHARD_INVENTORY_SCHEMA,
+    MergeError,
+    MergePaused,
     _acquire_merge_lock,
     _append_source_drift_notes,
     _attempt_evidence_rank,
@@ -103,19 +116,25 @@ from scripts.merge_ci_stream_shards import (
     frozen_store_artifact_set_sha256,
     merge_shards,
 )
+from tests.test_ci_source_sidecars import _git_fixture
+from tests.test_ci_stream_fetch import FakeGitHub, _zip_bytes
+from tests.test_ci_stream_inventory import (
+    END as INVENTORY_END,
+)
+from tests.test_ci_stream_inventory import (
+    START as INVENTORY_START,
+)
+from tests.test_ci_stream_inventory import (
+    DatasetAPI,
+)
+from tests.test_ci_stream_inventory import (
+    _run as _inventory_run,
+)
 from tests.test_export_ci_content_store_case5 import (
     TOKENIZER_JSON,
     _build_store,
     _provenance,
     _run_metadata,
-)
-from tests.test_ci_source_sidecars import _git_fixture
-from tests.test_ci_stream_fetch import FakeGitHub, _zip_bytes
-from tests.test_ci_stream_inventory import (
-    DatasetAPI,
-    END as INVENTORY_END,
-    START as INVENTORY_START,
-    _run as _inventory_run,
 )
 
 _UNKNOWN_PARSER_SHA256 = "1" * 64
@@ -155,19 +174,29 @@ def _empty_inventory_template(
     tmp_path: Path,
     *,
     repo_key: str = "owner/repo",
+    repo_keys: tuple[str, ...] | None = None,
+    start_utc: str = "2026-06-01T00:00:00Z",
+    end_utc: str = "2026-08-01T00:00:00Z",
+    run_ids: tuple[int, ...] = (100, 200, 300),
+    run_created_at: str = "2026-07-26T10:00:00Z",
+    script_sha256: str = "2" * 64,
 ) -> tuple[Path, dict[str, Any]]:
-    owner, name = repo_key.split("/", 1)
+    repository_scope = (repo_key,) if repo_keys is None else repo_keys
+    assert repository_scope
+    start_epoch = ci_inventory.parse_utc_instant(start_utc)
+    end_epoch = ci_inventory.parse_utc_instant(end_utc)
     path = tmp_path / "inventory-template.sqlite3"
     connection = sqlite3.connect(path)
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.executescript(INVENTORY_SQL)
         run_rows: list[tuple[int, bytes, str, dict[str, Any]]] = []
-        for run_id in (100, 200, 300):
+        for run_id in run_ids:
             _text, provenance = _record(
                 f"inventory seed {run_id}",
                 run_id=run_id,
                 archive_member=f"{run_id}.txt",
+                workflow_created_at=run_created_at,
             )
             run_metadata = _run_metadata(provenance)
             raw = _canonical_json_bytes(run_metadata)
@@ -179,23 +208,19 @@ def _empty_inventory_template(
                     run_metadata,
                 )
             )
-        run_keys_sha256 = _hash_lines(
-            f"{repo_key}\t{run_id}\t1\t{metadata_sha256}"
-            for run_id, _raw, metadata_sha256, _metadata in run_rows
-        )
         metadata = {
             "schema": INVENTORY_SCHEMA,
             "repo_list_path": "/frozen/repositories.json",
             "repo_list_sha256": "1" * 64,
-            "repo_scope_sha256": _hash_lines((repo_key,)),
-            "repo_count": "1",
-            "original_repo_count": "1",
+            "repo_scope_sha256": _hash_lines(repository_scope),
+            "repo_count": str(len(repository_scope)),
+            "original_repo_count": str(len(repository_scope)),
             "unresolved_count": "0",
-            "start_epoch": "1780272000",
-            "end_epoch": "1785542400",
-            "start_utc": "2026-06-01T00:00:00Z",
-            "end_utc": "2026-08-01T00:00:00Z",
-            "script_sha256": "2" * 64,
+            "start_epoch": str(start_epoch),
+            "end_epoch": str(end_epoch),
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+            "script_sha256": script_sha256,
             "metadata_encoding": METADATA_ENCODING,
             "smoke": "0",
             "max_repos": "",
@@ -205,98 +230,121 @@ def _empty_inventory_template(
             "INSERT INTO inventory_meta(key,value) VALUES (?,?)",
             sorted(metadata.items()),
         )
-        connection.execute(
-            """
-            INSERT INTO repos(repo_key,owner,name,canonical,ordinal)
-            VALUES (?,?,?,?,0)
-            """,
-            (repo_key, owner, name, repo_key),
-        )
-        window_id = int(
+        for ordinal, current_repo_key in enumerate(repository_scope):
+            owner, name = current_repo_key.split("/", 1)
+            run_keys_sha256 = _hash_lines(
+                f"{current_repo_key}\t{run_id}\t1\t{metadata_sha256}"
+                for run_id, _raw, metadata_sha256, _metadata in run_rows
+            )
             connection.execute(
                 """
-                INSERT INTO search_windows(
-                  repo_key,start_epoch,end_epoch,parent_id,depth,status,
-                  expected_total,expected_pages,pages_done,raw_items,
-                  distinct_items,duplicate_items,run_keys_sha256,
-                  created_at,updated_at
-                ) VALUES (
-                  ?,1780272000,1785542400,NULL,0,'done',
-                  3,1,1,3,3,0,?,
-                  '2026-07-26T09:00:00Z','2026-07-26T09:00:00Z'
-                )
+                INSERT INTO repos(repo_key,owner,name,canonical,ordinal)
+                VALUES (?,?,?,?,?)
                 """,
-                (repo_key, run_keys_sha256),
-            ).lastrowid
-        )
-        for run_id, raw, metadata_sha256, run_metadata in run_rows:
+                (current_repo_key, owner, name, current_repo_key, ordinal),
+            )
+            window_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO search_windows(
+                      repo_key,start_epoch,end_epoch,parent_id,depth,status,
+                      expected_total,expected_pages,pages_done,raw_items,
+                      distinct_items,duplicate_items,run_keys_sha256,
+                      created_at,updated_at
+                    ) VALUES (
+                      ?,?,?,NULL,0,'done',
+                      ?,1,1,?,?,0,?,
+                      '2026-07-26T09:00:00Z','2026-07-26T09:00:00Z'
+                    )
+                    """,
+                    (
+                        current_repo_key,
+                        start_epoch,
+                        end_epoch,
+                        len(run_rows),
+                        len(run_rows),
+                        len(run_rows),
+                        run_keys_sha256,
+                    ),
+                ).lastrowid
+            )
+            for run_id, raw, metadata_sha256, run_metadata in run_rows:
+                connection.execute(
+                    """
+                    INSERT INTO runs(
+                      repo_key,run_id,run_attempt,created_at,updated_at,
+                      run_started_at,status,conclusion,workflow_id,workflow_name,
+                      event,head_branch,head_sha,run_number,html_url,api_url,
+                      metadata_blob,metadata_sha256,first_seen_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        current_repo_key,
+                        run_id,
+                        1,
+                        run_metadata["created_at"],
+                        run_metadata["updated_at"],
+                        run_metadata["run_started_at"],
+                        run_metadata["status"],
+                        run_metadata["conclusion"],
+                        run_metadata["workflow_id"],
+                        run_metadata["name"],
+                        run_metadata["event"],
+                        run_metadata["head_branch"],
+                        run_metadata["head_sha"],
+                        run_metadata["run_number"],
+                        None,
+                        None,
+                        sqlite3.Binary(zlib.compress(raw, 6)),
+                        metadata_sha256,
+                        "2026-07-26T09:00:00Z",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO window_runs(
+                      window_id,repo_key,run_id,run_attempt,metadata_sha256
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        window_id,
+                        current_repo_key,
+                        run_id,
+                        1,
+                        metadata_sha256,
+                    ),
+                )
             connection.execute(
                 """
-                INSERT INTO runs(
-                  repo_key,run_id,run_attempt,created_at,updated_at,
-                  run_started_at,status,conclusion,workflow_id,workflow_name,
-                  event,head_branch,head_sha,run_number,html_url,api_url,
-                  metadata_blob,metadata_sha256,first_seen_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO window_pages(
+                  window_id,page_no,total_count,item_count,distinct_item_count,
+                  duplicate_item_count,payload_sha256,run_keys_sha256,fetched_at
+                ) VALUES (?,1,?,?,?,0,?,?,?)
                 """,
                 (
-                    repo_key,
-                    run_id,
-                    1,
-                    run_metadata["created_at"],
-                    run_metadata["updated_at"],
-                    run_metadata["run_started_at"],
-                    run_metadata["status"],
-                    run_metadata["conclusion"],
-                    run_metadata["workflow_id"],
-                    run_metadata["name"],
-                    run_metadata["event"],
-                    run_metadata["head_branch"],
-                    run_metadata["head_sha"],
-                    run_metadata["run_number"],
-                    None,
-                    None,
-                    sqlite3.Binary(zlib.compress(raw, 6)),
-                    metadata_sha256,
+                    window_id,
+                    len(run_rows),
+                    len(run_rows),
+                    len(run_rows),
+                    "3" * 64,
+                    run_keys_sha256,
                     "2026-07-26T09:00:00Z",
                 ),
             )
             connection.execute(
                 """
-                INSERT INTO window_runs(
-                  window_id,repo_key,run_id,run_attempt,metadata_sha256
-                ) VALUES (?,?,?,?,?)
+                INSERT INTO request_ledger(
+                  requested_at,repo_key,window_id,endpoint,page_no,per_page,
+                  attempt,http_status,outcome,latency_ms
+                ) VALUES (?,?,?,?,1,100,1,200,'success',1)
                 """,
-                (window_id, repo_key, run_id, 1, metadata_sha256),
+                (
+                    "2026-07-26T09:00:00Z",
+                    current_repo_key,
+                    window_id,
+                    f"/repos/{current_repo_key}/actions/runs",
+                ),
             )
-        connection.execute(
-            """
-            INSERT INTO window_pages(
-              window_id,page_no,total_count,item_count,distinct_item_count,
-              duplicate_item_count,payload_sha256,run_keys_sha256,fetched_at
-            ) VALUES (?,1,3,3,3,0,?,?,?)
-            """,
-            (
-                window_id,
-                "3" * 64,
-                run_keys_sha256,
-                "2026-07-26T09:00:00Z",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO request_ledger(
-              requested_at,repo_key,window_id,endpoint,page_no,per_page,
-              attempt,http_status,outcome,latency_ms
-            ) VALUES (?,?,?,?,1,100,1,200,'success',1)
-            """,
-            (
-                "2026-07-26T09:00:00Z",
-                repo_key,
-                window_id,
-                f"/repos/{repo_key}/actions/runs",
-            ),
-        )
         connection.commit()
     finally:
         connection.close()
@@ -445,14 +493,18 @@ def _materialize_genuine_done_evidence(state_path: Path) -> None:
             )
             for endpoint, page_no, http_status in (
                 (
-                    f"/repos/{canonical_repo}/actions/runs/{row['run_id']}/"
-                    f"attempts/{row['attempt']}/logs",
+                    (
+                        f"/repos/{canonical_repo}/actions/runs/{row['run_id']}/"
+                        f"attempts/{row['attempt']}/logs"
+                    ),
                     None,
                     302,
                 ),
                 (
-                    f"/repos/{canonical_repo}/actions/runs/{row['run_id']}/"
-                    f"attempts/{row['attempt']}/jobs",
+                    (
+                        f"/repos/{canonical_repo}/actions/runs/{row['run_id']}/"
+                        f"attempts/{row['attempt']}/jobs"
+                    ),
                     1,
                     200,
                 ),
@@ -735,6 +787,7 @@ def _record(
     run_id: int,
     archive_member: str,
     ordinal: int = 0,
+    workflow_created_at: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     provenance = _provenance(
         text,
@@ -743,6 +796,19 @@ def _record(
     )
     provenance["run_id"] = run_id
     provenance["run_attempt"] = 1
+    if workflow_created_at is not None:
+        instant = datetime.fromtimestamp(
+            ci_inventory.parse_utc_instant(workflow_created_at),
+            tz=UTC,
+        )
+
+        def timestamp(delta: timedelta) -> str:
+            return (instant + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        workflow = provenance["workflow"]
+        workflow["created_at"] = timestamp(timedelta())
+        workflow["started_at"] = timestamp(timedelta(seconds=1))
+        workflow["updated_at"] = timestamp(timedelta(minutes=1))
     return text, provenance
 
 
@@ -752,11 +818,13 @@ def _record_for_repo(
     repo_key: str,
     run_id: int,
     archive_member: str,
+    workflow_created_at: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     record = _record(
         text,
         run_id=run_id,
         archive_member=archive_member,
+        workflow_created_at=workflow_created_at,
     )
     provenance = record[1]
     for key in (
@@ -1281,13 +1349,26 @@ def _production_shard_for_repo(
     *,
     label: str,
     repo_key: str,
+    repo_keys: tuple[str, ...] | None = None,
     user_version: int = 0,
+    start_utc: str = "2026-06-01T00:00:00Z",
+    end_utc: str = "2026-08-01T00:00:00Z",
+    run_ids: tuple[int, ...] = (100, 200, 300),
+    run_created_at: str = "2026-07-26T10:00:00Z",
+    script_sha256: str = "2" * 64,
 ) -> BuiltShard:
+    repository_scope = (repo_key,) if repo_keys is None else repo_keys
     inventory_root = tmp_path / f"{label}-inventory"
     inventory_root.mkdir()
     inventory, inventory_receipt = _empty_inventory_template(
         inventory_root,
         repo_key=repo_key,
+        repo_keys=repository_scope,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        run_ids=run_ids,
+        run_created_at=run_created_at,
+        script_sha256=script_sha256,
     )
     shard = _build_shard(
         tmp_path / f"{label}-shard",
@@ -1296,12 +1377,18 @@ def _production_shard_for_repo(
         inventory_receipt,
         [
             _record_for_repo(
-                f"run {run_id}",
-                repo_key=repo_key,
+                (
+                    f"run {run_id}"
+                    if len(repository_scope) == 1
+                    else f"run {current_repo_key} {run_id}"
+                ),
+                repo_key=current_repo_key,
                 run_id=run_id,
                 archive_member=f"{run_id}.txt",
+                workflow_created_at=run_created_at,
             )
-            for run_id in (100, 200, 300)
+            for current_repo_key in repository_scope
+            for run_id in run_ids
         ],
     )
     if user_version:
@@ -1317,6 +1404,262 @@ def _production_shard_for_repo(
         )
     _promote_to_exhaustive_receipt(shard)
     return shard
+
+
+def _adjacent_production_shards(
+    tmp_path: Path,
+    tokenizer: ExactTokenizer,
+) -> tuple[BuiltShard, BuiltShard]:
+    repo_key = "owner/shared"
+    earlier = _production_shard_for_repo(
+        tmp_path,
+        tokenizer,
+        label="earlier",
+        repo_key=repo_key,
+        start_utc="2026-06-01T00:00:00Z",
+        end_utc="2026-07-01T00:00:00Z",
+        run_ids=(100, 200, 300),
+        run_created_at="2026-06-26T10:00:00Z",
+        script_sha256="2" * 64,
+    )
+    later = _production_shard_for_repo(
+        tmp_path,
+        tokenizer,
+        label="later",
+        repo_key=repo_key,
+        start_utc="2026-07-01T00:00:00Z",
+        end_utc="2026-08-01T00:00:00Z",
+        run_ids=(400, 500, 600),
+        run_created_at="2026-07-26T10:00:00Z",
+        script_sha256="4" * 64,
+    )
+    return earlier, later
+
+
+def _refresh_production_inventory_receipt(
+    shard: BuiltShard,
+    *,
+    reconciliation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    receipt = InventoryDB(
+        shard.inventory,
+        initialize_schema=False,
+    ).completion_receipt(
+        source_drift_reconciliation=reconciliation,
+    )
+    receipt["database"] = shard.original_inventory
+    receipt["database_artifact"]["path"] = shard.original_inventory
+    assert shard.inventory_receipt is not None
+    _write_json(shard.inventory_receipt, receipt)
+    _promote_to_exhaustive_receipt(shard)
+    return receipt
+
+
+def _reconcile_fixture_inventory(shard: BuiltShard) -> dict[str, Any]:
+    connection = sqlite3.connect(shard.inventory)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        meta = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute(
+                "SELECT key,value FROM inventory_meta"
+            )
+        }
+        root = connection.execute(
+            "SELECT * FROM search_windows WHERE parent_id IS NULL"
+        ).fetchone()
+        assert root is not None
+        root_id = int(root["id"])
+        left_id = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(id),0)+1 FROM search_windows"
+            ).fetchone()[0]
+        )
+        right_id = left_id + 1
+        start_epoch = int(meta["start_epoch"])
+        end_epoch = int(meta["end_epoch"])
+        boundary = start_epoch + (end_epoch - start_epoch) // 2
+        assert int(connection.execute(
+            """
+            SELECT COUNT(*) FROM runs
+            WHERE created_at<? OR created_at>=?
+            """,
+            (
+                ci_inventory.format_utc_instant(boundary),
+                ci_inventory.format_utc_instant(end_epoch),
+            ),
+        ).fetchone()[0]) == 0
+        empty_run_keys_sha256 = _hash_lines(())
+        connection.execute(
+            """
+            INSERT INTO search_windows(
+              id,repo_key,start_epoch,end_epoch,parent_id,depth,status,
+              expected_total,expected_pages,pages_done,raw_items,
+              distinct_items,duplicate_items,run_keys_sha256,
+              failure_class,failure_message,created_at,updated_at
+            ) VALUES (
+              ?,?,?,?, ?,1,'done',0,1,1,0,0,0,?,NULL,NULL,?,?
+            )
+            """,
+            (
+                left_id,
+                root["repo_key"],
+                start_epoch,
+                boundary,
+                root_id,
+                empty_run_keys_sha256,
+                root["created_at"],
+                root["updated_at"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO search_windows(
+              id,repo_key,start_epoch,end_epoch,parent_id,depth,status,
+              expected_total,expected_pages,pages_done,raw_items,
+              distinct_items,duplicate_items,run_keys_sha256,
+              failure_class,failure_message,created_at,updated_at
+            ) VALUES (?,?,?,?,?,1,'done',?,?,?,?,?,?,?,NULL,NULL,?,?)
+            """,
+            (
+                right_id,
+                root["repo_key"],
+                boundary,
+                end_epoch,
+                root_id,
+                root["expected_total"],
+                root["expected_pages"],
+                root["pages_done"],
+                root["raw_items"],
+                root["distinct_items"],
+                root["duplicate_items"],
+                root["run_keys_sha256"],
+                root["created_at"],
+                root["updated_at"],
+            ),
+        )
+        for table in (
+            "window_runs",
+            "window_pages",
+            "window_convergence",
+            "convergence_passes",
+            "convergence_pass_pages",
+            "convergence_runs",
+            "convergence_pass_runs",
+            "window_union_closures",
+            "request_ledger",
+        ):
+            connection.execute(
+                f'UPDATE "{table}" SET window_id=? WHERE window_id=?',
+                (right_id, root_id),
+            )
+        connection.execute(
+            """
+            INSERT INTO window_pages(
+              window_id,page_no,total_count,item_count,distinct_item_count,
+              duplicate_item_count,payload_sha256,run_keys_sha256,fetched_at
+            ) VALUES (?,1,0,0,0,0,?,?,?)
+            """,
+            (
+                left_id,
+                "5" * 64,
+                empty_run_keys_sha256,
+                root["updated_at"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE search_windows SET
+              status='split',expected_total=?,expected_pages=NULL,
+              pages_done=0,raw_items=0,distinct_items=0,duplicate_items=0,
+              run_keys_sha256=NULL,failure_class=NULL,failure_message=NULL
+            WHERE id=?
+            """,
+            (int(root["expected_total"]) + 1, root_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = InventoryDB(shard.inventory, initialize_schema=False)
+    diagnostic = database.completion_receipt(allow_nonproduction=True)
+    assert diagnostic["source_count_drift"]["windows"] == 1
+    connection = database.connect(readonly=True, immutable=True)
+    try:
+        roots = ci_inventory._minimal_source_drift_roots(connection)
+        assert len(roots) == 1
+        root = roots[0]
+        stored = ci_inventory._stored_reconciliation_members(
+            connection,
+            root,
+        )
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute(
+                "SELECT key,value FROM inventory_meta"
+            )
+        }
+    finally:
+        connection.close()
+    membership_sha256, metadata_sha256 = ci_inventory._run_projection_digests(
+        str(root["repo"]),
+        stored,
+    )
+    completed_at = "2026-08-02T12:00:00Z"
+    proof = {
+        "window_id": int(root["window_id"]),
+        "completed_at": completed_at,
+        "producer_script_sha256": metadata["script_sha256"],
+        "repo": root["repo"],
+        "interval": {
+            "start": ci_inventory.format_utc_instant(int(root["start_epoch"])),
+            "end": ci_inventory.format_utc_instant(int(root["end_epoch"])),
+            "semantics": "[start,end)",
+        },
+        "parent_total": int(root["parent_total"]),
+        "child_total": int(root["child_total"]),
+        "stored_count": len(stored),
+        "stored_membership_sha256": membership_sha256,
+        "stored_metadata_sha256": metadata_sha256,
+        "current_count": len(stored),
+        "current_membership_sha256": membership_sha256,
+        "current_metadata_sha256": metadata_sha256,
+        "retained_upstream_deleted_count": 0,
+        "new_current_count": 0,
+        "observed_union_count": len(stored),
+        "observed_union_membership_sha256": membership_sha256,
+        "metadata_changed_count": 0,
+        "current_members": [
+            [run_id, run_attempt, run_metadata_sha256]
+            for (run_id, run_attempt), run_metadata_sha256 in sorted(
+                stored.items()
+            )
+        ],
+        "passes": [
+            {
+                "pass": pass_number,
+                "page_observation_count": 1,
+                "request_count": 1,
+                "membership_sha256": membership_sha256,
+                "metadata_sha256": metadata_sha256,
+                "page_ledger_sha256": str(pass_number) * 64,
+            }
+            for pass_number in (1, 2)
+        ],
+    }
+    database.store_source_drift_reconciliation([proof], [])
+    reconciliation = ci_inventory._source_drift_reconciliation_payload(
+        script_sha256=metadata["script_sha256"],
+        source_count_drift=diagnostic["source_count_drift"],
+        roots=[proof],
+    )
+    receipt = _refresh_production_inventory_receipt(
+        shard,
+        reconciliation=reconciliation,
+    )
+    assert receipt["source_snapshot_mode"] == "reconciled-observed-union"
+    return receipt
 
 
 def _update_time_subset_meta(
@@ -1546,15 +1889,14 @@ def test_disjoint_union_preserves_request_multiplicity_and_final_state_binding(
     with FrozenStore(
         destination / "content_store",
         destination / "store_receipt.json",
-    ) as store:
-        with FrozenFetchState(
-            destination / "fetch_state.sqlite3",
-            tokenizer=exact_tokenizer,
-            store=store,
-        ) as state:
-            assert fetch_receipt["frozen_fetch_state"] == state.receipt_binding()
-            assert receipt["frozen_fetch_state"] == state.receipt_binding()
-            assert fetch_receipt["content_store_receipt"] == store_receipt
+    ) as store, FrozenFetchState(
+        destination / "fetch_state.sqlite3",
+        tokenizer=exact_tokenizer,
+        store=store,
+    ) as state:
+        assert fetch_receipt["frozen_fetch_state"] == state.receipt_binding()
+        assert receipt["frozen_fetch_state"] == state.receipt_binding()
+        assert fetch_receipt["content_store_receipt"] == store_receipt
 
 
 def test_official_continuation_clone_conserves_base_without_hardlinks(
@@ -2267,6 +2609,552 @@ def test_newer_rerun_continues_base_through_clone_merge_and_export(
         merge_receipt=final_union / "merge_receipt.json",
     )
     assert exported["production_complete"] is True
+
+
+def test_production_merge_composes_adjacent_same_repo_inventories_and_exports(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    earlier, later = _adjacent_production_shards(tmp_path, exact_tokenizer)
+    manifest = tmp_path / "adjacent-production-manifest.json"
+    destination = tmp_path / "adjacent-production-union"
+    sources = {"earlier": earlier, "later": later}
+    manifest_value = build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": sources[source_id].inventory,
+                "inventory_receipt": sources[source_id].inventory_receipt,
+                "content_store": sources[source_id].store,
+                "store_receipt": sources[source_id].store_receipt,
+                "fetch_state": sources[source_id].state,
+                "fetch_receipt": sources[source_id].fetch_receipt,
+            }
+            for source_id in ("later", "earlier")
+        ],
+    )
+    assert manifest_value["schema"] == PRODUCTION_MANIFEST_SCHEMA
+
+    with pytest.raises(MergePaused):
+        merge_shards(manifest, max_batches=1)
+    assert not destination.exists()
+    merged = merge_shards(manifest)
+
+    assert merged["schema"] == PRODUCTION_MERGE_RECEIPT_SCHEMA
+    assert merged["production_complete"] is True
+    binding = merged["inventory"]
+    assert binding["schema"] == COMPOSITE_INVENTORY_BINDING_SCHEMA
+    assert binding["policy"] == (
+        "same-repository-contiguous-time-inventory-union-v1"
+    )
+    assert binding["interval"] == {
+        "start": "2026-06-01T00:00:00Z",
+        "end": "2026-08-01T00:00:00Z",
+        "semantics": "[start,end)",
+    }
+    assert [row["source_id"] for row in binding["interval_partition"]] == [
+        "earlier",
+        "later",
+    ]
+    assert {
+        row["producer_lineage"]["terminal_script_sha256"]
+        for row in binding["sources"]
+    } == {"2" * 64, "4" * 64}
+    assert binding["canonical_inventory_metadata_semantics"] == (
+        "canonical-output-metadata-only; each contiguous source partition "
+        "retains an independently verified producer lineage"
+    )
+    assert len(binding["source_producer_lineages_sha256"]) == 64
+    with sqlite3.connect(destination / "inventory.sqlite3") as inventory:
+        assert inventory.execute("SELECT COUNT(*) FROM repos").fetchone() == (1,)
+        assert inventory.execute("SELECT COUNT(*) FROM runs").fetchone() == (6,)
+        windows = inventory.execute(
+            """
+            SELECT id,start_epoch,end_epoch,parent_id,depth,status,expected_total
+            FROM search_windows
+            ORDER BY depth,start_epoch,id
+            """
+        ).fetchall()
+        assert windows == [
+            (1, 1780272000, 1785542400, None, 0, "split", 6),
+            (2, 1780272000, 1782864000, 1, 1, "done", 3),
+            (3, 1782864000, 1785542400, 1, 1, "done", 3),
+        ]
+        assert inventory.execute(
+            """
+            SELECT request.id,request.window_id
+            FROM request_ledger request ORDER BY request.id
+            """
+        ).fetchall() == [(1, 2), (2, 3)]
+        assert inventory.execute(
+            "SELECT COUNT(*) FROM source_drift_reconciliations"
+        ).fetchone() == (0,)
+    with sqlite3.connect(destination / "fetch_state.sqlite3") as state:
+        assert state.execute("SELECT COUNT(*) FROM attempts").fetchone() == (6,)
+        assert state.execute(
+            "SELECT COUNT(DISTINCT repo) FROM attempts"
+        ).fetchone() == (1,)
+
+    export_receipt = export_store(
+        store_root=destination / "content_store",
+        store_receipt=destination / "store_receipt.json",
+        fetch_state=destination / "fetch_state.sqlite3",
+        tokenizer_json=TOKENIZER_JSON,
+        output=tmp_path / "adjacent-case5",
+        completion_mode=COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        inventory=destination / "inventory.sqlite3",
+        inventory_receipt=destination / "inventory_receipt.json",
+        fetch_receipt=destination / "fetch_receipt.json",
+        merge_receipt=destination / "merge_receipt.json",
+    )
+    assert export_receipt["schema"] == PRODUCTION_EXPORT_SCHEMA
+    assert export_receipt["production_complete"] is True
+
+    forward_manifest = tmp_path / "adjacent-forward-manifest.json"
+    forward_destination = tmp_path / "adjacent-forward-union"
+    build_canonical_manifest(
+        forward_manifest,
+        destination=forward_destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": sources[source_id].inventory,
+                "inventory_receipt": sources[source_id].inventory_receipt,
+                "content_store": sources[source_id].store,
+                "store_receipt": sources[source_id].store_receipt,
+                "fetch_state": sources[source_id].state,
+                "fetch_receipt": sources[source_id].fetch_receipt,
+            }
+            for source_id in ("earlier", "later")
+        ],
+    )
+    forward = merge_shards(forward_manifest)
+    assert forward["inventory"]["binding_sha256"] == binding["binding_sha256"]
+    forward_inventory_receipt = json.loads(
+        (forward_destination / "inventory_receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reverse_inventory_receipt = json.loads(
+        (destination / "inventory_receipt.json").read_text(encoding="utf-8")
+    )
+    for field in (
+        "run_set_sha256",
+        "expected_attempt_set_sha256",
+        "per_repo_ledger_sha256",
+        "window_closure_sha256",
+        "source_count_drift",
+        "source_drift_reconciliation",
+    ):
+        assert forward_inventory_receipt[field] == reverse_inventory_receipt[field]
+    with (
+        sqlite3.connect(destination / "inventory.sqlite3") as reverse_inventory,
+        sqlite3.connect(
+            forward_destination / "inventory.sqlite3"
+        ) as forward_inventory,
+    ):
+        assert forward_inventory.execute(
+            """
+            SELECT id,start_epoch,end_epoch,parent_id,depth,status,expected_total
+            FROM search_windows
+            ORDER BY depth,start_epoch,id
+            """
+        ).fetchall() == windows
+        table_names = [
+            str(row[0])
+            for row in reverse_inventory.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name!='inventory_meta'
+                ORDER BY name
+                """
+            )
+        ]
+        assert table_names == [
+            str(row[0])
+            for row in forward_inventory.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name!='inventory_meta'
+                ORDER BY name
+                """
+            )
+        ]
+        for table in table_names:
+            assert reverse_inventory.execute(
+                f'SELECT * FROM "{table}" ORDER BY rowid'
+            ).fetchall() == forward_inventory.execute(
+                f'SELECT * FROM "{table}" ORDER BY rowid'
+            ).fetchall()
+
+
+def test_adjacent_union_ready_resume_rejects_non_source_derived_inventory(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    earlier, later = _adjacent_production_shards(tmp_path, exact_tokenizer)
+    manifest = tmp_path / "adjacent-ready-tamper-manifest.json"
+    destination = tmp_path / "adjacent-ready-tamper-union"
+    build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for source_id, shard in (("earlier", earlier), ("later", later))
+        ],
+    )
+    partial = _prepare_ready_partial(manifest, destination)
+    inventory_path = partial / "inventory.sqlite3"
+    with sqlite3.connect(inventory_path) as inventory:
+        inventory.execute(
+            """
+            UPDATE search_windows SET created_at='2026-05-31T23:59:59Z'
+            WHERE parent_id IS NULL
+            """
+        )
+        inventory.commit()
+    regenerated = InventoryDB(
+        inventory_path,
+        initialize_schema=False,
+    ).completion_receipt()
+    regenerated["database"] = str(destination / "inventory.sqlite3")
+    regenerated["database_artifact"]["path"] = str(
+        destination / "inventory.sqlite3"
+    )
+    _write_json(partial / "inventory_receipt.json", regenerated)
+
+    with pytest.raises(
+        MergeError,
+        match="differs from its deterministic source derivation",
+    ):
+        merge_shards(manifest)
+    assert not destination.exists()
+
+
+def test_adjacent_union_preserves_remapped_source_drift_reconciliation(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    earlier, later = _adjacent_production_shards(tmp_path, exact_tokenizer)
+    source_receipt = _reconcile_fixture_inventory(earlier)
+    assert source_receipt["source_count_drift"]["windows"] == 1
+    manifest = tmp_path / "reconciled-adjacent-manifest.json"
+    destination = tmp_path / "reconciled-adjacent-union"
+    build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for source_id, shard in (("later", later), ("earlier", earlier))
+        ],
+    )
+
+    merged = merge_shards(manifest)
+
+    assert merged["production_complete"] is True
+    assert merged["inventory"][
+        "source_drift_reconciliation_producer_script_sha256"
+    ] == "2" * 64
+    inventory_receipt = json.loads(
+        (destination / "inventory_receipt.json").read_text(encoding="utf-8")
+    )
+    assert inventory_receipt["source_snapshot_stable"] is True
+    assert inventory_receipt["source_snapshot_mode"] == (
+        "reconciled-observed-union"
+    )
+    assert inventory_receipt["source_count_drift"]["windows"] == 1
+    reconciliation = inventory_receipt["source_drift_reconciliation"]
+    assert reconciliation["root_count"] == 1
+    assert reconciliation["roots"][0]["window_id"] == 2
+    with sqlite3.connect(destination / "inventory.sqlite3") as inventory:
+        row = inventory.execute(
+            """
+            SELECT window_id,proof_blob,proof_raw_size,proof_sha256
+            FROM source_drift_reconciliations
+            """
+        ).fetchone()
+        assert row is not None
+        raw = zlib.decompress(row[1])
+        assert len(raw) == row[2]
+        assert hashlib.sha256(raw).hexdigest() == row[3]
+        assert json.loads(raw)["window_id"] == row[0] == 2
+        assert inventory.execute(
+            """
+            SELECT id,parent_id,depth,status,expected_total
+            FROM search_windows ORDER BY id
+            """
+        ).fetchall() == [
+            (1, None, 0, "split", 7),
+            (2, 1, 1, "split", 4),
+            (3, 2, 2, "done", 0),
+            (4, 2, 2, "done", 3),
+            (5, 1, 1, "done", 3),
+        ]
+    exported = export_store(
+        store_root=destination / "content_store",
+        store_receipt=destination / "store_receipt.json",
+        fetch_state=destination / "fetch_state.sqlite3",
+        tokenizer_json=TOKENIZER_JSON,
+        output=tmp_path / "reconciled-adjacent-case5",
+        completion_mode=COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        inventory=destination / "inventory.sqlite3",
+        inventory_receipt=destination / "inventory_receipt.json",
+        fetch_receipt=destination / "fetch_receipt.json",
+        merge_receipt=destination / "merge_receipt.json",
+    )
+    assert exported["schema"] == PRODUCTION_EXPORT_SCHEMA
+    assert exported["production_complete"] is True
+
+
+def test_adjacent_union_materializes_multi_repo_scope_once(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    repo_keys = ("owner/alpha", "owner/beta")
+    earlier = _production_shard_for_repo(
+        tmp_path,
+        exact_tokenizer,
+        label="multi-earlier",
+        repo_key=repo_keys[0],
+        repo_keys=repo_keys,
+        start_utc="2026-06-01T00:00:00Z",
+        end_utc="2026-07-01T00:00:00Z",
+        run_ids=(100, 200, 300),
+        run_created_at="2026-06-26T10:00:00Z",
+        script_sha256="2" * 64,
+    )
+    later = _production_shard_for_repo(
+        tmp_path,
+        exact_tokenizer,
+        label="multi-later",
+        repo_key=repo_keys[0],
+        repo_keys=repo_keys,
+        start_utc="2026-07-01T00:00:00Z",
+        end_utc="2026-08-01T00:00:00Z",
+        run_ids=(400, 500, 600),
+        run_created_at="2026-07-26T10:00:00Z",
+        script_sha256="4" * 64,
+    )
+    manifest = tmp_path / "multi-repo-adjacent-manifest.json"
+    destination = tmp_path / "multi-repo-adjacent-union"
+    build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for source_id, shard in (("later", later), ("earlier", earlier))
+        ],
+    )
+
+    merged = merge_shards(manifest)
+
+    assert merged["production_complete"] is True
+    assert merged["inventory"]["repo_count"] == 2
+    assert merged["inventory"]["run_count"] == 12
+    with sqlite3.connect(destination / "inventory.sqlite3") as inventory:
+        assert inventory.execute(
+            "SELECT repo_key,ordinal FROM repos ORDER BY ordinal"
+        ).fetchall() == [("owner/alpha", 0), ("owner/beta", 1)]
+        assert inventory.execute(
+            """
+            SELECT repo_key,COUNT(*) FROM search_windows
+            WHERE parent_id IS NULL
+            GROUP BY repo_key ORDER BY repo_key
+            """
+        ).fetchall() == [("owner/alpha", 1), ("owner/beta", 1)]
+        assert inventory.execute(
+            """
+            SELECT root.repo_key,COUNT(child.id)
+            FROM search_windows root
+            JOIN search_windows child ON child.parent_id=root.id
+            WHERE root.parent_id IS NULL
+            GROUP BY root.repo_key ORDER BY root.repo_key
+            """
+        ).fetchall() == [("owner/alpha", 2), ("owner/beta", 2)]
+        assert inventory.execute(
+            "SELECT COUNT(*) FROM runs"
+        ).fetchone() == (12,)
+        assert inventory.execute(
+            "SELECT id,window_id FROM request_ledger ORDER BY id"
+        ).fetchall() == [(1, 3), (2, 4), (3, 5), (4, 6)]
+    with sqlite3.connect(destination / "fetch_state.sqlite3") as state:
+        assert state.execute(
+            "SELECT repo,COUNT(*) FROM attempts GROUP BY repo ORDER BY repo"
+        ).fetchall() == [("owner/alpha", 6), ("owner/beta", 6)]
+
+
+def test_adjacent_union_rejects_gap_and_routes_other_repo_to_disjoint_validation(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    gap_root = tmp_path / "gap"
+    gap_root.mkdir()
+    earlier = _production_shard_for_repo(
+        gap_root,
+        exact_tokenizer,
+        label="earlier",
+        repo_key="owner/shared",
+        start_utc="2026-06-01T00:00:00Z",
+        end_utc="2026-07-01T00:00:00Z",
+        run_ids=(100, 200, 300),
+        run_created_at="2026-06-26T10:00:00Z",
+    )
+    later = _production_shard_for_repo(
+        gap_root,
+        exact_tokenizer,
+        label="later",
+        repo_key="owner/shared",
+        start_utc="2026-07-02T00:00:00Z",
+        end_utc="2026-08-01T00:00:00Z",
+        run_ids=(400, 500, 600),
+        run_created_at="2026-07-26T10:00:00Z",
+    )
+    gap_manifest = tmp_path / "gap-manifest.json"
+    gap_destination = tmp_path / "gap-union"
+    build_canonical_manifest(
+        gap_manifest,
+        destination=gap_destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for source_id, shard in (("earlier", earlier), ("later", later))
+        ],
+    )
+    with pytest.raises(MergeError, match="intervals leave a gap"):
+        merge_shards(gap_manifest)
+    assert not gap_destination.exists()
+
+    mismatch_root = tmp_path / "mismatch"
+    mismatch_root.mkdir()
+    mismatch_earlier, _unused_later = _adjacent_production_shards(
+        mismatch_root,
+        exact_tokenizer,
+    )
+    mismatch_later = _production_shard_for_repo(
+        mismatch_root,
+        exact_tokenizer,
+        label="different-repo-later",
+        repo_key="owner/different",
+        start_utc="2026-07-01T00:00:00Z",
+        end_utc="2026-08-01T00:00:00Z",
+        run_ids=(700, 800, 900),
+        run_created_at="2026-07-26T10:00:00Z",
+    )
+    mismatch_manifest = tmp_path / "mismatch-manifest.json"
+    mismatch_destination = tmp_path / "mismatch-union"
+    build_canonical_manifest(
+        mismatch_manifest,
+        destination=mismatch_destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for source_id, shard in (
+                ("earlier", mismatch_earlier),
+                ("later", mismatch_later),
+            )
+        ],
+    )
+    with pytest.raises(MergeError, match="incompatible interval"):
+        merge_shards(mismatch_manifest)
+    assert not mismatch_destination.exists()
+
+
+def test_adjacent_union_rejects_incompatible_reconciliation_producers(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    earlier, later = _adjacent_production_shards(tmp_path, exact_tokenizer)
+    _reconcile_fixture_inventory(earlier)
+    _reconcile_fixture_inventory(later)
+    manifest = tmp_path / "producer-conflict-manifest.json"
+    destination = tmp_path / "producer-conflict-union"
+    build_canonical_manifest(
+        manifest,
+        destination=destination,
+        tokenizer_path=TOKENIZER_JSON,
+        target_unique_tokens=1,
+        shards=[
+            {
+                "id": source_id,
+                "role": "coverage",
+                "inventory": shard.inventory,
+                "inventory_receipt": shard.inventory_receipt,
+                "content_store": shard.store,
+                "store_receipt": shard.store_receipt,
+                "fetch_state": shard.state,
+                "fetch_receipt": shard.fetch_receipt,
+            }
+            for source_id, shard in (("earlier", earlier), ("later", later))
+        ],
+    )
+
+    with pytest.raises(
+        MergeError,
+        match="incompatible reconciliation producer semantics",
+    ):
+        merge_shards(manifest)
+    assert not destination.exists()
 
 
 def test_production_merge_composes_disjoint_inventory_scopes(
