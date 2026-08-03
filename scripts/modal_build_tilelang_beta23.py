@@ -3,10 +3,10 @@
 Builds ABI-matched tvm-ffi and TileLang wheels on a Modal H100, then installs
 flash-attn-4==4.0.0b23 and verifies the complete stack imports cleanly.
 
-The fork at de8bb88c carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix),
-restores TVM's required nvbench CUDA header via DatasunriseOU/tvm@e25ca6ae,
-removes the apache-tvm-ffi<0.1.10 cap, completes the CUDA driver stub, and
-restores special-scope CUDA declarations for TIRx AllocBuffer nodes.
+The fork at a760fe58 serializes identical JIT builds across ranks and pins TVM
+at DatasunriseOU/tvm@84af1727 with tvm-ffi@e4353339. The stack retains the
+TVMDerivedObject.__slots__, nvbench header, CUDA driver stub, and special-scope
+TIRx AllocBuffer fixes required by the production wheel.
 
 The clone and build directory are disposable container scratch. The compressed
 wheel is written to the durable cppmega-wheels Modal Volume.
@@ -29,9 +29,9 @@ import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
 TILELANG_BRANCH = "main"
-TILELANG_COMMIT = "de8bb88cc382b0e78bc804244f79c4be8cc9e75f"
-TILELANG_TVM_COMMIT = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
-TILELANG_TVM_FFI_COMMIT = "521efeb30bfd9e4946b248b3d76e6391028233a3"
+TILELANG_COMMIT = "a760fe587995def0f3108ee204be453d87467c5d"
+TILELANG_TVM_COMMIT = "84af17279edb5edad29749bd6b0eea2ed9393105"
+TILELANG_TVM_FFI_COMMIT = "e4353339293459e3e8a393afc1b6a6a869e75b13"
 EXPECTED_WHEEL = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 EXPECTED_TVM_FFI_WHEEL = (
     "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
