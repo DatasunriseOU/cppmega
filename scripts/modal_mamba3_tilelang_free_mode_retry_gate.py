@@ -69,8 +69,8 @@ except KeyError:
         "CPPMEGA_NUMERICAL_PHASE must be exactly 'r2' or 'r4'"
     ) from None
 
-RESULT_STEM = f"mamba3-ce28-old51-{NUMERICAL_PHASE}-full-parity-a1"
-APP_NAME = f"cppmega-ce28-old51-{NUMERICAL_PHASE}-full-parity-a1"
+RESULT_STEM = f"mamba3-ce28-old51-{NUMERICAL_PHASE}-full-parity-a2"
+APP_NAME = f"cppmega-ce28-old51-{NUMERICAL_PHASE}-full-parity-a2"
 
 SOURCE_BINDINGS = (
     (
@@ -104,7 +104,7 @@ SOURCE_BINDINGS = (
 )
 SOURCE_BINDING_SHA256 = {
     "/opt/cppmega/tests/test_cppmega_mamba3_tp_mixer.py": (
-        "58dc65ae063b2d615e3374c3c028310072d363b8678deca0778cf9dd930433bc"
+        "bb4b5e0c2f85df8ee72b01542f12ce67d230d1ffa7df6e2a72a0e4a46aa4048c"
     ),
     "/opt/cppmega/cppmega/features/mamba3/__init__.py": (
         "5c07007032c0cbdf3ba8343a5160954640bd2c02230f98b21e5a92e67b36c530"
@@ -197,7 +197,12 @@ def _image() -> modal.Image:
             "CPPMEGA_NUMERICAL_PHASE": NUMERICAL_PHASE,
             "CUDA_LAUNCH_BLOCKING": "1",
             "MEGATRON_LM_REPO": "/opt/megatron-lm",
+            "NCCL_DEBUG": "INFO",
             "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
+            "TORCH_NCCL_DESYNC_DEBUG": "1",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+            "TORCH_NCCL_ENABLE_TIMING": "1",
+            "TORCH_NCCL_TRACE_BUFFER_SIZE": "2000",
             "TORCH_SHOW_CPP_STACKTRACES": "1",
             "WANDB_MODE": "disabled",
         }
@@ -230,6 +235,7 @@ def _image() -> modal.Image:
         "| sha256sum -c -; "
         f"echo '{TVM_FFI_WHEEL_SHA256}  {REMOTE_TVM_FFI_WHEEL}' "
         "| sha256sum -c -; "
+        "command -v timeout; "
         f"python -m pip install --force-reinstall --no-deps "
         f"'{REMOTE_TVM_FFI_WHEEL}' '{REMOTE_TILELANG_WHEEL}'; "
         f"test \"$(git -C /opt/megatron-lm rev-parse HEAD)\" = '{MEGATRON_COMMIT}'"
@@ -431,6 +437,10 @@ def run_gate() -> dict[str, Any]:
         ]
 
         command = [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=30s",
+            "1500s",
             sys.executable,
             "-m",
             "pytest",

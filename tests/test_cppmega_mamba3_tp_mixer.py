@@ -17,6 +17,7 @@ There are two test layers:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import timedelta
 import importlib
 import os
 import pathlib
@@ -679,10 +680,16 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(world_size))
 
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
     tag = "sp_on" if sp_on else ("tp_sp_off" if world_size > 1 else "ref")
+    print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=process_group_start", flush=True)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=5),
+    )
+    print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=process_group_ready", flush=True)
 
     try:
         from megatron.core import parallel_state
@@ -700,6 +707,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
             tensor_model_parallel_size=world_size,
             pipeline_model_parallel_size=1,
         )
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=model_parallel_ready", flush=True)
         model_parallel_cuda_manual_seed(12345)
 
         config = _build_sp_config(world_size=world_size, sp_on=sp_on)
@@ -726,6 +734,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
         ).cuda()
 
         _override_sp_mixer_weights(mixer, rank=rank)
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=mixer_ready", flush=True)
 
         # ------------------------------------------------------------------
         # Build the fixed input (full shape) then slice per rank if SP is on.
@@ -738,6 +747,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
         )
         # Broadcast from rank 0 so every rank sees the same tensor.
         dist.broadcast(hs_full, src=0)
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=input_ready", flush=True)
 
         if sp_on and world_size > 1:
             L_loc = _SP_SEQLEN // world_size
@@ -748,6 +758,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
         hs_local.requires_grad_(True)
 
         out_local, _ = mixer(hs_local)
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=forward_done", flush=True)
         # out_local shape: (L, B, H) in reference, (L/tp, B, H) in SP-on.
 
         # A fixed deterministic "loss" -- we pick a reproducible gradient
@@ -764,6 +775,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
             g_local = g_full
         loss = (out_local.float() * g_local.float()).sum()
         loss.backward()
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=backward_done", flush=True)
 
         # ------------------------------------------------------------------
         # Gather the forward output back to the full (L, B, H) tensor on
@@ -778,6 +790,7 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
 
         if rank == 0:
             return_dict[(tag, "output")] = out_full.float().cpu()
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=output_published", flush=True)
 
         # ------------------------------------------------------------------
         # Per-param grad gather.  Four families:
@@ -906,7 +919,9 @@ def _parity_worker_sp(rank: int, world_size: int, master_port: int, sp_on: bool,
                 if rank == 0:
                     return_dict[(tag, f"grad.in_proj.{ln_attr}")] = g
 
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=gradients_published", flush=True)
         dist.barrier()
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=barrier_done", flush=True)
 
     except Exception as exc:
         return_dict[("error", tag, rank)] = repr(exc)
@@ -1149,9 +1164,16 @@ def _parity_worker_cp(
         str(index) for index in range(world_size)
     )
 
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     tag = "cp_on" if cp_on else "ref"
+    print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=process_group_start", flush=True)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=5),
+    )
+    print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=process_group_ready", flush=True)
 
     try:
         from megatron.core import parallel_state
@@ -1177,6 +1199,7 @@ def _parity_worker_cp(
             pipeline_model_parallel_size=1,
             context_parallel_size=cp_size,
         )
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=model_parallel_ready", flush=True)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         config = _build_sp_config(
             world_size=1,
@@ -1198,6 +1221,7 @@ def _parity_worker_cp(
             pp_layer_offset=0,
         ).cuda()
         _override_sp_mixer_weights(mixer, rank=0)
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=mixer_ready", flush=True)
 
         torch.manual_seed(0xBEEF)
         hs_full = torch.randn(
@@ -1219,6 +1243,7 @@ def _parity_worker_cp(
         structure_dataset_patch._set_current_structure_batch(
             {"document_ids": document_ids}
         )
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=input_ready", flush=True)
 
         if cp_on:
             cp_group = pg_collection.cp
@@ -1242,7 +1267,9 @@ def _parity_worker_cp(
 
         hs_local.requires_grad_(True)
         out_local, _ = mixer(hs_local)
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=forward_done", flush=True)
         (out_local.float() * g_local.float()).sum().backward()
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=backward_done", flush=True)
         if hs_local.grad is None:
             raise RuntimeError("Mamba3 CP input gradient is missing")
 
@@ -1291,7 +1318,9 @@ def _parity_worker_cp(
             return_dict[(tag, "input_grad")] = input_grad_full.float().cpu()
             for name, gradient in parameter_grads.items():
                 return_dict[(tag, f"grad.{name}")] = gradient
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=gradients_published", flush=True)
         dist.barrier()
+        print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=barrier_done", flush=True)
     except Exception as exc:
         return_dict[("error", tag, rank)] = repr(exc)
         raise
