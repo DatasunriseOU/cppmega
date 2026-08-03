@@ -69,8 +69,8 @@ except KeyError:
         "CPPMEGA_NUMERICAL_PHASE must be exactly 'r2' or 'r4'"
     ) from None
 
-RESULT_STEM = f"mamba3-ce28-old51-{NUMERICAL_PHASE}-full-parity-a2"
-APP_NAME = f"cppmega-ce28-old51-{NUMERICAL_PHASE}-full-parity-a2"
+RESULT_STEM = f"mamba3-ce28-old51-{NUMERICAL_PHASE}-full-parity-a3"
+APP_NAME = f"cppmega-ce28-old51-{NUMERICAL_PHASE}-full-parity-a3"
 
 SOURCE_BINDINGS = (
     (
@@ -273,6 +273,7 @@ def run_gate() -> dict[str, Any]:
     log_path = pathlib.Path(str(prefix) + ".log")
     junit_path = pathlib.Path(str(prefix) + "-junit.xml")
     temporary_junit = pathlib.Path(f"/tmp/{RESULT_STEM}.xml")
+    temporary_log = pathlib.Path(f"/tmp/{RESULT_STEM}.log")
 
     def write_receipt(payload: dict[str, Any]) -> None:
         temporary = receipt_path.with_name(
@@ -466,22 +467,40 @@ def run_gate() -> dict[str, Any]:
             ),
             flush=True,
         )
-        process = subprocess.Popen(
-            command,
-            cwd="/opt/cppmega",
-            env=os.environ.copy(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        lines: list[str] = []
-        assert process.stdout is not None
-        for line in process.stdout:
-            lines.append(line)
-            print(line, end="", flush=True)
-        returncode = process.wait(timeout=30)
-        output = "".join(lines)
+        with temporary_log.open("w", encoding="utf-8") as output_stream:
+            process = subprocess.Popen(
+                command,
+                cwd="/opt/cppmega",
+                env=os.environ.copy(),
+                stdout=output_stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            heartbeat_bucket = -1
+            while process.poll() is None:
+                time.sleep(5)
+                elapsed = time.time() - started
+                current_bucket = int(elapsed // 30)
+                if current_bucket != heartbeat_bucket:
+                    heartbeat_bucket = current_bucket
+                    print(
+                        "TILELANG_CE28_OLD51_FULL_PARITY_HEARTBEAT="
+                        + json.dumps(
+                            {
+                                "phase": NUMERICAL_PHASE,
+                                "elapsed_seconds": round(elapsed, 3),
+                                "output_bytes": temporary_log.stat().st_size,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+        returncode = process.returncode
+        assert returncode is not None
+        output = temporary_log.read_text(encoding="utf-8")
+        for line in output.splitlines():
+            if "CPPMEGA_PARITY" in line or "completes to compile kernel" in line:
+                print(line, flush=True)
         log_path.write_text(output)
         if temporary_junit.is_file():
             junit_path.write_bytes(temporary_junit.read_bytes())
