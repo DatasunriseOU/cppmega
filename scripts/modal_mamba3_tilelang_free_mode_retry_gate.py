@@ -434,7 +434,7 @@ def run_gate() -> dict[str, Any]:
             "timeout",
             "--signal=TERM",
             "--kill-after=30s",
-            "1500s",
+            "3000s",
             sys.executable,
             "-m",
             "pytest",

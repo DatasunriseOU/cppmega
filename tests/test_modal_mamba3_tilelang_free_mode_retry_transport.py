@@ -19,6 +19,7 @@ def test_retry_gate_uses_sandbox_and_persists_before_failing() -> None:
         'modal.Sandbox.create(\n            "sleep",\n            "infinity"' in source
     )
     assert "sandbox.exec(" in local_entrypoint
+    assert '"3000s"' in source
     assert '"CPPMEGA_GATE_RUN_ID": run_id' in local_entrypoint
     assert '"CPPMEGA_MODAL_SANDBOX_ID": sandbox_id' in local_entrypoint
     assert '"CPPMEGA_SANDBOX_WORKER": "1"' in local_entrypoint
