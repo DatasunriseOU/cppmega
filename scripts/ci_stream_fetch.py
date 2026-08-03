@@ -7306,6 +7306,7 @@ class CIStreamFetcher:
                 if not continuous:
                     return self.write_progress()
                 self.write_progress()
+                last_progress_at = time.monotonic()
                 self.sleeper(max(0.1, poll_seconds))
 
 
