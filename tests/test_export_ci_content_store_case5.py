@@ -796,9 +796,11 @@ def test_merge_bound_store_fast_path_is_exact_and_reports_progress(
         [(text, _provenance(text))],
     )
     def progress() -> set[tuple[str, str]]:
+        captured = capsys.readouterr()
+        assert captured.out == ""
         return {
             (event["phase"], event["status"])
-            for line in capsys.readouterr().out.splitlines()
+            for line in captured.err.splitlines()
             if (event := json.loads(line))
         }
 
@@ -827,6 +829,16 @@ def test_merge_bound_store_fast_path_is_exact_and_reports_progress(
     )
     assert bound is not None
     receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+
+    malformed = {path: dict(artifact) for path, artifact in bound.items()}
+    malformed["index.sqlite3"]["byte_size"] = "invalid"
+    with pytest.raises(ExportError, match="index.sqlite3.*byte_size"):
+        FrozenStore(
+            store_root,
+            receipt_path,
+            merge_bound_artifacts=malformed,
+            merge_bound_receipt_sha256=receipt_sha256,
+        )
 
     with FrozenStore(
         store_root,

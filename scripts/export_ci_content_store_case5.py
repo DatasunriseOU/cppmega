@@ -455,7 +455,7 @@ def _progress(
         event["completed"] = completed
     if total is not None:
         event["total"] = total
-    print(json.dumps(event, sort_keys=True), flush=True)
+    print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def _row_progress(phase: str, completed: int, total: int) -> None:
@@ -1246,10 +1246,23 @@ class FrozenStore:
             )
         self._merge_bound_artifacts: dict[str, tuple[int, str]] | None = None
         if merge_bound_artifacts is not None:
-            self._merge_bound_artifacts = {
-                relative: (int(artifact["byte_size"]), str(artifact["sha256"]))
-                for relative, artifact in merge_bound_artifacts.items()
-            }
+            self._merge_bound_artifacts = {}
+            for relative, raw_artifact in merge_bound_artifacts.items():
+                artifact = _require_mapping(
+                    raw_artifact,
+                    where=f"merge-bound store artifact {relative!r}",
+                )
+                self._merge_bound_artifacts[str(relative)] = (
+                    _require_int(
+                        artifact.get("byte_size"),
+                        where=f"merge-bound store artifact {relative!r}.byte_size",
+                        minimum=0,
+                    ),
+                    _require_hex64(
+                        artifact.get("sha256"),
+                        where=f"merge-bound store artifact {relative!r}.sha256",
+                    ),
+                )
         self.verification_mode = (
             "merge-receipt-artifact-fast-path"
             if self._merge_bound_artifacts is not None
