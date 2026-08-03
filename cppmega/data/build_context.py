@@ -47,7 +47,11 @@ _TARGET_FLAG_RE = re.compile(r"(?P<flag>(?:--target=|-march=|-mcpu=)(?P<value>[^
 _LANG_TOKEN_RE = re.compile(r"^(?:-x(?P<joined>.+)|-x)$")
 _VAR_ASSIGN_RE = re.compile(r"^\s*(?P<name>[A-Z_][A-Z0-9_]*)\s*(?:[:+?]?=)\s*(?P<value>.*?)\s*$")
 _STRING_LITERAL_RE = re.compile(r"['\"]([^'\"]+)['\"]", re.S)
-_CMAKE_STD_RE = re.compile(r"CMAKE_(?P<lang>C|CXX)_STANDARD\s+(\d+)", re.IGNORECASE)
+_CMAKE_STD_RE = re.compile(
+    r"CMAKE_(?P<lang>C|CXX)_STANDARD\s+"
+    r'(?P<quote>"?)(?P<version>\d+)(?P=quote)(?=[\s)])',
+    re.IGNORECASE,
+)
 _CMAKE_COMPILER_RE = re.compile(
     r"CMAKE_(?P<lang>C|CXX)_COMPILER\s+\"?([^\"\s)]+)\"?",
     re.IGNORECASE,
@@ -605,7 +609,9 @@ def _parse_cmake(text: str) -> BuildDetection | None:
     c_standard = None
     for match in _CMAKE_STD_RE.finditer(text):
         lang = match.group("lang").upper()
-        normalized = _normalize_standard(f"{'c++' if lang == 'CXX' else 'c'}{match.group(2)}")
+        normalized = _normalize_standard(
+            f"{'c++' if lang == 'CXX' else 'c'}{match.group('version')}"
+        )
         if lang == "CXX" and normalized:
             cxx_standard = normalized
         elif lang == "C" and normalized:

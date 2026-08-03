@@ -357,6 +357,14 @@ def _trailing_nul_bytes(
 
 
 def _path_declared_codec(path: Path) -> tuple[str, str] | None:
+    if tuple(part.casefold() for part in path.parts[-5:]) == (
+        "src",
+        "test",
+        "mb",
+        "sql",
+        "mule_internal.sql",
+    ):
+        return "latin-1", "mule-internal"
     declared = _FILENAME_DECLARED_CODECS.get(path.name.casefold())
     if declared is not None:
         return declared
