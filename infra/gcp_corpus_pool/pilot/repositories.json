@@ -1,0 +1,44 @@
+{
+  "repositories": [
+    {
+      "project_id": "fmtlib/fmt",
+      "repo": "fmt",
+      "source": {
+        "expected_commit": "e2243a6a7f4a8c09e9233a253f3d1f71e45d8cef",
+        "expected_tree": null,
+        "kind": "git_mirror",
+        "remote_url": "https://github.com/fmtlib/fmt.git"
+      }
+    },
+    {
+      "project_id": "gabime/spdlog",
+      "repo": "spdlog",
+      "source": {
+        "expected_commit": "989d28dd768adef702538634857942db24e1058a",
+        "expected_tree": null,
+        "kind": "git_mirror",
+        "remote_url": "https://github.com/gabime/spdlog.git"
+      }
+    },
+    {
+      "project_id": "google/googletest",
+      "repo": "googletest",
+      "source": {
+        "expected_commit": "1b6f64d659944658a4c685b7bd9f04c1c3b8a39b",
+        "expected_tree": null,
+        "kind": "git_mirror",
+        "remote_url": "https://github.com/google/googletest.git"
+      }
+    },
+    {
+      "project_id": "nlohmann/json",
+      "repo": "json",
+      "source": {
+        "expected_commit": "5f121d8c50433bc6c33b8954d93a6a86dc8544fe",
+        "expected_tree": null,
+        "kind": "git_mirror",
+        "remote_url": "https://github.com/nlohmann/json.git"
+      }
+    }
+  ]
+}

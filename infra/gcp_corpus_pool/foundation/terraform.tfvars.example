@@ -1,0 +1,9 @@
+project_id = "natural-bison-491019-t9"
+region     = "us-central1"
+
+# The default is <project_id>-cppmega-corpus. Override only if that globally
+# unique name is already occupied.
+# bucket_name = "natural-bison-491019-t9-cppmega-corpus"
+
+# Leave empty to restrict SSH to IAP TCP forwarding.
+admin_ssh_source_ranges = []
