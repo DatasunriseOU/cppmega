@@ -34,9 +34,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 from contextlib import contextmanager
 from datetime import timedelta
+from queue import Empty
 from types import SimpleNamespace
 from typing import Iterator
 
@@ -1047,6 +1049,55 @@ def _fa4_tp_sp_worker(
             torch.distributed.destroy_process_group()
 
 
+def _join_distributed_workers(
+    processes,
+    results,
+    *,
+    timeout_seconds: float,
+) -> list:
+    """Join one worker world by a common deadline and reap every timeout."""
+
+    deadline = time.monotonic() + timeout_seconds
+    for process in processes:
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    timed_out = [process for process in processes if process.is_alive()]
+    for process in timed_out:
+        process.terminate()
+    for process in timed_out:
+        process.join(timeout=10)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=10)
+
+    messages = []
+    result_deadline = time.monotonic() + (1 if timed_out else 10)
+    for _index in range(len(processes)):
+        try:
+            messages.append(
+                results.get(timeout=max(0.0, result_deadline - time.monotonic()))
+            )
+        except Empty:
+            break
+    results.close()
+    results.join_thread()
+
+    exitcodes = [process.exitcode for process in processes]
+    if timed_out:
+        raise AssertionError(
+            "FA4 distributed workers timed out after "
+            f"{timeout_seconds:g}s; timed_out_pids="
+            f"{[process.pid for process in timed_out]}; "
+            f"exitcodes={exitcodes}; messages={messages!r}"
+        )
+    if len(messages) != len(processes):
+        raise AssertionError(
+            f"expected {len(processes)} FA4 worker reports, got "
+            f"{len(messages)}; exitcodes={exitcodes}; messages={messages!r}"
+        )
+    return messages
+
+
 def _run_fa4_tp_sp_world(
     *,
     cp_size: int,
@@ -1065,9 +1116,11 @@ def _run_fa4_tp_sp_world(
     ]
     for process in processes:
         process.start()
-    for process in processes:
-        process.join(timeout=600)
-    messages = [results.get(timeout=10) for _ in range(world_size)]
+    messages = _join_distributed_workers(
+        processes,
+        results,
+        timeout_seconds=600,
+    )
     assert all(process.exitcode == 0 for process in processes), messages
     assert sorted((message[0], message[1]) for message in messages) == [
         ("ok", rank) for rank in range(world_size)
@@ -1343,9 +1396,11 @@ class TestFA4H200Parity:
         ]
         for process in processes:
             process.start()
-        for process in processes:
-            process.join(timeout=300)
-        messages = [results.get(timeout=5) for _ in range(2)]
+        messages = _join_distributed_workers(
+            processes,
+            results,
+            timeout_seconds=300,
+        )
         assert all(process.exitcode == 0 for process in processes), messages
         assert sorted(messages) == [("ok", 0), ("ok", 1)]
 
