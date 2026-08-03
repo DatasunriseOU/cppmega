@@ -1758,6 +1758,49 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
     } == {"ZSTD"}
 
 
+def test_metadata_ledgers_accept_bounded_records_over_one_mib(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "compile source.cpp"
+    provenance = _provenance(text)
+    provenance["archive"]["member"] = "large bounded job metadata.txt"
+    provenance["job"] = {
+        "id": 99,
+        "name": "large bounded job metadata",
+        "steps": [
+            {"number": index + 1, "name": "x" * 256}
+            for index in range(4_096)
+        ],
+    }
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, provenance)],
+    )
+    output = tmp_path / "large-bounded-metadata"
+
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+    )
+
+    occurrence = _read_parquet_ledger(
+        output / receipt["occurrence_metadata"]["artifact"],
+        domain=receipt["occurrence_metadata"]["logical_domain"],
+        schema=receipt["occurrence_metadata"]["schema"],
+    )[0]
+    representative = _read_parquet_ledger(
+        output / receipt["representative_metadata"]["artifact"],
+        schema=receipt["representative_metadata"]["schema"],
+    )[0]
+    assert len(_canonical_bytes(occurrence)) > 1024 * 1024
+    assert len(_canonical_bytes(representative)) > 1024 * 1024
+
+
 def test_legacy_source_bindings_require_authorization_and_export_as_overlay(
     tmp_path: Path,
     exact_tokenizer: ExactTokenizer,

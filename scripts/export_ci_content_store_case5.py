@@ -5200,7 +5200,7 @@ def export_store(
             occurrence_metadata_writer = CanonicalParquetLedgerWriter(
                 temp_path / "occurrence_metadata.parquet",
                 domain=OCCURRENCE_METADATA_LEDGER_DOMAIN,
-                max_record_bytes=1024 * 1024,
+                max_record_bytes=MAX_STATE_JSON_EVIDENCE_BYTES,
             )
             source_binding_projection_counts: Counter[str] = Counter()
             previous_source_binding_projection_key: (
@@ -5921,7 +5921,7 @@ def export_store(
             )
             representative_metadata_writer = CanonicalParquetLedgerWriter(
                 temp_path / "representative_metadata.parquet",
-                max_record_bytes=1024 * 1024,
+                max_record_bytes=MAX_STATE_JSON_EVIDENCE_BYTES,
             )
             row_buffers: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
             row_counts: Counter[tuple[str, int]] = Counter()
