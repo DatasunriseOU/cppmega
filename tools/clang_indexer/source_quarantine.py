@@ -7,15 +7,14 @@ versioned manifest entry. It is not a parse-error suppression mechanism.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
-from typing import Iterable
 import zipfile
-
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Iterable
 
 MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v1"
 RECEIPT_SCHEMA = "cppmega.source_quarantine_receipt_v1"
@@ -219,22 +218,31 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
                 f"but the fixture is not ASCII: {exc}"
             ) from exc
-        required_lines = {
+        compiler_contract = {
             "// RUN: not --crash %clang_cc1 %s 2>&1 | FileCheck %s",
             "// REQUIRES: crash-recovery",
             "// CHECK: prag\\",
             "// CHECK-NEXT: ma",
-        }
-        if not required_lines.issubset(decoded.splitlines()):
+        }.issubset(decoded.splitlines()) and decoded.count(
+            "#prag\\\nma clang __debug crash\n"
+        ) == 1
+        index_contract = {
+            "// RUN: not c-index-test -test-load-source all %s 2> %t.err",
+            "// RUN: FileCheck < %t.err -check-prefix=CHECK-LOAD-SOURCE-CRASH %s",
+            "// CHECK-LOAD-SOURCE-CRASH: Unable to load translation unit",
+            (
+                "// RUN: env LIBCLANG_DISABLE_CRASH_RECOVERY=1 not --crash "
+                "c-index-test -test-load-source all %s"
+            ),
+            "// REQUIRES: crash-recovery",
+            "#pragma clang __debug crash",
+        }.issubset(decoded.splitlines()) and decoded.splitlines().count(
+            "#pragma clang __debug crash"
+        ) == 1
+        if not (compiler_contract or index_contract):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
-                "but the Clang crash-test contract is incomplete"
-            )
-        crash_pragma = "#prag\\\nma clang __debug crash\n"
-        if decoded.count(crash_pragma) != 1:
-            raise SourceQuarantineError(
-                f"{entry.relative_path}: declared clang_debug_crash_pragma "
-                "but the deliberate crash signature is absent or ambiguous"
+                "but the Clang crash-test contract is incomplete or ambiguous"
             )
         return
 

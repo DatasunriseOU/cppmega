@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import gzip
 import json
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -474,6 +474,19 @@ def test_atomic_publish_replaces_only_after_success(tmp_path: Path) -> None:
     with atomic_output_file(output) as stage:
         stage.write_text("complete\n", encoding="utf-8")
     assert output.read_text(encoding="utf-8") == "complete\n"
+
+
+def test_index_jsonl_output_is_gzip_streamable(tmp_path: Path) -> None:
+    from tools.clang_indexer.index_project import _open_jsonl_output
+
+    output = tmp_path / "source.enriched.jsonl.gz"
+    with _open_jsonl_output(output, append=False, compressed=True) as stream:
+        stream.write('{"doc":1}\n')
+    with _open_jsonl_output(output, append=True, compressed=True) as stream:
+        stream.write('{"doc":2}\n')
+
+    with gzip.open(output, "rt", encoding="utf-8") as stream:
+        assert stream.readlines() == ['{"doc":1}\n', '{"doc":2}\n']
 
 
 def test_memory_guard_disabled_limit_is_a_noop() -> None:

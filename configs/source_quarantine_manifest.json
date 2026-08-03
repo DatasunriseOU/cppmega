@@ -20,6 +20,15 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
     },
     {
+      "project_id": "google/filament",
+      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Index/crash-recovery.c",
+      "size_bytes": 344,
+      "sha256": "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang index regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
       "project_id": "microsoft/DirectXShaderCompiler",
       "relative_path": "tools/clang/test/Parser/crash-report.c",
       "size_bytes": 271,

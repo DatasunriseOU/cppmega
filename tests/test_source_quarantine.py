@@ -3,23 +3,23 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-from pathlib import Path
 import zipfile
+from pathlib import Path
 
 import pytest
 
 from tools.clang_indexer import index_project as ip
 from tools.clang_indexer.source_quarantine import (
     MANIFEST_SCHEMA,
-    ProjectSourceQuarantine,
     RECEIPT_SCHEMA,
+    ProjectSourceQuarantine,
     SourceQuarantineError,
 )
-
 
 PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
 RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
+RELATIVE_INDEX_CRASH_FIXTURE = "tools/clang/test/Index/crash-recovery.c"
 RELATIVE_PARSER_CRASH_FIXTURE = (
     "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
 )
@@ -50,6 +50,20 @@ def _clang_crash_fixture_bytes() -> bytes:
         b"// CHECK: prag\\\n"
         b"// CHECK-NEXT: ma\n"
         b"\n"
+    )
+
+
+def _clang_index_crash_fixture_bytes() -> bytes:
+    return (
+        b"// RUN: not c-index-test -test-load-source all %s 2> %t.err\n"
+        b"// RUN: FileCheck < %t.err -check-prefix=CHECK-LOAD-SOURCE-CRASH %s\n"
+        b"// CHECK-LOAD-SOURCE-CRASH: Unable to load translation unit\n"
+        b"// RUN: env LIBCLANG_DISABLE_CRASH_RECOVERY=1 not --crash "
+        b"c-index-test -test-load-source all %s\n"
+        b"//\n"
+        b"// REQUIRES: crash-recovery\n"
+        b"\n"
+        b"#pragma clang __debug crash\n"
     )
 
 
@@ -246,11 +260,19 @@ def test_quarantine_hash_mismatch_fails_without_filtering(
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "payload"),
+    [
+        (RELATIVE_CRASH_FIXTURE, _clang_crash_fixture_bytes()),
+        (RELATIVE_INDEX_CRASH_FIXTURE, _clang_index_crash_fixture_bytes()),
+    ],
+)
 def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
     tmp_path: Path,
+    relative_path: str,
+    payload: bytes,
 ) -> None:
-    payload = _clang_crash_fixture_bytes()
-    candidate = tmp_path / RELATIVE_CRASH_FIXTURE
+    candidate = tmp_path / relative_path
     candidate.parent.mkdir(parents=True)
     candidate.write_bytes(payload)
     manifest = tmp_path / "quarantine.json"
@@ -259,7 +281,7 @@ def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
         payload,
         classification="deliberate_compiler_crash_fixture",
         detected_format="clang_debug_crash_pragma",
-        relative_path=RELATIVE_CRASH_FIXTURE,
+        relative_path=relative_path,
         reason="fixture deliberately crashes Clang",
     )
 
@@ -459,6 +481,7 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
         for item in manifest["entries"]
         if item["project_id"]
         in {"google/filament", "microsoft/DirectXShaderCompiler"}
+        and item["relative_path"].endswith(RELATIVE_CRASH_FIXTURE)
     ]
 
     assert len(payload) == 271
@@ -471,6 +494,31 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
         assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
         assert entry["classification"] == "deliberate_compiler_crash_fixture"
         assert entry["detected_format"] == "clang_debug_crash_pragma"
+
+
+def test_checked_in_filament_index_crash_manifest_matches_reference_fixture() -> None:
+    payload = _clang_index_crash_fixture_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "google/filament"
+        and item["relative_path"].endswith(RELATIVE_INDEX_CRASH_FIXTURE)
+    )
+
+    assert len(payload) == 344
+    assert hashlib.sha256(payload).hexdigest() == (
+        "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727"
+    )
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_crash_fixture"
+    assert entry["detected_format"] == "clang_debug_crash_pragma"
 
 
 def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None:

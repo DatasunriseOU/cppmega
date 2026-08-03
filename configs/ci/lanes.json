@@ -41,6 +41,8 @@
             "tests/test_case4_identity_parity.py",
             "tests/test_case5_v7_parser_token_span_regressions.py",
             "tests/test_data_pipeline_contracts.py",
+            "tests/test_source_processing_core_behavior.py",
+            "tests/test_source_quarantine.py",
             "tests/test_data_prep_parquet_to_megatron.py",
             "tests/test_case5_ksh_domain_contract.py",
             "tests/test_domain_embedding.py",

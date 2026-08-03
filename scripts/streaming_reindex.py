@@ -1079,7 +1079,7 @@ def stage_index_source(
     index_stall_timeout_s: int | None = None,
     source_quarantine_manifest: Path | None = None,
 ) -> Path:
-    """index_project.py --enriched -> <repo>.enriched.jsonl.
+    """index_project.py --enriched -> <repo>.enriched.jsonl.gz.
 
     Passes --tokenizer-path so index_project runs FUNCTION-LEVEL tokenized-hash
     dedup before grouping; --dedup-db makes that dedup GLOBAL + resumable +
@@ -1092,7 +1092,7 @@ def stage_index_source(
     project_id = require_project_identity(
         project_id, source=f"stage_index_source({repo})"
     )
-    enriched = work / f"{repo}.enriched.jsonl"
+    enriched = work / f"{repo}.enriched.jsonl.gz"
     cmd = [
         VENV_PYTHON, INDEX_PROJECT,
         "--project-dir", repo_dir,

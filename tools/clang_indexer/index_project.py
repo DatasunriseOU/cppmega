@@ -26,9 +26,10 @@ Usage:
 """
 
 import argparse
-from array import array
 import ctypes.util
 import glob
+import gzip
+import hashlib
 import importlib
 import json
 import os
@@ -37,32 +38,44 @@ import re
 import shutil
 import sqlite3
 import sys
-import hashlib
 import time
 import warnings
+from array import array
 
 # Increase recursion limit for deeply nested ASTs (gcc-mirror, llvm-project, boost)
 sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterable,
+    Iterator,
+    Optional,
+    Protocol,
+    Sequence,
+    TextIO,
+    TypeAlias,
+    cast,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from cppmega.data.language_info import detect_language_info
 from cppmega.data.build_context import (
     detect_build_context,
     find_compile_commands_file,
     load_compile_commands_file,
 )
+from cppmega.data.language_info import detect_language_info
+from cppmega.data.source_identity import source_identity, source_identity_for_path
 from cppmega.symbol_identity import (
     EXTERNAL_PROVIDER_PROJECTS,
+    SYMBOL_ID_MAX,  # noqa: F401 - re-exported for global index consumers
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
-    SYMBOL_ID_MAX,  # noqa: F401 - re-exported for global index consumers
     SymbolIdentityError,
     SymbolIdentityRegistry,
     canonical_external_provider_file,
@@ -76,9 +89,8 @@ from cppmega.symbol_identity import (
     parse_usr_identity,
     require_project_identity,
 )
-from cppmega.data.source_identity import source_identity, source_identity_for_path
-from scripts.data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.data.atomic_publish import atomic_output_file
+from scripts.data.memory_guard import check_memory_limit, start_memory_guard
 
 if __package__:
     from .source_quarantine import ProjectSourceQuarantine
@@ -90,8 +102,15 @@ else:
 
 if TYPE_CHECKING:
     import clang.cindex as clang_cindex  # pyright: ignore[reportMissingImports]
-    from clang.cindex import Config as ClangConfig  # pyright: ignore[reportMissingImports]
-    from clang.cindex import Cursor, CursorKind, Index, TranslationUnit  # pyright: ignore[reportMissingImports]
+    from clang.cindex import (
+        Config as ClangConfig,  # pyright: ignore[reportMissingImports]
+    )
+    from clang.cindex import (  # pyright: ignore[reportMissingImports]
+        Cursor,
+        CursorKind,
+        Index,
+        TranslationUnit,
+    )
 else:
     clang_cindex = None
     ClangConfig = object
@@ -104,6 +123,24 @@ else:
 class _MissingCursorKind:
     def __getattr__(self, name: str) -> str:
         return f"<missing-clang-cursorkind:{name}>"
+
+
+def _open_jsonl_output(
+    path: Path,
+    *,
+    append: bool,
+    compressed: bool,
+) -> TextIO:
+    mode = "at" if append else "wt"
+    if compressed:
+        return gzip.open(
+            path,
+            mode,
+            compresslevel=1,
+            encoding="utf-8",
+            newline="\n",
+        )
+    return path.open(mode, encoding="utf-8", newline="\n")
 
 
 class _MissingIndex:
@@ -11269,7 +11306,11 @@ def main() -> int:
     with atomic_output_file(final_output) as staged_output:
         if append_mode and final_output.exists():
             shutil.copyfile(final_output, staged_output)
-        with staged_output.open('a' if append_mode else 'w') as out:
+        with _open_jsonl_output(
+            staged_output,
+            append=append_mode,
+            compressed=final_output.suffix == ".gz",
+        ) as out:
             def _write_doc(doc: str | dict[str, object]) -> None:
                 nonlocal total_docs
                 if enriched:
