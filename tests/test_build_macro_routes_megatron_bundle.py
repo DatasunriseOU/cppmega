@@ -1615,6 +1615,78 @@ def test_builder_requires_exactly_one_objective_artifact_per_bucket(
         _parse_objective_artifacts([f"1024={artifact}"], (1024, 2048))
 
 
+def test_production_objective_target_is_exact_hash_bound_and_enforced() -> None:
+    target = builder._load_production_objective_target()
+    sample_targets = {
+        "1024": 281580,
+        "2048": 167040,
+        "4096": 95400,
+        "8192": 45540,
+        "16384": 19740,
+    }
+    policy = target["materialization"]
+
+    assert target["sample_targets"] == sample_targets
+    assert policy == {
+        "seed": 17,
+        "quota_window_samples": 60,
+        "quota_lookahead_samples": 180,
+        "objective_seed_kinds": ["code", "commits"],
+        "graph_relations": [
+            "call",
+            "type",
+            "domain",
+            "build",
+            "shell",
+            "diagnostic",
+            "cross_domain",
+        ],
+    }
+    assert target["megatron_split"] == {
+        "value": "969,30,1",
+        "fractions": ["0.969", "0.030", "0.001"],
+        "rounding": "python_round_on_cumulative_document_counts",
+    }
+    assert builder._sha256(builder.PRODUCTION_OBJECTIVE_TARGET_PATH) == (
+        builder.PRODUCTION_OBJECTIVE_TARGET_SHA256
+    )
+    contract = {
+        "seed": 17,
+        "quota_window_samples": 60,
+        "totals": {"samples": 0},
+        "source_selection": {"quota_lookahead_samples": 180},
+        "graph_auxiliary": {"relations": policy["graph_relations"]},  # type: ignore[index]
+        "source_snapshot": {"pools": {"objective_seed": {"files": []}}},
+    }
+    for bucket, samples in zip(
+        builder.DEFAULT_BUCKETS, sample_targets.values(), strict=True
+    ):
+        contract["totals"]["samples"] = samples  # type: ignore[index]
+        snapshot = contract["source_snapshot"]  # type: ignore[assignment]
+        snapshot["sequence_length"] = bucket
+        snapshot["pools"]["objective_seed"]["files"] = [  # type: ignore[index]
+            {"path": f"code/{bucket}/code.parquet"},
+            {"path": f"commits/{bucket}/commits.parquet"},
+        ]
+        builder._validate_production_objective_contract(
+            contract=contract,
+            bucket=bucket,
+            target=target,
+        )
+    seed_files = contract["source_snapshot"]["pools"]["objective_seed"][  # type: ignore[index]
+        "files"
+    ]
+    seed_files.append({"path": "pr/16384/pr.parquet"})
+    with pytest.raises(RuntimeError, match="production objective|production target"):
+        builder._validate_production_objective_contract(
+            contract=contract,
+            bucket=16384,
+            target=target,
+        )
+    with pytest.raises(RuntimeError, match="exactly cover buckets"):
+        builder._validate_production_objective_artifacts({}, (1024,))
+
+
 def test_every_bucket_conversion_receives_hash_bound_objective_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2277,7 +2349,7 @@ def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> N
         assert hashlib.sha256(staged.read_bytes()).hexdigest() == record["sha256"]
 
 
-def test_builder_stages_frozen_domain_and_tokenizer_contracts(tmp_path: Path) -> None:
+def test_builder_stages_all_frozen_data_contracts(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
 
@@ -2285,11 +2357,18 @@ def test_builder_stages_frozen_domain_and_tokenizer_contracts(tmp_path: Path) ->
     resumed = _stage_data_contracts(bundle)
 
     assert resumed == descriptors
-    assert set(descriptors) == {"domain_schema", "tokenizer_contract"}
+    assert set(descriptors) == {
+        "domain_schema",
+        "tokenizer_contract",
+        "production_objective_target",
+    }
     for descriptor in descriptors.values():
         staged = bundle / str(descriptor["path"])
         assert staged.stat().st_size == descriptor["size"]
         assert hashlib.sha256(staged.read_bytes()).hexdigest() == descriptor["sha256"]
+    assert descriptors["production_objective_target"]["sha256"] == (
+        builder.PRODUCTION_OBJECTIVE_TARGET_SHA256
+    )
 
 
 def test_bucket_prefixes_are_bundle_relative_and_cannot_escape(tmp_path: Path) -> None:
