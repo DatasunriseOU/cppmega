@@ -1,5 +1,34 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-03: TileLang a760 stack promoted after R2/R4 H200 parity
+
+The operational wheel pins now select TileLang
+`a760fe587995def0f3108ee204be453d87467c5d`, vendored TVM
+`84af17279edb5edad29749bd6b0eea2ed9393105`, and vendored tvm-ffi
+`e4353339293459e3e8a393afc1b6a6a869e75b13`. The a760 descendant retains the
+stable Bind/shared-RMW fixes and adds reducer/consumer layout ordering,
+free-mode retry isolation, and cross-rank JIT-cache serialization. The TVM/FFI
+pair preserves C++ exception RTTI and restores Python thread state when an FFI
+exception crosses back into Python. The release keeps the complete nine-wheel
+matrix; only these three source revisions change.
+
+The candidate build manifest has SHA-256
+`60a7666f93a390d803e0e99955430ada7f63a35d2ed46bf093e9a3286983c0eb`.
+Two independent exact 2×H200 receipts are green with source identity preserved
+and runtime mutation disabled:
+
+- R2/chunk-32 run `129b949cdd1348e1b386674a9da6b88d`: 3/3 tests passed
+  in 1534.084 seconds; receipt SHA-256
+  `21ab2adb07409a7b76a7e16db1e0cd8bc8518d80c91d312bff897309a43b420d`.
+- R4/chunk-16 run `73564e9432464d44bc18212d939f9f7e`: 3/3 tests passed
+  in 1518.811 seconds, including CP2 forward/backward parity; receipt SHA-256
+  `a5b2d38fd8894f349da3ad35d50468204e6c45ac0eca106ff1cdf6d330bb3477`.
+
+The retry harness records `merge_authorized=false` because it never mutates or
+promotes a release by itself; this reviewed pin update is the separate
+promotion action. Numerical tolerances, model code, Megatron pin, and wheel
+membership are unchanged.
+
 ## 2026-08-03: training status survives a missing live CI receipt
 
 The training-data watcher now reports a configured but missing CI progress

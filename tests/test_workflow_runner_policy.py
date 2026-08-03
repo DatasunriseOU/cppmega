@@ -519,9 +519,9 @@ def test_image_build_binds_triggering_source_and_wheel_release() -> None:
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "de8bb88cc382b0e78bc804244f79c4be8cc9e75f"
-    tvm_commit = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
-    tvm_ffi_commit = "521efeb30bfd9e4946b248b3d76e6391028233a3"
+    tilelang_commit = "a760fe587995def0f3108ee204be453d87467c5d"
+    tvm_commit = "84af17279edb5edad29749bd6b0eea2ed9393105"
+    tvm_ffi_commit = "e4353339293459e3e8a393afc1b6a6a869e75b13"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
     ffi_wheel_name = (
         "apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
@@ -571,6 +571,14 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
     assert "--no-build-isolation" not in install
     assert "Smoke TileLang wheel linkage and import" in workflow
     assert "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5" in workflow
+    assert (
+        'test "$(git -C "$tvm_dir" rev-parse HEAD)" = '
+        f'"{tvm_commit}"'
+    ) in workflow
+    assert (
+        'test "$(git -C "$ffi_dir" rev-parse HEAD)" = '
+        f'"{tvm_ffi_commit}"'
+    ) in workflow
     assert "wheels/apache_tvm_ffi-*.whl" in workflow
     assert "'apache_tvm_ffi-*.whl'" in workflow
     assert "'apache_tvm_ffi-*.whl'" in image_workflow
@@ -578,6 +586,7 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
         rebuild.index("3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD")
     )
     assert "python - <<'PY'" in modal_build
+    assert 'TILELANG_BRANCH = "fix/reducer-consumer-layout"' in modal_build
     assert 'f"candidates/{tilelang_commit}/linux-cuda13.2-cp313"' in modal_build
     assert "refusing to overwrite existing candidate directory" in modal_build
     assert "cppmega_tilelang_candidate_build_v1" in modal_build

@@ -8,18 +8,23 @@
 #   Root cause: tvm-ffi 0.1.10+ enforces __slots__=() on Object subclasses
 #   (_ObjectSlotsMeta), but TileLang's vendored TVM (882a774) lacks the fix
 #   from apache/tvm#18938 (TVMDerivedObject.__slots__ = ("__dict__","__weakref__")).
-#   Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12, so it is
-#   NOT usable. The DatasunriseOU/tilelang fork at de8bb88c is the clean path:
+#   Upstream tile-ai/tilelang HEAD caps apache-tvm-ffi<0.1.13, so it cannot
+#   consume this stack's 0.1.13.post5 wheel. The DatasunriseOU/tilelang fork
+#   at a760fe58 is the clean path:
 #     - carries upstream tile-ai/tilelang#2071 (removes the <0.1.10 cap)
-#     - vendored TVM submodule = DatasunriseOU/tvm@e25ca6ae, which includes
+#     - vendored TVM submodule = DatasunriseOU/tvm@84af1727, which includes
 #       apache/tvm#18938 (the __slots__ fix) and restores the nvbench CUDA
 #       L2-cache-flush header that TVM still compiles
-#     - vendored tvm-ffi = DatasunriseOU/tvm-ffi@521efeb3
+#     - vendored tvm-ffi = DatasunriseOU/tvm-ffi@e4353339
 #       (v0.1.13.post5), exactly matching the linked TVM runtime ABI
+#     - preserves cross-library C++ exception RTTI and restores Python thread
+#       state when an FFI exception crosses back into Python
 #     - adapts AdjustMatmulOrder to the fork's boxed-Integer permute_dims API
 #     - completes the lazy CUDA driver stub for CUDA 13.2 TVM
 #     - restores TIRx AllocBuffer CUDA declarations for WGMMA descriptors and
 #       local.var scalars
+#     - defers unanchored fragment consumers, seeds fill producers, isolates
+#       free-mode retry state, and serializes identical JITs across ranks
 #   This script clones that fork commit, ensures the TVM submodule is checked
 #   out at the fixed commit, builds the wheel, and drops it in wheels/.
 #
@@ -33,21 +38,21 @@
 #
 # Env overrides:
 #   TILELANG_REPO    fork repo URL   (default: DatasunriseOU/tilelang)
-#   TILELANG_REF     fork commit     (default: de8bb88c...)
-#   TILELANG_TVM_REF vendored TVM commit (default: e25ca6ae...)
-#   TILELANG_TVM_FFI_REF vendored tvm-ffi commit (default: 521efeb3...)
+#   TILELANG_REF     fork commit     (default: a760fe58...)
+#   TILELANG_TVM_REF vendored TVM commit (default: 84af1727...)
+#   TILELANG_TVM_FFI_REF vendored tvm-ffi commit (default: e4353339...)
 #   TILELANG_SRC_DIR clone dir        (default: $HOME/tilelang-build)
 #   WHEELS_DIR       output dir       (default: <repo>/wheels)
 
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-de8bb88cc382b0e78bc804244f79c4be8cc9e75f}"
+TILELANG_REF="${TILELANG_REF:-a760fe587995def0f3108ee204be453d87467c5d}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.
-TILELANG_TVM_REF="${TILELANG_TVM_REF:-e25ca6ae50beee0e907b1e5ed32949879caddde1}"
-TILELANG_TVM_FFI_REF="${TILELANG_TVM_FFI_REF:-521efeb30bfd9e4946b248b3d76e6391028233a3}"
+TILELANG_TVM_REF="${TILELANG_TVM_REF:-84af17279edb5edad29749bd6b0eea2ed9393105}"
+TILELANG_TVM_FFI_REF="${TILELANG_TVM_FFI_REF:-e4353339293459e3e8a393afc1b6a6a869e75b13}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHEELS_DIR="${WHEELS_DIR:-${REPO_ROOT}/wheels}"

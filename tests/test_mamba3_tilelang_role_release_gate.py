@@ -20,10 +20,12 @@ from cppmega.megatron.release_gate_integrity import (
 
 _ROOT = Path(__file__).resolve().parents[1]
 _HARNESS = _ROOT / "scripts/modal_mamba3_tilelang_role_release_gate.py"
-_CANDIDATE_TILELANG_SHA = "de8bb88cc382b0e78bc804244f79c4be8cc9e75f"
+_CANDIDATE_TILELANG_SHA = "a760fe587995def0f3108ee204be453d87467c5d"
+_CANDIDATE_TVM_SHA = "84af17279edb5edad29749bd6b0eea2ed9393105"
+_CANDIDATE_TVM_FFI_SHA = "e4353339293459e3e8a393afc1b6a6a869e75b13"
 
 
-def test_candidate_tilelang_sha_is_bound_across_release_surfaces():
+def test_candidate_stack_shas_are_bound_across_release_surfaces():
     workflow = (_ROOT / ".github/workflows/build-wheels.yml").read_text()
     stack = (_ROOT / "STACK.lock").read_text()
     harness = _HARNESS.read_text()
@@ -32,7 +34,16 @@ def test_candidate_tilelang_sha_is_bound_across_release_surfaces():
     assert workflow.count(_CANDIDATE_TILELANG_SHA) == 2
     assert f"ref: {_CANDIDATE_TILELANG_SHA}" in stack
     assert f'_CANDIDATE_TILELANG_SHA = "{_CANDIDATE_TILELANG_SHA}"' in harness
-    assert f"`{_CANDIDATE_TILELANG_SHA}`" in changelog
+    for name, sha in (
+        ("TILELANG", _CANDIDATE_TILELANG_SHA),
+        ("TVM", _CANDIDATE_TVM_SHA),
+        ("TVM_FFI", _CANDIDATE_TVM_FFI_SHA),
+    ):
+        assert f'{name}_SHA: {sha}' in workflow
+        assert f'_CANDIDATE_{name}_SHA = "{sha}"' in harness
+        assert f"`{sha}`" in changelog
+    assert _CANDIDATE_TVM_SHA in stack
+    assert f"ref: {_CANDIDATE_TVM_FFI_SHA}" in stack
 
 
 def _record_hash(payload: bytes) -> str:

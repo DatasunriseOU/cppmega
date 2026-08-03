@@ -156,14 +156,16 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
             # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
-            #   - de8bb88c carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - a760fe58 carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
             #     and links TVM's CUDA driver calls, including cuFuncGetAttribute,
             #     to TileLang's lazy stub
-            #   - vendored TVM submodule (DatasunriseOU/tvm@e25ca6ae) includes
+            #   - vendored TVM submodule (DatasunriseOU/tvm@84af1727) includes
             #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
             #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
-            #   - vendored tvm-ffi is v0.1.13.post5: official v0.1.13 plus the
-            #     compatibility seams required by this TVM/TileLang fork
+            #   - vendored TVM preserves cross-library exception RTTI and its
+            #     tvm-ffi@e4353339 restores Python thread state on FFI exceptions
+            #   - vendored tvm-ffi remains v0.1.13.post5: official v0.1.13 plus
+            #     the compatibility seams required by this TVM/TileLang fork
             #   - the same TVM pin restores nvbench/l2_cache_flush.h, which
             #     TileLang's CUDA runtime still compiles.
             #   - the TVM pin adapts AdjustMatmulOrder's axes to this fork's
@@ -176,11 +178,14 @@ jobs:
             #     AllocBuffer nodes (WGMMA descriptors and local.var scalars).
             #   - TileLang classifies bodyless Bind roles, plans dependent
             #     shared RMW fail-closed, and selects fragment owners stably.
-            #   - upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12,
-            #     incompatible with FA4 beta23's >=0.1.12 floor.
+            #   - TileLang defers unanchored fragment consumers, seeds fill
+            #     producers, isolates free-mode retries, and serializes identical
+            #     JITs across ranks during TP/CP cold starts.
+            #   - upstream tile-ai/tilelang HEAD caps apache-tvm-ffi<0.1.13,
+            #     excluding this stack's 0.1.13.post5 wheel.
             # Must match STACK.lock wheels.tilelang.ref.
             repo: DatasunriseOU/tilelang
-            ref: de8bb88cc382b0e78bc804244f79c4be8cc9e75f
+            ref: a760fe587995def0f3108ee204be453d87467c5d
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda
@@ -594,8 +599,10 @@ jobs:
         if: success() && matrix.name == 'tilelang'
         run: |
           set -euo pipefail
-          ffi_dir="$GITHUB_WORKSPACE/src/3rdparty/tvm/3rdparty/tvm-ffi"
-          test "$(git -C "$ffi_dir" rev-parse HEAD)" = "521efeb30bfd9e4946b248b3d76e6391028233a3"
+          tvm_dir="$GITHUB_WORKSPACE/src/3rdparty/tvm"
+          ffi_dir="$tvm_dir/3rdparty/tvm-ffi"
+          test "$(git -C "$tvm_dir" rev-parse HEAD)" = "84af17279edb5edad29749bd6b0eea2ed9393105"
+          test "$(git -C "$ffi_dir" rev-parse HEAD)" = "e4353339293459e3e8a393afc1b6a6a869e75b13"
           SETUPTOOLS_SCM_PRETEND_VERSION_FOR_APACHE_TVM_FFI=0.1.13.post5 \
             pip wheel "$ffi_dir" --no-build-isolation --no-deps \
               -w "$GITHUB_WORKSPACE/wheels" -v
@@ -816,9 +823,9 @@ jobs:
       - name: Write exact release manifest
         env:
           CPPMEGA_SHA: ${{ github.sha }}
-          TILELANG_SHA: de8bb88cc382b0e78bc804244f79c4be8cc9e75f
-          TVM_SHA: e25ca6ae50beee0e907b1e5ed32949879caddde1
-          TVM_FFI_SHA: 521efeb30bfd9e4946b248b3d76e6391028233a3
+          TILELANG_SHA: a760fe587995def0f3108ee204be453d87467c5d
+          TVM_SHA: 84af17279edb5edad29749bd6b0eea2ed9393105
+          TVM_FFI_SHA: e4353339293459e3e8a393afc1b6a6a869e75b13
         run: |
           set -euo pipefail
           python3 - <<'PY'

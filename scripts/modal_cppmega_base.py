@@ -8,9 +8,9 @@ Stack (all cp313 prebuilt, no source builds):
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
   - flash-attn-4 4.0.0b23 (NVIDIA PyPI)
-  - tilelang 0.1.9 from DatasunriseOU/tilelang@de8bb88c (local abi3 wheel;
-    carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
-    the apache-tvm-ffi<0.1.10 cap)
+  - tilelang 0.1.9 from DatasunriseOU/tilelang@a760fe58 (local abi3 wheel;
+    carries the TVM __slots__ fix, stable reducer/consumer layout inference,
+    cross-rank JIT locking, and the FA4-compatible tvm-ffi contract)
   - qoptim_cuda 0.0.0 (local wheel)
   - fast_hadamard_transform 1.1.0 (local wheel)
   - apache-tvm-ffi 0.1.13.post5 (local wheel matching TileLang's linked TVM ABI)

@@ -4,13 +4,14 @@
 # Identical to docker/Dockerfile except:
 #   - flash-attn-4 upgraded from 4.0.0b19 to 4.0.0b23
 #   - apache-tvm-ffi upgraded from 0.1.9 to the ABI-matched 0.1.13.post5 wheel
-#   - TileLang from DatasunriseOU/tilelang@de8bb88c (supports tvm-ffi >=0.1.12)
+#   - TileLang from DatasunriseOU/tilelang@a760fe58 (supports tvm-ffi >=0.1.12)
 #     wheel: tilelang-0.1.9-cp38-abi3-linux_x86_64.whl:
 #     the fork carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix, via
-#     vendored TVM DatasunriseOU/tvm@e25ca6ae), restores the nvbench CUDA
+#     vendored TVM DatasunriseOU/tvm@84af1727), restores the nvbench CUDA
 #     header needed by the TVM runtime, and resolves the previous
 #     '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
-#     under tvm-ffi >=0.1.10, and removes the apache-tvm-ffi<0.1.10 cap.
+#     under tvm-ffi >=0.1.10, removes the apache-tvm-ffi<0.1.10 cap, and uses
+#     tvm-ffi@e4353339 for exception-safe Python thread-state restoration.
 #
 # Wheels are built upstream by .github/workflows/build-wheels.yml and uploaded
 # as GH Release assets. This Dockerfile assumes a sibling `wheels/` directory

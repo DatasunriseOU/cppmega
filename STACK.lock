@@ -92,17 +92,18 @@ wheels:
 
   tvm_ffi:
     repo: DatasunriseOU/tvm-ffi
-    ref: 521efeb30bfd9e4946b248b3d76e6391028233a3
+    ref: e4353339293459e3e8a393afc1b6a6a869e75b13
     version: 0.1.13.post5
     build_with: tilelang
     produces:
       - apache_tvm_ffi-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at de8bb88c carries:
+    # DatasunriseOU/tilelang fork at a760fe58 carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
-    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@e25ca6ae, which includes
+    #   - vendored TVM submodule bumped to
+    #     DatasunriseOU/tvm@84af17279edb5edad29749bd6b0eea2ed9393105, which includes
     #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
     #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
     #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
@@ -119,15 +120,22 @@ wheels:
     #   - links TVM CUDA driver calls through TileLang's lazy libcuda_stub,
     #     including cuFuncGetAttribute required by CUDA 13.2 TVM, so wheel
     #     repair cannot leave libtvm_runtime.so with unresolved cu* symbols.
-    #   - vendored tvm-ffi is DatasunriseOU/tvm-ffi@521efeb3
+    #   - vendored TVM preserves cross-library C++ exception RTTI and vendored
+    #     tvm-ffi restores the Python thread state across FFI exceptions.
+    #   - vendored tvm-ffi is DatasunriseOU/tvm-ffi@e4353339
     #     (v0.1.13.post5), matching both FA4's >=0.1.12 contract and the C++
     #     ABI used to link libtvm_runtime.so.
     #   - bodyless Bind roles are classified before rewrite, dependent shared
     #     RMW is planned fail-closed, and fragment owners are selected stably.
-    # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
-    # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
+    #   - unanchored fragment consumers are deferred until a producer is
+    #     available, fill producers seed layout inference, and free-mode retry
+    #     queues cannot leak containment state between attempts.
+    #   - identical TileLang JITs are serialized across ranks, avoiding
+    #     concurrent cache publication during TP/CP cold starts.
+    # Upstream tile-ai/tilelang HEAD caps apache-tvm-ffi<0.1.13, so it cannot
+    # consume this stack's 0.1.13.post5 wheel. The fork remains the clean path.
     repo: DatasunriseOU/tilelang
-    ref: de8bb88cc382b0e78bc804244f79c4be8cc9e75f
+    ref: a760fe587995def0f3108ee204be453d87467c5d
     version: 0.1.9
     submodules: true
     build: |
