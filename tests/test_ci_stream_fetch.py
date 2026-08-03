@@ -2836,6 +2836,14 @@ def test_fetcher_preserves_duplicate_github_zip_members(tmp_path: Path) -> None:
         assert {row["raw_sha256"] for row in members} == {
             hashlib.sha256(value).hexdigest() for value in (b"first", b"second")
         }
+        occurrences = list(fetcher.store.iter_occurrences())
+        assert {
+            item["provenance"]["archive"]["member"] for item in occurrences
+        } == {row["archive_member"] for row in members}
+        assert {
+            item["provenance"]["archive"]["original_member"]
+            for item in occurrences
+        } == {"0_build.txt"}
     finally:
         fetcher.close()
 

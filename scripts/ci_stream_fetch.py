@@ -6917,8 +6917,8 @@ class CIStreamFetcher:
                 },
                 "job": job,
                 "archive": {
-                    "member": member_name,
-                    "member_identity": archive_member,
+                    "member": archive_member,
+                    "original_member": member_name,
                     "duplicate_name_occurrence": duplicate_occurrence,
                     "member_raw_sha256": raw_sha,
                 },
