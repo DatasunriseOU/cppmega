@@ -154,6 +154,12 @@ def _inventory(path: Path, count: int) -> Path:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE INDEX idx_runs_created
+            ON runs(repo_key,created_at,run_id,run_attempt)
+            """
+        )
         for run_id in range(1, count + 1):
             value = _run_metadata(run_id)
             raw = json.dumps(
@@ -2324,6 +2330,147 @@ print(json.dumps({"inserted": inserted, "summary": summary}, sort_keys=True))
         }
 
 
+def test_v2_exhaustive_discovery_replays_v1_cursor_without_skipping(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 2)
+    state_path = tmp_path / "fetch.sqlite"
+    store = tmp_path / "store"
+    binding = _exhaustive_binding(
+        run_count=2,
+        attempt_keys=[("owner/repo", run_id, 1) for run_id in (1, 2)],
+    )
+
+    state = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store,
+        tokenizer=ci.ExactTokenizer(_FROZEN_TOKENIZER),
+        resume=False,
+    )
+    try:
+        state.discover(row_limit=1, exhaustive_inventory=binding)
+    finally:
+        state.close()
+
+    v2_path = ci.exhaustive_discovery_sidecar_path(state_path)
+    legacy_path = state_path.with_name(
+        f"{state_path.name}.inventory-exhaustive.json"
+    )
+    legacy = json.loads(v2_path.read_text(encoding="utf-8"))
+    legacy["schema"] = "cppmega_ci_stream_fetch_discovery_v1"
+    legacy["cursor"][0], legacy["cursor"][1] = (
+        legacy["cursor"][1],
+        legacy["cursor"][0],
+    )
+    ci.atomic_write_json(legacy_path, legacy)
+    v2_path.unlink()
+
+    resumed = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store,
+        tokenizer=ci.ExactTokenizer(_FROZEN_TOKENIZER),
+        resume=True,
+    )
+    try:
+        resumed.discover(row_limit=1, exhaustive_inventory=binding)
+        replay = ci.load_exhaustive_discovery_sidecar(v2_path)
+        assert replay is not None
+        assert replay["schema"] == ci.EXHAUSTIVE_DISCOVERY_SCHEMA
+        assert replay["rows_seen"] == 1
+        resumed.discover(row_limit=1, exhaustive_inventory=binding)
+        resumed.discover(row_limit=1, exhaustive_inventory=binding)
+        summary = resumed.exhaustive_discovery_summary()
+        assert summary is not None
+        assert summary["discovery_eof"] is True
+        assert summary["rows_seen"] == 2
+    finally:
+        resumed.close()
+    assert json.loads(legacy_path.read_text(encoding="utf-8")) == legacy
+
+    conflicted = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store,
+        tokenizer=ci.ExactTokenizer(_FROZEN_TOKENIZER),
+        resume=True,
+    )
+    try:
+        with pytest.raises(
+            ci.BindingError,
+            match="different production inventory",
+        ):
+            conflicted.discover(
+                row_limit=1,
+                exhaustive_inventory=ci.ExhaustiveInventoryBinding(
+                    receipt_path=binding.receipt_path,
+                    receipt_sha256="d" * 64,
+                    database_sha256=binding.database_sha256,
+                    db_logical_sha256=binding.db_logical_sha256,
+                    expected_run_count=binding.expected_run_count,
+                    expected_attempt_count=binding.expected_attempt_count,
+                    expected_attempt_set_sha256=(
+                        binding.expected_attempt_set_sha256
+                    ),
+                ),
+            )
+    finally:
+        conflicted.close()
+
+
+def test_inventory_cursor_pages_multiple_repositories_without_gaps(
+    tmp_path: Path,
+) -> None:
+    inventory_path = _inventory(tmp_path / "inventory.sqlite", 4)
+    with sqlite3.connect(inventory_path) as connection:
+        connection.execute(
+            "UPDATE runs SET repo_key='z/repo', created_at='2026-01-01T00:00:00Z' "
+            "WHERE run_id IN (1,2)"
+        )
+        connection.execute(
+            "UPDATE runs SET repo_key='a/repo', created_at='2026-01-01T00:00:00Z' "
+            "WHERE run_id IN (3,4)"
+        )
+    state = object.__new__(ci.FetchState)
+    state.inventory_path = inventory_path
+    inventory = state._inventory_connection()
+    try:
+        first = state._fetch_inventory_page(
+            inventory,
+            row_limit=2,
+            cursor=None,
+        )
+        last = first[-1]
+        second = state._fetch_inventory_page(
+            inventory,
+            row_limit=2,
+            cursor=(
+                str(last["repo_key"]),
+                str(last["created_at"]),
+                int(last["run_id"]),
+                int(last["run_attempt"]),
+            ),
+        )
+        final = second[-1]
+        assert state._fetch_inventory_page(
+            inventory,
+            row_limit=2,
+            cursor=(
+                str(final["repo_key"]),
+                str(final["created_at"]),
+                int(final["run_id"]),
+                int(final["run_attempt"]),
+            ),
+        ) == []
+    finally:
+        inventory.close()
+    assert [
+        (str(row["repo_key"]), int(row["run_id"]))
+        for row in (*first, *second)
+    ] == [("a/repo", 3), ("a/repo", 4), ("z/repo", 1), ("z/repo", 2)]
+
+
 def test_exhaustive_discovery_expands_exact_rerun_keyset_and_requeues_failed(
     tmp_path: Path,
 ) -> None:
@@ -3943,6 +4090,57 @@ def test_inventory_page_rechecks_blob_bounds_in_its_read_snapshot(
     finally:
         inventory.close()
         state.close()
+
+
+def test_inventory_page_cursor_uses_frozen_inventory_index(tmp_path: Path) -> None:
+    inventory_path = _inventory(tmp_path / "inventory.sqlite", 3)
+    state = object.__new__(ci.FetchState)
+    state.inventory_path = inventory_path
+    inventory = state._inventory_connection()
+
+    def fetch_plans(
+        cursor: tuple[str, str, int, int] | None,
+    ) -> tuple[list[sqlite3.Row], list[str]]:
+        traced: list[str] = []
+        inventory.set_trace_callback(traced.append)
+        try:
+            rows = state._fetch_inventory_page(
+                inventory,
+                row_limit=1,
+                cursor=cursor,
+            )
+        finally:
+            inventory.set_trace_callback(None)
+        plans = []
+        for query in traced:
+            if "FROM runs" not in query:
+                continue
+            plans.append(
+                " ".join(
+                    str(row[3])
+                    for row in inventory.execute(
+                        f"EXPLAIN QUERY PLAN {query}"
+                    )
+                )
+            )
+        return rows, plans
+
+    try:
+        first, initial_plans = fetch_plans(None)
+        first_row = first[-1]
+        cursor = (
+            str(first_row["repo_key"]),
+            str(first_row["created_at"]),
+            int(first_row["run_id"]),
+            int(first_row["run_attempt"]),
+        )
+        _second, cursor_plans = fetch_plans(cursor)
+        assert len(initial_plans) == len(cursor_plans) == 2
+        for plan in (*initial_plans, *cursor_plans):
+            assert "idx_runs_created" in plan
+            assert "TEMP B-TREE" not in plan
+    finally:
+        inventory.close()
 
 
 def test_genuine_done_attempt_satisfies_positive_evidence_contract(
