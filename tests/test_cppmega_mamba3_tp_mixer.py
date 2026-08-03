@@ -1143,6 +1143,64 @@ def test_tp2_sp_off_replicated_parameter_gradient_parity_vs_tp1():
     )
 
 
+def _cp_token_mean_dot_loss(output, upstream_gradient):
+    """Return the per-token mean used by Megatron's non-per-token-loss schedule."""
+
+    if output.ndim != 3 or output.shape != upstream_gradient.shape:
+        raise ValueError(
+            "CP parity loss expects matching [sequence, batch, hidden] tensors"
+        )
+    local_token_count = output.shape[0] * output.shape[1]
+    if local_token_count == 0:
+        raise ValueError("CP parity loss requires at least one local token")
+    return (output.float() * upstream_gradient.float()).sum() / local_token_count
+
+
+def test_cp_token_mean_and_replica_average_match_global_reference():
+    """Local token means plus a CP replica average equal the global token mean."""
+
+    import torch
+
+    cp_size = 2
+    full_input = torch.ones(8, 2, 3, dtype=torch.float32, requires_grad=True)
+    full_upstream = torch.ones_like(full_input)
+    full_weight = torch.tensor(1.5, dtype=torch.float32, requires_grad=True)
+    _cp_token_mean_dot_loss(full_input * full_weight, full_upstream).backward()
+    expected_input_grad = full_input.grad.detach().clone()
+    expected_weight_grad = full_weight.grad.detach().clone()
+
+    local_input_grads = []
+    local_weight_grads = []
+    for input_shard, upstream_shard in zip(
+        full_input.detach().chunk(cp_size, dim=0),
+        full_upstream.chunk(cp_size, dim=0),
+        strict=True,
+    ):
+        local_input = input_shard.clone().requires_grad_(True)
+        local_weight = torch.tensor(1.5, dtype=torch.float32, requires_grad=True)
+        _cp_token_mean_dot_loss(
+            local_input * local_weight,
+            upstream_shard,
+        ).backward()
+        local_input_grads.append(local_input.grad.detach())
+        local_weight_grads.append(local_weight.grad.detach())
+
+    averaged_input_grad = torch.cat(local_input_grads, dim=0) / cp_size
+    averaged_weight_grad = torch.stack(local_weight_grads).sum() / cp_size
+    torch.testing.assert_close(
+        averaged_input_grad,
+        expected_input_grad,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        averaged_weight_grad,
+        expected_weight_grad,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def _parity_worker_cp(
     rank: int,
     world_size: int,
@@ -1268,7 +1326,10 @@ def _parity_worker_cp(
         hs_local.requires_grad_(True)
         out_local, _ = mixer(hs_local)
         print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=forward_done", flush=True)
-        (out_local.float() * g_local.float()).sum().backward()
+        # Megatron's default loss schedule divides each CP rank's local loss
+        # sum by its local token count.  Replicated parameter gradients are
+        # then averaged over the DP+CP group below.
+        _cp_token_mean_dot_loss(out_local, g_local).backward()
         print(f"CPPMEGA_PARITY rank={rank} tag={tag} stage=backward_done", flush=True)
         if hs_local.grad is None:
             raise RuntimeError("Mamba3 CP input gradient is missing")
@@ -1300,6 +1361,9 @@ def _parity_worker_cp(
                 cp_size,
                 packed_seq_params=None,
             )
+            # CP ranks differentiate local token means, so their activation
+            # gradients are CP-size larger than the global-token reference.
+            input_grad_full.div_(cp_size)
         else:
             out_full = out_local.detach()
             input_grad_full = hs_local.grad.detach()
@@ -1315,6 +1379,7 @@ def _parity_worker_cp(
             gradient = parameter.grad.detach().float()
             if cp_on:
                 dist.all_reduce(gradient, group=cp_group)
+                gradient.div_(cp_size)
             parameter_grads[name] = gradient.cpu()
 
         if rank == 0:
