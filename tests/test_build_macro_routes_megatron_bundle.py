@@ -1658,9 +1658,8 @@ def test_production_objective_target_is_exact_hash_bound_and_enforced() -> None:
         "graph_auxiliary": {"relations": policy["graph_relations"]},  # type: ignore[index]
         "source_snapshot": {"pools": {"objective_seed": {"files": []}}},
     }
-    for bucket, samples in zip(
-        builder.DEFAULT_BUCKETS, sample_targets.values(), strict=True
-    ):
+    for bucket in builder.DEFAULT_BUCKETS:
+        samples = sample_targets[str(bucket)]
         contract["totals"]["samples"] = samples  # type: ignore[index]
         snapshot = contract["source_snapshot"]  # type: ignore[assignment]
         snapshot["sequence_length"] = bucket
@@ -1676,6 +1675,14 @@ def test_production_objective_target_is_exact_hash_bound_and_enforced() -> None:
     seed_files = contract["source_snapshot"]["pools"]["objective_seed"][  # type: ignore[index]
         "files"
     ]
+    seed_files[0]["path"] = "code/../pr/16384/pr.parquet"
+    with pytest.raises(RuntimeError, match="objective source path is not canonical"):
+        builder._validate_production_objective_contract(
+            contract=contract,
+            bucket=16384,
+            target=target,
+        )
+    seed_files[0]["path"] = "code/16384/code.parquet"
     seed_files.append({"path": "pr/16384/pr.parquet"})
     with pytest.raises(RuntimeError, match="production objective|production target"):
         builder._validate_production_objective_contract(

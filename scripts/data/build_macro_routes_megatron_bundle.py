@@ -2281,6 +2281,36 @@ def _parse_objective_artifacts(
     return artifacts
 
 
+def _canonical_objective_source_path(
+    raw_path: object,
+    *,
+    bucket: int,
+    allowed_kinds: set[str],
+) -> Path:
+    if isinstance(raw_path, Path):
+        path_text = raw_path.as_posix()
+    elif isinstance(raw_path, str):
+        path_text = raw_path
+    else:
+        raise RuntimeError(
+            f"bucket {bucket}: objective source path is not canonical: {raw_path!r}"
+        )
+    relative = Path(path_text)
+    if (
+        "\\" in path_text
+        or relative.is_absolute()
+        or len(relative.parts) != 3
+        or relative.parts[0] not in allowed_kinds
+        or relative.parts[1] != str(bucket)
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or path_text != relative.as_posix()
+    ):
+        raise RuntimeError(
+            f"bucket {bucket}: objective source path is not canonical: {path_text}"
+        )
+    return relative
+
+
 def _validate_production_objective_contract(
     *,
     contract: dict[str, object],
@@ -2290,6 +2320,16 @@ def _validate_production_objective_contract(
     try:
         policy = target["materialization"]
         snapshot = contract["source_snapshot"]
+        seed_kinds = sorted(
+            {
+                _canonical_objective_source_path(
+                    record["path"],
+                    bucket=bucket,
+                    allowed_kinds={"code", "commits", "pr"},
+                ).parts[0]
+                for record in snapshot["pools"]["objective_seed"]["files"]
+            }
+        )
         actual = (
             contract["totals"]["samples"],
             contract["seed"],
@@ -2297,12 +2337,7 @@ def _validate_production_objective_contract(
             contract["source_selection"]["quota_lookahead_samples"],
             contract["graph_auxiliary"]["relations"],
             snapshot["sequence_length"],
-            sorted(
-                {
-                    Path(record["path"]).parts[0]
-                    for record in snapshot["pools"]["objective_seed"]["files"]
-                }
-            ),
+            seed_kinds,
         )
         expected = (
             target["sample_targets"][str(bucket)],
@@ -2419,16 +2454,11 @@ def _validate_objective_source_binding(
         ]
 
     for record, relative, allowed_kinds in source_records:
-        if (
-            relative.is_absolute()
-            or len(relative.parts) != 3
-            or relative.parts[0] not in allowed_kinds
-            or relative.parts[1] != str(bucket)
-            or relative.name in {"", ".", ".."}
-        ):
-            raise RuntimeError(
-                f"bucket {bucket}: objective source path is not canonical: {relative}"
-            )
+        relative = _canonical_objective_source_path(
+            relative,
+            bucket=bucket,
+            allowed_kinds=allowed_kinds,
+        )
         objective_records.append(
             {
                 "kind": relative.parts[0],
