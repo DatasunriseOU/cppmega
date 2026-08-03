@@ -197,10 +197,11 @@ def _load_production_objective_target() -> dict[str, object]:
     path = PRODUCTION_OBJECTIVE_TARGET_PATH
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"production objective target is not a regular file: {path}")
-    if _sha256(path) != PRODUCTION_OBJECTIVE_TARGET_SHA256:
-        raise RuntimeError("production objective target bytes are unapproved")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != PRODUCTION_OBJECTIVE_TARGET_SHA256:
+            raise RuntimeError("production objective target bytes are unapproved")
+        payload = json.loads(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError("production objective target is not valid JSON") from error
     if (
