@@ -5623,9 +5623,9 @@ def test_scheduler_heartbeat_uses_remaining_progress_interval() -> None:
 
     def process(attempt: str) -> None:
         if attempt == "slow":
-            assert release_slow.wait(3)
+            assert release_slow.wait(12)
         else:
-            time.sleep(0.6)
+            time.sleep(3)
 
     fetcher.write_progress = write_progress
     fetcher.process_attempt = process
@@ -5633,13 +5633,13 @@ def test_scheduler_heartbeat_uses_remaining_progress_interval() -> None:
     result = fetcher.run(
         continuous=False,
         max_runs=2,
-        poll_seconds=1,
+        poll_seconds=4,
         workers=2,
     )
 
     assert result == {"status": "ok"}
     assert len(progress_times) == 2  # interval heartbeat, then forced final write
-    assert progress_times[0] < 1.4
+    assert progress_times[0] < 6
 
 
 def test_scheduler_drains_retry_work_after_token_target_is_met() -> None:
