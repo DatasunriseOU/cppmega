@@ -44,6 +44,8 @@ from data_prep_parquet_to_megatron import (  # noqa: E402
     convert_parquet_to_megatron,
 )
 from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
+    CANONICAL_PRODUCTION_OBJECTIVE_TARGET_PATH,
+    CANONICAL_PRODUCTION_OBJECTIVE_TARGET_SHA256,
     EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
     EXPECTED_VOCAB_SIZE,
     _objective_source_snapshot_summary,
@@ -106,12 +108,8 @@ PRODUCTION_CI_MERGE_RECEIPT_SCHEMA = (
 )
 PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v2"
 BUNDLE_KNOWN_LIMITATIONS: tuple[str, ...] = ()
-PRODUCTION_OBJECTIVE_TARGET_PATH = (
-    REPO_ROOT / "configs/production_objective_materialization_target.json"
-)
-PRODUCTION_OBJECTIVE_TARGET_SHA256 = (
-    "e941ee6503533a867151115822729ba8a62cb66645eec11f080d7920cddd981d"
-)
+PRODUCTION_OBJECTIVE_TARGET_PATH = CANONICAL_PRODUCTION_OBJECTIVE_TARGET_PATH
+PRODUCTION_OBJECTIVE_TARGET_SHA256 = CANONICAL_PRODUCTION_OBJECTIVE_TARGET_SHA256
 DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
@@ -2823,14 +2821,22 @@ def _stage_data_contracts(bundle_root: Path) -> dict[str, dict[str, object]]:
     }
     descriptors: dict[str, dict[str, object]] = {}
     for name, source in sources.items():
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeError(f"data contract source is invalid: {source}")
+        raw = source.read_bytes()
         staged = target / source.name
-        expected_size = source.stat().st_size
-        expected_sha256 = _sha256(source)
+        expected_size = len(raw)
+        expected_sha256 = hashlib.sha256(raw).hexdigest()
+        if (
+            name == "production_objective_target"
+            and expected_sha256 != PRODUCTION_OBJECTIVE_TARGET_SHA256
+        ):
+            raise RuntimeError("production objective target bytes are unapproved")
         if staged.exists():
             if staged.is_symlink() or not staged.is_file():
                 raise RuntimeError(f"staged data contract is invalid: {staged}")
         else:
-            shutil.copy2(source, staged)
+            staged.write_bytes(raw)
         if (
             staged.stat().st_size != expected_size
             or _sha256(staged) != expected_sha256

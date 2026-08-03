@@ -135,6 +135,12 @@ CANONICAL_TOKENIZER_CONTRACT_PATH = (
     REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
 )
 CANONICAL_DOMAIN_SCHEMA_PATH = REPO_ROOT / "data/domain_schema_v1.json"
+CANONICAL_PRODUCTION_OBJECTIVE_TARGET_PATH = (
+    REPO_ROOT / "configs/production_objective_materialization_target.json"
+)
+CANONICAL_PRODUCTION_OBJECTIVE_TARGET_SHA256 = (
+    "e941ee6503533a867151115822729ba8a62cb66645eec11f080d7920cddd981d"
+)
 CANONICAL_TOKENIZER_CONTRACT_BYTES = CANONICAL_TOKENIZER_CONTRACT_PATH.read_bytes()
 CANONICAL_TOKENIZER_CONTRACT_SHA256 = hashlib.sha256(
     CANONICAL_TOKENIZER_CONTRACT_BYTES
@@ -1437,11 +1443,6 @@ def _validate_data_contract_descriptors(
     bundle: Path, manifest: dict, artifact_by_path: dict[str, dict]
 ) -> set[Path]:
     descriptors = manifest.get("data_contracts")
-    if not isinstance(descriptors, dict) or set(descriptors) != {
-        "domain_schema",
-        "tokenizer_contract",
-    }:
-        raise ValueError("bundle data_contracts descriptor is missing or incomplete")
     expected = {
         "domain_schema": (
             CANONICAL_DOMAIN_SCHEMA_PATH,
@@ -1452,6 +1453,13 @@ def _validate_data_contract_descriptors(
             CANONICAL_TOKENIZER_CONTRACT_SHA256,
         ),
     }
+    if manifest.get("schema") == "cppmega_megatron_bundle_v4":
+        expected["production_objective_target"] = (
+            CANONICAL_PRODUCTION_OBJECTIVE_TARGET_PATH,
+            CANONICAL_PRODUCTION_OBJECTIVE_TARGET_SHA256,
+        )
+    if not isinstance(descriptors, dict) or set(descriptors) != set(expected):
+        raise ValueError("bundle data_contracts descriptor is missing or incomplete")
     referenced: set[Path] = set()
     for name, (_canonical_path, canonical_sha256) in expected.items():
         descriptor = descriptors[name]

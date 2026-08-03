@@ -2376,6 +2376,21 @@ def test_builder_stages_all_frozen_data_contracts(tmp_path: Path) -> None:
     assert descriptors["production_objective_target"]["sha256"] == (
         builder.PRODUCTION_OBJECTIVE_TARGET_SHA256
     )
+    publisher._validate_data_contract_descriptors(
+        bundle,
+        {
+            "schema": "cppmega_megatron_bundle_v4",
+            "data_contracts": descriptors,
+        },
+        {
+            str(descriptor["path"]): {
+                "path": str(descriptor["path"]),
+                "size": int(descriptor["size"]),
+                "sha256": str(descriptor["sha256"]),
+            }
+            for descriptor in descriptors.values()
+        },
+    )
 
 
 def test_bucket_prefixes_are_bundle_relative_and_cannot_escape(tmp_path: Path) -> None:
