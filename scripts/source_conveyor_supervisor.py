@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate immutable source inputs and launch one revision-bound code conveyor."""
+"""Launch a revision-bound full or targeted source-code conveyor."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +24,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from cppmega.data.source_conveyor_composition import _load_run  # noqa: E402
 from scripts import streaming_conveyor as conveyor  # noqa: E402
 
 LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
+TARGETED_LAUNCH_SCHEMA = "cppmega.canonical_source_targeted_retry_launch_v1"
+TARGETED_EXIT_SCHEMA = "cppmega.canonical_source_targeted_retry_exit_v1"
 FAILURE_SCHEMA = "cppmega.canonical_source_supervisor_failure_v1"
 ARCHIVE_SHA_SCHEMA = "cppmega.source_archive_sha256_verification_v1"
 ARCHIVE_INVENTORY_SCHEMA = "cppmega.source_archive_inventory_binding_v1"
@@ -78,7 +81,7 @@ _REMOVED_CHILD_ENVIRONMENT = frozenset(
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _sha256_file(path: Path) -> str:
@@ -126,7 +129,7 @@ def _read_json_snapshot(
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"{label} is not valid JSON: {path}") from exc
     if not isinstance(value, dict):
-        raise RuntimeError(f"{label} must contain a JSON object")
+        raise TypeError(f"{label} must contain a JSON object")
     return value, hashlib.sha256(payload).hexdigest()
 
 
@@ -250,6 +253,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-limit-gb", type=float, default=16.0)
     parser.add_argument("--code-index-timeout-s", type=int, default=0)
     parser.add_argument("--code-index-stall-timeout-s", type=int, default=0)
+    parser.add_argument(
+        "--repair-base-code-run-root",
+        help="Terminal failed full-code run whose outputs and dedup DB are reused.",
+    )
+    parser.add_argument(
+        "--only-repo",
+        action="append",
+        default=[],
+        help="Failed bare repository name to repair (repeatable).",
+    )
     return parser
 
 
@@ -272,6 +285,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     for name in ("code_index_timeout_s", "code_index_stall_timeout_s"):
         if getattr(args, name) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} must be >= 0")
+    if bool(args.repair_base_code_run_root) != bool(args.only_repo):
+        raise SystemExit(
+            "--repair-base-code-run-root and at least one --only-repo "
+            "must be provided together"
+        )
+    if len(args.only_repo) != len(set(args.only_repo)) or any(
+        not repository for repository in args.only_repo
+    ):
+        raise SystemExit("--only-repo values must be unique non-empty names")
+    args.only_repo = sorted(args.only_repo)
+    if args.repair_base_code_run_root and (
+        Path(args.repair_base_code_run_root).expanduser().resolve()
+        == Path(args.run_root).expanduser().resolve()
+    ):
+        raise SystemExit("--run-root must be separate from the repair base run")
     return args
 
 
@@ -424,7 +452,7 @@ def validate_inputs(
     )
     streaming_contract = inventory.get("streaming_contract")
     if not isinstance(streaming_contract, dict):
-        raise RuntimeError("archive inventory has no streaming contract")
+        raise TypeError("archive inventory has no streaming contract")
     if (
         streaming_contract.get("expected_attempted_repo_count") != repository_count
         or streaming_contract.get("persistent_source_cache") is not False
@@ -486,14 +514,215 @@ def validate_inputs(
     }
 
 
+def load_repair_base_code_run(code_run_root: Path) -> dict[str, Any]:
+    """Validate one terminal failed full-code run used by targeted repairs."""
+
+    root = code_run_root.expanduser()
+    if root.is_symlink():
+        raise RuntimeError(f"repair base run root must not be a symlink: {root}")
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"repair base run root cannot be resolved: {root}") from exc
+    if not root.is_dir():
+        raise RuntimeError(f"repair base run root is not a directory: {root}")
+
+    launch_path = root / "launch_receipt.json"
+    exit_path = root / "exit_receipt.json"
+    manifest_path = root / "conveyor" / "_done.json"
+    launch, launch_sha256 = _read_json_snapshot(
+        launch_path,
+        label="repair base launch receipt",
+    )
+    outputs = launch.get("outputs")
+    if not isinstance(outputs, dict):
+        raise TypeError("repair base launch outputs must be an object")
+    lengths = launch.get("target_lengths")
+    if (
+        not isinstance(lengths, list)
+        or not lengths
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in lengths)
+        or tuple(sorted(set(lengths))) != tuple(lengths)
+    ):
+        raise RuntimeError("repair base target lengths are invalid")
+
+    def output_path(name: str) -> Path:
+        value = outputs.get(name)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"repair base {name} is missing")
+        path = Path(value).expanduser()
+        if path.is_symlink():
+            raise RuntimeError(f"repair base {name} must not be a symlink: {path}")
+        return path.resolve()
+
+    code_output_root = output_path("code_output_root")
+    commit_output_root = output_path("commit_output_root")
+    dedup_db = output_path("dedup_db")
+    if not dedup_db.is_file():
+        raise RuntimeError(f"repair base dedup database is not a regular file: {dedup_db}")
+    (
+        portable,
+        allowlist,
+        _files,
+        code_terminal,
+        commit_terminal,
+        failed_repositories,
+        failed_units,
+        archive_identity,
+        input_binding,
+        details,
+    ) = _load_run(
+        {
+            "run_id": "repair-base-code",
+            "launch_receipt": str(launch_path),
+            "exit_receipt": str(exit_path),
+            "manifest": str(manifest_path),
+        },
+        buckets=tuple(lengths),
+        code_root=code_output_root,
+        commit_root=commit_output_root,
+    )
+    inventory = details["inventory"]
+    if not isinstance(inventory, dict):
+        raise TypeError("repair base archive inventory is invalid")
+    expected_count = _require_int(
+        inventory.get("archive_unique_worktree_repo_count"),
+        label="repair base archive repository count",
+        minimum=1,
+    )
+    expected_names_sha256 = _require_sha256(
+        inventory.get("archive_sorted_repo_names_json_sha256"),
+        label="repair base archive repository names sha256",
+    )
+    if (
+        portable["launch"]["schema"] != LAUNCH_SCHEMA
+        or portable["streams"] != "code"
+        or portable["exit"]["exit_code"] == 0
+        or commit_terminal
+        or not failed_repositories
+        or not failed_units
+        or launch.get("expected_repository_count") != expected_count
+        or len(code_terminal) != expected_count
+        or _canonical_sha256(sorted(code_terminal)) != expected_names_sha256
+    ):
+        raise RuntimeError("repair base is not a terminal failed full code run")
+    inputs = launch.get("inputs")
+    if not isinstance(inputs, dict):
+        raise TypeError("repair base launch inputs must be an object")
+    run_binding = launch.get("run_binding")
+    if not isinstance(run_binding, dict):
+        raise TypeError("repair base run binding must be an object")
+    run_binding_sha256 = _require_sha256(
+        launch.get("run_binding_sha256"),
+        label="repair base run binding sha256",
+    )
+    if _canonical_sha256(run_binding) != run_binding_sha256:
+        raise RuntimeError("repair base run binding digest drifted")
+    identity = {
+        "launch_sha256": launch_sha256,
+        "exit_sha256": portable["exit"]["sha256"],
+        "manifest_sha256": portable["manifest"]["sha256"],
+    }
+    done = details["done"]
+    if not isinstance(done, dict):
+        raise TypeError("repair base done manifest must be an object")
+    return {
+        "root": root,
+        "launch_path": launch_path,
+        "exit_path": exit_path,
+        "manifest_path": manifest_path,
+        "launch": launch,
+        "inputs": inputs,
+        "identity": identity,
+        "archive_identity": archive_identity,
+        "input_binding": input_binding,
+        "code_output_root": code_output_root,
+        "commit_output_root": commit_output_root,
+        "dedup_db": dedup_db,
+        "target_lengths": tuple(lengths),
+        "repositories": tuple(sorted(code_terminal)),
+        "failed_repositories": tuple(sorted(failed_repositories)),
+        "successful_repositories": tuple(
+            sorted(
+                unit[: -len("::code")]
+                for unit in done
+                if unit.endswith("::code")
+            )
+        ),
+        "code_artifacts": tuple(
+            sorted(
+                (bucket, filename)
+                for (kind, bucket), files in allowlist.items()
+                if kind == "code"
+                for filename in files
+            )
+        ),
+    }
+
+
+def validate_repair_request(
+    args: argparse.Namespace,
+    inputs: dict[str, Any],
+    repair_base: dict[str, Any],
+) -> None:
+    """Require a repair to preserve every immutable input except quarantine policy."""
+
+    base_inputs = repair_base["inputs"]
+    for name in (
+        "archive_sha256_receipt",
+        "archive_inventory_receipt",
+        "repo_list",
+        "tokenizer",
+    ):
+        if base_inputs[name]["sha256"] != inputs[name]["sha256"]:
+            raise RuntimeError(f"repair {name} differs from its base code run")
+    if base_inputs["archive"]["sha256"] != inputs["archive"]["sha256"]:
+        raise RuntimeError("repair source archive differs from its base code run")
+    if tuple(args.target_lengths) != repair_base["target_lengths"]:
+        raise RuntimeError("repair target lengths differ from its base code run")
+    selected = set(args.only_repo)
+    failed = set(repair_base["failed_repositories"])
+    if not selected <= failed:
+        raise RuntimeError(
+            "targeted repair includes repositories not failed by its base run: "
+            + ", ".join(sorted(selected - failed))
+        )
+
+
+def _output_paths(
+    args: argparse.Namespace,
+    repair_base: dict[str, Any] | None,
+) -> dict[str, Path]:
+    run_root = Path(args.run_root).expanduser().resolve()
+    return {
+        "code_output_root": (
+            repair_base["code_output_root"]
+            if repair_base is not None
+            else run_root / "reindexed"
+        ),
+        "commit_output_root": (
+            repair_base["commit_output_root"]
+            if repair_base is not None
+            else run_root / "reindexed-commits"
+        ),
+        "dedup_db": (
+            repair_base["dedup_db"]
+            if repair_base is not None
+            else run_root / "dedup.sqlite"
+        ),
+    }
+
+
 def build_command(
     args: argparse.Namespace,
     inputs: dict[str, Any],
+    repair_base: dict[str, Any] | None = None,
 ) -> list[str]:
     run_root = Path(args.run_root).expanduser().resolve()
+    outputs = _output_paths(args, repair_base)
     lengths = ",".join(str(length) for length in args.target_lengths)
     minimum_free_gib = args.minimum_free_bytes / 1024**3
-    return [
+    command = [
         str(inputs["python"]["path"]),
         "-u",
         "scripts/streaming_conveyor.py",
@@ -512,13 +741,13 @@ def build_command(
         "--work-parent-dir",
         str(run_root / "work-parent"),
         "--code-output-root",
-        str(run_root / "reindexed"),
+        str(outputs["code_output_root"]),
         "--commit-output-root",
-        str(run_root / "reindexed-commits"),
+        str(outputs["commit_output_root"]),
         "--conveyor-root",
         str(run_root / "conveyor"),
         "--dedup-db",
-        str(run_root / "dedup.sqlite"),
+        str(outputs["dedup_db"]),
         "--progress-jsonl",
         str(run_root / "conveyor" / "progress.jsonl"),
         "--completion-receipt",
@@ -546,13 +775,19 @@ def build_command(
         "--min-free-disk-gb",
         str(minimum_free_gib),
     ]
+    for repository in args.only_repo:
+        command.extend(("--only-repo", repository))
+    if args.only_repo:
+        command.extend(("--max-repos", str(len(args.only_repo))))
+    return command
 
 
 def build_run_binding(
     args: argparse.Namespace,
     inputs: dict[str, Any],
+    repair_base: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    binding = {
         "schema": RUN_BINDING_SCHEMA,
         "streams": "code",
         "code_revision": args.expected_code_revision,
@@ -594,6 +829,66 @@ def build_run_binding(
             "persistent_source_cache": False,
         },
     }
+    if repair_base is not None:
+        binding["repair_base_code_run"] = repair_base["identity"]
+        binding["selected_repositories"] = list(args.only_repo)
+    return binding
+
+
+def build_launch_receipt(
+    args: argparse.Namespace,
+    *,
+    inputs: dict[str, Any],
+    command: list[str],
+    run_binding: dict[str, Any],
+    attempt: int,
+    repair_base: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the persisted launch contract for a full or targeted code run."""
+
+    run_root = Path(args.run_root).expanduser().resolve()
+    outputs = _output_paths(args, repair_base)
+    receipt: dict[str, Any] = {
+        "schema": TARGETED_LAUNCH_SCHEMA if repair_base else LAUNCH_SCHEMA,
+        "status": "validated",
+        "created_at": _utc_now(),
+        "attempt": attempt,
+        "repository_identity": "cppmega",
+        "code_revision": args.expected_code_revision,
+        "repository_root": str(_REPO_ROOT),
+        "supervisor": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": _sha256_file(Path(__file__).resolve()),
+        },
+        "inputs": inputs,
+        "outputs": {
+            "run_root": str(run_root),
+            "code_output_root": str(outputs["code_output_root"]),
+            "commit_output_root": str(outputs["commit_output_root"]),
+            "conveyor_manifest": str(run_root / "conveyor" / "_done.json"),
+            "completion_receipt": str(
+                run_root / "conveyor" / "completion_receipt.json"
+            ),
+            "dedup_db": str(outputs["dedup_db"]),
+        },
+        "source_cache": {
+            "enabled": False,
+            "mode": "direct_verified_archive_stream",
+        },
+        "target_lengths": list(args.target_lengths),
+        "run_binding": run_binding,
+        "run_binding_sha256": _canonical_sha256(run_binding),
+        "command": command,
+    }
+    if repair_base is None:
+        receipt["expected_repository_count"] = inputs[
+            "archive_inventory_receipt"
+        ]["repository_count"]
+    else:
+        receipt["repair_base_code_run"] = repair_base["identity"]
+        receipt["selected_repositories"] = list(args.only_repo)
+        receipt["expected_selected_repository_count"] = len(args.only_repo)
+    return receipt
 
 
 def _resume_attempt(
@@ -615,11 +910,11 @@ def _resume_attempt(
             )
         return 1
     existing = _read_json(launch_path, label="existing launch receipt")
-    if existing.get("schema") != LAUNCH_SCHEMA:
+    if existing.get("schema") not in {LAUNCH_SCHEMA, TARGETED_LAUNCH_SCHEMA}:
         raise RuntimeError("existing run root has an unsupported launch receipt")
     existing_binding = existing.get("run_binding")
     if not isinstance(existing_binding, dict):
-        raise RuntimeError("existing launch receipt has no immutable run binding")
+        raise TypeError("existing launch receipt has no immutable run binding")
     existing_digest = _require_sha256(
         existing.get("run_binding_sha256"),
         label="existing run binding sha256",
@@ -694,6 +989,7 @@ def revalidate_recorded_inputs(
         expected_code_revision=launch.get("code_revision"),
         run_root=str(run_root),
         minimum_free_bytes=0,
+        only_repo=list(launch.get("selected_repositories", [])),
     )
     live = validate_inputs(
         args,
@@ -818,11 +1114,14 @@ def write_exit_receipt(
     manifest_path: Path,
     completion_path: Path,
     terminal_coverage: dict[str, Any] | None = None,
+    schema: str = EXIT_SCHEMA,
+    selected_repositories: list[str] | None = None,
+    repair_base_code_run: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Write the canonical exit binding shared by source supervisors."""
 
     receipt: dict[str, Any] = {
-        "schema": EXIT_SCHEMA,
+        "schema": schema,
         "finished_at": _utc_now(),
         "exit_code": return_code,
         "status": "success" if return_code == 0 else "failed",
@@ -832,6 +1131,13 @@ def write_exit_receipt(
         "completion_receipt": None,
         "terminal_coverage": terminal_coverage,
     }
+    if schema == TARGETED_EXIT_SCHEMA:
+        if not selected_repositories or repair_base_code_run is None:
+            raise RuntimeError("targeted exit requires selection and repair-base binding")
+        receipt["selected_repositories"] = selected_repositories
+        receipt["repair_base_code_run"] = repair_base_code_run
+    elif selected_repositories is not None or repair_base_code_run is not None:
+        raise RuntimeError("full exit must not contain targeted repair fields")
     for field, artifact in (
         ("done_manifest", manifest_path),
         ("completion_receipt", completion_path),
@@ -864,7 +1170,7 @@ def verify_completion_receipt(
 
     manifest = receipt.get("manifest")
     if not isinstance(manifest, dict):
-        raise RuntimeError("source completion receipt has no manifest binding")
+        raise TypeError("source completion receipt has no manifest binding")
     try:
         receipt_manifest_path = Path(str(manifest.get("path", ""))).resolve(strict=True)
         expected_manifest_path = manifest_path.resolve(strict=True)
@@ -914,16 +1220,23 @@ def verify_completion_receipt(
     if non_code_done_unit_count or total_done_unit_count != len(repositories):
         raise RuntimeError("completion manifest contains non-code done units")
 
-    expected_count = int(inputs["archive_inventory_receipt"]["repository_count"])
+    selected = sorted(getattr(args, "only_repo", []))
+    expected_count = (
+        len(selected)
+        if selected
+        else int(inputs["archive_inventory_receipt"]["repository_count"])
+    )
     if len(repositories) != expected_count or len(set(repositories)) != expected_count:
         raise RuntimeError(
             "completion manifest repository coverage is incomplete: "
             f"expected={expected_count} actual={len(set(repositories))}"
         )
     repository_names_sha256 = _canonical_sha256(repositories)
-    if (
-        repository_names_sha256
-        != inputs["archive_inventory_receipt"]["repository_names_sha256"]
+    expected_names_sha256 = inputs["archive_inventory_receipt"][
+        "repository_names_sha256"
+    ]
+    if (selected and repositories != selected) or (
+        not selected and repository_names_sha256 != expected_names_sha256
     ):
         raise RuntimeError("completion manifest repository set differs from inventory")
     receipt_repository_names_sha256 = _require_sha256(
@@ -975,47 +1288,28 @@ def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("source conveyor supervisor is already running") from exc
 
         inputs = validate_inputs(args)
-        command = build_command(args, inputs)
-        run_binding = build_run_binding(args, inputs)
-        repository_count = int(inputs["archive_inventory_receipt"]["repository_count"])
+        repair_base = (
+            load_repair_base_code_run(Path(args.repair_base_code_run_root))
+            if args.repair_base_code_run_root
+            else None
+        )
+        if repair_base is not None:
+            validate_repair_request(args, inputs, repair_base)
+        command = build_command(args, inputs, repair_base)
+        run_binding = build_run_binding(args, inputs, repair_base)
         launch_path = run_root / "launch_receipt.json"
         attempt = _resume_attempt(
             launch_path,
             run_binding=run_binding,
         )
-        launch_receipt: dict[str, Any] = {
-            "schema": LAUNCH_SCHEMA,
-            "status": "validated",
-            "created_at": _utc_now(),
-            "attempt": attempt,
-            "repository_identity": "cppmega",
-            "code_revision": args.expected_code_revision,
-            "repository_root": str(_REPO_ROOT),
-            "supervisor": {
-                "path": str(Path(__file__).resolve()),
-                "sha256": _sha256_file(Path(__file__).resolve()),
-            },
-            "inputs": inputs,
-            "outputs": {
-                "run_root": str(run_root),
-                "code_output_root": str(run_root / "reindexed"),
-                "commit_output_root": str(run_root / "reindexed-commits"),
-                "conveyor_manifest": str(run_root / "conveyor" / "_done.json"),
-                "completion_receipt": str(
-                    run_root / "conveyor" / "completion_receipt.json"
-                ),
-                "dedup_db": str(run_root / "dedup.sqlite"),
-            },
-            "source_cache": {
-                "enabled": False,
-                "mode": "direct_verified_archive_stream",
-            },
-            "target_lengths": list(args.target_lengths),
-            "expected_repository_count": repository_count,
-            "run_binding": run_binding,
-            "run_binding_sha256": _canonical_sha256(run_binding),
-            "command": command,
-        }
+        launch_receipt = build_launch_receipt(
+            args,
+            inputs=inputs,
+            command=command,
+            run_binding=run_binding,
+            attempt=attempt,
+            repair_base=repair_base,
+        )
         _atomic_json(launch_path, launch_receipt)
 
         def mark_started(child_pid: int) -> None:
@@ -1042,7 +1336,16 @@ def _run(args: argparse.Namespace) -> int:
                 args,
                 enforce_minimum_free_disk=False,
             )
-            if _canonical_sha256(build_run_binding(args, terminal_inputs)) != (
+            terminal_repair_base = (
+                load_repair_base_code_run(Path(args.repair_base_code_run_root))
+                if args.repair_base_code_run_root
+                else None
+            )
+            if terminal_repair_base is not None:
+                validate_repair_request(args, terminal_inputs, terminal_repair_base)
+            if _canonical_sha256(
+                build_run_binding(args, terminal_inputs, terminal_repair_base)
+            ) != (
                 _canonical_sha256(run_binding)
             ):
                 raise RuntimeError(
@@ -1063,6 +1366,9 @@ def _run(args: argparse.Namespace) -> int:
             manifest_path=done_manifest,
             completion_path=completion_receipt,
             terminal_coverage=terminal_coverage,
+            schema=TARGETED_EXIT_SCHEMA if repair_base else EXIT_SCHEMA,
+            selected_repositories=(list(args.only_repo) if repair_base else None),
+            repair_base_code_run=(repair_base["identity"] if repair_base else None),
         )
         return return_code
     finally:
@@ -1073,7 +1379,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         return _run(args)
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - persist every supervisor failure
         run_root = Path(args.run_root).expanduser().resolve()
         failure = {
             "schema": FAILURE_SCHEMA,

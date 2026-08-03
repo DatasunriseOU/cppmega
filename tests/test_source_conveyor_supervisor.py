@@ -184,6 +184,129 @@ def test_supervisor_validates_bound_inputs_and_builds_repo_native_command(
     assert "--only-repo" not in command
 
 
+def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
+    tmp_path: Path,
+) -> None:
+    repo, argv = _input_fixture(tmp_path)
+    base_args = supervisor.parse_args(argv)
+    base_inputs = supervisor.validate_inputs(base_args, repo_root=repo)
+    base_root = Path(base_args.run_root)
+    (base_root / "reindexed").mkdir()
+    (base_root / "reindexed-commits").mkdir()
+    (base_root / "dedup.sqlite").write_bytes(b"dedup")
+    base_command = supervisor.build_command(base_args, base_inputs)
+    base_binding = supervisor.build_run_binding(base_args, base_inputs)
+    base_launch = supervisor.build_launch_receipt(
+        base_args,
+        inputs=base_inputs,
+        command=base_command,
+        run_binding=base_binding,
+        attempt=1,
+    )
+    base_launch["status"] = "running"
+    base_launch_path = base_root / "launch_receipt.json"
+    supervisor._atomic_json(base_launch_path, base_launch)
+    base_manifest = base_root / "conveyor" / "_done.json"
+    supervisor._atomic_json(
+        base_manifest,
+        {
+            "code_revision": base_inputs["code_revision"],
+            "done": {},
+            "failed": {"project::code": {"stage": "index_project"}},
+        },
+    )
+    supervisor.write_exit_receipt(
+        base_root / "exit_receipt.json",
+        launch_path=base_launch_path,
+        code_revision=base_args.expected_code_revision,
+        return_code=1,
+        manifest_path=base_manifest,
+        completion_path=base_root / "conveyor" / "completion_receipt.json",
+    )
+
+    repair_root = tmp_path / "repair"
+    repair_root.mkdir()
+    repair_argv = list(argv)
+    repair_argv[repair_argv.index("--run-root") + 1] = str(repair_root)
+    repair_argv.extend(
+        [
+            "--repair-base-code-run-root",
+            str(base_root),
+            "--only-repo",
+            "project",
+        ]
+    )
+    repair_args = supervisor.parse_args(repair_argv)
+    repair_inputs = supervisor.validate_inputs(repair_args, repo_root=repo)
+    repair_base = supervisor.load_repair_base_code_run(base_root)
+    wrong_selection_argv = list(repair_argv)
+    wrong_selection_argv[-1] = "owner/project"
+    with pytest.raises(RuntimeError, match="not failed by its base run"):
+        supervisor.validate_repair_request(
+            supervisor.parse_args(wrong_selection_argv),
+            repair_inputs,
+            repair_base,
+        )
+    supervisor.validate_repair_request(repair_args, repair_inputs, repair_base)
+    command = supervisor.build_command(repair_args, repair_inputs, repair_base)
+    binding = supervisor.build_run_binding(repair_args, repair_inputs, repair_base)
+    launch = supervisor.build_launch_receipt(
+        repair_args,
+        inputs=repair_inputs,
+        command=command,
+        run_binding=binding,
+        attempt=1,
+        repair_base=repair_base,
+    )
+
+    assert launch["schema"] == supervisor.TARGETED_LAUNCH_SCHEMA
+    assert launch["selected_repositories"] == ["project"]
+    assert launch["repair_base_code_run"] == repair_base["identity"]
+    assert launch["outputs"]["code_output_root"] == str(
+        base_root / "reindexed"
+    )
+    assert launch["outputs"]["commit_output_root"] == str(
+        base_root / "reindexed-commits"
+    )
+    assert launch["outputs"]["dedup_db"] == str(base_root / "dedup.sqlite")
+    assert command[command.index("--only-repo") + 1] == "project"
+    assert command[command.index("--max-repos") + 1] == "1"
+    assert command[command.index("--conveyor-root") + 1] == str(
+        repair_root / "conveyor"
+    )
+    parsed_child = supervisor.conveyor.parse_args(command[3:])
+    assert parsed_child.only_repo == ["project"]
+    assert parsed_child.max_repos == 1
+    assert parsed_child.code_output_root == str(base_root / "reindexed")
+
+    launch["status"] = "running"
+    repair_launch_path = repair_root / "launch_receipt.json"
+    supervisor._atomic_json(repair_launch_path, launch)
+    repair_manifest = repair_root / "conveyor" / "_done.json"
+    supervisor._atomic_json(
+        repair_manifest,
+        {
+            "code_revision": repair_inputs["code_revision"],
+            "done": {"project::code": {}},
+            "failed": {},
+        },
+    )
+    exit_receipt = supervisor.write_exit_receipt(
+        repair_root / "exit_receipt.json",
+        launch_path=repair_launch_path,
+        code_revision=repair_args.expected_code_revision,
+        return_code=0,
+        manifest_path=repair_manifest,
+        completion_path=repair_root / "conveyor" / "completion_receipt.json",
+        schema=supervisor.TARGETED_EXIT_SCHEMA,
+        selected_repositories=["project"],
+        repair_base_code_run=repair_base["identity"],
+    )
+    assert exit_receipt["schema"] == supervisor.TARGETED_EXIT_SCHEMA
+    assert exit_receipt["selected_repositories"] == ["project"]
+    assert exit_receipt["repair_base_code_run"] == repair_base["identity"]
+
+
 def test_supervisor_rejects_inventory_that_does_not_bind_sha_receipt(
     tmp_path: Path,
 ) -> None:
