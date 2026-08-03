@@ -1,4 +1,4 @@
-"""Read-only R2/R4 full parity gate for TileLang be312b80 on old51 Mamba."""
+"""Read-only R2/R4 full parity gate for TileLang ce28ea0f on old51 Mamba."""
 
 from __future__ import annotations
 
@@ -13,19 +13,24 @@ import modal
 LOCAL_CPPMEGA_ROOT = pathlib.Path("/Volumes/external/sources/cppmega")
 LOCAL_CANDIDATE_ROOT = pathlib.Path(
     "/Volumes/external/cppmega_data/tilelang_candidate_wheels/"
-    "be312b8029e64a31669dfd2ec82cb2d3eb70d26d/linux-cuda13.2-cp313"
+    "ce28ea0f462339638756aa5088f712aaf15e53ec/linux-cuda13.2-cp313"
 )
 OLD_BASE_IMAGE_REF = (
     "ghcr.io/datasunriseou/cppmega@"
     "sha256:85a09018ab4689c09025c8eb2e732242c80392167e4d5d59418da49184af970a"
 )
 OLD51_D66_IMAGE_ID = "im-p7seeW5FdaipoteRTDe1Lo"
-TILELANG_COMMIT = "be312b8029e64a31669dfd2ec82cb2d3eb70d26d"
+TILELANG_COMMIT = "ce28ea0f462339638756aa5088f712aaf15e53ec"
+TVM_COMMIT = "84af17279edb5edad29749bd6b0eea2ed9393105"
+TVM_FFI_COMMIT = "e4353339293459e3e8a393afc1b6a6a869e75b13"
 TILELANG_WHEEL_SHA256 = (
-    "4bd7128967e680f691c84c59c36bd67aef8d63bc106467ad0f9851eee4360cd3"
+    "5d88bb31a27e0abf62acd53769fa842bef8b73f204a287caa3b6fe6458361eb9"
 )
 TVM_FFI_WHEEL_SHA256 = (
-    "b1fbabb8f059ebe79353f0e908410adce75981d9596c83d4e2f1b0d34b451932"
+    "8233d526de8dd9a8c7cdd88e8e6085a04b577d24a7461791beca9451f3f912f3"
+)
+BUILD_MANIFEST_SHA256 = (
+    "d2c3d45880859351662a291f86b25c63fd463aadab4693054c4b011a40b64e80"
 )
 MAMBA_SOURCE_SHA256 = (
     "51dab809a47bd33a9b610725599dff956187edd70cae1518618f1ef31115d320"
@@ -64,8 +69,8 @@ except KeyError:
         "CPPMEGA_NUMERICAL_PHASE must be exactly 'r2' or 'r4'"
     ) from None
 
-RESULT_STEM = f"mamba3-be312-old51-{NUMERICAL_PHASE}-full-parity-a1"
-APP_NAME = f"cppmega-be312-old51-{NUMERICAL_PHASE}-full-parity-a1"
+RESULT_STEM = f"mamba3-ce28-old51-{NUMERICAL_PHASE}-full-parity-a1"
+APP_NAME = f"cppmega-ce28-old51-{NUMERICAL_PHASE}-full-parity-a1"
 
 SOURCE_BINDINGS = (
     (
@@ -122,6 +127,30 @@ SOURCE_BINDING_SHA256 = {
 }
 
 if modal.is_local():
+    manifest_path = LOCAL_CANDIDATE_ROOT / "BUILD_MANIFEST.json"
+    observed_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if observed_manifest_sha256 != BUILD_MANIFEST_SHA256:
+        raise RuntimeError("local candidate build manifest drifted")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    observed_source = {
+        key: manifest.get(key)
+        for key in (
+            "status",
+            "tilelang_commit",
+            "tvm_commit",
+            "tvm_ffi_commit",
+        )
+    }
+    expected_source = {
+        "status": "success",
+        "tilelang_commit": TILELANG_COMMIT,
+        "tvm_commit": TVM_COMMIT,
+        "tvm_ffi_commit": TVM_FFI_COMMIT,
+    }
+    if observed_source != expected_source:
+        raise RuntimeError(
+            f"local candidate source provenance drifted: {observed_source!r}"
+        )
     observed_wheels = {
         "tilelang": hashlib.sha256(
             (
@@ -293,7 +322,7 @@ def run_gate() -> dict[str, Any]:
     receipt: dict[str, Any] = {
         "schema_version": 1,
         "gate": (
-            f"H200_{NUMERICAL_PHASE.upper()}_BE312_OLD51_FULL_NUMERICAL_PARITY"
+            f"H200_{NUMERICAL_PHASE.upper()}_CE28_OLD51_FULL_NUMERICAL_PARITY"
         ),
         "phase": NUMERICAL_PHASE,
         "status": "running",
@@ -309,6 +338,9 @@ def run_gate() -> dict[str, Any]:
             "old_base_image_ref": OLD_BASE_IMAGE_REF,
             "old51_d66_image_id": OLD51_D66_IMAGE_ID,
             "tilelang_commit": TILELANG_COMMIT,
+            "tvm_commit": TVM_COMMIT,
+            "tvm_ffi_commit": TVM_FFI_COMMIT,
+            "build_manifest_sha256": BUILD_MANIFEST_SHA256,
             "tilelang_wheel_sha256": TILELANG_WHEEL_SHA256,
             "tvm_ffi_wheel_sha256": TVM_FFI_WHEEL_SHA256,
             "mamba_source_sha256": MAMBA_SOURCE_SHA256,
@@ -410,7 +442,7 @@ def run_gate() -> dict[str, Any]:
         ]
         receipt["command"] = command
         print(
-            "TILELANG_BE312_OLD51_FULL_PARITY_START="
+            "TILELANG_CE28_OLD51_FULL_PARITY_START="
             + json.dumps(
                 {
                     "phase": NUMERICAL_PHASE,
@@ -520,7 +552,7 @@ def run_gate() -> dict[str, Any]:
                 receipt["post_failure_source_hash_error"] = repr(post_exc)
     write_receipt(receipt)
     print(
-        "TILELANG_BE312_OLD51_FULL_PARITY_RESULT="
+        "TILELANG_CE28_OLD51_FULL_PARITY_RESULT="
         + json.dumps(receipt, sort_keys=True),
         flush=True,
     )
@@ -531,7 +563,7 @@ def run_gate() -> dict[str, Any]:
 def main() -> None:
     result = run_gate.remote()
     print(
-        "TILELANG_BE312_OLD51_FULL_PARITY_SUMMARY="
+        "TILELANG_CE28_OLD51_FULL_PARITY_SUMMARY="
         + json.dumps(
             {
                 "phase": NUMERICAL_PHASE,
@@ -544,4 +576,3 @@ def main() -> None:
             sort_keys=True,
         )
     )
-
