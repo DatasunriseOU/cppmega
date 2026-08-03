@@ -539,6 +539,10 @@ def test_checked_in_filament_index_crash_manifest_matches_reference_fixture() ->
         for relative_path in fixtures
     }
 
+    assert len(fixtures[RELATIVE_INDEX_CRASH_FIXTURE]) == 344
+    assert hashlib.sha256(
+        fixtures[RELATIVE_INDEX_CRASH_FIXTURE]
+    ).hexdigest() == "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727"
     assert len(fixtures[RELATIVE_INDEX_REMAP_CRASH_FIXTURE]) == 398
     assert hashlib.sha256(
         fixtures[RELATIVE_INDEX_REMAP_CRASH_FIXTURE]
