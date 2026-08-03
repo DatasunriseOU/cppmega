@@ -1,8 +1,9 @@
 """Exact, receipt-bound quarantine for non-parser inputs and crash fixtures.
 
 The quarantine is deliberately narrow: it only accepts files whose relative
-path, byte size, SHA-256 digest, and independently verifiable format all match a
-versioned manifest entry. It is not a parse-error suppression mechanism.
+path, byte size, SHA-256 digest, and independently verifiable format match an
+exact entry or an exact content-set collection. It is not a parse-error
+suppression mechanism.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v1"
+LEGACY_MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v1"
+MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v2"
 RECEIPT_SCHEMA = "cppmega.source_quarantine_receipt_v1"
 _ENTRY_KEYS = frozenset(
     {
@@ -24,6 +26,18 @@ _ENTRY_KEYS = frozenset(
         "relative_path",
         "size_bytes",
         "sha256",
+        "classification",
+        "detected_format",
+        "reason",
+    }
+)
+_COLLECTION_KEYS = frozenset(
+    {
+        "project_id",
+        "relative_path_prefix",
+        "relative_path_suffix",
+        "expected_file_count",
+        "content_set_sha256",
         "classification",
         "detected_format",
         "reason",
@@ -73,10 +87,28 @@ class SourceQuarantineEntry:
         }
 
 
-def _require_string(value: object, *, field: str, index: int) -> str:
+@dataclass(frozen=True)
+class SourceQuarantineCollection:
+    project_id: str
+    relative_path_prefix: str
+    relative_path_suffix: str
+    expected_file_count: int
+    content_set_sha256: str
+    classification: str
+    detected_format: str
+    reason: str
+
+
+def _require_string(
+    value: object,
+    *,
+    field: str,
+    index: int,
+    container: str = "entries",
+) -> str:
     if not isinstance(value, str) or not value:
         raise SourceQuarantineError(
-            f"entries[{index}].{field} must be a non-empty string"
+            f"{container}[{index}].{field} must be a non-empty string"
         )
     return value
 
@@ -92,7 +124,11 @@ def _parse_entry(raw: object, *, index: int) -> SourceQuarantineEntry:
             f"entries[{index}] has invalid fields: missing={missing} unknown={unknown}"
         )
 
-    project_id = _require_string(raw["project_id"], field="project_id", index=index)
+    project_id = _require_string(
+        raw["project_id"],
+        field="project_id",
+        index=index,
+    )
     relative_path = _require_string(
         raw["relative_path"],
         field="relative_path",
@@ -111,7 +147,11 @@ def _parse_entry(raw: object, *, index: int) -> SourceQuarantineEntry:
         )
 
     size_bytes = raw["size_bytes"]
-    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+    if (
+        isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+    ):
         raise SourceQuarantineError(
             f"entries[{index}].size_bytes must be a non-negative integer"
         )
@@ -151,6 +191,126 @@ def _parse_entry(raw: object, *, index: int) -> SourceQuarantineEntry:
     )
 
 
+def _parse_collection(raw: object, *, index: int) -> SourceQuarantineCollection:
+    if not isinstance(raw, dict):
+        raise SourceQuarantineError(f"collections[{index}] must be an object")
+    keys = frozenset(raw)
+    if keys != _COLLECTION_KEYS:
+        missing = sorted(_COLLECTION_KEYS - keys)
+        unknown = sorted(keys - _COLLECTION_KEYS)
+        raise SourceQuarantineError(
+            f"collections[{index}] has invalid fields: "
+            f"missing={missing} unknown={unknown}"
+        )
+
+    project_id = _require_string(
+        raw["project_id"],
+        field="project_id",
+        index=index,
+        container="collections",
+    )
+    prefix = _require_string(
+        raw["relative_path_prefix"],
+        field="relative_path_prefix",
+        index=index,
+        container="collections",
+    )
+    pure_prefix = PurePosixPath(prefix.removesuffix("/"))
+    if (
+        not prefix.endswith("/")
+        or pure_prefix.is_absolute()
+        or not pure_prefix.parts
+        or prefix != f"{pure_prefix.as_posix()}/"
+        or any(part in {"", ".", ".."} for part in pure_prefix.parts)
+        or "\\" in prefix
+    ):
+        raise SourceQuarantineError(
+            f"collections[{index}].relative_path_prefix is not a canonical "
+            f"safe POSIX directory prefix: {prefix!r}"
+        )
+    suffix = _require_string(
+        raw["relative_path_suffix"],
+        field="relative_path_suffix",
+        index=index,
+        container="collections",
+    )
+    if "/" in suffix or "\\" in suffix:
+        raise SourceQuarantineError(
+            f"collections[{index}].relative_path_suffix must not contain a "
+            "path separator"
+        )
+    expected_file_count = raw["expected_file_count"]
+    if (
+        isinstance(expected_file_count, bool)
+        or not isinstance(expected_file_count, int)
+        or expected_file_count <= 0
+    ):
+        raise SourceQuarantineError(
+            f"collections[{index}].expected_file_count must be a positive integer"
+        )
+    content_set_sha256 = _require_string(
+        raw["content_set_sha256"],
+        field="content_set_sha256",
+        index=index,
+        container="collections",
+    )
+    if _SHA256_RE.fullmatch(content_set_sha256) is None:
+        raise SourceQuarantineError(
+            f"collections[{index}].content_set_sha256 must be 64 lowercase "
+            "hexadecimal characters"
+        )
+    classification = _require_string(
+        raw["classification"],
+        field="classification",
+        index=index,
+        container="collections",
+    )
+    detected_format = _require_string(
+        raw["detected_format"],
+        field="detected_format",
+        index=index,
+        container="collections",
+    )
+    if _FORMAT_RE.fullmatch(detected_format) is None:
+        raise SourceQuarantineError(
+            f"collections[{index}].detected_format is invalid: {detected_format!r}"
+        )
+    if (classification, detected_format) not in _SUPPORTED_CLASSIFICATION_FORMATS:
+        raise SourceQuarantineError(
+            f"collections[{index}] unsupported quarantine "
+            f"classification/format: {classification}/{detected_format}"
+        )
+    reason = _require_string(
+        raw["reason"],
+        field="reason",
+        index=index,
+        container="collections",
+    )
+    return SourceQuarantineCollection(
+        project_id=project_id,
+        relative_path_prefix=prefix,
+        relative_path_suffix=suffix,
+        expected_file_count=expected_file_count,
+        content_set_sha256=content_set_sha256,
+        classification=classification,
+        detected_format=detected_format,
+        reason=reason,
+    )
+
+
+def _content_set_sha256(entries: Iterable[SourceQuarantineEntry]) -> str:
+    rows = [
+        [entry.relative_path, entry.size_bytes, entry.sha256]
+        for entry in sorted(entries, key=lambda item: item.relative_path)
+    ]
+    payload = json.dumps(
+        rows,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -169,7 +329,11 @@ def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
         length = first_length
     else:
         length_bytes = first_length & 0x7F
-        if length_bytes == 0 or length_bytes > 4 or offset + 2 + length_bytes > len(payload):
+        if (
+            length_bytes == 0
+            or length_bytes > 4
+            or offset + 2 + length_bytes > len(payload)
+        ):
             raise ValueError("invalid DER long-form length")
         encoded_length = payload[offset + 2 : offset + 2 + length_bytes]
         if encoded_length[0] == 0:
@@ -204,8 +368,7 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             ) from exc
         if not decoded.lstrip("\ufeff \t\r\n").startswith(("<", "<?xml")):
             raise SourceQuarantineError(
-                f"{entry.relative_path}: declared xml_utf16le but XML prefix "
-                "is absent"
+                f"{entry.relative_path}: declared xml_utf16le but XML prefix is absent"
             )
         return
 
@@ -224,9 +387,7 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             "// REQUIRES: crash-recovery",
             "// CHECK: prag\\",
             "// CHECK-NEXT: ma",
-        }.issubset(lines) and decoded.count(
-            "#prag\\\nma clang __debug crash\n"
-        ) == 1
+        }.issubset(lines) and decoded.count("#prag\\\nma clang __debug crash\n") == 1
         index_contract = {
             "// RUN: not c-index-test -test-load-source all %s 2> %t.err",
             "// RUN: FileCheck < %t.err -check-prefix=CHECK-LOAD-SOURCE-CRASH %s",
@@ -237,9 +398,7 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             ),
             "// REQUIRES: crash-recovery",
             "#pragma clang __debug crash",
-        }.issubset(lines) and lines.count(
-            "#pragma clang __debug crash"
-        ) == 1
+        }.issubset(lines) and lines.count("#pragma clang __debug crash") == 1
         remap_contract = {
             "// RUN: echo env CINDEXTEST_EDITING=1 \\",
             "// RUN:   not c-index-test -test-load-source-reparse 1 local \\",
@@ -248,14 +407,8 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 'crash-recovery-code-complete-remap.c" \\'
             ),
             "// RUN:   %s 2> %t.err",
-            (
-                "// RUN: FileCheck < %t.err "
-                "-check-prefix=CHECK-CODE-COMPLETE-CRASH %s"
-            ),
-            (
-                "// CHECK-CODE-COMPLETE-CRASH: Unable to reparse "
-                "translation unit"
-            ),
+            ("// RUN: FileCheck < %t.err -check-prefix=CHECK-CODE-COMPLETE-CRASH %s"),
+            ("// CHECK-CODE-COMPLETE-CRASH: Unable to reparse translation unit"),
             "#pragma clang __debug crash",
         }.issubset(lines) and lines.count("#pragma clang __debug crash") == 1
         if not (compiler_contract or index_contract or remap_contract):
@@ -414,7 +567,9 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                     wrapper_start,
                 )
                 if cert_tag != 0x30 or cert_end != wrapper_end:
-                    raise ValueError("wrapper does not contain one certificate SEQUENCE")
+                    raise ValueError(
+                        "wrapper does not contain one certificate SEQUENCE"
+                    )
                 child_offset = cert_start
                 for expected_tag in (0x30, 0x30, 0x03):
                     child_tag, _, child_offset = _der_tlv_bounds(
@@ -447,6 +602,7 @@ class ProjectSourceQuarantine:
     manifest_entry_count: int
     project_id: str
     entries_by_path: dict[str, SourceQuarantineEntry]
+    collections: tuple[SourceQuarantineCollection, ...]
 
     @classmethod
     def load(
@@ -468,33 +624,66 @@ class ProjectSourceQuarantine:
             raise SourceQuarantineError(
                 f"invalid source quarantine manifest JSON {path}: {exc}"
             ) from exc
-        if not isinstance(raw, dict) or set(raw) != {"schema", "entries"}:
+        if not isinstance(raw, dict):
+            raise SourceQuarantineError(f"{path}: manifest root must be an object")
+        schema = raw.get("schema")
+        expected_keys = (
+            {"schema", "entries"}
+            if schema == LEGACY_MANIFEST_SCHEMA
+            else {"schema", "entries", "collections"}
+        )
+        if schema not in {LEGACY_MANIFEST_SCHEMA, MANIFEST_SCHEMA}:
             raise SourceQuarantineError(
-                f"{path}: expected exactly schema and entries fields"
+                f"{path}: unsupported schema {schema!r}; expected one of "
+                f"{[LEGACY_MANIFEST_SCHEMA, MANIFEST_SCHEMA]!r}"
             )
-        if raw["schema"] != MANIFEST_SCHEMA:
+        if set(raw) != expected_keys:
             raise SourceQuarantineError(
-                f"{path}: unsupported schema {raw['schema']!r}; "
-                f"expected {MANIFEST_SCHEMA!r}"
+                f"{path}: expected exactly {sorted(expected_keys)!r} fields"
             )
         raw_entries = raw["entries"]
         if not isinstance(raw_entries, list):
             raise SourceQuarantineError(f"{path}: entries must be a list")
-        parsed = [_parse_entry(item, index=index) for index, item in enumerate(raw_entries)]
+        parsed = [
+            _parse_entry(item, index=index) for index, item in enumerate(raw_entries)
+        ]
+        raw_collections = raw.get("collections", [])
+        if not isinstance(raw_collections, list):
+            raise SourceQuarantineError(f"{path}: collections must be a list")
+        parsed_collections = [
+            _parse_collection(item, index=index)
+            for index, item in enumerate(raw_collections)
+        ]
         identities = [(entry.project_id, entry.relative_path) for entry in parsed]
         if len(set(identities)) != len(identities):
             raise SourceQuarantineError(f"{path}: duplicate project/path entries")
+        collection_identities = [
+            (
+                collection.project_id,
+                collection.relative_path_prefix,
+                collection.relative_path_suffix,
+            )
+            for collection in parsed_collections
+        ]
+        if len(set(collection_identities)) != len(collection_identities):
+            raise SourceQuarantineError(f"{path}: duplicate collection entries")
         project_entries = {
             entry.relative_path: entry
             for entry in parsed
             if entry.project_id == project_id
         }
+        project_collections = tuple(
+            collection
+            for collection in parsed_collections
+            if collection.project_id == project_id
+        )
         return cls(
             manifest_path=path,
             manifest_sha256=hashlib.sha256(payload).hexdigest(),
-            manifest_entry_count=len(parsed),
+            manifest_entry_count=len(parsed) + len(parsed_collections),
             project_id=project_id,
             entries_by_path=project_entries,
+            collections=project_collections,
         )
 
     def filter_candidates(
@@ -505,6 +694,7 @@ class ProjectSourceQuarantine:
         root = os.path.abspath(os.fspath(project_root))
         kept: list[str] = []
         consumed: dict[str, SourceQuarantineEntry] = {}
+        collection_entries = {collection: [] for collection in self.collections}
         candidate_list = list(candidates)
         for candidate in candidate_list:
             absolute_candidate = os.path.abspath(candidate)
@@ -515,7 +705,20 @@ class ProjectSourceQuarantine:
                     f"source candidate escapes project root: {candidate}"
                 )
             entry = self.entries_by_path.get(relative_posix)
-            if entry is None:
+            matching_collections = [
+                collection
+                for collection in self.collections
+                if relative_posix.startswith(collection.relative_path_prefix)
+                and relative_posix.endswith(collection.relative_path_suffix)
+            ]
+            if len(matching_collections) > 1 or (
+                entry is not None and matching_collections
+            ):
+                raise SourceQuarantineError(
+                    f"{relative_posix}: candidate matches multiple quarantine rules"
+                )
+            collection = matching_collections[0] if matching_collections else None
+            if entry is None and collection is None:
                 kept.append(candidate)
                 continue
             path = Path(absolute_candidate)
@@ -525,19 +728,34 @@ class ProjectSourceQuarantine:
                 raise SourceQuarantineError(
                     f"cannot stat quarantined candidate {path}: {exc}"
                 ) from exc
-            if observed_size != entry.size_bytes:
+            if entry is not None and observed_size != entry.size_bytes:
                 raise SourceQuarantineError(
                     f"{relative_posix}: quarantine size mismatch: "
                     f"observed={observed_size} expected={entry.size_bytes}"
                 )
             observed_sha256 = _sha256_file(path)
-            if observed_sha256 != entry.sha256:
+            if entry is not None and observed_sha256 != entry.sha256:
                 raise SourceQuarantineError(
                     f"{relative_posix}: quarantine SHA-256 mismatch: "
                     f"observed={observed_sha256} expected={entry.sha256}"
                 )
-            _verify_detected_format(path, entry)
-            consumed[relative_posix] = entry
+            if entry is not None:
+                observed_entry = entry
+            else:
+                assert collection is not None
+                observed_entry = SourceQuarantineEntry(
+                    project_id=self.project_id,
+                    relative_path=relative_posix,
+                    size_bytes=observed_size,
+                    sha256=observed_sha256,
+                    classification=collection.classification,
+                    detected_format=collection.detected_format,
+                    reason=collection.reason,
+                )
+            _verify_detected_format(path, observed_entry)
+            consumed[relative_posix] = observed_entry
+            if collection is not None:
+                collection_entries[collection].append(observed_entry)
 
         missing = sorted(set(self.entries_by_path) - set(consumed))
         if missing:
@@ -545,17 +763,33 @@ class ProjectSourceQuarantine:
                 f"{self.project_id}: manifest entries were not discovered as source "
                 f"candidates: {missing}"
             )
-        quarantined_entries = [
-            consumed[path].as_dict()
-            for path in sorted(consumed)
-        ]
+        for collection, observed_entries in collection_entries.items():
+            observed_count = len(observed_entries)
+            if observed_count != collection.expected_file_count:
+                raise SourceQuarantineError(
+                    f"{self.project_id}: quarantine collection "
+                    f"{collection.relative_path_prefix!r} count mismatch: "
+                    f"observed={observed_count} "
+                    f"expected={collection.expected_file_count}"
+                )
+            observed_digest = _content_set_sha256(observed_entries)
+            if observed_digest != collection.content_set_sha256:
+                raise SourceQuarantineError(
+                    f"{self.project_id}: quarantine collection "
+                    f"{collection.relative_path_prefix!r} content-set SHA-256 "
+                    f"mismatch: observed={observed_digest} "
+                    f"expected={collection.content_set_sha256}"
+                )
+        quarantined_entries = [consumed[path].as_dict() for path in sorted(consumed)]
         receipt = {
             "schema": RECEIPT_SCHEMA,
             "project_id": self.project_id,
             "manifest_path": str(self.manifest_path),
             "manifest_sha256": self.manifest_sha256,
             "manifest_entry_count": self.manifest_entry_count,
-            "project_manifest_entry_count": len(self.entries_by_path),
+            "project_manifest_entry_count": (
+                len(self.entries_by_path) + len(self.collections)
+            ),
             "candidate_count_before_quarantine": len(candidate_list),
             "candidate_count_after_quarantine": len(kept),
             "quarantined_count": len(quarantined_entries),

@@ -1,5 +1,5 @@
 {
-  "schema": "cppmega.source_quarantine_manifest_v1",
+  "schema": "cppmega.source_quarantine_manifest_v2",
   "entries": [
     {
       "project_id": "corpus.local/Xbox_Live_Source",
@@ -65,15 +65,6 @@
       "reason": "Generated UTF-16LE C byte array embedding a ThreadX module ELF, prefixed by a UTF-8 license block"
     },
     {
-      "project_id": "xemu-project/xemu",
-      "relative_path": "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/PoliciesP1234subsubCAP123P12CertreversecrossCertificatePair.cp",
-      "size_bytes": 955,
-      "sha256": "8734808c3859f30101cb1934bf7d71d153430dd85ae357d41c1641fc7a8addfe",
-      "classification": "mislabeled_non_cpp",
-      "detected_format": "asn1_der_x509_certificate_pair",
-      "reason": "DER X.509 CertificatePair test vector stored under a .cp suffix"
-    },
-    {
       "project_id": "python/cpython",
       "relative_path": "Lib/test/archivetestdata/exe_with_z64",
       "size_bytes": 978,
@@ -90,6 +81,18 @@
       "classification": "generated_executable_archive",
       "detected_format": "posix_shell_appended_zip",
       "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
+    }
+  ],
+  "collections": [
+    {
+      "project_id": "xemu-project/xemu",
+      "relative_path_prefix": "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/",
+      "relative_path_suffix": ".cp",
+      "expected_file_count": 348,
+      "content_set_sha256": "4d92e2254cef41f0a84525e6e30a1d6fcda5237d0b878522ed911cfa973c6ef7",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "asn1_der_x509_certificate_pair",
+      "reason": "Pinned pyca-cryptography PKITS DER X.509 CertificatePair vector set stored under .cp suffixes"
     }
   ]
 }
