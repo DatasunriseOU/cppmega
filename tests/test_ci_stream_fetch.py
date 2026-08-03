@@ -5,17 +5,18 @@ import http.client
 import io
 import json
 import os
-from pathlib import Path
-from functools import lru_cache
 import re
 import sqlite3
 import subprocess
 import sys
 import threading
-from typing import Any, Mapping
 import urllib.error
 import zipfile
 import zlib
+from collections.abc import Mapping
+from functools import cache
+from pathlib import Path
+from typing import Any, ClassVar, Self
 
 import pytest
 
@@ -32,7 +33,6 @@ from scripts.ci_zlib_evidence import (
     strict_bounded_zlib_decode,
 )
 
-
 _FROZEN_TOKENIZER = (
     Path(__file__).resolve().parents[1]
     / "data"
@@ -41,7 +41,7 @@ _FROZEN_TOKENIZER = (
 )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _compressed_repetition(
     raw_size: int,
     value: bytes = b"x",
@@ -337,7 +337,7 @@ def _zip_bytes(
 
 class _IncompleteArchiveResponse:
     status = 200
-    headers: dict[str, str] = {}
+    headers: ClassVar[dict[str, str]] = {}
 
     def __init__(self) -> None:
         self._reads = 0
@@ -377,7 +377,7 @@ class _SignedArchiveResponse:
         self.headers = dict(headers)
         self._reads = iter(reads)
 
-    def __enter__(self) -> "_SignedArchiveResponse":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -1832,12 +1832,12 @@ def test_fetch_state_v3_inspection_reads_guarded_inode_and_detects_path_swap(
 def test_fetch_state_projection_builds_only_through_guarded_descriptor(
     tmp_path: Path,
 ) -> None:
+    from scripts.ci_content_store import _sqlite_schema_sha256
     from scripts.ci_fetch_state_migration import (
         CURRENT_V4_SQLITE_SCHEMA_SHA256,
         _build_destination,
         _open_inspection,
     )
-    from scripts.ci_content_store import _sqlite_schema_sha256
 
     source = tmp_path / "source.sqlite"
     temporary = tmp_path / "projection-temporary.sqlite"
@@ -1955,7 +1955,7 @@ def test_frozen_fetch_state_rejects_raw_v3_and_accepts_projection(
     )
 
     class FixtureTokenizer:
-        contract: dict[str, object] = {}
+        contract: ClassVar[dict[str, object]] = {}
         fingerprint = "f" * 64
 
     class FixtureStore:
@@ -1974,13 +1974,12 @@ def test_frozen_fetch_state_rejects_raw_v3_and_accepts_projection(
     tokenizer = FixtureTokenizer()
     store = FixtureStore(store_path)
 
-    with pytest.raises(ExportError, match="frozen v4"):
-        with FrozenFetchState(
-            source,
-            tokenizer=tokenizer,  # type: ignore[arg-type]
-            store=store,  # type: ignore[arg-type]
-        ):
-            pass
+    with pytest.raises(ExportError, match="frozen v4"), FrozenFetchState(
+        source,
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+    ):
+        pass
 
     project_fetch_state_v3_to_v4(source, destination)
     with FrozenFetchState(
@@ -2689,6 +2688,21 @@ def test_zip_validation_rejects_traversal_symlink_and_duplicate(
             max_member_bytes=100,
             max_uncompressed_bytes=100,
         )
+    infos = ci._safe_zip_infos(
+        duplicate,
+        max_members=10,
+        max_member_bytes=100,
+        max_uncompressed_bytes=100,
+        allow_duplicate_names=True,
+    )
+    identities = ci._zip_member_identities(infos)
+    assert len(identities) == len(set(identities)) == 2
+    assert [ci._archive_member_name_and_occurrence(value) for value in identities] == [
+        ("same.txt", 0),
+        ("same.txt", 1),
+    ]
+    jobs = [{"id": 10, "name": "same"}, {"id": 11, "name": "same"}]
+    assert [ci._job_for_member(value, jobs)["id"] for value in identities] == [10, 11]
 
 
 class FakeGitHub:
@@ -2787,6 +2801,51 @@ class FakeGitHub:
         self.signed_url = url
         destination.write_bytes(self.archive)
         return len(self.archive), hashlib.sha256(self.archive).hexdigest()
+
+
+def test_fetcher_preserves_duplicate_github_zip_members(tmp_path: Path) -> None:
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("0_build.txt", "first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("0_build.txt", "second")
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    github = FakeGitHub(archive_buffer.getvalue())
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=_FROZEN_TOKENIZER,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        progress = fetcher.run(continuous=False, max_runs=1)
+        assert progress["fetch"]["attempt_statuses"] == {"done": 1}
+        members = fetcher.state._connection.execute(
+            "SELECT archive_member,raw_sha256 FROM members ORDER BY archive_member"
+        ).fetchall()
+        assert len(members) == 2
+        assert len({row["archive_member"] for row in members}) == 2
+        assert {row["raw_sha256"] for row in members} == {
+            hashlib.sha256(value).hexdigest() for value in (b"first", b"second")
+        }
+        occurrences = list(fetcher.store.iter_occurrences())
+        assert {
+            item["provenance"]["archive"]["member"] for item in occurrences
+        } == {row["archive_member"] for row in members}
+        assert {
+            item["provenance"]["archive"]["original_member"]
+            for item in occurrences
+        } == {"0_build.txt"}
+    finally:
+        fetcher.close()
 
 
 def test_terminal_log_probe_does_not_spend_a_jobs_request(
@@ -4439,7 +4498,7 @@ def test_progress_heartbeat_is_written_while_parser_is_still_running(
                     poll_seconds=0.01,
                 )
             )
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures.
             errors.append(exc)
 
     runner = threading.Thread(target=run_fetcher)
@@ -5425,7 +5484,7 @@ def test_exhaustive_scheduler_ignores_met_target_and_drains_pending() -> None:
 
 def test_exhaustive_completion_gate_refuses_failed_attempts() -> None:
     class State:
-        statuses = {"done": 1, "failed": 1}
+        statuses: ClassVar[dict[str, int]] = {"done": 1, "failed": 1}
 
         @staticmethod
         def exhaustive_discovery_summary() -> dict[str, object]:

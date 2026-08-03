@@ -47,6 +47,41 @@ jobs:
           trap 'on_pre_python_error' ERR
           pre_python_step="python_bin is executable"
           test -x "${python_bin}"
+          pre_python_step="Triton, MLX, and environment receipt are local and pinned"
+          "${python_bin}" - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import json
+          import os
+          import sys
+          import mlx.core
+          import triton
+
+          expected_version = "3.6.0+git5a196a55"
+          prefix = Path(sys.prefix).resolve()
+          triton_origin = Path(triton.__file__).resolve()
+          mlx_origin = Path(mlx.core.__file__).resolve()
+          environment_receipt = json.loads(
+              (prefix / "cppmega-environment.json").read_text(encoding="utf-8")
+          )
+          if version("triton") != expected_version or not triton_origin.is_relative_to(prefix):
+              raise SystemExit(
+                  f"CI Triton must be {expected_version} under {prefix}; found {triton_origin}"
+              )
+          if not mlx_origin.is_relative_to(prefix):
+              raise SystemExit(f"CI MLX must be installed under {prefix}; found {mlx_origin}")
+          receipt_root = environment_receipt.get("megatron_root")
+          expected_root = os.environ.get("MEGATRON_LM_REPO")
+          expected_commit = os.environ.get("CPPMEGA_MEGATRON_COMMIT")
+          if (
+              not isinstance(receipt_root, str)
+              or not expected_root
+              or Path(receipt_root).resolve() != Path(expected_root).resolve()
+              or environment_receipt.get("megatron_commit") != expected_commit
+              or environment_receipt.get("source_dirty") is not False
+          ):
+              raise SystemExit("CI environment receipt does not bind the pinned Megatron checkout")
+          PY
           pre_python_step="Megatron root and commit are both set"
           : "${MEGATRON_LM_REPO:?set repository variable MEGATRON_LM_REPO}"
           : "${CPPMEGA_MEGATRON_COMMIT:?set repository variable CPPMEGA_MEGATRON_COMMIT}"

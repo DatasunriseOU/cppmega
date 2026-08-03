@@ -14,6 +14,29 @@ can be imported through the same validation/parser/tokenizer path.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
+import http.client
+import inspect
+import io
+import json
+import math
+import multiprocessing
+import os
+import re
+import sqlite3
+import stat
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+import zlib
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -22,50 +45,36 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import fcntl
-import hashlib
-import http.client
-import io
-import inspect
-import json
-import math
-import multiprocessing
-import os
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-import re
-import sqlite3
-import stat
-import sys
-import tempfile
-import threading
-import textwrap
-import time
-from typing import Any, Callable, Iterable, Mapping, Sequence
-import urllib.error
-import urllib.parse
-import urllib.request
-import zipfile
-import zlib
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.ci_content_store import (  # noqa: E402
-    CIContentStore,
+from cppmega.data.tokenizer_contract import (  # noqa: E402,RUF100
+    TOKENIZER_CONTRACT_SHA256,
+)
+from cppmega.tokenizer.cpp_tokenizer import (  # noqa: E402,RUF100
+    CppMegaTokenizer,
+    TokenizerContractError,
+    load_cppmega_tokenizer,
+)
+from scripts.ci_content_store import (  # noqa: E402,RUF100
     PRODUCTION_TARGET_UNIQUE_TOKENS,
+    CIContentStore,
     hash_token_sequence,
 )
-from scripts.ci_log_sidecars import canonicalize_ci_log  # noqa: E402
-from scripts.ci_stream_inventory import (  # noqa: E402
+from scripts.ci_log_sidecars import canonicalize_ci_log  # noqa: E402,RUF100
+from scripts.ci_stream_inventory import (  # noqa: E402,RUF100
     GITHUB_API_VERSION,
     HTTPResponse,
     TokenPool,
     load_token_pool,
     verify_inventory_completion_receipt,
 )
-from scripts.ci_zlib_evidence import (  # noqa: E402
+from scripts.ci_zlib_evidence import (  # noqa: E402,RUF100
     MAX_JOBS_EVIDENCE_BYTES,
     MAX_JOBS_EVIDENCE_COMPRESSED_BYTES,
     MAX_RUN_METADATA_BYTES,
@@ -77,15 +86,6 @@ from scripts.ci_zlib_evidence import (  # noqa: E402
     fetch_state_evidence_bound_violation,
     strict_bounded_zlib_decode,
 )
-from cppmega.data.tokenizer_contract import (  # noqa: E402
-    TOKENIZER_CONTRACT_SHA256,
-)
-from cppmega.tokenizer.cpp_tokenizer import (  # noqa: E402
-    CppMegaTokenizer,
-    TokenizerContractError,
-    load_cppmega_tokenizer,
-)
-
 
 SCHEMA_VERSION = "cppmega_ci_stream_fetch_v4"
 PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v4"
@@ -898,7 +898,9 @@ def _is_canonical_utc_timestamp(value: object) -> bool:
     ) is None:
         return False
     try:
-        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=UTC
+        )
     except ValueError:
         return False
     return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
@@ -1629,7 +1631,7 @@ def _validate_preserved_archive_provenance(
         source_row,
         witness_sha,
         witnesses,
-        artifact_producer_binding,
+        _artifact_producer_binding,
     ) = (
         _validate_preserved_recovery_receipt(
             receipt,
@@ -1719,7 +1721,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _script_sha256() -> str:
@@ -1983,7 +1985,7 @@ def _acquire_fetch_state_inode_lease(
         inode_record = (
             f"device={guarded.st_dev}\ninode={guarded.st_ino}\n"
             f"state={state}\n"
-        ).encode("utf-8")
+        ).encode()
         os.ftruncate(inode_lease_descriptor, 0)
         view = memoryview(inode_record)
         while view:
@@ -2133,7 +2135,7 @@ def _acquire_fetch_state_process_lease(
         )
         lease_record = (
             f"pid={os.getpid()}\nstate={state}\nowner={owner}\n"
-        ).encode("utf-8")
+        ).encode()
         os.ftruncate(descriptor, 0)
         view = memoryview(lease_record)
         while view:
@@ -4162,21 +4164,19 @@ class FetchState:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 key_row = self._connection.execute(
-                    (
-                        """
+                    """
                     SELECT repo,run_id,attempt FROM attempts
                     WHERE status='retry'
                     ORDER BY created_at,repo,run_id,attempt
                     LIMIT 1
-                        """
-                        if retry_only
-                        else """
+                    """
+                    if retry_only
+                    else """
                     SELECT repo,run_id,attempt FROM attempts
                     WHERE status IN ('pending','retry')
                     ORDER BY created_at,repo,run_id,attempt
                     LIMIT 1
-                        """
-                    )
+                    """
                 ).fetchone()
                 if key_row is None:
                     self._connection.execute("COMMIT")
@@ -5251,7 +5251,7 @@ class FetchState:
                     (
                         f"{row['repo']}\t{row['run_id']}\t{row['attempt']}\t"
                         f"{row['archive_member']}\t{row['sidecar_sha256']}\n"
-                    ).encode("utf-8")
+                    ).encode()
                 )
             binding_upgrades = [
                 {
@@ -5745,6 +5745,7 @@ def _member_job_hint(name: str) -> tuple[int | None, str]:
 def _job_for_member(
     name: str, jobs: Sequence[Mapping[str, object]]
 ) -> dict[str, object] | None:
+    name, duplicate_occurrence = _archive_member_name_and_occurrence(name)
     ordinal, hint = _member_job_hint(name)
     normalized_hint = _normalized_job_name(hint)
     exact = [
@@ -5754,9 +5755,61 @@ def _job_for_member(
     ]
     if len(exact) == 1:
         return exact[0]
+    if (
+        duplicate_occurrence is not None
+        and duplicate_occurrence < len(exact)
+    ):
+        return exact[duplicate_occurrence]
     if ordinal is not None and 0 <= ordinal < len(jobs):
         return dict(jobs[ordinal])
     return None
+
+
+_DUPLICATE_MEMBER_PREFIX = "\\cppmega-duplicate-zip-member-v1:"
+
+
+def _archive_member_name_and_occurrence(name: str) -> tuple[str, int | None]:
+    if not name.startswith(_DUPLICATE_MEMBER_PREFIX):
+        return name, None
+    try:
+        value = json.loads(name.removeprefix(_DUPLICATE_MEMBER_PREFIX))
+    except json.JSONDecodeError as exc:
+        raise ArchiveError("invalid duplicate ZIP member identity") from exc
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not isinstance(value[0], str)
+        or isinstance(value[1], bool)
+        or not isinstance(value[1], int)
+        or value[1] < 0
+    ):
+        raise ArchiveError("invalid duplicate ZIP member identity")
+    return value[0], value[1]
+
+
+def _zip_member_identities(infos: Sequence[zipfile.ZipInfo]) -> list[str]:
+    totals: dict[str, int] = {}
+    for info in infos:
+        totals[info.filename] = totals.get(info.filename, 0) + 1
+    occurrences: dict[str, int] = {}
+    identities: list[str] = []
+    for info in infos:
+        occurrence = occurrences.get(info.filename, 0)
+        occurrences[info.filename] = occurrence + 1
+        if totals[info.filename] == 1:
+            identities.append(info.filename)
+        else:
+            identities.append(
+                _DUPLICATE_MEMBER_PREFIX
+                + json.dumps(
+                    [info.filename, occurrence],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+    if len(set(identities)) != len(identities):
+        raise ArchiveError("ZIP member identities are not unique")
+    return identities
 
 
 def _validated_zip_infos(
@@ -5765,6 +5818,7 @@ def _validated_zip_infos(
     max_members: int,
     max_member_bytes: int,
     max_uncompressed_bytes: int,
+    allow_duplicate_names: bool = False,
 ) -> list[zipfile.ZipInfo]:
     infos = handle.infolist()
     if len(infos) > max_members:
@@ -5781,7 +5835,7 @@ def _validated_zip_infos(
         pure = PurePosixPath(name)
         if pure.is_absolute() or any(part == ".." for part in pure.parts):
             raise ArchiveError(f"unsafe ZIP traversal member: {name!r}")
-        if name in names:
+        if name in names and not allow_duplicate_names:
             raise ArchiveError(f"duplicate ZIP member: {name!r}")
         names.add(name)
         mode = (info.external_attr >> 16) & 0xFFFF
@@ -5811,6 +5865,7 @@ def _safe_zip_infos(
     max_members: int,
     max_member_bytes: int,
     max_uncompressed_bytes: int,
+    allow_duplicate_names: bool = False,
 ) -> list[zipfile.ZipInfo]:
     if archive.is_symlink() or not archive.is_file():
         raise ArchiveError(f"archive path is unsafe: {archive}")
@@ -5821,6 +5876,7 @@ def _safe_zip_infos(
                 max_members=max_members,
                 max_member_bytes=max_member_bytes,
                 max_uncompressed_bytes=max_uncompressed_bytes,
+                allow_duplicate_names=allow_duplicate_names,
             )
     except (OSError, zipfile.BadZipFile) as exc:
         raise ArchiveError(f"invalid ZIP archive: {exc}") from exc
@@ -6074,17 +6130,17 @@ class RescueSpool:
                 continue
             size = path.stat().st_size
             digest = _sha256_file(path)
-            if manifest is not None and manifest.get("status") in {
-                "zip",
-                "http410",
-            }:
-                if (
+            if (
+                manifest is not None
+                and manifest.get("status") in {"zip", "http410"}
+                and (
                     int(manifest["bytes"]) != size
                     or manifest["sha256"] != digest
-                ):
-                    raise ArchiveError(
-                        f"rescue artifact digest mismatch: {path.name}"
-                    )
+                )
+            ):
+                raise ArchiveError(
+                    f"rescue artifact digest mismatch: {path.name}"
+                )
             if kind == "http410":
                 return TerminalHTTP(410, path.read_bytes(), "rescue-spool")
             if kind == "invalid":
@@ -6697,6 +6753,7 @@ class CIStreamFetcher:
         *,
         archive: ArchiveSource,
         info: zipfile.ZipInfo,
+        archive_member: str,
         jobs: Sequence[Mapping[str, object]],
     ) -> tuple[int, int]:
         if not attempt.run_metadata_exact:
@@ -6707,16 +6764,19 @@ class CIStreamFetcher:
             archive.path, info, max_member_bytes=self.max_member_bytes
         )
         raw_sha = _sha256_bytes(raw)
-        job = _job_for_member(info.filename, jobs)
+        member_name, duplicate_occurrence = _archive_member_name_and_occurrence(
+            archive_member
+        )
+        job = _job_for_member(archive_member, jobs)
         job_id = None if job is None else job.get("id")
         job_name = None if job is None else job.get("name")
         job_key = (
             f"{job_id if isinstance(job_id, int) else 'unresolved'}:"
-            f"{info.filename}"
+            f"{archive_member}"
         )
         replayed = self.state.replayed_member(
             attempt,
-            archive_member=info.filename,
+            archive_member=archive_member,
             job_key=job_key,
             raw_sha256=raw_sha,
             raw_size=len(raw),
@@ -6739,7 +6799,9 @@ class CIStreamFetcher:
                 "job": job,
                 "job_id": job_id,
                 "job_name": job_name,
-                "archive_member": info.filename,
+                "archive_member": member_name,
+                "archive_member_identity": archive_member,
+                "archive_member_duplicate_occurrence": duplicate_occurrence,
                 "archive_member_raw_sha256": raw_sha,
             }
         )
@@ -6855,7 +6917,9 @@ class CIStreamFetcher:
                 },
                 "job": job,
                 "archive": {
-                    "member": info.filename,
+                    "member": archive_member,
+                    "original_member": member_name,
+                    "duplicate_name_occurrence": duplicate_occurrence,
                     "member_raw_sha256": raw_sha,
                 },
                 "parser_sidecar_sha256": sidecar.get("sidecar_sha256"),
@@ -6892,7 +6956,7 @@ class CIStreamFetcher:
             raise FetchError("materialized member digests are invalid")
         self.state.store_member(
             attempt,
-            archive_member=info.filename,
+            archive_member=archive_member,
             job_key=job_key,
             raw_sha256=raw_sha,
             raw_size=len(raw),
@@ -6947,12 +7011,20 @@ class CIStreamFetcher:
                 max_members=self.max_members,
                 max_member_bytes=self.max_member_bytes,
                 max_uncompressed_bytes=self.max_uncompressed_bytes,
+                allow_duplicate_names=archive.source
+                in {"github-inline", "github-signed-url"},
             )
             chunk_count = 0
             occurrence_tokens = 0
-            for info in infos:
+            for info, archive_member in zip(
+                infos, _zip_member_identities(infos), strict=True
+            ):
                 member_chunks, member_tokens = self._process_member(
-                    attempt, archive=archive, info=info, jobs=jobs
+                    attempt,
+                    archive=archive,
+                    info=info,
+                    archive_member=archive_member,
+                    jobs=jobs,
                 )
                 chunk_count += member_chunks
                 occurrence_tokens += member_tokens

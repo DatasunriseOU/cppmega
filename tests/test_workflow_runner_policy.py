@@ -160,6 +160,16 @@ def test_macos_lane_writes_a_pre_python_failure_receipt() -> None:
     assert '"schema_version": "cppmega.repository-ci.v1"' in macos
     assert '"failure_stage": "workflow-preamble"' in macos
     assert 'pre_python_step="python_bin is executable"' in macos
+    assert (
+        'pre_python_step="Triton, MLX, and environment receipt are local and pinned"'
+        in macos
+    )
+    assert 'expected_version = "3.6.0+git5a196a55"' in macos
+    assert "not triton_origin.is_relative_to(prefix)" in macos
+    assert "not mlx_origin.is_relative_to(prefix)" in macos
+    assert 'prefix / "cppmega-environment.json"' in macos
+    assert 'environment_receipt.get("megatron_commit") != expected_commit' in macos
+    assert 'environment_receipt.get("source_dirty") is not False' in macos
     assert 'CPPMEGA_CI_PYTHON: ${{ vars.CPPMEGA_CI_PYTHON }}' in macos
     assert 'MEGATRON_LM_REPO: ${{ vars.MEGATRON_LM_REPO }}' in macos
     assert 'CPPMEGA_MEGATRON_COMMIT: ${{ vars.CPPMEGA_MEGATRON_COMMIT }}' in macos
