@@ -13,6 +13,8 @@ wheel is written to the durable cppmega-wheels Modal Volume.
 
 Usage:
     modal run scripts/modal_build_tilelang_beta23.py
+    modal run scripts/modal_build_tilelang_beta23.py \
+      --tilelang-commit <full-sha> --tilelang-branch <branch>
 
 Output wheels:
   - tilelang-0.1.9-cp38-abi3-linux_x86_64.whl
@@ -25,6 +27,7 @@ import pathlib
 import modal
 
 TILELANG_REPO = "https://github.com/DatasunriseOU/tilelang.git"
+TILELANG_BRANCH = "main"
 TILELANG_COMMIT = "de8bb88cc382b0e78bc804244f79c4be8cc9e75f"
 TILELANG_TVM_COMMIT = "e25ca6ae50beee0e907b1e5ed32949879caddde1"
 TILELANG_TVM_FFI_COMMIT = "521efeb30bfd9e4946b248b3d76e6391028233a3"
@@ -91,11 +94,36 @@ def _build_image() -> modal.Image:
     timeout=3600,
     volumes={"/wheels": wheels_vol},
 )
-def build_tilelang_wheel():
+def build_tilelang_wheel(
+    tilelang_commit: str = TILELANG_COMMIT,
+    tilelang_branch: str = TILELANG_BRANCH,
+):
     """Build the exact TileLang/TVM pins and verify FA4 beta23 imports."""
+    import hashlib
+    import json
+    import re
     import shutil
     import subprocess
     import sys
+
+    if not re.fullmatch(r"[0-9a-f]{40}", tilelang_commit):
+        raise ValueError("tilelang_commit must be a full lowercase git SHA")
+    if (
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", tilelang_branch)
+        or ".." in tilelang_branch
+        or "//" in tilelang_branch
+    ):
+        raise ValueError("tilelang_branch is not a safe git branch name")
+    volume_subdir = (
+        ""
+        if tilelang_commit == TILELANG_COMMIT
+        else f"candidates/{tilelang_commit}/linux-cuda13.2-cp313"
+    )
+    volume_dir = pathlib.Path("/wheels") / volume_subdir
+    if volume_subdir and volume_dir.exists():
+        raise RuntimeError(
+            f"refusing to overwrite existing candidate directory: {volume_dir}"
+        )
 
     def run(cmd: str, **kw):
         print(f"+ {cmd}")
@@ -115,8 +143,14 @@ def build_tilelang_wheel():
         f"git clone --recurse-submodules --shallow-submodules "
         f"{TILELANG_REPO} /tmp/tilelang"
     )
-    run(f"cd /tmp/tilelang && git checkout {TILELANG_COMMIT}")
+    run(
+        "cd /tmp/tilelang && "
+        f"git fetch origin refs/heads/{tilelang_branch} && "
+        f"git checkout --detach {tilelang_commit}"
+    )
     run("cd /tmp/tilelang && git submodule update --init --recursive")
+    observed_commit = run("git -C /tmp/tilelang rev-parse HEAD").strip()
+    assert observed_commit == tilelang_commit, observed_commit
 
     # Verify both the immutable TVM gitlink and the header whose absence broke
     # the H200 wheel build.
@@ -158,10 +192,8 @@ def build_tilelang_wheel():
     )
     wheel_name = pathlib.Path(wheel_path).name
     print(f"Wheel: {wheel_name}")
-    shutil.copy2(wheel_path, f"/wheels/{EXPECTED_WHEEL}")
     ffi_wheel_path = f"/tmp/tilelang-wheel-out/{EXPECTED_TVM_FFI_WHEEL}"
     assert pathlib.Path(ffi_wheel_path).is_file(), ffi_wheel_path
-    shutil.copy2(ffi_wheel_path, f"/wheels/{EXPECTED_TVM_FFI_WHEEL}")
 
     # --- 5. Install FA4 beta23, then the exact linked FFI + TileLang wheels ---
     run(
@@ -176,11 +208,41 @@ def build_tilelang_wheel():
     # --- 6. Verify imports ---
     run(f"python - <<'PY'\n{VERIFY_CODE.strip()}\nPY")
 
-    # --- 7. Commit wheel to volume ---
+    # --- 7. Publish only the verified wheel pair ---
+    volume_dir.mkdir(parents=True, exist_ok=True)
+    wheel_target = volume_dir / EXPECTED_WHEEL
+    ffi_target = volume_dir / EXPECTED_TVM_FFI_WHEEL
+    shutil.copy2(wheel_path, wheel_target)
+    shutil.copy2(ffi_wheel_path, ffi_target)
+    if volume_subdir:
+        artifacts = {}
+        for path in (wheel_target, ffi_target):
+            with path.open("rb") as source:
+                digest = hashlib.file_digest(source, "sha256").hexdigest()
+            artifacts[path.name] = {
+                "sha256": digest,
+                "size_bytes": path.stat().st_size,
+            }
+        (volume_dir / "BUILD_MANIFEST.json").write_text(
+            json.dumps(
+                {
+                    "schema": "cppmega_tilelang_candidate_build_v1",
+                    "status": "success",
+                    "tilelang_branch": tilelang_branch,
+                    "tilelang_commit": tilelang_commit,
+                    "tvm_commit": TILELANG_TVM_COMMIT,
+                    "tvm_ffi_commit": TILELANG_TVM_FFI_COMMIT,
+                    "artifacts": artifacts,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     wheels_vol.commit()
-    print(f"\nSUCCESS: {wheel_name} written to cppmega-wheels volume")
-    print(f"Expected filename: {EXPECTED_WHEEL}")
-    return wheel_name
+    volume_path = str(pathlib.PurePosixPath(volume_subdir) / wheel_name)
+    print(f"\nSUCCESS: {volume_path} written to cppmega-wheels volume")
+    return volume_path
 
 
 @app.function(
@@ -222,10 +284,13 @@ def verify_existing_wheels():
 
 
 @app.local_entrypoint()
-def main():
-    wheel_name = build_tilelang_wheel.remote()
-    print(f"\nDone. Wheel: {wheel_name}")
+def main(
+    tilelang_commit: str = TILELANG_COMMIT,
+    tilelang_branch: str = TILELANG_BRANCH,
+):
+    wheel_path = build_tilelang_wheel.remote(tilelang_commit, tilelang_branch)
+    print(f"\nDone. Wheel: {wheel_path}")
     print(
         "To download: modal volume get cppmega-wheels "
-        f"/{wheel_name} --output wheels/{wheel_name}"
+        f"/{wheel_path} --output wheels/{pathlib.Path(wheel_path).name}"
     )

@@ -563,6 +563,9 @@ def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
         rebuild.index("3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD")
     )
     assert "python - <<'PY'" in modal_build
+    assert 'f"candidates/{tilelang_commit}/linux-cuda13.2-cp313"' in modal_build
+    assert "refusing to overwrite existing candidate directory" in modal_build
+    assert "cppmega_tilelang_candidate_build_v1" in modal_build
     assert 'python -c "{verify_code.strip()}"' not in modal_build
     assert "pip wheel . --no-build-isolation --no-deps" in modal_build
     for text in (
