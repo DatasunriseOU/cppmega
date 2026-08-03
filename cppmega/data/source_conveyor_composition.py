@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -130,13 +130,9 @@ def _resolve_regular_file(path: Path, *, where: str) -> Path:
     return resolved
 
 
-def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes, dict]:
-    path = _resolve_regular_file(path, where=where)
-    size = path.stat().st_size
-    if size > max_bytes:
-        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
-    raw = path.read_bytes()
-
+def _duplicate_rejector(
+    where: str,
+) -> Callable[[list[tuple[str, Any]]], dict[str, Any]]:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -145,13 +141,50 @@ def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes,
             result[key] = value
         return result
 
+    return reject_duplicates
+
+
+def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes, dict]:
+    path = _resolve_regular_file(path, where=where)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
+    raw = path.read_bytes()
+
     try:
-        payload = json.loads(raw, object_pairs_hook=reject_duplicates)
+        payload = json.loads(raw, object_pairs_hook=_duplicate_rejector(where))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
     if not isinstance(payload, dict):
         raise TypeError(f"{where} must be a JSON object: {path}")
     return raw, payload
+
+
+def _load_json_object_streaming(
+    path: Path, *, where: str, max_bytes: int
+) -> tuple[str, dict[str, Any]]:
+    """Hash and parse a large JSON object without retaining its raw bytes."""
+
+    path = _resolve_regular_file(path, where=where)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(8 * 1024 * 1024):
+                digest.update(chunk)
+            stream.seek(0)
+            payload = json.load(
+                stream,
+                object_pairs_hook=_duplicate_rejector(where),
+            )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise TypeError(f"{where} must be a JSON object: {path}")
+    return digest.hexdigest(), payload
 
 
 def _require_mapping(value: object, *, where: str) -> dict[str, Any]:
@@ -748,7 +781,7 @@ def _load_run(
     exit_raw, exit_receipt = _load_json_object(
         exit_path, where=f"{run_id} exit receipt", max_bytes=_MAX_RECEIPT_BYTES
     )
-    manifest_raw, manifest = _load_json_object(
+    manifest_sha256, manifest = _load_json_object_streaming(
         manifest_path,
         where=f"{run_id} conveyor manifest",
         max_bytes=_MAX_MANIFEST_BYTES,
@@ -785,7 +818,7 @@ def _load_run(
             done_binding.get("sha256"),
             where=f"{run_id} exit done_manifest.sha256",
         )
-        != hashlib.sha256(manifest_raw).hexdigest()
+        != manifest_sha256
     ):
         raise ValueError(f"{run_id} exit receipt does not bind the conveyor manifest")
 
@@ -1068,7 +1101,7 @@ def _load_run(
             "exit_code": exit_code,
         },
         "manifest": {
-            "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "sha256": manifest_sha256,
             "done_units": len(done),
             "failed_units": len(failed),
             "done_unit_set_sha256": _canonical_sha256(sorted(done)),

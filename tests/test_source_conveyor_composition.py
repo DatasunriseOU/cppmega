@@ -14,7 +14,7 @@ from cppmega.data.source_conveyor_composition import (
     PACKED_SOURCE_INVENTORY_SCHEMA,
     SOURCE_COMPOSITION_PLAN_SCHEMA,
     SourceComposition,
-    _load_json_object,
+    _load_json_object_streaming,
     _manifest_allowlist,
     _MAX_MANIFEST_BYTES,
     build_packed_source_inventory_receipt,
@@ -38,14 +38,29 @@ def test_legacy_full_run_manifest_can_exceed_old_64_mib_bound(
             stream.write(chunk)
         stream.write(b'"}},"failed":{}}')
 
-    raw, value = _load_json_object(
+    digest, value = _load_json_object_streaming(
         manifest,
         where="legacy full-source manifest",
         max_bytes=_MAX_MANIFEST_BYTES,
     )
 
-    assert len(raw) > 64 * 1024 * 1024
+    assert digest == _sha256(manifest)
     assert value["failed"] == {}
+
+
+def test_streaming_manifest_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
+    manifest = tmp_path / "_done.json"
+    manifest.write_text(
+        '{"done":{},"done":{},"failed":{}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key 'done'"):
+        _load_json_object_streaming(
+            manifest,
+            where="legacy full-source manifest",
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
 
 
 def _canonical_sha256(value: object) -> str:
