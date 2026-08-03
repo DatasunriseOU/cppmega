@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,9 @@ _ARTIFACT_FILENAME_RE = re.compile(
 )
 _MAX_PLAN_BYTES = 4 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 4 * 1024 * 1024
-_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
+# ponytail: legacy full-source runs embed parse-recovery records in _done.json;
+# keep a finite 2 GiB bridge until those records are stored as bound sidecars.
+_MAX_MANIFEST_BYTES = 2 * 1024 * 1024 * 1024
 _DEDUP_TABLES = frozenset(
     {
         "exact",
@@ -128,13 +130,9 @@ def _resolve_regular_file(path: Path, *, where: str) -> Path:
     return resolved
 
 
-def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes, dict]:
-    path = _resolve_regular_file(path, where=where)
-    size = path.stat().st_size
-    if size > max_bytes:
-        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
-    raw = path.read_bytes()
-
+def _duplicate_rejector(
+    where: str,
+) -> Callable[[list[tuple[str, Any]]], dict[str, Any]]:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -143,13 +141,50 @@ def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes,
             result[key] = value
         return result
 
+    return reject_duplicates
+
+
+def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes, dict]:
+    path = _resolve_regular_file(path, where=where)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
+    raw = path.read_bytes()
+
     try:
-        payload = json.loads(raw, object_pairs_hook=reject_duplicates)
+        payload = json.loads(raw, object_pairs_hook=_duplicate_rejector(where))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
     if not isinstance(payload, dict):
         raise TypeError(f"{where} must be a JSON object: {path}")
     return raw, payload
+
+
+def _load_json_object_streaming(
+    path: Path, *, where: str, max_bytes: int
+) -> tuple[str, dict[str, Any]]:
+    """Hash and parse a large JSON object without retaining its raw bytes."""
+
+    path = _resolve_regular_file(path, where=where)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(8 * 1024 * 1024):
+                digest.update(chunk)
+            stream.seek(0)
+            payload = json.load(
+                stream,
+                object_pairs_hook=_duplicate_rejector(where),
+            )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise TypeError(f"{where} must be a JSON object: {path}")
+    return digest.hexdigest(), payload
 
 
 def _require_mapping(value: object, *, where: str) -> dict[str, Any]:
@@ -237,6 +272,14 @@ def _revision_binding(value: object, *, where: str) -> dict[str, object]:
             "source_sha256": source_sha256,
             "dependency_closure_sha256": closure_sha256,
         },
+    }
+
+
+def _code_run_identity(value: object, *, where: str) -> dict[str, str]:
+    identity = _require_mapping(value, where=where)
+    return {
+        name: _require_sha256(identity.get(name), where=f"{where}.{name}")
+        for name in ("launch_sha256", "exit_sha256", "manifest_sha256")
     }
 
 
@@ -738,7 +781,7 @@ def _load_run(
     exit_raw, exit_receipt = _load_json_object(
         exit_path, where=f"{run_id} exit receipt", max_bytes=_MAX_RECEIPT_BYTES
     )
-    manifest_raw, manifest = _load_json_object(
+    manifest_sha256, manifest = _load_json_object_streaming(
         manifest_path,
         where=f"{run_id} conveyor manifest",
         max_bytes=_MAX_MANIFEST_BYTES,
@@ -775,12 +818,29 @@ def _load_run(
             done_binding.get("sha256"),
             where=f"{run_id} exit done_manifest.sha256",
         )
-        != hashlib.sha256(manifest_raw).hexdigest()
+        != manifest_sha256
     ):
         raise ValueError(f"{run_id} exit receipt does not bind the conveyor manifest")
 
     if launch.get("repository_identity") != "cppmega":
         raise ValueError(f"{run_id} launch receipt is not bound to cppmega")
+    source_code_runs: list[dict[str, str]] | None = None
+    raw_source_code_runs = launch.get("source_code_runs")
+    if raw_source_code_runs is not None:
+        if not isinstance(raw_source_code_runs, list) or not raw_source_code_runs:
+            raise ValueError(f"{run_id} source code run identities are invalid")
+        source_code_runs = [
+            _code_run_identity(value, where=f"{run_id} source code run {index}")
+            for index, value in enumerate(raw_source_code_runs)
+        ]
+    if "source_code_run" in launch:
+        source_code_run = _code_run_identity(
+            launch.get("source_code_run"), where=f"{run_id} source code run"
+        )
+        if source_code_runs is None:
+            source_code_runs = [source_code_run]
+        elif source_code_run != source_code_runs[0]:
+            raise ValueError(f"{run_id} source code run bindings drifted")
     command = launch.get("command")
     if not isinstance(command, list) or not command:
         raise ValueError(f"{run_id} launch command is missing")
@@ -870,7 +930,13 @@ def _load_run(
         )
         for name, (binding, _path) in input_artifacts.items()
     }
-    input_binding = _canonical_sha256(input_binding_hashes)
+    input_binding = _canonical_sha256(
+        {
+            name: digest
+            for name, digest in input_binding_hashes.items()
+            if name != "source_quarantine_manifest"
+        }
+    )
     if (
         Path(_single_option(command, "--repo-list")).expanduser().resolve()
         != input_artifacts["repo_list"][1]
@@ -969,6 +1035,7 @@ def _load_run(
     ):
         raise ValueError(f"{run_id} code-only run contains PR inputs")
     selected: set[str] = set()
+    repair_base_code_run: dict[str, Any] | None = None
     if launch_schema == _TARGETED_LAUNCH_SCHEMA:
         raw_selected = launch.get("selected_repositories")
         if (
@@ -987,6 +1054,19 @@ def _load_run(
             raise ValueError(f"{run_id} targeted command selection drifted")
         if int(_single_option(command, "--max-repos")) != len(selected):
             raise ValueError(f"{run_id} targeted command repository count drifted")
+        repair_base_code_run = _require_mapping(
+            launch.get("repair_base_code_run"),
+            where=f"{run_id} repair base code run",
+        )
+        _require_exact_fields(
+            repair_base_code_run,
+            {"launch_sha256", "exit_sha256", "manifest_sha256"},
+            where=f"{run_id} repair base code run",
+        )
+        for name, value in repair_base_code_run.items():
+            _require_sha256(value, where=f"{run_id} repair base {name}")
+        if exit_receipt.get("repair_base_code_run") != repair_base_code_run:
+            raise ValueError(f"{run_id} targeted exit repair-base binding drifted")
     elif "--only-repo" in command or "--max-repos" in command:
         raise ValueError(f"{run_id} full launch contains a targeted repository limit")
 
@@ -1021,7 +1101,7 @@ def _load_run(
             "exit_code": exit_code,
         },
         "manifest": {
-            "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "sha256": manifest_sha256,
             "done_units": len(done),
             "failed_units": len(failed),
             "done_unit_set_sha256": _canonical_sha256(sorted(done)),
@@ -1040,6 +1120,10 @@ def _load_run(
     }
     if pr_provenance is not None:
         portable["pr_completion"] = pr_provenance
+    if repair_base_code_run is not None:
+        portable["repair_base_code_run"] = repair_base_code_run
+    if source_code_runs is not None:
+        portable["source_code_runs"] = source_code_runs
     files = {
         "launch": launch_path,
         "exit": exit_path,
@@ -1071,6 +1155,8 @@ def _load_run(
             "expected_repository_count": launch.get("expected_repository_count"),
             "done": done,
             "failed": failed,
+            "repair_base_code_run": repair_base_code_run,
+            "source_code_runs": source_code_runs,
         },
     )
 
@@ -1170,6 +1256,58 @@ def load_source_composition(
 
     if len(archive_identities) != 1 or len(input_bindings) != 1:
         raise ValueError("source composition runs do not share one immutable input set")
+
+    full_code_runs = {
+        (
+            str(portable["launch"]["sha256"]),
+            str(portable["exit"]["sha256"]),
+            str(portable["manifest"]["sha256"]),
+        ): details
+        for portable, details in zip(run_receipts, run_details, strict=True)
+        if details["launch_schema"] == _FULL_LAUNCH_SCHEMA
+        and details["streams"] in {"code", "both"}
+    }
+    for portable, details in zip(run_receipts, run_details, strict=True):
+        repair_base = details["repair_base_code_run"]
+        if repair_base is None:
+            continue
+        base_details = full_code_runs.get(
+            (
+                str(repair_base["launch_sha256"]),
+                str(repair_base["exit_sha256"]),
+                str(repair_base["manifest_sha256"]),
+            )
+        )
+        if base_details is None:
+            raise ValueError(
+                f"{portable['run_id']} repair base code run is absent from the plan"
+            )
+        base_failed = {
+            _unit_repo(str(unit))
+            for unit in _require_mapping(base_details["failed"], where="base failed")
+        }
+        selected = set(portable["selected_repositories"])
+        if not selected <= base_failed:
+            raise ValueError(
+                f"{portable['run_id']} targets repositories not failed by its base run"
+            )
+    if any(details["repair_base_code_run"] is not None for details in run_details):
+        code_run_identities = [
+            {
+                "launch_sha256": str(portable["launch"]["sha256"]),
+                "exit_sha256": str(portable["exit"]["sha256"]),
+                "manifest_sha256": str(portable["manifest"]["sha256"]),
+            }
+            for portable, details in zip(run_receipts, run_details, strict=True)
+            if details["streams"] in {"code", "both"}
+        ]
+        for portable, details in zip(run_receipts, run_details, strict=True):
+            if details["streams"] != "commits":
+                continue
+            if details["source_code_runs"] != code_run_identities:
+                raise ValueError(
+                    f"{portable['run_id']} does not bind every composed code run"
+                )
     if any(not files for files in combined_allowlist.values()):
         missing = [
             f"{kind}/{bucket}"

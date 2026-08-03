@@ -14,7 +14,9 @@ from cppmega.data.source_conveyor_composition import (
     PACKED_SOURCE_INVENTORY_SCHEMA,
     SOURCE_COMPOSITION_PLAN_SCHEMA,
     SourceComposition,
+    _load_json_object_streaming,
     _manifest_allowlist,
+    _MAX_MANIFEST_BYTES,
     build_packed_source_inventory_receipt,
     load_source_composition,
 )
@@ -23,6 +25,42 @@ from scripts.nanochat_data.route_packed_source_docs import _complete_input_recei
 
 _BUCKETS = (1024,)
 _REPOSITORIES = ("alpha", "beta")
+
+
+def test_legacy_full_run_manifest_can_exceed_old_64_mib_bound(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "_done.json"
+    with manifest.open("wb") as stream:
+        stream.write(b'{"done":{"paddle::code":{"legacy_records":"')
+        chunk = b"x" * (1024 * 1024)
+        for _ in range(80):
+            stream.write(chunk)
+        stream.write(b'"}},"failed":{}}')
+
+    digest, value = _load_json_object_streaming(
+        manifest,
+        where="legacy full-source manifest",
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+
+    assert digest == _sha256(manifest)
+    assert value["failed"] == {}
+
+
+def test_streaming_manifest_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
+    manifest = tmp_path / "_done.json"
+    manifest.write_text(
+        '{"done":{},"done":{},"failed":{}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key 'done'"):
+        _load_json_object_streaming(
+            manifest,
+            where="legacy full-source manifest",
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
 
 
 def _canonical_sha256(value: object) -> str:
@@ -154,6 +192,8 @@ def _write_run(
     quarantine: Path,
     tokenizer: Path,
     targeted: tuple[str, ...] = (),
+    repair_base: dict[str, str] | None = None,
+    source_code_runs: list[dict[str, str]] | None = None,
     pr_inputs: dict[str, object] | None = None,
 ) -> dict[str, str]:
     run_root = root / run_id
@@ -272,10 +312,14 @@ def _write_run(
     if targeted:
         launch["selected_repositories"] = list(targeted)
         launch["expected_selected_repository_count"] = len(targeted)
+        launch["repair_base_code_run"] = repair_base
     else:
         launch["expected_repository_count"] = len(_REPOSITORIES)
     if pr_inputs is not None:
         launch["pr_inputs"] = copy.deepcopy(pr_inputs)
+    if source_code_runs is not None:
+        launch["source_code_run"] = source_code_runs[0]
+        launch["source_code_runs"] = source_code_runs
     _write_json(launch_path, launch)
 
     exit_code = 0 if not failed else 1
@@ -297,6 +341,7 @@ def _write_run(
     }
     if targeted:
         exit_receipt["selected_repositories"] = list(targeted)
+        exit_receipt["repair_base_code_run"] = repair_base
     _write_json(exit_path, exit_receipt)
     return {
         "run_id": run_id,
@@ -371,6 +416,40 @@ def _write_dedup_receipt(root: Path, dedup_db: Path) -> Path:
     return path
 
 
+def _refresh_repair_base_binding(plan: dict[str, object]) -> None:
+    runs = plan["runs"]
+    base, repair = runs[0], runs[1]
+    binding = {
+        "launch_sha256": _sha256(Path(base["launch_receipt"])),
+        "exit_sha256": _sha256(Path(base["exit_receipt"])),
+        "manifest_sha256": _sha256(Path(base["manifest"])),
+    }
+    repair_launch_path = Path(repair["launch_receipt"])
+    repair_exit_path = Path(repair["exit_receipt"])
+    repair_launch = json.loads(repair_launch_path.read_text(encoding="utf-8"))
+    repair_launch["repair_base_code_run"] = binding
+    _write_json(repair_launch_path, repair_launch)
+    repair_exit = json.loads(repair_exit_path.read_text(encoding="utf-8"))
+    repair_exit["repair_base_code_run"] = binding
+    repair_exit["launch_receipt_sha256"] = _sha256(repair_launch_path)
+    _write_json(repair_exit_path, repair_exit)
+    repair_identity = {
+        "launch_sha256": _sha256(repair_launch_path),
+        "exit_sha256": _sha256(repair_exit_path),
+        "manifest_sha256": _sha256(Path(repair["manifest"])),
+    }
+    commit = runs[2]
+    commit_launch_path = Path(commit["launch_receipt"])
+    commit_exit_path = Path(commit["exit_receipt"])
+    commit_launch = json.loads(commit_launch_path.read_text(encoding="utf-8"))
+    commit_launch["source_code_run"] = binding
+    commit_launch["source_code_runs"] = [binding, repair_identity]
+    _write_json(commit_launch_path, commit_launch)
+    commit_exit = json.loads(commit_exit_path.read_text(encoding="utf-8"))
+    commit_exit["launch_receipt_sha256"] = _sha256(commit_launch_path)
+    _write_json(commit_exit_path, commit_exit)
+
+
 def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     code_root = tmp_path / "code"
     commit_root = tmp_path / "commits"
@@ -421,50 +500,63 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     dedup_receipt = _write_dedup_receipt(tmp_path, dedup_db)
     pr_inputs = _write_pr_inputs(tmp_path)
     failed_record = {"stage": "index_project", "detail": "USR failure"}
+    base_run = _write_run(
+        tmp_path,
+        run_id="base-code",
+        digit="3",
+        streams="code",
+        done={
+            "alpha::code": {
+                "artifact_filename": "alpha.parquet",
+                "lengths": _lengths(),
+            }
+        },
+        failed={"beta::repo": failed_record},
+        code_root=code_root,
+        commit_root=commit_root,
+        dedup_db=dedup_db,
+        inventory=inventory,
+        archive_receipt=archive_receipt,
+        repo_list=repo_list,
+        quarantine=quarantine,
+        tokenizer=tokenizer,
+    )
+    repair_base = {
+        "launch_sha256": _sha256(Path(base_run["launch_receipt"])),
+        "exit_sha256": _sha256(Path(base_run["exit_receipt"])),
+        "manifest_sha256": _sha256(Path(base_run["manifest"])),
+    }
+    repair_run = _write_run(
+        tmp_path,
+        run_id="repair-code",
+        digit="4",
+        streams="code",
+        done={
+            "beta::code": {
+                "artifact_filename": "beta.parquet",
+                "lengths": _lengths(),
+            }
+        },
+        failed={},
+        code_root=code_root,
+        commit_root=commit_root,
+        dedup_db=dedup_db,
+        inventory=inventory,
+        archive_receipt=archive_receipt,
+        repo_list=repo_list,
+        quarantine=quarantine,
+        tokenizer=tokenizer,
+        targeted=("beta",),
+        repair_base=repair_base,
+    )
+    repair_identity = {
+        "launch_sha256": _sha256(Path(repair_run["launch_receipt"])),
+        "exit_sha256": _sha256(Path(repair_run["exit_receipt"])),
+        "manifest_sha256": _sha256(Path(repair_run["manifest"])),
+    }
     runs = [
-        _write_run(
-            tmp_path,
-            run_id="base-code",
-            digit="3",
-            streams="code",
-            done={
-                "alpha::code": {
-                    "artifact_filename": "alpha.parquet",
-                    "lengths": _lengths(),
-                }
-            },
-            failed={"beta::repo": failed_record},
-            code_root=code_root,
-            commit_root=commit_root,
-            dedup_db=dedup_db,
-            inventory=inventory,
-            archive_receipt=archive_receipt,
-            repo_list=repo_list,
-            quarantine=quarantine,
-            tokenizer=tokenizer,
-        ),
-        _write_run(
-            tmp_path,
-            run_id="repair-code",
-            digit="4",
-            streams="code",
-            done={
-                "beta::code": {
-                    "artifact_filename": "beta.parquet",
-                    "lengths": _lengths(),
-                }
-            },
-            failed={},
-            code_root=code_root,
-            commit_root=commit_root,
-            dedup_db=dedup_db,
-            inventory=inventory,
-            archive_receipt=archive_receipt,
-            repo_list=repo_list,
-            quarantine=quarantine,
-            tokenizer=tokenizer,
-            targeted=("beta",),
-        ),
+        base_run,
+        repair_run,
         _write_run(
             tmp_path,
             run_id="full-commits",
@@ -491,6 +583,7 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             repo_list=repo_list,
             quarantine=quarantine,
             tokenizer=tokenizer,
+            source_code_runs=[repair_base, repair_identity],
             pr_inputs=pr_inputs,
         ),
     ]
@@ -648,6 +741,76 @@ def test_source_composition_resolves_revision_bound_code_repair(
     )
     assert commit_run["pr_completion"]["status"] == "verified"
     assert commit_run["pr_completion"]["stored_pr_count"] == 2
+
+
+def test_source_composition_allows_repair_quarantine_but_not_tokenizer_drift(
+    tmp_path: Path,
+) -> None:
+    def replace_repair_input(
+        plan: dict[str, object],
+        *,
+        name: str,
+        replacement: Path,
+        command_option: str | None = None,
+    ) -> None:
+        repair = plan["runs"][1]
+        launch_path = Path(repair["launch_receipt"])
+        exit_path = Path(repair["exit_receipt"])
+        launch = json.loads(launch_path.read_text(encoding="utf-8"))
+        launch["inputs"][name] = {
+            "path": str(replacement),
+            "sha256": _sha256(replacement),
+        }
+        if command_option is not None:
+            launch["command"][launch["command"].index(command_option) + 1] = str(
+                replacement
+            )
+        _write_json(launch_path, launch)
+        exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+        exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+        _write_json(exit_path, exit_receipt)
+        _refresh_repair_base_binding(plan)
+
+    accepted_root = tmp_path / "accepted"
+    accepted_root.mkdir()
+    plan_path, code_root, commit_root = _composition_fixture(accepted_root)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    quarantine = accepted_root / "repair-quarantine.json"
+    _write_json(quarantine, {"schema": "fixture", "entries": ["beta"]})
+    replace_repair_input(
+        plan,
+        name="source_quarantine_manifest",
+        replacement=quarantine,
+        command_option="--source-quarantine-manifest",
+    )
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+    quarantine_hashes = {
+        run["input_artifacts"]["source_quarantine_manifest"]
+        for run in composition.receipt["runs"]
+    }
+    assert len(quarantine_hashes) == 2
+
+    drift_root = tmp_path / "tokenizer-drift"
+    drift_root.mkdir()
+    plan_path, code_root, commit_root = _composition_fixture(drift_root)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    tokenizer = drift_root / "repair-tokenizer.json"
+    _write_json(tokenizer, {"schema": "fixture", "vocab": {"drift": 1}})
+    replace_repair_input(plan, name="tokenizer", replacement=tokenizer)
+
+    with pytest.raises(ValueError, match="one immutable input set"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
 
 
 def test_commit_supervisor_plan_is_accepted_by_source_composition(
@@ -810,6 +973,107 @@ def test_source_composition_rejects_duplicate_repair_output(
         )
 
 
+def test_source_composition_rejects_commit_missing_repair_identity(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    commit = plan["runs"][2]
+    launch_path = Path(commit["launch_receipt"])
+    exit_path = Path(commit["exit_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["source_code_runs"] = launch["source_code_runs"][:1]
+    _write_json(launch_path, launch)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(ValueError, match="does not bind every composed code run"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_source_composition_rejects_drifted_singular_code_run_binding(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    commit = plan["runs"][2]
+    launch_path = Path(commit["launch_receipt"])
+    exit_path = Path(commit["exit_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["source_code_run"] = copy.deepcopy(launch["source_code_run"])
+    launch["source_code_run"]["manifest_sha256"] = "0" * 64
+    _write_json(launch_path, launch)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(ValueError, match="source code run bindings drifted"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_source_composition_accepts_singular_only_single_code_run_binding(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    base, _repair, commit = plan["runs"]
+
+    base_manifest_path = Path(base["manifest"])
+    base_exit_path = Path(base["exit_receipt"])
+    base_manifest = json.loads(base_manifest_path.read_text(encoding="utf-8"))
+    base_manifest["done"]["beta::code"] = {
+        "artifact_filename": "beta.parquet",
+        "lengths": _lengths(),
+    }
+    base_manifest["failed"] = {}
+    _write_json(base_manifest_path, base_manifest)
+    base_exit = json.loads(base_exit_path.read_text(encoding="utf-8"))
+    base_exit["status"] = "success"
+    base_exit["exit_code"] = 0
+    base_exit["done_manifest"]["sha256"] = _sha256(base_manifest_path)
+    _write_json(base_exit_path, base_exit)
+
+    base_identity = {
+        "launch_sha256": _sha256(Path(base["launch_receipt"])),
+        "exit_sha256": _sha256(base_exit_path),
+        "manifest_sha256": _sha256(base_manifest_path),
+    }
+    commit_launch_path = Path(commit["launch_receipt"])
+    commit_exit_path = Path(commit["exit_receipt"])
+    commit_launch = json.loads(commit_launch_path.read_text(encoding="utf-8"))
+    commit_launch["source_code_run"] = base_identity
+    del commit_launch["source_code_runs"]
+    _write_json(commit_launch_path, commit_launch)
+    commit_exit = json.loads(commit_exit_path.read_text(encoding="utf-8"))
+    commit_exit["launch_receipt_sha256"] = _sha256(commit_launch_path)
+    _write_json(commit_exit_path, commit_exit)
+    plan["runs"] = [base, commit]
+    _write_json(plan_path, plan)
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+
+    assert [run["run_id"] for run in composition.receipt["runs"]] == [
+        "base-code",
+        "full-commits",
+    ]
+
+
 def test_source_composition_rejects_weakened_near_dedup_receipt(
     tmp_path: Path,
 ) -> None:
@@ -913,6 +1177,8 @@ def test_source_composition_accepts_hash_identical_relocated_repo_list(
         exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
         _write_json(exit_path, exit_receipt)
 
+    _refresh_repair_base_binding(plan)
+
     original_repo_list.unlink()
 
     composition = load_source_composition(
@@ -940,6 +1206,7 @@ def test_source_composition_rejects_source_archive_command_drift(
     exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
     exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
     _write_json(exit_path, exit_receipt)
+    _refresh_repair_base_binding(plan)
 
     with pytest.raises(
         ValueError,
@@ -992,6 +1259,7 @@ def test_source_composition_rejects_full_launch_count_drift(
     exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
     exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
     _write_json(exit_path, exit_receipt)
+    _refresh_repair_base_binding(plan)
 
     with pytest.raises(ValueError, match="full launch repository count drifted"):
         load_source_composition(

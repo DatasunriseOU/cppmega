@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the commit conveyor from one terminal canonical code run."""
+"""Launch the commit conveyor from a terminal canonical code-run chain."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 import os
 import shutil
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -17,15 +17,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from cppmega.data.source_conveyor_composition import (
+from cppmega.data.source_conveyor_composition import (  # noqa: E402
     SOURCE_COMPOSITION_PLAN_SCHEMA,
     _load_run,
     build_packed_source_inventory_receipt,
     load_source_composition,
 )
-from scripts import source_conveyor_supervisor as source_supervisor
-from scripts import streaming_conveyor as conveyor
-from scripts.data.verify_global_dedup_store import verify_global_dedup_store
+from scripts import source_conveyor_supervisor as source_supervisor  # noqa: E402
+from scripts import streaming_conveyor as conveyor  # noqa: E402
+from scripts.data.verify_global_dedup_store import (  # noqa: E402
+    verify_global_dedup_store,
+)
 
 DEFAULT_MINIMUM_FREE_BYTES = 50 * 1024**3
 
@@ -58,6 +60,12 @@ def _plain_file(path: Path, *, label: str) -> Path:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--code-run-root", required=True)
+    parser.add_argument(
+        "--code-repair-run-root",
+        action="append",
+        default=[],
+        help="Targeted code-repair run root (repeatable, ordered).",
+    )
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--pr-store", required=True)
     parser.add_argument("--pr-repo-list", required=True)
@@ -93,11 +101,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         == Path(args.run_root).expanduser().resolve()
     ):
         raise SystemExit("--run-root must be separate from --code-run-root")
+    roots = [
+        Path(value).expanduser().resolve() for value in args.code_repair_run_root
+    ]
+    if len(roots) != len(set(roots)):
+        raise SystemExit("--code-repair-run-root values must be unique")
+    reserved = {
+        Path(args.code_run_root).expanduser().resolve(),
+        Path(args.run_root).expanduser().resolve(),
+    }
+    if any(root in reserved for root in roots):
+        raise SystemExit(
+            "code repair run roots must be separate from base and commit run roots"
+        )
     return args
 
 
-def load_terminal_code_run(code_run_root: Path) -> dict[str, Any]:
+def load_terminal_code_run(
+    code_run_root: Path,
+    *,
+    repair_run_roots: Sequence[Path] = (),
+) -> dict[str, Any]:
     """Revalidate one full code run through the canonical production loaders."""
+
+    if repair_run_roots:
+        return load_terminal_code_run_chain(code_run_root, repair_run_roots)
 
     root = code_run_root.expanduser().resolve()
     launch_path = root / "launch_receipt.json"
@@ -219,6 +247,236 @@ def load_terminal_code_run(code_run_root: Path) -> dict[str, Any]:
     }
 
 
+def load_terminal_code_run_chain(
+    code_run_root: Path,
+    repair_run_roots: Sequence[Path],
+) -> dict[str, Any]:
+    """Validate a failed full-code run plus targeted repairs as one final corpus."""
+
+    base = source_supervisor.load_repair_base_code_run(code_run_root)
+    base_producer_root = Path(
+        _text(base["launch"].get("repository_root"), label="base repository root")
+    )
+    if base_producer_root.is_symlink():
+        raise RuntimeError(
+            f"base repository root must not be a symlink: {base_producer_root}"
+        )
+    base_producer_root = base_producer_root.resolve(strict=True)
+    source_supervisor.revalidate_recorded_inputs(
+        base["launch"],
+        run_root=base["root"],
+        repo_root=base_producer_root,
+    )
+    expected_repositories = set(base["repositories"])
+    base_failed = set(base["failed_repositories"])
+    successful = set(base["successful_repositories"])
+    code_artifacts = set(base["code_artifacts"])
+    repair_runs: list[dict[str, Any]] = []
+    identities = [base["identity"]]
+
+    for index, raw_root in enumerate(repair_run_roots, start=1):
+        root = raw_root.expanduser()
+        if root.is_symlink():
+            raise RuntimeError(f"code repair run root must not be a symlink: {root}")
+        try:
+            root = root.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"code repair run root cannot be resolved: {root}") from exc
+        if not root.is_dir():
+            raise RuntimeError(f"code repair run root is not a directory: {root}")
+        launch_path = root / "launch_receipt.json"
+        exit_path = root / "exit_receipt.json"
+        manifest_path = root / "conveyor" / "_done.json"
+        completion_path = root / "conveyor" / "completion_receipt.json"
+        launch, launch_sha256 = source_supervisor._read_json_snapshot(
+            launch_path,
+            label=f"code repair {index} launch receipt",
+        )
+        producer_root = Path(
+            _text(
+                launch.get("repository_root"),
+                label=f"code repair {index} repository root",
+            )
+        )
+        if producer_root.is_symlink():
+            raise RuntimeError(
+                f"code repair {index} repository root must not be a symlink: "
+                f"{producer_root}"
+            )
+        producer_root = producer_root.resolve(strict=True)
+        live_inputs, validation_args = source_supervisor.revalidate_recorded_inputs(
+            launch,
+            run_root=root,
+            repo_root=producer_root,
+        )
+        (
+            portable,
+            allowlist,
+            _files,
+            code_terminal,
+            commit_terminal,
+            _failed_repositories,
+            _failed_units,
+            archive_identity,
+            input_binding,
+            details,
+        ) = _load_run(
+            {
+                "run_id": f"code-repair-{index}",
+                "launch_receipt": str(launch_path),
+                "exit_receipt": str(exit_path),
+                "manifest": str(manifest_path),
+            },
+            buckets=base["target_lengths"],
+            code_root=base["code_output_root"],
+            commit_root=base["commit_output_root"],
+        )
+        if portable["exit"]["exit_code"] != 0:
+            raise RuntimeError(f"code repair {index} exit code is non-zero")
+        selected = set(portable["selected_repositories"])
+        if (
+            portable["launch"]["sha256"] != launch_sha256
+            or portable["launch"]["schema"]
+            != source_supervisor.TARGETED_LAUNCH_SCHEMA
+            or portable["streams"] != "code"
+            or commit_terminal
+            or code_terminal != selected
+            or not selected <= base_failed
+            or portable.get("repair_base_code_run") != base["identity"]
+            or archive_identity != base["archive_identity"]
+            or input_binding != base["input_binding"]
+            or Path(str(details["dedup_path"])).resolve() != base["dedup_db"]
+        ):
+            raise RuntimeError(
+                f"code repair {index} is not bound to its failed full-code base"
+            )
+        done = details["done"]
+        if not isinstance(done, dict):
+            raise TypeError(f"code repair {index} done manifest must be an object")
+        repair_success = {
+            unit[: -len("::code")]
+            for unit in done
+            if unit.endswith("::code")
+        }
+        duplicate_success = successful & repair_success
+        if duplicate_success:
+            raise RuntimeError(
+                "code repair duplicates successful repositories: "
+                + ", ".join(sorted(duplicate_success))
+            )
+        repair_artifacts = {
+            (bucket, filename)
+            for (kind, bucket), files in allowlist.items()
+            if kind == "code"
+            for filename in files
+        }
+        if code_artifacts & repair_artifacts:
+            raise RuntimeError("code repair duplicates a published code shard")
+        successful.update(repair_success)
+        code_artifacts.update(repair_artifacts)
+
+        stored_inputs = _object(launch.get("inputs"), label="code repair inputs")
+        run_binding = _object(
+            launch.get("run_binding"),
+            label=f"code repair {index} run binding",
+        )
+        run_binding_sha256 = source_supervisor._require_sha256(
+            launch.get("run_binding_sha256"),
+            label=f"code repair {index} run binding sha256",
+        )
+        if source_supervisor._canonical_sha256(run_binding) != run_binding_sha256:
+            raise RuntimeError(f"code repair {index} run binding digest drifted")
+        if portable["exit"]["exit_code"] == 0:
+            coverage = source_supervisor.verify_completion_receipt(
+                completion_path,
+                manifest_path=manifest_path,
+                args=validation_args,
+                inputs=live_inputs,
+            )
+            if coverage["successful_repository_count"] != len(selected):
+                raise RuntimeError(f"code repair {index} completion coverage drifted")
+            exit_receipt = source_supervisor._read_json(
+                exit_path,
+                label=f"code repair {index} exit receipt",
+            )
+            completion_binding = _object(
+                exit_receipt.get("completion_receipt"),
+                label=f"code repair {index} exit completion binding",
+            )
+            terminal_coverage = _object(
+                exit_receipt.get("terminal_coverage"),
+                label=f"code repair {index} terminal coverage",
+            )
+            if (
+                Path(
+                    _text(
+                        completion_binding.get("path"),
+                        label=f"code repair {index} completion path",
+                    )
+                ).resolve()
+                != completion_path.resolve()
+                or completion_binding.get("sha256")
+                != source_supervisor._sha256_file(completion_path)
+                or terminal_coverage.get("status") != "complete"
+                or terminal_coverage.get("expected_repository_count")
+                != len(selected)
+                or terminal_coverage.get("successful_repository_count")
+                != len(selected)
+                or terminal_coverage.get("immutable_inputs_reverified_at_finish")
+                is not True
+            ):
+                raise RuntimeError(
+                    f"code repair {index} exit completion binding drifted"
+                )
+        identity = {
+            "launch_sha256": launch_sha256,
+            "exit_sha256": portable["exit"]["sha256"],
+            "manifest_sha256": portable["manifest"]["sha256"],
+        }
+        repair_runs.append(
+            {
+                "run_id": f"code-repair-{index}",
+                "root": root,
+                "launch_path": launch_path,
+                "exit_path": exit_path,
+                "manifest_path": manifest_path,
+                "launch": launch,
+                "inputs": stored_inputs,
+                "producer_root": producer_root,
+                "identity": identity,
+            }
+        )
+        identities.append(identity)
+
+    if successful != expected_repositories:
+        raise RuntimeError(
+            "final code-success coverage is incomplete: "
+            f"expected={len(expected_repositories)} actual={len(successful)} "
+            f"missing={sorted(expected_repositories - successful)[:20]}"
+        )
+
+    execution = repair_runs[-1]
+    producer_root = execution["producer_root"]
+
+    return {
+        "root": base["root"],
+        "launch_path": base["launch_path"],
+        "exit_path": base["exit_path"],
+        "manifest_path": base["manifest_path"],
+        "launch": execution["launch"],
+        "inputs": execution["inputs"],
+        "producer_root": producer_root,
+        "code_output_root": base["code_output_root"],
+        "commit_output_root": base["commit_output_root"],
+        "dedup_db": base["dedup_db"],
+        "target_lengths": base["target_lengths"],
+        "repositories": tuple(sorted(expected_repositories)),
+        "identity": base["identity"],
+        "identities": identities,
+        "repair_runs": repair_runs,
+    }
+
+
 def validate_pr_inputs(
     *,
     source_repo_list: Path,
@@ -335,17 +593,29 @@ def _write_composition_plan(
     commit_run_root: Path,
     dedup_receipt: Path,
 ) -> None:
+    code_runs = [
+        {
+            "run_id": "full-code",
+            "launch_receipt": str(code_run["launch_path"]),
+            "exit_receipt": str(code_run["exit_path"]),
+            "manifest": str(code_run["manifest_path"]),
+        },
+        *(
+            {
+                "run_id": repair["run_id"],
+                "launch_receipt": str(repair["launch_path"]),
+                "exit_receipt": str(repair["exit_path"]),
+                "manifest": str(repair["manifest_path"]),
+            }
+            for repair in code_run.get("repair_runs", ())
+        ),
+    ]
     source_supervisor._atomic_json(
         path,
         {
             "schema": SOURCE_COMPOSITION_PLAN_SCHEMA,
             "runs": [
-                {
-                    "run_id": "full-code",
-                    "launch_receipt": str(code_run["launch_path"]),
-                    "exit_receipt": str(code_run["exit_path"]),
-                    "manifest": str(code_run["manifest_path"]),
-                },
+                *code_runs,
                 {
                     "run_id": "full-commits",
                     "launch_receipt": str(commit_run_root / "launch_receipt.json"),
@@ -368,7 +638,11 @@ def _run(args: argparse.Namespace) -> int:
         except BlockingIOError as exc:
             raise RuntimeError("commit conveyor supervisor is already running") from exc
 
-        code_run = load_terminal_code_run(Path(args.code_run_root))
+        repair_run_roots = tuple(Path(value) for value in args.code_repair_run_root)
+        code_run = load_terminal_code_run(
+            Path(args.code_run_root),
+            repair_run_roots=repair_run_roots,
+        )
         free_bytes = shutil.disk_usage(run_root).free
         if free_bytes < args.minimum_free_bytes:
             raise RuntimeError(
@@ -388,6 +662,7 @@ def _run(args: argparse.Namespace) -> int:
             "schema": source_supervisor.RUN_BINDING_SCHEMA,
             "streams": "commits",
             "source_code_run": code_run["identity"],
+            "source_code_runs": code_run.get("identities", [code_run["identity"]]),
             "pr_completion": pr_inputs["completion_binding"],
             "command": command,
         }
@@ -409,6 +684,7 @@ def _run(args: argparse.Namespace) -> int:
                 "sha256": source_supervisor._sha256_file(Path(__file__).resolve()),
             },
             "source_code_run": code_run["identity"],
+            "source_code_runs": code_run.get("identities", [code_run["identity"]]),
             "inputs": code_run["inputs"],
             "pr_inputs": pr_inputs,
             "outputs": {
@@ -464,8 +740,13 @@ def _run(args: argparse.Namespace) -> int:
             return return_code
 
         try:
-            current_code_run = load_terminal_code_run(Path(args.code_run_root))
-            if current_code_run["identity"] != code_run["identity"]:
+            current_code_run = load_terminal_code_run(
+                Path(args.code_run_root),
+                repair_run_roots=repair_run_roots,
+            )
+            if current_code_run.get("identities", [current_code_run["identity"]]) != (
+                code_run.get("identities", [code_run["identity"]])
+            ):
                 raise RuntimeError("terminal code run changed during commit extraction")
             pr_store, pr_repo_list, pr_completion = pr_paths
             conveyor.revalidate_pr_completion_binding(
