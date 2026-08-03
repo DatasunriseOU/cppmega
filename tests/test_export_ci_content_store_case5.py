@@ -68,6 +68,7 @@ from scripts.export_ci_content_store_case5 import (
     OccurrenceRecord,
     _decode_provenance,
     _fragment_ranges,
+    _merge_bound_store_artifacts,
     _project_content,
     _publish_directory_no_replace,
     _sequence_digest,
@@ -781,6 +782,87 @@ def _build_store(
         ),
     )
     return store_root, receipt_path, fetch_state
+
+
+def test_merge_bound_store_fast_path_is_exact_and_reports_progress(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    text = "compile source.cpp"
+    store_root, receipt_path, _fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, _provenance(text))],
+    )
+    def progress() -> set[tuple[str, str]]:
+        return {
+            (event["phase"], event["status"])
+            for line in capsys.readouterr().out.splitlines()
+            if (event := json.loads(line))
+        }
+
+    capsys.readouterr()
+    with FrozenStore(store_root, receipt_path) as store:
+        snapshots = store._initial_snapshot
+    assert progress().issuperset(
+        {
+            ("store-sqlite-integrity-check", "started"),
+            ("store-sqlite-integrity-check", "complete"),
+            ("store-verification", "complete:full-exporter-verification"),
+        }
+    )
+    artifacts = {
+        f"{store_root.name}/{item.relative_path}": {
+            "byte_size": item.size,
+            "sha256": item.sha256,
+        }
+        for item in snapshots
+    }
+    store_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    bound = _merge_bound_store_artifacts(
+        artifacts=artifacts,
+        store_root=store_root,
+        store_receipt=store_receipt,
+    )
+    assert bound is not None
+    receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+
+    with FrozenStore(
+        store_root,
+        receipt_path,
+        merge_bound_artifacts=bound,
+        merge_bound_receipt_sha256=receipt_sha256,
+    ):
+        pass
+    events = progress()
+    assert (
+        "store-verification",
+        "complete:merge-receipt-artifact-fast-path",
+    ) in events
+    assert not any(phase == "store-sqlite-integrity-check" for phase, _ in events)
+
+    tampered = {path: dict(artifact) for path, artifact in bound.items()}
+    tampered["index.sqlite3"]["sha256"] = "f" * 64
+    with pytest.raises(
+        ExportError,
+        match="differs from merge receipt artifacts",
+    ), FrozenStore(
+        store_root,
+        receipt_path,
+        merge_bound_artifacts=tampered,
+        merge_bound_receipt_sha256=receipt_sha256,
+    ):
+        pass
+    del artifacts[f"{store_root.name}/index.sqlite3"]
+    assert (
+        _merge_bound_store_artifacts(
+            artifacts=artifacts,
+            store_root=store_root,
+            store_receipt=store_receipt,
+        )
+        is None
+    )
 
 
 def _assert_balanced_case5_row(row: dict[str, Any], *, bucket: int) -> None:
