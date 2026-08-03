@@ -239,6 +239,13 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
     repair_args = supervisor.parse_args(repair_argv)
     repair_inputs = supervisor.validate_inputs(repair_args, repo_root=repo)
     repair_base = supervisor.load_repair_base_code_run(base_root)
+    for invalid_lengths in ([0, 2048], [-1, 2048]):
+        invalid_base_launch = dict(base_launch)
+        invalid_base_launch["target_lengths"] = invalid_lengths
+        supervisor._atomic_json(base_launch_path, invalid_base_launch)
+        with pytest.raises(RuntimeError, match="target lengths are invalid"):
+            supervisor.load_repair_base_code_run(base_root)
+    supervisor._atomic_json(base_launch_path, base_launch)
     wrong_selection_argv = list(repair_argv)
     wrong_selection_argv[-1] = "owner/project"
     with pytest.raises(RuntimeError, match="not failed by its base run"):

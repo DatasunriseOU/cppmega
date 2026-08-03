@@ -542,6 +542,7 @@ def load_repair_base_code_run(code_run_root: Path) -> dict[str, Any]:
         not isinstance(lengths, list)
         or not lengths
         or any(isinstance(value, bool) or not isinstance(value, int) for value in lengths)
+        or any(value <= 0 for value in lengths)
         or tuple(sorted(set(lengths))) != tuple(lengths)
     ):
         raise RuntimeError("repair base target lengths are invalid")
