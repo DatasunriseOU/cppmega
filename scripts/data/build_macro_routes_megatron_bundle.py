@@ -90,10 +90,7 @@ from scripts.nanochat_data.route_packed_source_docs import (  # noqa: E402
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
-# CI CASE5 accepts only this audited extension of the default ladder.  The
-# default remains intentionally unchanged for existing live bundle workflows.
-SUPPORTED_CI_BUCKETS = (*DEFAULT_BUCKETS, 32768, 65536)
-BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v3"
+BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v4"
 SNAPSHOT_PLAN_SCHEMA = "cppmega_macro_routes_snapshot_plan_v2"
 SOURCE_ROUTE_SET_SCHEMA = "cppmega_packed_source_primary_routes_v1"
 CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
@@ -109,6 +106,12 @@ PRODUCTION_CI_MERGE_RECEIPT_SCHEMA = (
 )
 PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v2"
 BUNDLE_KNOWN_LIMITATIONS: tuple[str, ...] = ()
+PRODUCTION_OBJECTIVE_TARGET_PATH = (
+    REPO_ROOT / "configs/production_objective_materialization_target.json"
+)
+PRODUCTION_OBJECTIVE_TARGET_SHA256 = (
+    "e941ee6503533a867151115822729ba8a62cb66645eec11f080d7920cddd981d"
+)
 DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
@@ -188,6 +191,25 @@ def _stat_signature(stat: os.stat_result) -> tuple[int, int, int, int, int]:
         stat.st_mtime_ns,
         stat.st_ctime_ns,
     )
+
+
+def _load_production_objective_target() -> dict[str, object]:
+    path = PRODUCTION_OBJECTIVE_TARGET_PATH
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"production objective target is not a regular file: {path}")
+    if _sha256(path) != PRODUCTION_OBJECTIVE_TARGET_SHA256:
+        raise RuntimeError("production objective target bytes are unapproved")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("production objective target is not valid JSON") from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema")
+        != "cppmega_production_objective_materialization_target_v1"
+    ):
+        raise RuntimeError("production objective target payload is unapproved")
+    return payload
 
 
 def _copy_private(source: Path, target: Path) -> None:
@@ -560,10 +582,10 @@ def _load_content_store_ci_export_allowlist(
     case5 = manifest.get("case5_contract")
     if (
         not isinstance(case5, dict)
-        or case5.get("buckets") != list(buckets)
+        or case5.get("buckets") != list(DEFAULT_BUCKETS)
         or not buckets
         or len(set(buckets)) != len(buckets)
-        or any(bucket not in SUPPORTED_CI_BUCKETS for bucket in buckets)
+        or any(bucket not in DEFAULT_BUCKETS for bucket in buckets)
         or case5.get("overflow_rows") != 0
         or case5.get("parquet_shard_max_rows") != 512
         or case5.get("parquet_layout")
@@ -2259,6 +2281,72 @@ def _parse_objective_artifacts(
     return artifacts
 
 
+def _validate_production_objective_contract(
+    *,
+    contract: dict[str, object],
+    bucket: int,
+    target: dict[str, object],
+) -> None:
+    try:
+        policy = target["materialization"]
+        snapshot = contract["source_snapshot"]
+        actual = (
+            contract["totals"]["samples"],
+            contract["seed"],
+            contract["quota_window_samples"],
+            contract["source_selection"]["quota_lookahead_samples"],
+            contract["graph_auxiliary"]["relations"],
+            snapshot["sequence_length"],
+            sorted(
+                {
+                    Path(record["path"]).parts[0]
+                    for record in snapshot["pools"]["objective_seed"]["files"]
+                }
+            ),
+        )
+        expected = (
+            target["sample_targets"][str(bucket)],
+            policy["seed"],
+            policy["quota_window_samples"],
+            policy["quota_lookahead_samples"],
+            policy["graph_relations"],
+            bucket,
+            policy["objective_seed_kinds"],
+        )
+    except (IndexError, KeyError, TypeError) as error:
+        raise RuntimeError(
+            f"bucket {bucket}: objective contract cannot prove the production target"
+        ) from error
+    if actual != expected:
+        raise RuntimeError(
+            f"bucket {bucket}: objective policy differs from approved production "
+            f"target: actual={actual!r} expected={expected!r}"
+        )
+
+
+def _validate_production_objective_artifacts(
+    objective_artifacts: dict[int, Path], buckets: tuple[int, ...]
+) -> None:
+    target = _load_production_objective_target()
+    if (
+        buckets != DEFAULT_BUCKETS
+        or set(objective_artifacts) != set(DEFAULT_BUCKETS)
+    ):
+        raise RuntimeError(
+            "production objective artifacts must exactly cover buckets "
+            f"{DEFAULT_BUCKETS}"
+        )
+    for bucket in DEFAULT_BUCKETS:
+        artifact = load_objective_materialization_artifact(
+            objective_artifacts[bucket]
+        )
+        _validate_production_objective_contract(
+            contract=artifact.contract.payload,
+            bucket=bucket,
+            target=target,
+        )
+
+
 def _objective_expected_counts(path: Path) -> dict[str, int]:
     artifact = load_objective_materialization_artifact(path)
     totals = artifact.contract.payload["totals"]
@@ -2700,6 +2788,7 @@ def _stage_data_contracts(bundle_root: Path) -> dict[str, dict[str, object]]:
         "tokenizer_contract": (
             REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
         ),
+        "production_objective_target": PRODUCTION_OBJECTIVE_TARGET_PATH,
     }
     descriptors: dict[str, dict[str, object]] = {}
     for name, source in sources.items():
@@ -2794,6 +2883,7 @@ def _create_build_plan(
     pr_manifest: dict[str, object],
 ) -> dict[str, object]:
     objective_records = _objective_build_records(objective_artifacts, buckets)
+    _load_production_objective_target()
     tokenizer_dir = args.tokenizer_dir.resolve()
     tokenizer_records = _source_file_records(
         _validate_tokenizer_directory(tokenizer_dir), tokenizer_dir
@@ -2801,6 +2891,7 @@ def _create_build_plan(
     contract_paths = (
         REPO_ROOT / "data/domain_schema_v1.json",
         REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json",
+        PRODUCTION_OBJECTIVE_TARGET_PATH,
     )
     converter_path = REPO_ROOT / "scripts/data_prep_parquet_to_megatron.py"
     plan = {
@@ -3734,6 +3825,10 @@ def _run_build(
     objective_artifacts: dict[int, Path],
     output_dir: Path,
 ) -> int:
+    _validate_production_objective_artifacts(
+        objective_artifacts,
+        buckets,
+    )
     (
         partial_dir,
         builder_revision,
