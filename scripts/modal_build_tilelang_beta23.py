@@ -14,7 +14,8 @@ wheel is written to the durable cppmega-wheels Modal Volume.
 Usage:
     modal run scripts/modal_build_tilelang_beta23.py
     modal run scripts/modal_build_tilelang_beta23.py \
-      --tilelang-commit <full-sha> --tilelang-branch <branch>
+      --tilelang-commit <full-sha> --tilelang-branch <branch> \
+      --tvm-commit <full-sha> --tvm-ffi-commit <full-sha>
 
 Output wheels:
   - tilelang-0.1.9-cp38-abi3-linux_x86_64.whl
@@ -97,6 +98,8 @@ def _build_image() -> modal.Image:
 def build_tilelang_wheel(
     tilelang_commit: str = TILELANG_COMMIT,
     tilelang_branch: str = TILELANG_BRANCH,
+    tvm_commit: str = TILELANG_TVM_COMMIT,
+    tvm_ffi_commit: str = TILELANG_TVM_FFI_COMMIT,
 ):
     """Build the exact TileLang/TVM pins and verify FA4 beta23 imports."""
     import hashlib
@@ -106,8 +109,13 @@ def build_tilelang_wheel(
     import subprocess
     import sys
 
-    if not re.fullmatch(r"[0-9a-f]{40}", tilelang_commit):
-        raise ValueError("tilelang_commit must be a full lowercase git SHA")
+    for name, commit in (
+        ("tilelang_commit", tilelang_commit),
+        ("tvm_commit", tvm_commit),
+        ("tvm_ffi_commit", tvm_ffi_commit),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError(f"{name} must be a full lowercase git SHA")
     if (
         not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", tilelang_branch)
         or ".." in tilelang_branch
@@ -156,14 +164,14 @@ def build_tilelang_wheel(
     # the H200 wheel build.
     out = run("cd /tmp/tilelang && git submodule status 3rdparty/tvm")
     print(f"TVM submodule: {out.strip()}")
-    assert TILELANG_TVM_COMMIT in out, (
-        f"Expected TVM submodule at {TILELANG_TVM_COMMIT}, got: {out}"
+    assert tvm_commit in out, (
+        f"Expected TVM submodule at {tvm_commit}, got: {out}"
     )
     out = run(
         "cd /tmp/tilelang && "
         "git -C 3rdparty/tvm/3rdparty/tvm-ffi rev-parse HEAD"
     )
-    assert out.strip() == TILELANG_TVM_FFI_COMMIT, out
+    assert out.strip() == tvm_ffi_commit, out
     run("test -f /tmp/tilelang/3rdparty/tvm/3rdparty/nvbench/l2_cache_flush.h")
 
     # --- 2. Install torch (needed for build) ---
@@ -230,8 +238,8 @@ def build_tilelang_wheel(
                     "status": "success",
                     "tilelang_branch": tilelang_branch,
                     "tilelang_commit": tilelang_commit,
-                    "tvm_commit": TILELANG_TVM_COMMIT,
-                    "tvm_ffi_commit": TILELANG_TVM_FFI_COMMIT,
+                    "tvm_commit": tvm_commit,
+                    "tvm_ffi_commit": tvm_ffi_commit,
                     "artifacts": artifacts,
                 },
                 indent=2,
@@ -287,8 +295,12 @@ def verify_existing_wheels():
 def main(
     tilelang_commit: str = TILELANG_COMMIT,
     tilelang_branch: str = TILELANG_BRANCH,
+    tvm_commit: str = TILELANG_TVM_COMMIT,
+    tvm_ffi_commit: str = TILELANG_TVM_FFI_COMMIT,
 ):
-    wheel_path = build_tilelang_wheel.remote(tilelang_commit, tilelang_branch)
+    wheel_path = build_tilelang_wheel.remote(
+        tilelang_commit, tilelang_branch, tvm_commit, tvm_ffi_commit
+    )
     print(f"\nDone. Wheel: {wheel_path}")
     print(
         "To download: modal volume get cppmega-wheels "
