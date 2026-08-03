@@ -1292,6 +1292,7 @@ def _run(args: argparse.Namespace) -> int:
     run_root = Path(args.run_root).expanduser().resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     lock_stream = (run_root / "launch.lock").open("a+b")
+    repair_lock_stream = None
     try:
         try:
             fcntl.flock(
@@ -1302,12 +1303,30 @@ def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("source conveyor supervisor is already running") from exc
 
         inputs = validate_inputs(args)
-        repair_base = (
-            load_repair_base_code_run(Path(args.repair_base_code_run_root))
-            if args.repair_base_code_run_root
-            else None
-        )
-        if repair_base is not None:
+        repair_base = None
+        if args.repair_base_code_run_root:
+            repair_base_root = Path(args.repair_base_code_run_root).expanduser()
+            if repair_base_root.is_symlink():
+                raise RuntimeError(
+                    f"repair base run root must not be a symlink: {repair_base_root}"
+                )
+            repair_base_root = repair_base_root.resolve(strict=True)
+            repair_lock_path = repair_base_root / "targeted-repair.lock"
+            if repair_lock_path.is_symlink():
+                raise RuntimeError(
+                    f"targeted repair lock must not be a symlink: {repair_lock_path}"
+                )
+            repair_lock_stream = repair_lock_path.open("a+b")
+            try:
+                fcntl.flock(
+                    repair_lock_stream.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    "another targeted repair is already writing to this base run"
+                ) from exc
+            repair_base = load_repair_base_code_run(repair_base_root)
             validate_repair_request(args, inputs, repair_base)
         command = build_command(args, inputs, repair_base)
         run_binding = build_run_binding(args, inputs, repair_base)
@@ -1386,6 +1405,8 @@ def _run(args: argparse.Namespace) -> int:
         )
         return return_code
     finally:
+        if repair_lock_stream is not None:
+            repair_lock_stream.close()
         lock_stream.close()
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import signal
@@ -323,6 +324,44 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
             supervisor.load_repair_base_code_run(base_root)
         output_root.unlink()
         output_root.mkdir()
+
+
+def test_targeted_repairs_exclusively_lock_shared_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, argv = _input_fixture(tmp_path)
+    base_root = tmp_path / "base"
+    base_root.mkdir()
+    repair_argv = list(argv)
+    repair_argv.extend(
+        [
+            "--repair-base-code-run-root",
+            str(base_root),
+            "--only-repo",
+            "project",
+        ]
+    )
+    args = supervisor.parse_args(repair_argv)
+    inputs = supervisor.validate_inputs(args, repo_root=repo)
+    monkeypatch.setattr(supervisor, "validate_inputs", lambda _args: inputs)
+    loaded = False
+
+    def reject_base_load(_root: Path) -> dict[str, object]:
+        nonlocal loaded
+        loaded = True
+        raise AssertionError("base state was read before acquiring its write lock")
+
+    monkeypatch.setattr(supervisor, "load_repair_base_code_run", reject_base_load)
+    lock_path = base_root / "targeted-repair.lock"
+    held = lock_path.open("a+b")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(RuntimeError, match="another targeted repair"):
+            supervisor._run(args)
+    finally:
+        held.close()
+    assert loaded is False
 
 
 def test_supervisor_rejects_inventory_that_does_not_bind_sha_receipt(
