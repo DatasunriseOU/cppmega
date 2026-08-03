@@ -55,7 +55,12 @@ assert megatron.__spec__ is not None
 assert not getattr(megatron, "__cppmega_stub__", False)
 """
     environment = os.environ.copy()
-    for name in ("PYTHONPATH", "MEGATRON_LM_REPO", "MEGATRON_ROOT"):
+    for name in (
+        "PYTHONPATH",
+        "PYTHONSAFEPATH",
+        "MEGATRON_LM_REPO",
+        "MEGATRON_ROOT",
+    ):
         environment.pop(name, None)
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -73,6 +78,7 @@ def test_pytest_bootstrap_fails_loudly_for_invalid_explicit_megatron_root(tmp_pa
     missing_root = tmp_path / "missing-megatron"
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONSAFEPATH", None)
     environment.pop("MEGATRON_ROOT", None)
     environment["MEGATRON_LM_REPO"] = str(missing_root)
     result = subprocess.run(
@@ -168,6 +174,7 @@ def test_explicit_megatron_root_without_receipt_requires_exact_commit(
     (source / "megatron" / "core" / "__init__.py").write_text("", encoding="utf-8")
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONSAFEPATH", None)
     environment.pop("CPPMEGA_MEGATRON_COMMIT", None)
     environment["MEGATRON_LM_REPO"] = str(source)
     result = subprocess.run(
