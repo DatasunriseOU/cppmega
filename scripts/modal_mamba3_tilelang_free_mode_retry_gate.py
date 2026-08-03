@@ -1,4 +1,4 @@
-"""Read-only R2/R4 full parity gate for TileLang ce28ea0f on old51 Mamba."""
+"""Read-only R2/R4 full parity gate for TileLang a760fe58 on old51 Mamba."""
 
 from __future__ import annotations
 
@@ -6,38 +6,36 @@ import hashlib
 import json
 import os
 import pathlib
+import sys
 from typing import Any
 
 import modal
 
+SCRIPT_PATH = pathlib.Path(__file__).resolve()
 LOCAL_CPPMEGA_ROOT = pathlib.Path("/Volumes/external/sources/cppmega")
 LOCAL_CANDIDATE_ROOT = pathlib.Path(
     "/Volumes/external/cppmega_data/tilelang_candidate_wheels/"
-    "ce28ea0f462339638756aa5088f712aaf15e53ec/linux-cuda13.2-cp313"
+    "a760fe587995def0f3108ee204be453d87467c5d/linux-cuda13.2-cp313"
 )
 OLD_BASE_IMAGE_REF = (
     "ghcr.io/datasunriseou/cppmega@"
     "sha256:85a09018ab4689c09025c8eb2e732242c80392167e4d5d59418da49184af970a"
 )
 OLD51_D66_IMAGE_ID = "im-p7seeW5FdaipoteRTDe1Lo"
-TILELANG_COMMIT = "ce28ea0f462339638756aa5088f712aaf15e53ec"
+TILELANG_COMMIT = "a760fe587995def0f3108ee204be453d87467c5d"
 TVM_COMMIT = "84af17279edb5edad29749bd6b0eea2ed9393105"
 TVM_FFI_COMMIT = "e4353339293459e3e8a393afc1b6a6a869e75b13"
 TILELANG_WHEEL_SHA256 = (
-    "5d88bb31a27e0abf62acd53769fa842bef8b73f204a287caa3b6fe6458361eb9"
+    "3bbda181f28820e8b9bc7c4a894238ae64a945d09a16de01c67576a867ad7fcf"
 )
 TVM_FFI_WHEEL_SHA256 = (
     "8233d526de8dd9a8c7cdd88e8e6085a04b577d24a7461791beca9451f3f912f3"
 )
 BUILD_MANIFEST_SHA256 = (
-    "d2c3d45880859351662a291f86b25c63fd463aadab4693054c4b011a40b64e80"
+    "60a7666f93a390d803e0e99955430ada7f63a35d2ed46bf093e9a3286983c0eb"
 )
-MAMBA_SOURCE_SHA256 = (
-    "51dab809a47bd33a9b610725599dff956187edd70cae1518618f1ef31115d320"
-)
-MAMBA_BACKUP_SHA256 = (
-    "980dadcec29cdd318c51c1660697d54b5a7d3311d2b681b4a68b31e7d21e64b9"
-)
+MAMBA_SOURCE_SHA256 = "51dab809a47bd33a9b610725599dff956187edd70cae1518618f1ef31115d320"
+MAMBA_BACKUP_SHA256 = "980dadcec29cdd318c51c1660697d54b5a7d3311d2b681b4a68b31e7d21e64b9"
 MEGATRON_COMMIT = "ba7b5ebce12af60627a80985792a1449ce45f46c"
 MAMBA_SOURCE = (
     "/usr/local/lib/python3.13/dist-packages/"
@@ -45,16 +43,18 @@ MAMBA_SOURCE = (
 )
 MAMBA_BACKUP = MAMBA_SOURCE + ".cppmega_stage2_force_nontma.bak"
 REMOTE_TILELANG_WHEEL = "/tmp/tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
-REMOTE_TVM_FFI_WHEEL = (
-    "/tmp/apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
-)
+REMOTE_TVM_FFI_WHEEL = "/tmp/apache_tvm_ffi-0.1.13.post5-cp313-cp313-linux_x86_64.whl"
+REMOTE_RUNNER = "/opt/cppmega/scripts/modal_mamba3_tilelang_free_mode_retry_gate.py"
 TEST_NODES = (
-    "tests/test_cppmega_mamba3_tp_mixer.py::"
-    "test_tp2_sp_on_parity_vs_tp1",
-    "tests/test_cppmega_mamba3_tp_mixer.py::"
-    "test_tp2_sp_off_replicated_parameter_gradient_parity_vs_tp1",
-    "tests/test_cppmega_mamba3_tp_mixer.py::"
-    "test_cp2_actual_mamba3_forward_backward_parity_vs_cp1",
+    "tests/test_cppmega_mamba3_tp_mixer.py::test_tp2_sp_on_parity_vs_tp1",
+    (
+        "tests/test_cppmega_mamba3_tp_mixer.py::"
+        "test_tp2_sp_off_replicated_parameter_gradient_parity_vs_tp1"
+    ),
+    (
+        "tests/test_cppmega_mamba3_tp_mixer.py::"
+        "test_cp2_actual_mamba3_forward_backward_parity_vs_cp1"
+    ),
 )
 GPU_SPEC = "H200:2"
 
@@ -65,12 +65,10 @@ try:
         "r4": (4, 16),
     }[NUMERICAL_PHASE]
 except KeyError:
-    raise RuntimeError(
-        "CPPMEGA_NUMERICAL_PHASE must be exactly 'r2' or 'r4'"
-    ) from None
+    raise RuntimeError("CPPMEGA_NUMERICAL_PHASE must be exactly 'r2' or 'r4'") from None
 
-RESULT_STEM = f"mamba3-ce28-old51-{NUMERICAL_PHASE}-full-parity-a3"
-APP_NAME = f"cppmega-ce28-old51-{NUMERICAL_PHASE}-full-parity-a3"
+RESULT_STEM = f"mamba3-a760-old51-{NUMERICAL_PHASE}-full-parity-a3"
+APP_NAME = f"cppmega-a760-old51-{NUMERICAL_PHASE}-full-parity-a3"
 
 SOURCE_BINDINGS = (
     (
@@ -126,7 +124,7 @@ SOURCE_BINDING_SHA256 = {
     ),
 }
 
-if modal.is_local():
+if modal.is_local() and os.environ.get("CPPMEGA_SANDBOX_WORKER") != "1":
     manifest_path = LOCAL_CANDIDATE_ROOT / "BUILD_MANIFEST.json"
     observed_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if observed_manifest_sha256 != BUILD_MANIFEST_SHA256:
@@ -154,14 +152,12 @@ if modal.is_local():
     observed_wheels = {
         "tilelang": hashlib.sha256(
             (
-                LOCAL_CANDIDATE_ROOT
-                / pathlib.Path(REMOTE_TILELANG_WHEEL).name
+                LOCAL_CANDIDATE_ROOT / pathlib.Path(REMOTE_TILELANG_WHEEL).name
             ).read_bytes()
         ).hexdigest(),
         "tvm_ffi": hashlib.sha256(
             (
-                LOCAL_CANDIDATE_ROOT
-                / pathlib.Path(REMOTE_TVM_FFI_WHEEL).name
+                LOCAL_CANDIDATE_ROOT / pathlib.Path(REMOTE_TVM_FFI_WHEEL).name
             ).read_bytes()
         ).hexdigest(),
     }
@@ -174,9 +170,7 @@ if modal.is_local():
             f"local candidate wheel payloads drifted: {observed_wheels!r}"
         )
     observed_bindings = {
-        remote: hashlib.sha256(
-            (LOCAL_CPPMEGA_ROOT / relative).read_bytes()
-        ).hexdigest()
+        remote: hashlib.sha256((LOCAL_CPPMEGA_ROOT / relative).read_bytes()).hexdigest()
         for relative, remote in SOURCE_BINDINGS
     }
     if observed_bindings != SOURCE_BINDING_SHA256:
@@ -185,7 +179,7 @@ if modal.is_local():
             f"{observed_bindings!r}"
         )
 
-SCRIPT_SHA256 = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+SCRIPT_SHA256 = hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()
 
 
 def _image() -> modal.Image:
@@ -222,6 +216,11 @@ def _image() -> modal.Image:
         remote_path=REMOTE_TVM_FFI_WHEEL,
         copy=True,
     )
+    image = image.add_local_file(
+        str(SCRIPT_PATH),
+        remote_path=REMOTE_RUNNER,
+        copy=True,
+    )
     source_checks = " ".join(
         f"echo '{digest}  {remote}' | sha256sum -c -;"
         for remote, digest in sorted(SOURCE_BINDING_SHA256.items())
@@ -235,6 +234,7 @@ def _image() -> modal.Image:
         "| sha256sum -c -; "
         f"echo '{TVM_FFI_WHEEL_SHA256}  {REMOTE_TVM_FFI_WHEEL}' "
         "| sha256sum -c -; "
+        f"echo '{SCRIPT_SHA256}  {REMOTE_RUNNER}' | sha256sum -c -; "
         "command -v timeout; "
         f"python -m pip install --force-reinstall --no-deps "
         f"'{REMOTE_TVM_FFI_WHEEL}' '{REMOTE_TILELANG_WHEEL}'; "
@@ -243,21 +243,21 @@ def _image() -> modal.Image:
 
 
 app = modal.App(APP_NAME)
-results = modal.Volume.from_name("cppmega-test-results", create_if_missing=True)
 
 
 def _sha256(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-@app.function(
-    image=_image(),
-    gpu=GPU_SPEC,
-    cpu=8,
-    memory=131_072,
-    timeout=3600,
-    volumes={"/results": results},
-)
+def _artifact_paths(root: pathlib.Path, run_id: str) -> dict[str, pathlib.Path]:
+    prefix = root / f"{RESULT_STEM}-{run_id}"
+    return {
+        "receipt": prefix.with_suffix(".json"),
+        "log": prefix.with_suffix(".log"),
+        "junit": prefix.with_name(f"{prefix.name}-junit.xml"),
+    }
+
+
 def run_gate() -> dict[str, Any]:
     import importlib.metadata
     import subprocess
@@ -267,13 +267,14 @@ def run_gate() -> dict[str, Any]:
     import uuid
     import xml.etree.ElementTree as ET
 
-    task_id = os.environ.get("MODAL_TASK_ID", "unknown-task")
-    prefix = pathlib.Path(f"/results/{RESULT_STEM}-{task_id}")
-    receipt_path = pathlib.Path(str(prefix) + ".json")
-    log_path = pathlib.Path(str(prefix) + ".log")
-    junit_path = pathlib.Path(str(prefix) + "-junit.xml")
-    temporary_junit = pathlib.Path(f"/tmp/{RESULT_STEM}.xml")
-    temporary_log = pathlib.Path(f"/tmp/{RESULT_STEM}.log")
+    sandbox_id = os.environ["CPPMEGA_MODAL_SANDBOX_ID"]
+    run_id = os.environ["CPPMEGA_GATE_RUN_ID"]
+    paths = _artifact_paths(pathlib.Path("/tmp"), run_id)
+    receipt_path = paths["receipt"]
+    log_path = paths["log"]
+    junit_path = paths["junit"]
+    temporary_junit = junit_path
+    temporary_log = log_path
 
     def write_receipt(payload: dict[str, Any]) -> None:
         temporary = receipt_path.with_name(
@@ -281,14 +282,10 @@ def run_gate() -> dict[str, Any]:
         )
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True))
         temporary.replace(receipt_path)
-        results.commit()
 
     def runtime_hashes() -> dict[str, str]:
         return {
-            **{
-                path: _sha256(pathlib.Path(path))
-                for path in SOURCE_BINDING_SHA256
-            },
+            **{path: _sha256(pathlib.Path(path)) for path in SOURCE_BINDING_SHA256},
             MAMBA_SOURCE: _sha256(pathlib.Path(MAMBA_SOURCE)),
             MAMBA_BACKUP: _sha256(pathlib.Path(MAMBA_BACKUP)),
         }
@@ -328,9 +325,7 @@ def run_gate() -> dict[str, Any]:
     started = time.time()
     receipt: dict[str, Any] = {
         "schema_version": 1,
-        "gate": (
-            f"H200_{NUMERICAL_PHASE.upper()}_CE28_OLD51_FULL_NUMERICAL_PARITY"
-        ),
+        "gate": (f"H200_{NUMERICAL_PHASE.upper()}_A760_OLD51_FULL_NUMERICAL_PARITY"),
         "phase": NUMERICAL_PHASE,
         "status": "running",
         "started_unix": started,
@@ -356,9 +351,8 @@ def run_gate() -> dict[str, Any]:
             "bound_source_sha256": SOURCE_BINDING_SHA256,
         },
         "modal": {
-            "function_call_id": modal.current_function_call_id(),
-            "input_id": modal.current_input_id(),
-            "task_id": task_id,
+            "sandbox_id": sandbox_id,
+            "run_id": run_id,
             "gpu_spec": GPU_SPEC,
             "app_name": APP_NAME,
         },
@@ -392,9 +386,7 @@ def run_gate() -> dict[str, Any]:
             MAMBA_BACKUP: MAMBA_BACKUP_SHA256,
         }
         if before != expected_hashes:
-            raise RuntimeError(
-                f"runtime source binding mismatch: observed={before!r}"
-            )
+            raise RuntimeError(f"runtime source binding mismatch: observed={before!r}")
         receipt["source_sha256_before_test"] = before
 
         receipt["wheel_payload_sha256"] = {
@@ -415,9 +407,7 @@ def run_gate() -> dict[str, Any]:
             timeout=30,
         ).stdout.strip()
         if megatron_head != MEGATRON_COMMIT:
-            raise RuntimeError(
-                f"Megatron revision drifted: observed={megatron_head!r}"
-            )
+            raise RuntimeError(f"Megatron revision drifted: observed={megatron_head!r}")
         receipt["megatron_head"] = megatron_head
         receipt["versions"] = {
             name: importlib.metadata.version(name)
@@ -453,7 +443,7 @@ def run_gate() -> dict[str, Any]:
         ]
         receipt["command"] = command
         print(
-            "TILELANG_CE28_OLD51_FULL_PARITY_START="
+            "TILELANG_A760_OLD51_FULL_PARITY_START="
             + json.dumps(
                 {
                     "phase": NUMERICAL_PHASE,
@@ -484,7 +474,7 @@ def run_gate() -> dict[str, Any]:
                 if current_bucket != heartbeat_bucket:
                     heartbeat_bucket = current_bucket
                     print(
-                        "TILELANG_CE28_OLD51_FULL_PARITY_HEARTBEAT="
+                        "TILELANG_A760_OLD51_FULL_PARITY_HEARTBEAT="
                         + json.dumps(
                             {
                                 "phase": NUMERICAL_PHASE,
@@ -501,11 +491,6 @@ def run_gate() -> dict[str, Any]:
         for line in output.splitlines():
             if "CPPMEGA_PARITY" in line or "completes to compile kernel" in line:
                 print(line, flush=True)
-        log_path.write_text(output)
-        if temporary_junit.is_file():
-            junit_path.write_bytes(temporary_junit.read_bytes())
-        results.commit()
-
         counts = junit_counts()
         markers = {
             marker: output.count(marker)
@@ -560,7 +545,7 @@ def run_gate() -> dict[str, Any]:
             "source_identity_preserved": True,
             "merge_authorized": False,
         }
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - always seal a terminal receipt
         receipt.update(
             {
                 "status": "red",
@@ -581,8 +566,7 @@ def run_gate() -> dict[str, Any]:
                 receipt["post_failure_source_hash_error"] = repr(post_exc)
     write_receipt(receipt)
     print(
-        "TILELANG_CE28_OLD51_FULL_PARITY_RESULT="
-        + json.dumps(receipt, sort_keys=True),
+        "TILELANG_A760_OLD51_FULL_PARITY_RESULT=" + json.dumps(receipt, sort_keys=True),
         flush=True,
     )
     return receipt
@@ -590,9 +574,110 @@ def run_gate() -> dict[str, Any]:
 
 @app.local_entrypoint()
 def main() -> None:
-    result = run_gate.remote()
+    import time
+    import traceback
+    import uuid
+
+    run_id = uuid.uuid4().hex
+    remote_paths = _artifact_paths(pathlib.Path("/tmp"), run_id)
+    local_paths = _artifact_paths(LOCAL_CANDIDATE_ROOT, run_id)
+    sandbox: modal.Sandbox | None = None
+    sandbox_id: str | None = None
+    process_returncode: int | None = None
+    transport_error: dict[str, str] | None = None
+    artifact_read_errors: dict[str, str] = {}
+    started = time.time()
+
+    def persist(name: str, payload: bytes) -> None:
+        destination = local_paths[name]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{run_id}.tmp")
+        temporary.write_bytes(payload)
+        temporary.replace(destination)
+
+    try:
+        sandbox = modal.Sandbox.create(
+            "sleep",
+            "infinity",
+            app=app,
+            image=_image(),
+            gpu=GPU_SPEC,
+            cpu=8,
+            memory=131_072,
+            timeout=3600,
+            workdir="/opt/cppmega",
+        )
+        sandbox_id = sandbox.object_id
+        process = sandbox.exec(
+            "python",
+            REMOTE_RUNNER,
+            "--sandbox-worker",
+            env={
+                "CPPMEGA_GATE_RUN_ID": run_id,
+                "CPPMEGA_MODAL_SANDBOX_ID": sandbox_id,
+                "CPPMEGA_SANDBOX_WORKER": "1",
+            },
+            timeout=3300,
+            workdir="/opt/cppmega",
+        )
+        for line in process.stdout:
+            print(line, end="", flush=True)
+        stderr = process.stderr.read()
+        if stderr:
+            print(stderr, file=sys.stderr, end="", flush=True)
+        process_returncode = process.wait()
+    except BaseException as exc:  # noqa: BLE001 - preserve evidence before exit
+        transport_error = {
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "traceback_tail": traceback.format_exc()[-16000:],
+        }
+    finally:
+        if sandbox is not None:
+            for name, remote_path in remote_paths.items():
+                try:
+                    persist(name, sandbox.filesystem.read_bytes(str(remote_path)))
+                except BaseException as exc:  # noqa: BLE001 - collect all artifacts
+                    artifact_read_errors[name] = repr(exc)
+            try:
+                sandbox.terminate(wait=True)
+            except BaseException as exc:  # noqa: BLE001 - retain prior evidence
+                artifact_read_errors["sandbox_terminate"] = repr(exc)
+
+    receipt_path = local_paths["receipt"]
+    if not receipt_path.is_file():
+        fallback = {
+            "schema_version": 1,
+            "gate": (
+                f"H200_{NUMERICAL_PHASE.upper()}_A760_OLD51_FULL_NUMERICAL_PARITY"
+            ),
+            "phase": NUMERICAL_PHASE,
+            "status": "red",
+            "started_unix": started,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "runner_sha256": SCRIPT_SHA256,
+            "modal": {
+                "sandbox_id": sandbox_id,
+                "run_id": run_id,
+                "gpu_spec": GPU_SPEC,
+                "app_name": APP_NAME,
+            },
+            "transport": {
+                "process_returncode": process_returncode,
+                "error": transport_error,
+                "artifact_read_errors": artifact_read_errors,
+            },
+            "artifacts": {name: str(path) for name, path in local_paths.items()},
+            "verdict": {
+                "numerical_parity_passed": False,
+                "merge_authorized": False,
+            },
+        }
+        persist("receipt", json.dumps(fallback, indent=2, sort_keys=True).encode())
+
+    result = json.loads(receipt_path.read_text(encoding="utf-8"))
     print(
-        "TILELANG_CE28_OLD51_FULL_PARITY_SUMMARY="
+        "TILELANG_A760_OLD51_FULL_PARITY_SUMMARY="
         + json.dumps(
             {
                 "phase": NUMERICAL_PHASE,
@@ -600,8 +685,31 @@ def main() -> None:
                 "elapsed_seconds": result.get("elapsed_seconds"),
                 "junit": result.get("junit"),
                 "marker_counts": result.get("marker_counts"),
-                "artifacts": result.get("artifacts"),
+                "artifacts": {name: str(path) for name, path in local_paths.items()},
+                "sandbox_id": sandbox_id,
+                "run_id": run_id,
+                "process_returncode": process_returncode,
+                "artifact_read_errors": artifact_read_errors,
             },
             sort_keys=True,
         )
     )
+    if (
+        result.get("status") != "green"
+        or process_returncode != 0
+        or transport_error is not None
+        or artifact_read_errors
+    ):
+        raise RuntimeError(
+            "sandbox H200 gate did not produce a complete green durable receipt: "
+            f"status={result.get('status')!r}, "
+            f"process_returncode={process_returncode!r}, "
+            f"transport_error={transport_error!r}, "
+            f"artifact_read_errors={artifact_read_errors!r}"
+        )
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--sandbox-worker"]:
+        raise SystemExit("expected exactly --sandbox-worker")
+    run_gate()
