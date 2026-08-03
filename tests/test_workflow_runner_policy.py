@@ -160,6 +160,11 @@ def test_macos_lane_writes_a_pre_python_failure_receipt() -> None:
     assert '"schema_version": "cppmega.repository-ci.v1"' in macos
     assert '"failure_stage": "workflow-preamble"' in macos
     assert 'pre_python_step="python_bin is executable"' in macos
+    assert 'CPPMEGA_CI_PYTHON: ${{ vars.CPPMEGA_CI_PYTHON }}' in macos
+    assert 'MEGATRON_LM_REPO: ${{ vars.MEGATRON_LM_REPO }}' in macos
+    assert 'CPPMEGA_MEGATRON_COMMIT: ${{ vars.CPPMEGA_MEGATRON_COMMIT }}' in macos
+    assert 'pre_python_step="Megatron checkout matches pinned commit"' in macos
+    assert 'pre_python_step="Megatron checkout is clean"' in macos
     assert 'pre_python_step="verify tokenizer contract' in macos
     # the trap is disarmed before the orchestrator writes its own receipts
     assert macos.rindex("trap - ERR") < macos.index(

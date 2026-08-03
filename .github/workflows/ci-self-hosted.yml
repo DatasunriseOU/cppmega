@@ -22,6 +22,9 @@ jobs:
       - name: Run repository-owned macOS lane
         shell: bash
         env:
+          CPPMEGA_CI_PYTHON: ${{ vars.CPPMEGA_CI_PYTHON }}
+          MEGATRON_LM_REPO: ${{ vars.MEGATRON_LM_REPO }}
+          CPPMEGA_MEGATRON_COMMIT: ${{ vars.CPPMEGA_MEGATRON_COMMIT }}
           CPPMEGA_MLX_REFERENCE_ROOT: ${{ vars.CPPMEGA_MLX_REFERENCE_ROOT }}
           CPPMEGA_MLX_REFERENCE_COMMIT: ${{ vars.CPPMEGA_MLX_REFERENCE_COMMIT }}
           CPPMEGA_RECIPE_PARITY_PEER_ROOT: ${{ vars.CPPMEGA_MLX_REFERENCE_ROOT }}
@@ -29,7 +32,7 @@ jobs:
           CPPMEGA_RECIPE_PARITY_PYTHON: ${{ vars.CPPMEGA_RECIPE_PARITY_PYTHON }}
         run: |
           set -eEuo pipefail
-          python_bin="${CPPMEGA_CI_PYTHON:-/Volumes/external/sources/.venvs/cppmega.source/bin/python}"
+          python_bin="${CPPMEGA_CI_PYTHON:?set repository variable CPPMEGA_CI_PYTHON}"
           receipt_dir="${RUNNER_TEMP}/cppmega-repository-ci-macos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           pre_python_step="preamble start"
           on_pre_python_error() {
@@ -42,9 +45,15 @@ jobs:
             exit "${exit_code}"
           }
           trap 'on_pre_python_error' ERR
-          export MEGATRON_LM_REPO=/Volumes/external/sources/Megatron-LM-core_v0.18.0
           pre_python_step="python_bin is executable"
           test -x "${python_bin}"
+          pre_python_step="Megatron root and commit are both set"
+          : "${MEGATRON_LM_REPO:?set repository variable MEGATRON_LM_REPO}"
+          : "${CPPMEGA_MEGATRON_COMMIT:?set repository variable CPPMEGA_MEGATRON_COMMIT}"
+          pre_python_step="Megatron checkout matches pinned commit"
+          test "$(git -C "${MEGATRON_LM_REPO}" rev-parse HEAD)" = "${CPPMEGA_MEGATRON_COMMIT}"
+          pre_python_step="Megatron checkout is clean"
+          test -z "$(git -C "${MEGATRON_LM_REPO}" status --porcelain --untracked-files=no)"
           pre_python_step="checkout matches GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           pre_python_step="resolve expected source tree"
