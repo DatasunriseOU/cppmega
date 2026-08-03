@@ -15,9 +15,10 @@ transaction.  The destination fetch-state itself remains the exact standard
 v3 schema; merge maps and progress never leak into that schema.
 
 One completed full inventory is normally the publication anchor.  Production
-may instead compose multiple completed coverage inventories only when their
-repository scopes are exactly disjoint and their interval/producer semantics
-match.  Additional inputs for the single-anchor form may name the same
+may instead compose completed coverage inventories when their repository
+scopes are exactly disjoint under shared interval/producer semantics, or when
+exactly two byte-identical scopes cover contiguous time intervals.  Additional
+inputs for the single-anchor form may name the same
 byte-identical inventory or use the exact ``cppmega_ci_inventory_time_shard_v1``
 projection produced for time-sharded fetching.  A time shard is accepted only
 after every authoritative GitHub run field is proven byte-for-byte identical
@@ -29,78 +30,106 @@ values remain validated and bound into the proof.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import fcntl
 import hashlib
+import heapq
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
-import signal
 import shutil
+import signal
 import sqlite3
 import stat
 import struct
 import sys
 import tempfile
-from types import SimpleNamespace
-from typing import Any, Iterable, Iterator, Mapping, Sequence, cast
 import zlib
-
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+from typing import Any, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.ci_content_store import (  # noqa: E402
+from scripts.ci_content_store import (
+    RECEIPT_SCHEMA as STORE_RECEIPT_SCHEMA,
+)
+from scripts.ci_content_store import (
+    STORE_SCHEMA,
     CIContentStore,
     ContentStoreError,
-    RECEIPT_SCHEMA as STORE_RECEIPT_SCHEMA,
-    STORE_SCHEMA,
     ThresholdNotMetError,
     _hash_records,
-    _script_sha256 as _current_store_script_sha256,
     _sqlite_schema_sha256,
 )
-from scripts.ci_fetch_state_migration import (  # noqa: E402
+from scripts.ci_content_store import (
+    _script_sha256 as _current_store_script_sha256,
+)
+from scripts.ci_fetch_state_migration import (
     CURRENT_V4_SQLITE_SCHEMA_SHA256,
-    FetchStateMigrationError,
     LEGACY_FETCH_STATE_SCHEMA,
     LEGACY_V3_SQLITE_SCHEMA_SHA256,
-    PROJECTION_SCHEMA as FETCH_STATE_PROJECTION_SCHEMA,
+    FetchStateMigrationError,
     project_fetch_state_v3_to_v4,
 )
-from scripts.ci_stream_fetch import (  # noqa: E402
+from scripts.ci_fetch_state_migration import (
+    PROJECTION_SCHEMA as FETCH_STATE_PROJECTION_SCHEMA,
+)
+from scripts.ci_stream_fetch import (
+    _BINDING_KEYS,
     COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
     COMPLETION_MODE_THRESHOLD,
     EXHAUSTIVE_RECEIPT_SCHEMA,
-    RECEIPT_SCHEMA as FETCH_RECEIPT_SCHEMA,
-    SCHEMA_VERSION as FETCH_STATE_SCHEMA,
-    _BINDING_KEYS,
-    _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
     ExactTokenizer,
+)
+from scripts.ci_stream_fetch import (
+    _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
+)
+from scripts.ci_stream_fetch import (
+    RECEIPT_SCHEMA as FETCH_RECEIPT_SCHEMA,
+)
+from scripts.ci_stream_fetch import (
+    SCHEMA_VERSION as FETCH_STATE_SCHEMA,
+)
+from scripts.ci_stream_fetch import (
     _parser_sha256 as _current_parser_script_sha256,
+)
+from scripts.ci_stream_fetch import (
     _script_sha256 as _current_fetcher_script_sha256,
 )
-from scripts.ci_stream_receipts import (  # noqa: E402
+from scripts.ci_stream_inventory import (
+    _SCHEMA_SQL as INVENTORY_SQL,
+)
+from scripts.ci_stream_inventory import (
+    RECEIPT_SCHEMA as INVENTORY_RECEIPT_SCHEMA,
+)
+from scripts.ci_stream_inventory import (
+    CompletionError as InventoryCompletionError,
+)
+from scripts.ci_stream_inventory import (
+    InventoryDB,
+    InventoryError,
+    _load_source_drift_proofs,
+    _minimal_source_drift_roots,
+    _source_drift_reconciliation_payload,
+    format_utc_instant,
+    parse_utc_instant,
+    verify_inventory_completion_receipt,
+)
+from scripts.ci_stream_inventory import (
+    _hash_lines as _inventory_hash_lines,
+)
+from scripts.ci_stream_receipts import (
     ReceiptFinalizationError,
     convergent_transition_layout,
     exhaustive_coverage_proof,
     verify_continuation_seed_inclusion,
 )
-from scripts.ci_stream_inventory import (  # noqa: E402
-    CompletionError as InventoryCompletionError,
-    InventoryDB,
-    InventoryError,
-    RECEIPT_SCHEMA as INVENTORY_RECEIPT_SCHEMA,
-    _SCHEMA_SQL as INVENTORY_SQL,
-    _hash_lines as _inventory_hash_lines,
-    format_utc_instant,
-    parse_utc_instant,
-    verify_inventory_completion_receipt,
-)
-from scripts.export_ci_content_store_case5 import (  # noqa: E402
+from scripts.export_ci_content_store_case5 import (
     ExportError,
     FrozenFetchState,
     FrozenStore,
@@ -111,7 +140,6 @@ from scripts.export_ci_content_store_case5 import (  # noqa: E402
     _require_frozen_sqlite,
     _sha256_file,
 )
-
 
 MANIFEST_SCHEMA = "cppmega_ci_stream_shard_union_manifest_v1"
 PRODUCTION_MANIFEST_SCHEMA = "cppmega_ci_stream_shard_union_manifest_v2"
@@ -131,7 +159,7 @@ MEMBER_MAP_SCHEMA = "cppmega_ci_stream_member_resolution_v1"
 TIME_SHARD_INVENTORY_SCHEMA = "cppmega_ci_inventory_time_shard_v1"
 INVENTORY_BINDING_SCHEMA = "cppmega_ci_stream_union_inventory_binding_v2"
 COMPOSITE_INVENTORY_BINDING_SCHEMA = (
-    "cppmega_ci_stream_union_inventory_binding_v3"
+    "cppmega_ci_stream_union_inventory_binding_v4"
 )
 
 _INVENTORY_NAME = "inventory.sqlite3"
@@ -499,7 +527,7 @@ class InventoryContract:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _canonical_json(value: object) -> str:
@@ -2938,7 +2966,7 @@ def _state_summary_projection(
             (
                 f"{row['repo']}\t{row['run_id']}\t{row['attempt']}\t"
                 f"{row['archive_member']}\t{row['sidecar_sha256']}\n"
-            ).encode("utf-8")
+            ).encode()
         )
     sidecar_set_sha256 = sidecar_digest.hexdigest()
     return (
@@ -3338,17 +3366,19 @@ def _preflight_source(
         inventory_proof["completion_receipt_sha256"] = (
             spec.inventory.receipt.sha256
         )
-        if manifest.completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
-            if (
+        if (
+            manifest.completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+            and (
                 inventory_receipt.get("production_complete") is not True
                 or inventory_receipt.get("source_snapshot_stable") is not True
                 or inventory_receipt.get("enumeration_complete") is not True
                 or inventory_receipt.get("mode") != "production"
-            ):
-                raise MergeError(
-                    f"{spec.shard_id} production inventory receipt is "
-                    "unstable or non-production"
-                )
+            )
+        ):
+            raise MergeError(
+                f"{spec.shard_id} production inventory receipt is "
+                "unstable or non-production"
+            )
     if manifest.completion_mode == COMPLETION_MODE_THRESHOLD:
         if fetch_receipt.get("schema") != FETCH_RECEIPT_SCHEMA:
             raise MergeError(
@@ -3746,6 +3776,16 @@ def _inventory_logical_projection(receipt: Mapping[str, Any]) -> dict[str, Any]:
     return projected
 
 
+def _inventory_source_derivation_projection(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project only deterministic logical evidence for source reconstruction."""
+
+    projected = _inventory_logical_projection(receipt)
+    projected.pop("database_artifact", None)
+    return projected
+
+
 def _expected_inventory_schema_sha256() -> str:
     connection = sqlite3.connect(":memory:")
     try:
@@ -3956,6 +3996,423 @@ def _completed_inventory_repositories(
     ]
 
 
+def _inventory_interval(
+    receipt: Mapping[str, Any],
+    *,
+    where: str,
+) -> tuple[int, int, dict[str, str]]:
+    interval = _require_mapping(receipt.get("interval"), where=f"{where} interval")
+    start = interval.get("start")
+    end = interval.get("end")
+    if (
+        not isinstance(start, str)
+        or not isinstance(end, str)
+        or interval.get("semantics") != "[start,end)"
+    ):
+        raise MergeError(f"{where} interval is not canonical [start,end)")
+    try:
+        start_epoch = parse_utc_instant(start)
+        end_epoch = parse_utc_instant(end)
+    except (TypeError, ValueError) as exc:
+        raise MergeError(f"{where} interval is invalid") from exc
+    if (
+        start_epoch >= end_epoch
+        or format_utc_instant(start_epoch) != start
+        or format_utc_instant(end_epoch) != end
+    ):
+        raise MergeError(f"{where} interval is not canonical [start,end)")
+    return start_epoch, end_epoch, {
+        "start": start,
+        "end": end,
+        "semantics": "[start,end)",
+    }
+
+
+def _inventory_producer_lineage(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    lineage = {
+        "terminal_script_sha256": receipt["script_sha256"],
+        "binding_upgrades": receipt["binding_upgrades"],
+    }
+    return {
+        **lineage,
+        "lineage_sha256": _sha256_bytes(_canonical_json_bytes(lineage)),
+    }
+
+
+def _inventory_allowed_producers(
+    receipt: Mapping[str, Any],
+) -> set[str]:
+    allowed = {str(receipt["script_sha256"])}
+    for raw_upgrade in cast(Sequence[Mapping[str, Any]], receipt["binding_upgrades"]):
+        allowed.add(str(raw_upgrade["from_script_sha256"]))
+        allowed.add(str(raw_upgrade["to_script_sha256"]))
+    return allowed
+
+
+def _inventory_reconciliation_producer(
+    receipt: Mapping[str, Any],
+) -> str | None:
+    raw_reconciliation = receipt.get("source_drift_reconciliation")
+    if raw_reconciliation is None:
+        return None
+    reconciliation = _require_mapping(
+        raw_reconciliation,
+        where="source-drift reconciliation",
+    )
+    producer = reconciliation.get("producer_script_sha256")
+    if not isinstance(producer, str) or _HEX64_RE.fullmatch(producer) is None:
+        raise MergeError("source-drift reconciliation producer is invalid")
+    return producer
+
+
+def _select_composite_inventory_producer(
+    anchors: Sequence[SourceAudit],
+) -> tuple[SourceAudit, str | None]:
+    reconciliation_producers = {
+        producer
+        for anchor in anchors
+        if anchor.inventory_receipt is not None
+        for producer in (_inventory_reconciliation_producer(anchor.inventory_receipt),)
+        if producer is not None
+    }
+    if len(reconciliation_producers) > 1:
+        raise MergeError(
+            "distinct production inventories have incompatible reconciliation "
+            "producer semantics"
+        )
+    reconciliation_producer = next(iter(reconciliation_producers), None)
+    if reconciliation_producer is None:
+        return anchors[0], None
+    compatible = [
+        anchor
+        for anchor in anchors
+        if anchor.inventory_receipt is not None
+        and reconciliation_producer
+        in _inventory_allowed_producers(anchor.inventory_receipt)
+    ]
+    if not compatible:
+        raise MergeError(
+            "source-drift reconciliation producer is outside every composite "
+            "inventory producer lineage"
+        )
+    return compatible[0], reconciliation_producer
+
+
+def _combined_inventory_per_repo_ledger(
+    anchors: Sequence[SourceAudit],
+    repositories: Sequence[tuple[str, str, str, str, int]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    accumulators = {
+        repo_key: {
+            "repo": repo_key,
+            "canonical": canonical,
+            "ordinal": ordinal,
+            "run_count": 0,
+            "expected_attempt_count": 0,
+            "_run_digest": hashlib.sha256(),
+            "_attempt_digest": hashlib.sha256(),
+        }
+        for repo_key, _owner, _name, canonical, ordinal in repositories
+    }
+    connections: list[sqlite3.Connection] = []
+    try:
+        iterators: list[Iterator[tuple[str, int, int, str]]] = []
+        for anchor in anchors:
+            connection = sqlite3.connect(
+                f"{anchor.spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            connections.append(connection)
+            rows = connection.execute(
+                """
+                SELECT repo_key,run_id,run_attempt,metadata_sha256
+                FROM runs ORDER BY repo_key,run_id,run_attempt
+                """
+            )
+            iterator = (
+                (str(row[0]), int(row[1]), int(row[2]), str(row[3]))
+                for row in rows
+            )
+            iterators.append(iterator)
+        run_count = 0
+        expected_attempt_count = 0
+        previous_run: tuple[str, int] | None = None
+        for repo_key, run_id, run_attempt, metadata_sha256 in heapq.merge(
+            *iterators
+        ):
+            run_key = (repo_key, run_id)
+            if run_key == previous_run:
+                raise MergeError(
+                    "adjacent production inventories repeat workflow run "
+                    f"{repo_key}#{run_id}"
+                )
+            previous_run = run_key
+            accumulator = accumulators.get(repo_key)
+            if accumulator is None:
+                raise MergeError(
+                    "adjacent production inventory run is outside its exact "
+                    f"repository scope: {repo_key}#{run_id}"
+                )
+            line = (
+                f"{repo_key}\t{run_id}\t{run_attempt}\t{metadata_sha256}\n"
+            ).encode()
+            accumulator["_run_digest"].update(line)
+            accumulator["run_count"] += 1
+            accumulator["expected_attempt_count"] += run_attempt
+            for attempt in range(1, run_attempt + 1):
+                accumulator["_attempt_digest"].update(
+                    f"{repo_key}\t{run_id}\t{attempt}\n".encode()
+                )
+            run_count += 1
+            expected_attempt_count += run_attempt
+    finally:
+        for connection in connections:
+            connection.close()
+    ledger = [
+        {
+            "repo": accumulator["repo"],
+            "canonical": accumulator["canonical"],
+            "ordinal": accumulator["ordinal"],
+            "run_count": accumulator["run_count"],
+            "expected_attempt_count": accumulator["expected_attempt_count"],
+            "run_set_sha256": accumulator["_run_digest"].hexdigest(),
+            "expected_attempt_set_sha256": accumulator[
+                "_attempt_digest"
+            ].hexdigest(),
+        }
+        for accumulator in accumulators.values()
+    ]
+    return ledger, run_count, expected_attempt_count
+
+
+def _adjacent_inventory_contract(
+    audits: Sequence[SourceAudit],
+    anchors: Sequence[SourceAudit],
+) -> InventoryContract:
+    if len(anchors) != 2 or len(anchors) != len(audits):
+        raise MergeError(
+            "adjacent production inventory union requires exactly two "
+            "completed coverage sources"
+        )
+    if any(
+        audit.spec.role != "coverage"
+        or audit.inventory_role != "anchor_candidate"
+        for audit in audits
+    ):
+        raise MergeError(
+            "every adjacent production inventory must be a completed "
+            "coverage shard"
+        )
+
+    repositories = _completed_inventory_repositories(anchors[0])
+    for anchor in anchors[1:]:
+        if _completed_inventory_repositories(anchor) != repositories:
+            raise MergeError(
+                "adjacent production inventories have non-identical "
+                "repository rows"
+            )
+    if any(ordinal != index for index, (*_fields, ordinal) in enumerate(repositories)):
+        raise MergeError(
+            "adjacent production inventory repository ordinals are not exact"
+        )
+
+    receipt_rows: list[tuple[SourceAudit, Mapping[str, Any], int, int, dict[str, str]]] = []
+    first_repo_list: dict[str, Any] | None = None
+    metadata_encoding: object = None
+    for anchor in anchors:
+        receipt = cast(Mapping[str, Any], anchor.inventory_receipt)
+        repo_list = dict(
+            _require_mapping(
+                receipt.get("repo_list"),
+                where=f"{anchor.spec.shard_id} inventory repo_list",
+            )
+        )
+        repo_binding = {
+            key: repo_list.get(key)
+            for key in (
+                "sha256",
+                "scope_sha256",
+                "repos",
+                "original_repos",
+                "unresolved",
+            )
+        }
+        if first_repo_list is None:
+            first_repo_list = repo_binding
+            metadata_encoding = receipt.get("metadata_encoding")
+        elif repo_binding != first_repo_list:
+            raise MergeError(
+                "adjacent production inventories have incompatible "
+                "repository-list bindings"
+            )
+        if receipt.get("metadata_encoding") != metadata_encoding:
+            raise MergeError(
+                "adjacent production inventories have incompatible metadata "
+                "encoding"
+            )
+        start, end, interval = _inventory_interval(
+            receipt,
+            where=f"{anchor.spec.shard_id} inventory",
+        )
+        receipt_rows.append((anchor, receipt, start, end, interval))
+    assert first_repo_list is not None
+    repo_keys = [row[0] for row in repositories]
+    if (
+        first_repo_list["repos"] != len(repositories)
+        or first_repo_list["original_repos"] != len(repositories)
+        or first_repo_list["unresolved"] != 0
+        or first_repo_list["scope_sha256"] != _inventory_hash_lines(repo_keys)
+    ):
+        raise MergeError(
+            "adjacent production inventory repository receipt differs from "
+            "its byte-identical rows"
+        )
+
+    receipt_rows.sort(key=lambda item: (item[2], item[3], item[0].spec.shard_id))
+    first_anchor, _first_receipt, first_start, first_end, _first_interval = (
+        receipt_rows[0]
+    )
+    second_anchor, _second_receipt, second_start, second_end, _second_interval = (
+        receipt_rows[1]
+    )
+    if first_end > second_start:
+        raise MergeError(
+            "distinct production inventories have overlapping repository "
+            "scope and time intervals"
+        )
+    if first_end < second_start:
+        raise MergeError(
+            "same-repository production inventory intervals leave a gap"
+        )
+    if first_start >= second_end:
+        raise MergeError("adjacent production inventory interval is empty")
+    ordered_anchors = (first_anchor, second_anchor)
+    canonical_anchor, reconciliation_producer = (
+        _select_composite_inventory_producer(ordered_anchors)
+    )
+    canonical_receipt = cast(Mapping[str, Any], canonical_anchor.inventory_receipt)
+    per_repo_ledger, run_count, expected_attempt_count = (
+        _combined_inventory_per_repo_ledger(ordered_anchors, repositories)
+    )
+    if run_count != sum(
+        int(cast(Mapping[str, Any], anchor.inventory_receipt)["run_count"])
+        for anchor in ordered_anchors
+    ) or expected_attempt_count != sum(
+        int(
+            cast(Mapping[str, Any], anchor.inventory_receipt)[
+                "expected_attempt_count"
+            ]
+        )
+        for anchor in ordered_anchors
+    ):
+        raise MergeError(
+            "adjacent production inventory run conservation proof differs "
+            "from source receipts"
+        )
+
+    partition: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
+    for ordinal, (anchor, receipt, start, end, interval) in enumerate(receipt_rows):
+        logical_receipt_sha256 = _sha256_bytes(
+            _canonical_json_bytes(_inventory_logical_projection(receipt))
+        )
+        partition_row = {
+            "ordinal": ordinal,
+            "source_id": anchor.spec.shard_id,
+            "interval": interval,
+            "start_epoch": start,
+            "end_epoch": end,
+            "inventory_artifact_sha256": anchor.inventory_file.sha256,
+            "inventory_receipt_logical_sha256": logical_receipt_sha256,
+            "run_count": receipt["run_count"],
+            "expected_attempt_count": receipt["expected_attempt_count"],
+        }
+        partition.append(partition_row)
+        sources.append(
+            {
+                "source_id": anchor.spec.shard_id,
+                "role": "contiguous_time_partition",
+                "partition_ordinal": ordinal,
+                "original_inventory_path": anchor.spec.original_inventory,
+                "staged_inventory_path": str(anchor.spec.inventory.path),
+                "manifest_inventory_sha256": anchor.spec.inventory.sha256,
+                "artifact_sha256": anchor.inventory_file.sha256,
+                "artifact_byte_size": anchor.inventory_file.size,
+                "receipt_sha256": anchor.spec.inventory.receipt.sha256,
+                "receipt_logical_sha256": logical_receipt_sha256,
+                "producer_lineage": _inventory_producer_lineage(receipt),
+                "proof": {
+                    **anchor.inventory_proof,
+                    "repo_count": len(repositories),
+                    "repo_scope_sha256": first_repo_list["scope_sha256"],
+                    "interval": interval,
+                    "run_count": receipt["run_count"],
+                    "expected_attempt_count": receipt[
+                        "expected_attempt_count"
+                    ],
+                },
+                "source_state_joined_attempts": anchor.state_counts[
+                    "inventory_joined_attempts"
+                ],
+            }
+        )
+    interval = {
+        "start": format_utc_instant(first_start),
+        "end": format_utc_instant(second_end),
+        "semantics": "[start,end)",
+    }
+    binding = {
+        "schema": COMPOSITE_INVENTORY_BINDING_SCHEMA,
+        "policy": "same-repository-contiguous-time-inventory-union-v1",
+        "coverage_semantics": (
+            "exact-identical-repository-scope-contiguous-time-union"
+        ),
+        "source_count": 2,
+        "repo_count": len(repositories),
+        "repo_scope_sha256": first_repo_list["scope_sha256"],
+        "repository_rows_sha256": _sha256_bytes(
+            _canonical_json_bytes(repositories)
+        ),
+        "run_count": run_count,
+        "expected_attempt_count": expected_attempt_count,
+        "per_repo_ledger_sha256": _sha256_bytes(
+            _canonical_json_bytes(per_repo_ledger)
+        ),
+        "interval": interval,
+        "script_sha256": canonical_receipt["script_sha256"],
+        "metadata_encoding": metadata_encoding,
+        "binding_upgrades": canonical_receipt["binding_upgrades"],
+        "canonical_inventory_source_id": canonical_anchor.spec.shard_id,
+        "canonical_inventory_metadata_semantics": (
+            "canonical-output-metadata-only; each contiguous source partition "
+            "retains an independently verified producer lineage"
+        ),
+        "source_producer_lineages_sha256": _sha256_bytes(
+            _canonical_json_bytes(
+                [
+                    {
+                        "source_id": source["source_id"],
+                        "producer_lineage": source["producer_lineage"],
+                    }
+                    for source in sources
+                ]
+            )
+        ),
+        "source_drift_reconciliation_producer_script_sha256": (
+            reconciliation_producer
+        ),
+        "interval_partition": partition,
+        "interval_partition_sha256": _sha256_bytes(
+            _canonical_json_bytes(partition)
+        ),
+        "sources": sources,
+    }
+    binding["binding_sha256"] = _sha256_bytes(_canonical_json_bytes(binding))
+    return InventoryContract(anchors=ordered_anchors, binding=binding)
+
+
 def _disjoint_inventory_contract(
     audits: Sequence[SourceAudit],
     anchors: Sequence[SourceAudit],
@@ -4076,6 +4533,9 @@ def _disjoint_inventory_contract(
         run_count += int(receipt["run_count"])
         expected_attempt_count += int(receipt["expected_attempt_count"])
 
+    canonical_anchor, reconciliation_producer = (
+        _select_composite_inventory_producer(anchors)
+    )
     binding = {
         "schema": COMPOSITE_INVENTORY_BINDING_SCHEMA,
         "policy": "disjoint-completed-production-inventory-union-v1",
@@ -4087,6 +4547,10 @@ def _disjoint_inventory_contract(
         "expected_attempt_count": expected_attempt_count,
         "per_repo_ledger_sha256": _sha256_bytes(
             _canonical_json_bytes(per_repo_ledger)
+        ),
+        "canonical_inventory_source_id": canonical_anchor.spec.shard_id,
+        "source_drift_reconciliation_producer_script_sha256": (
+            reconciliation_producer
         ),
         **shared_fields,
         "sources": sources,
@@ -4166,6 +4630,22 @@ def _validate_cross_source_contracts(
             raise MergeError(
                 "multiple distinct completed inventory anchors are ambiguous"
             )
+        repository_key_scopes = [
+            tuple(row[0] for row in _completed_inventory_repositories(anchor))
+            for anchor in anchor_candidates
+        ]
+        intervals = sorted(
+            _inventory_interval(
+                cast(Mapping[str, Any], anchor.inventory_receipt),
+                where=f"{anchor.spec.shard_id} inventory",
+            )[:2]
+            for anchor in anchor_candidates
+        )
+        contiguous_pair = (
+            len(intervals) == 2 and intervals[0][1] == intervals[1][0]
+        )
+        if len(set(repository_key_scopes)) == 1 or contiguous_pair:
+            return _adjacent_inventory_contract(audits, anchor_candidates)
         return _disjoint_inventory_contract(audits, anchor_candidates)
 
     if subsets:
@@ -4896,6 +5376,153 @@ def _copy_attached_inventory_table(
     )
 
 
+def _copy_source_drift_reconciliations(
+    connection: sqlite3.Connection,
+    *,
+    window_offset: int,
+    max_blob_bytes: int,
+) -> int:
+    source_columns = [
+        str(row[1])
+        for row in connection.execute(
+            'PRAGMA source.table_info("source_drift_reconciliations")'
+        )
+    ]
+    destination_columns = [
+        str(row[1])
+        for row in connection.execute(
+            'PRAGMA main.table_info("source_drift_reconciliations")'
+        )
+    ]
+    if not source_columns or source_columns != destination_columns:
+        raise MergeError(
+            "composite inventory source-drift reconciliation schema differs"
+        )
+    copied = 0
+    for row in connection.execute(
+        """
+        SELECT window_id,proof_blob,proof_raw_size,proof_sha256,
+               producer_script_sha256,completed_at
+        FROM source.source_drift_reconciliations
+        ORDER BY window_id
+        """
+    ):
+        source_window_id = int(row[0])
+        blob = row[1]
+        if not isinstance(blob, bytes) or len(blob) > max_blob_bytes:
+            raise MergeError(
+                "source-drift reconciliation proof is not a bounded BLOB"
+            )
+        raw = _bounded_zlib_decode(
+            blob,
+            max_blob_bytes=max_blob_bytes,
+            where="source-drift reconciliation proof",
+        )
+        if (
+            len(raw) != int(row[2])
+            or _sha256_bytes(raw) != str(row[3])
+        ):
+            raise MergeError(
+                "source-drift reconciliation proof size or digest differs"
+            )
+        try:
+            proof = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise MergeError(
+                "source-drift reconciliation proof is invalid JSON"
+            ) from exc
+        if (
+            not isinstance(proof, dict)
+            or _canonical_json_bytes(proof) != raw
+            or proof.get("window_id") != source_window_id
+            or proof.get("producer_script_sha256") != row[4]
+            or proof.get("completed_at") != row[5]
+        ):
+            raise MergeError(
+                "source-drift reconciliation proof is not canonically bound"
+            )
+        destination_window_id = source_window_id + window_offset
+        proof["window_id"] = destination_window_id
+        destination_raw = _canonical_json_bytes(proof)
+        destination_blob = zlib.compress(destination_raw, 6)
+        if len(destination_blob) > max_blob_bytes:
+            raise MergeError(
+                "remapped source-drift reconciliation proof exceeds its bound"
+            )
+        connection.execute(
+            """
+            INSERT INTO main.source_drift_reconciliations(
+              window_id,proof_blob,proof_raw_size,proof_sha256,
+              producer_script_sha256,completed_at
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (
+                destination_window_id,
+                sqlite3.Binary(destination_blob),
+                len(destination_raw),
+                _sha256_bytes(destination_raw),
+                row[4],
+                row[5],
+            ),
+        )
+        copied += 1
+    return copied
+
+
+def _inventory_completion_receipt(
+    path: Path,
+    inventory_contract: InventoryContract,
+) -> dict[str, Any]:
+    if len(inventory_contract.anchors) == 1:
+        source_receipt = inventory_contract.anchors[0].inventory_receipt
+        assert source_receipt is not None
+        producer = _inventory_reconciliation_producer(source_receipt)
+    else:
+        raw_producer = inventory_contract.binding.get(
+            "source_drift_reconciliation_producer_script_sha256"
+        )
+        if raw_producer is not None and not isinstance(raw_producer, str):
+            raise MergeError(
+                "composite source-drift reconciliation producer is invalid"
+            )
+        producer = raw_producer
+    inventory = InventoryDB(path, initialize_schema=False)
+    if producer is None:
+        return inventory.completion_receipt()
+    diagnostic = inventory.completion_receipt(allow_nonproduction=True)
+    drift = _require_mapping(
+        diagnostic.get("source_count_drift"),
+        where="destination inventory source_count_drift",
+    )
+    if drift.get("windows") in {None, 0}:
+        raise MergeError(
+            "source-drift reconciliation producer exists without destination "
+            "drift"
+        )
+    connection = inventory.connect(readonly=True, immutable=True)
+    try:
+        proofs = _load_source_drift_proofs(connection)
+        expected_roots = _minimal_source_drift_roots(connection)
+        expected_window_ids = {
+            int(root["window_id"]) for root in expected_roots
+        }
+        if set(proofs) != expected_window_ids:
+            raise MergeError(
+                "destination source-drift proofs differ from its drift roots"
+            )
+        roots = [proofs[int(root["window_id"])] for root in expected_roots]
+    finally:
+        connection.close()
+    reconciliation = _source_drift_reconciliation_payload(
+        script_sha256=producer,
+        source_count_drift=drift,
+        roots=roots,
+    )
+    return inventory.completion_receipt(
+        source_drift_reconciliation=reconciliation
+    )
+
+
 def _build_composite_inventory(
     temporary: Path,
     manifest: Manifest,
@@ -4921,7 +5548,29 @@ def _build_composite_inventory(
             )
         finally:
             connection.close()
-    metadata = dict(source_meta[0])
+    policy = inventory_contract.binding.get("policy")
+    adjacent = policy == "same-repository-contiguous-time-inventory-union-v1"
+    canonical_source_id = inventory_contract.binding.get(
+        "canonical_inventory_source_id",
+        anchors[0].spec.shard_id,
+    )
+    canonical_indexes = [
+        index
+        for index, anchor in enumerate(anchors)
+        if anchor.spec.shard_id == canonical_source_id
+    ]
+    if len(canonical_indexes) != 1:
+        raise MergeError(
+            "composite inventory canonical producer source is not exact"
+        )
+    canonical_index = canonical_indexes[0]
+    metadata = dict(source_meta[canonical_index])
+    interval = _require_mapping(
+        inventory_contract.binding.get("interval"),
+        where="composite inventory interval",
+    )
+    start = parse_utc_instant(str(interval["start"]))
+    end = parse_utc_instant(str(interval["end"]))
     metadata.update(
         {
             "repo_list_path": str(manifest.path),
@@ -4937,8 +5586,52 @@ def _build_composite_inventory(
             "smoke": "0",
             "max_repos": "",
             "created_at": min(item["created_at"] for item in source_meta),
+            "start_epoch": str(start),
+            "end_epoch": str(end),
+            "start_utc": format_utc_instant(start),
+            "end_utc": format_utc_instant(end),
         }
     )
+
+    adjacent_root_rows: dict[str, list[tuple[int, str, str]]] = {}
+    if adjacent:
+        expected_repositories = _completed_inventory_repositories(anchors[0])
+        adjacent_root_rows = {row[0]: [] for row in expected_repositories}
+        for anchor in anchors:
+            source = sqlite3.connect(
+                f"{anchor.spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            try:
+                roots = source.execute(
+                    """
+                    SELECT repo_key,expected_total,created_at,updated_at
+                    FROM search_windows
+                    WHERE parent_id IS NULL
+                    ORDER BY repo_key
+                    """
+                ).fetchall()
+            finally:
+                source.close()
+            if len(roots) != len(expected_repositories):
+                raise MergeError(
+                    "adjacent production inventory root set is not exact"
+                )
+            for repo_key, expected_total, created_at, updated_at in roots:
+                rows = adjacent_root_rows.get(str(repo_key))
+                if rows is None or expected_total is None:
+                    raise MergeError(
+                        "adjacent production inventory root differs from its "
+                        "repository scope"
+                    )
+                rows.append(
+                    (int(expected_total), str(created_at), str(updated_at))
+                )
+        if any(len(rows) != 2 for rows in adjacent_root_rows.values()):
+            raise MergeError(
+                "adjacent production inventory does not provide two roots "
+                "per repository"
+            )
 
     connection = sqlite3.connect(temporary, timeout=60.0, uri=True)
     connection.row_factory = sqlite3.Row
@@ -4965,7 +5658,7 @@ def _build_composite_inventory(
             try:
                 connection.execute("PRAGMA defer_foreign_keys=ON")
                 connection.execute("BEGIN IMMEDIATE")
-                if index == 0:
+                if index == canonical_index:
                     for table in (
                         "inventory_upgrades",
                         "inventory_binding_upgrades",
@@ -4975,22 +5668,80 @@ def _build_composite_inventory(
                             table,
                             order_by="id",
                         )
-                _copy_attached_inventory_table(
-                    connection,
-                    "repos",
-                    transforms={"ordinal": f'"ordinal"+{repo_offset}'},
-                    order_by="ordinal",
+                if not adjacent or index == 0:
+                    _copy_attached_inventory_table(
+                        connection,
+                        "repos",
+                        transforms={
+                            "ordinal": (
+                                '"ordinal"'
+                                if adjacent
+                                else f'"ordinal"+{repo_offset}'
+                            )
+                        },
+                        order_by="ordinal",
+                    )
+                if adjacent and index == 0:
+                    repository_rows = _completed_inventory_repositories(
+                        anchors[0]
+                    )
+                    for synthetic_id, repository in enumerate(
+                        repository_rows,
+                        start=1,
+                    ):
+                        repo_key = repository[0]
+                        roots = adjacent_root_rows[repo_key]
+                        connection.execute(
+                            """
+                            INSERT INTO main.search_windows(
+                              id,repo_key,start_epoch,end_epoch,parent_id,
+                              depth,status,expected_total,expected_pages,
+                              pages_done,raw_items,distinct_items,
+                              duplicate_items,run_keys_sha256,failure_class,
+                              failure_message,created_at,updated_at
+                            ) VALUES (
+                              ?,?,?,?,NULL,0,'split',?,NULL,0,0,0,0,
+                              NULL,NULL,NULL,?,?
+                            )
+                            """,
+                            (
+                                synthetic_id,
+                                repo_key,
+                                start,
+                                end,
+                                sum(row[0] for row in roots),
+                                min(row[1] for row in roots),
+                                max(row[2] for row in roots),
+                            ),
+                        )
+                    window_offset = int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(id),0) FROM search_windows"
+                        ).fetchone()[0]
+                    )
+                parent_transform = (
+                    "CASE WHEN \"parent_id\" IS NULL THEN "
+                    "(SELECT root.id FROM main.search_windows AS root "
+                    "WHERE root.repo_key="
+                    '"source"."search_windows"."repo_key" '
+                    "AND root.parent_id IS NULL) "
+                    f'ELSE "parent_id"+{window_offset} END'
+                    if adjacent
+                    else (
+                        "CASE WHEN \"parent_id\" IS NULL THEN NULL "
+                        f'ELSE "parent_id"+{window_offset} END'
+                    )
                 )
+                window_transforms = {
+                    "id": f'"id"+{window_offset}',
+                    "parent_id": parent_transform,
+                }
+                if adjacent:
+                    window_transforms["depth"] = '"depth"+1'
                 _copy_attached_inventory_table(
                     connection,
                     "search_windows",
-                    transforms={
-                        "id": f'"id"+{window_offset}',
-                        "parent_id": (
-                            "CASE WHEN \"parent_id\" IS NULL THEN NULL "
-                            f'ELSE "parent_id"+{window_offset} END'
-                        ),
-                    },
+                    transforms=window_transforms,
                     order_by="id",
                 )
                 _copy_attached_inventory_table(connection, "runs")
@@ -5020,7 +5771,18 @@ def _build_composite_inventory(
                     },
                     order_by="id",
                 )
+                _copy_source_drift_reconciliations(
+                    connection,
+                    window_offset=window_offset,
+                    max_blob_bytes=manifest.limits.max_state_blob_bytes,
+                )
                 connection.commit()
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                raise MergeError(
+                    "composite inventory source rows conflict during exact "
+                    "copy"
+                ) from exc
             except BaseException:
                 connection.rollback()
                 raise
@@ -5122,7 +5884,7 @@ def _validate_inventory_receipt_contract(
         or receipt.get("source_snapshot_stable") is not True
     ):
         raise MergeError(
-            "validated composite inventory differs from its disjoint sources"
+            "validated composite inventory differs from its bound sources"
         )
 
 
@@ -5131,18 +5893,21 @@ def _copy_and_validate_inventory(
     manifest: Manifest,
     inventory_contract: InventoryContract,
     journal: sqlite3.Connection,
-) -> None:
+) -> bool:
     anchors = inventory_contract.anchors
     destination = partial / _INVENTORY_NAME
+    built_from_sources = not destination.exists()
     if not destination.exists():
         temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
         try:
             if len(anchors) == 1:
-                with anchors[0].spec.inventory.path.open("rb") as source:
-                    with temporary.open("xb") as target:
-                        shutil.copyfileobj(source, target, 1024 * 1024)
-                        target.flush()
-                        os.fsync(target.fileno())
+                with (
+                    anchors[0].spec.inventory.path.open("rb") as source,
+                    temporary.open("xb") as target,
+                ):
+                    shutil.copyfileobj(source, target, 1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
             else:
                 _build_composite_inventory(
                     temporary,
@@ -5160,10 +5925,10 @@ def _copy_and_validate_inventory(
     ):
         raise MergeError("destination inventory copy differs from frozen source")
     try:
-        inventory_receipt = InventoryDB(
+        inventory_receipt = _inventory_completion_receipt(
             destination,
-            initialize_schema=False,
-        ).completion_receipt()
+            inventory_contract,
+        )
     except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
         raise MergeError("copied union inventory failed full validation") from exc
     inventory_receipt["database"] = str(
@@ -5183,6 +5948,7 @@ def _copy_and_validate_inventory(
     _require_frozen_sqlite(destination, label="destination inventory")
     _write_json(partial / _INVENTORY_RECEIPT_NAME, inventory_receipt)
     _set_journal_phase(journal, "state")
+    return built_from_sources
 
 
 def _destination_state_settings(
@@ -5368,7 +6134,11 @@ def _attempt_evidence_rank(
 
 
 def _mapping_row(row: sqlite3.Row) -> dict[str, Any]:
-    return {key: _normalized_sql_value(row[key]) for key in row.keys()}
+    return {
+        # sqlite3.Row iterates values, not column names.
+        key: _normalized_sql_value(row[key])
+        for key in row.keys()  # noqa: SIM118
+    }
 
 
 def _insert_named_row(
@@ -6389,7 +7159,7 @@ def _append_source_drift_notes(
     for audit in audits:
         try:
             _source_still_unchanged(audit)
-        except BaseException as drift:
+        except BaseException as drift:  # noqa: BLE001
             primary.add_note(
                 "source drift audit failed for "
                 f"{audit.spec.shard_id}: {type(drift).__name__}: {drift}"
@@ -6402,7 +7172,7 @@ def _append_migration_drift_note(
 ) -> None:
     try:
         _migration_still_unchanged(audit)
-    except BaseException as drift:
+    except BaseException as drift:  # noqa: BLE001
         primary.add_note(
             "legacy migration drift audit failed: "
             f"{type(drift).__name__}: {drift}"
@@ -6448,6 +7218,8 @@ def _validate_destination_inventory(
     partial: Path,
     manifest: Manifest,
     inventory_contract: InventoryContract,
+    *,
+    rebuilt_in_current_process: bool,
 ) -> None:
     anchors = inventory_contract.anchors
     path = partial / _INVENTORY_NAME
@@ -6462,10 +7234,10 @@ def _validate_destination_inventory(
     ):
         raise MergeError("destination inventory differs from its frozen source")
     try:
-        computed = InventoryDB(
+        computed = _inventory_completion_receipt(
             path,
-            initialize_schema=False,
-        ).completion_receipt()
+            inventory_contract,
+        )
     except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
         raise MergeError("destination inventory failed final validation") from exc
     computed["database"] = str(manifest.destination / _INVENTORY_NAME)
@@ -6474,6 +7246,33 @@ def _validate_destination_inventory(
         manifest,
         inventory_contract,
     )
+    if len(anchors) > 1 and not rebuilt_in_current_process:
+        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        if temporary.exists() or temporary.is_symlink():
+            raise MergeError(
+                "composite inventory derivation temporary path is occupied"
+            )
+        try:
+            _build_composite_inventory(
+                temporary,
+                manifest,
+                inventory_contract,
+            )
+            expected = _inventory_completion_receipt(
+                temporary,
+                inventory_contract,
+            )
+            if (
+                _inventory_source_derivation_projection(computed)
+                != _inventory_source_derivation_projection(expected)
+            ):
+                raise MergeError(
+                    "destination composite inventory differs from its "
+                    "deterministic source derivation"
+                )
+        finally:
+            if temporary.exists():
+                temporary.unlink()
     declared, _raw = _load_json(
         partial / _INVENTORY_RECEIPT_NAME,
         where="destination inventory receipt",
@@ -6883,8 +7682,14 @@ def _finalize_receipts(
     *,
     merge_script_sha256: str,
     migration_audit: MigrationAudit | None,
+    inventory_rebuilt_in_current_process: bool,
 ) -> dict[str, Any]:
-    _validate_destination_inventory(partial, manifest, inventory_contract)
+    _validate_destination_inventory(
+        partial,
+        manifest,
+        inventory_contract,
+        rebuilt_in_current_process=inventory_rebuilt_in_current_process,
+    )
     store_receipt = _load_destination_store_receipt(partial)
     destination_settings = _destination_state_settings(
         manifest,
@@ -7876,16 +8681,18 @@ def _load_pinned_tokenizer(
         _fsync_directory(scratch)
     digest = hashlib.sha256()
     try:
-        with source.open("rb") as input_handle:
-            with pinned.open("xb") as output_handle:
-                while True:
-                    block = input_handle.read(1024 * 1024)
-                    if not block:
-                        break
-                    output_handle.write(block)
-                    digest.update(block)
-                output_handle.flush()
-                os.fsync(output_handle.fileno())
+        with (
+            source.open("rb") as input_handle,
+            pinned.open("xb") as output_handle,
+        ):
+            while True:
+                block = input_handle.read(1024 * 1024)
+                if not block:
+                    break
+                output_handle.write(block)
+                digest.update(block)
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
         if digest.hexdigest() != expected.sha256:
             raise MergeError("tokenizer changed while its pinned copy was created")
         tokenizer = ExactTokenizer(pinned)
@@ -7985,6 +8792,7 @@ def merge_shards(
         _release_merge_lock(lock_descriptor)
         raise
     batch_budget: list[int | None] = [max_batches]
+    inventory_rebuilt_in_current_process = False
     scratch = partial / ".source-verification"
     audits: list[SourceAudit] = []
     try:
@@ -8059,7 +8867,7 @@ def merge_shards(
                 migration_audit,
                 where="pre-inventory replay",
             )
-            _copy_and_validate_inventory(
+            inventory_rebuilt_in_current_process = _copy_and_validate_inventory(
                 partial,
                 manifest,
                 inventory_contract,
@@ -8113,6 +8921,9 @@ def merge_shards(
                 journal,
                 merge_script_sha256=merge_script_snapshot.sha256,
                 migration_audit=migration_audit,
+                inventory_rebuilt_in_current_process=(
+                    inventory_rebuilt_in_current_process
+                ),
             )
             _reject_migration_output_aliases(
                 partial,
@@ -8179,7 +8990,7 @@ def merge_shards(
                 tokenizer_snapshot=tokenizer_snapshot,
                 merge_script_snapshot=merge_script_snapshot,
             )
-        except BaseException as drift:
+        except BaseException as drift:  # noqa: BLE001
             exc.add_note(
                 "control-input drift audit failed while preserving pause: "
                 f"{type(drift).__name__}: {drift}"
