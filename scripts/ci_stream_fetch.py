@@ -7218,6 +7218,8 @@ class CIStreamFetcher:
             "exhaustive_inventory",
             None,
         )
+        progress_interval = max(0.1, poll_seconds)
+        last_progress_at = time.monotonic()
         processed = 0
         submitted = 0
         with ThreadPoolExecutor(
@@ -7256,19 +7258,28 @@ class CIStreamFetcher:
                         submitted += 1
                     if not futures:
                         break
+                    progress_timeout = max(
+                        0.0,
+                        last_progress_at
+                        + progress_interval
+                        - time.monotonic(),
+                    )
                     completed, _pending = wait(
                         futures,
-                        timeout=max(0.1, poll_seconds),
+                        timeout=progress_timeout,
                         return_when=FIRST_COMPLETED,
                     )
                     if not completed:
                         self.write_progress()
+                        last_progress_at = time.monotonic()
                         continue
                     for future in completed:
                         future.result()
                         futures.pop(future)
                         processed += 1
+                    if time.monotonic() - last_progress_at >= progress_interval:
                         self.write_progress()
+                        last_progress_at = time.monotonic()
                 if (
                     completion_mode == COMPLETION_MODE_THRESHOLD
                     and self.threshold_met()

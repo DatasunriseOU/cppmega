@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import zipfile
 import zlib
@@ -5559,7 +5560,14 @@ def test_rolling_scheduler_refills_a_slot_before_a_slow_attempt_finishes() -> No
     fetcher.store = Store()
     fetcher.target_unique_tokens = 1_000_000
     fetcher.sleeper = lambda _: None
-    fetcher.write_progress = lambda: {"status": "ok"}
+    progress_writes = 0
+
+    def write_progress() -> dict[str, str]:
+        nonlocal progress_writes
+        progress_writes += 1
+        return {"status": "ok"}
+
+    fetcher.write_progress = write_progress
 
     def process(attempt: int) -> None:
         if attempt == 1:
@@ -5574,11 +5582,64 @@ def test_rolling_scheduler_refills_a_slot_before_a_slow_attempt_finishes() -> No
     result = fetcher.run(
         continuous=False,
         max_runs=3,
+        poll_seconds=3600,
         workers=2,
     )
 
     assert result == {"status": "ok"}
     assert third_started.is_set()
+    assert progress_writes == 1
+
+
+def test_scheduler_heartbeat_uses_remaining_progress_interval() -> None:
+    release_slow = threading.Event()
+    attempts = iter(["slow", "near-deadline"])
+
+    class State:
+        def discover(self) -> None:
+            return None
+
+        def next_attempt(self, *, retry_only: bool = False) -> str | None:
+            assert not retry_only
+            return next(attempts, None)
+
+    class Store:
+        @staticmethod
+        def status() -> dict[str, object]:
+            return {"counters": {"exact_unique_payload_tokens": 0}}
+
+    fetcher = object.__new__(ci.CIStreamFetcher)
+    fetcher.state = State()
+    fetcher.store = Store()
+    fetcher.target_unique_tokens = 1_000_000
+    fetcher.sleeper = lambda _: None
+    started_at = time.monotonic()
+    progress_times: list[float] = []
+
+    def write_progress() -> dict[str, str]:
+        progress_times.append(time.monotonic() - started_at)
+        release_slow.set()
+        return {"status": "ok"}
+
+    def process(attempt: str) -> None:
+        if attempt == "slow":
+            assert release_slow.wait(3)
+        else:
+            time.sleep(0.6)
+
+    fetcher.write_progress = write_progress
+    fetcher.process_attempt = process
+
+    result = fetcher.run(
+        continuous=False,
+        max_runs=2,
+        poll_seconds=1,
+        workers=2,
+    )
+
+    assert result == {"status": "ok"}
+    assert len(progress_times) == 2  # interval heartbeat, then forced final write
+    assert progress_times[0] < 1.4
 
 
 def test_scheduler_drains_retry_work_after_token_target_is_met() -> None:
