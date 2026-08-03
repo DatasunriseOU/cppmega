@@ -8,7 +8,7 @@ _HARNESS = (
 
 def test_retry_gate_uses_sandbox_and_persists_before_failing() -> None:
     source = _HARNESS.read_text(encoding="utf-8")
-    local_entrypoint = source[source.index("@app.local_entrypoint()") :]
+    local_entrypoint = source[source.index("def main() -> None:") :]
 
     assert "modal.Volume" not in source
     assert ".commit()" not in source
@@ -23,8 +23,11 @@ def test_retry_gate_uses_sandbox_and_persists_before_failing() -> None:
     assert '"CPPMEGA_MODAL_SANDBOX_ID": sandbox_id' in local_entrypoint
     assert '"CPPMEGA_SANDBOX_WORKER": "1"' in local_entrypoint
     assert (
-        'modal.is_local() and os.environ.get("CPPMEGA_SANDBOX_WORKER") != "1"' in source
+        'IS_SANDBOX_WORKER = os.environ.get("CPPMEGA_SANDBOX_WORKER") == "1"' in source
     )
+    assert "if not IS_SANDBOX_WORKER:\n    import modal" in source
+    assert "if not IS_SANDBOX_WORKER and modal.is_local():" in source
+    assert "main = app.local_entrypoint()(main)" in source
     assert 'paths = _artifact_paths(pathlib.Path("/tmp"), run_id)' in source
     assert "sandbox.filesystem.read_bytes(str(remote_path))" in local_entrypoint
     assert "sandbox.terminate(wait=True)" in local_entrypoint

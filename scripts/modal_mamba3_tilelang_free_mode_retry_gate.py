@@ -9,7 +9,9 @@ import pathlib
 import sys
 from typing import Any
 
-import modal
+IS_SANDBOX_WORKER = os.environ.get("CPPMEGA_SANDBOX_WORKER") == "1"
+if not IS_SANDBOX_WORKER:
+    import modal
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve()
 LOCAL_CPPMEGA_ROOT = pathlib.Path("/Volumes/external/sources/cppmega")
@@ -124,7 +126,7 @@ SOURCE_BINDING_SHA256 = {
     ),
 }
 
-if modal.is_local() and os.environ.get("CPPMEGA_SANDBOX_WORKER") != "1":
+if not IS_SANDBOX_WORKER and modal.is_local():
     manifest_path = LOCAL_CANDIDATE_ROOT / "BUILD_MANIFEST.json"
     observed_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if observed_manifest_sha256 != BUILD_MANIFEST_SHA256:
@@ -242,7 +244,8 @@ def _image() -> modal.Image:
     )
 
 
-app = modal.App(APP_NAME)
+if not IS_SANDBOX_WORKER:
+    app = modal.App(APP_NAME)
 
 
 def _sha256(path: pathlib.Path) -> str:
@@ -572,7 +575,6 @@ def run_gate() -> dict[str, Any]:
     return receipt
 
 
-@app.local_entrypoint()
 def main() -> None:
     import time
     import traceback
@@ -709,7 +711,11 @@ def main() -> None:
         )
 
 
+if not IS_SANDBOX_WORKER:
+    main = app.local_entrypoint()(main)
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--sandbox-worker"]:
+    if not IS_SANDBOX_WORKER or sys.argv[1:] != ["--sandbox-worker"]:
         raise SystemExit("expected exactly --sandbox-worker")
     run_gate()
