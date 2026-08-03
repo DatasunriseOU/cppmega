@@ -4634,17 +4634,7 @@ def _validate_cross_source_contracts(
             tuple(row[0] for row in _completed_inventory_repositories(anchor))
             for anchor in anchor_candidates
         ]
-        intervals = sorted(
-            _inventory_interval(
-                cast(Mapping[str, Any], anchor.inventory_receipt),
-                where=f"{anchor.spec.shard_id} inventory",
-            )[:2]
-            for anchor in anchor_candidates
-        )
-        contiguous_pair = (
-            len(intervals) == 2 and intervals[0][1] == intervals[1][0]
-        )
-        if len(set(repository_key_scopes)) == 1 or contiguous_pair:
+        if len(set(repository_key_scopes)) == 1:
             return _adjacent_inventory_contract(audits, anchor_candidates)
         return _disjoint_inventory_contract(audits, anchor_candidates)
 

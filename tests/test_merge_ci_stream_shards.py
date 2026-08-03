@@ -3024,7 +3024,7 @@ def test_adjacent_union_materializes_multi_repo_scope_once(
         ).fetchall() == [("owner/alpha", 6), ("owner/beta", 6)]
 
 
-def test_adjacent_union_rejects_gap_and_repository_row_mismatch(
+def test_adjacent_union_rejects_gap_and_routes_other_repo_to_disjoint_validation(
     tmp_path: Path,
     exact_tokenizer: ExactTokenizer,
 ) -> None:
@@ -3115,7 +3115,7 @@ def test_adjacent_union_rejects_gap_and_repository_row_mismatch(
             )
         ],
     )
-    with pytest.raises(MergeError, match="non-identical repository rows"):
+    with pytest.raises(MergeError, match="incompatible interval"):
         merge_shards(mismatch_manifest)
     assert not mismatch_destination.exists()
 
