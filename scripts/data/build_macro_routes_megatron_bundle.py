@@ -3407,7 +3407,7 @@ def _load_source_routes(
         route = load_primary_route_receipt(
             getattr(args, receipt_attribute),
             input_root=input_root,
-            expected_allowlist=source_composition.allowlist,
+            source_composition=source_composition,
             kind=kind,
             buckets=buckets,
         )

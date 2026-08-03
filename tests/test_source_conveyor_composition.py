@@ -5,14 +5,21 @@ import hashlib
 import json
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from cppmega.data.source_conveyor_composition import (
     GLOBAL_DEDUP_RECEIPT_SCHEMA,
+    PACKED_SOURCE_INVENTORY_SCHEMA,
     SOURCE_COMPOSITION_PLAN_SCHEMA,
+    SourceComposition,
+    _manifest_allowlist,
+    build_packed_source_inventory_receipt,
     load_source_composition,
 )
 from scripts import commit_source_conveyor_supervisor as commit_supervisor
+from scripts.nanochat_data.route_packed_source_docs import _complete_input_receipt
 
 _BUCKETS = (1024,)
 _REPOSITORIES = ("alpha", "beta")
@@ -420,7 +427,12 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             run_id="base-code",
             digit="3",
             streams="code",
-            done={"alpha::code": {"lengths": _lengths()}},
+            done={
+                "alpha::code": {
+                    "artifact_filename": "alpha.parquet",
+                    "lengths": _lengths(),
+                }
+            },
             failed={"beta::repo": failed_record},
             code_root=code_root,
             commit_root=commit_root,
@@ -436,7 +448,12 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             run_id="repair-code",
             digit="4",
             streams="code",
-            done={"beta::code": {"lengths": _lengths()}},
+            done={
+                "beta::code": {
+                    "artifact_filename": "beta.parquet",
+                    "lengths": _lengths(),
+                }
+            },
             failed={},
             code_root=code_root,
             commit_root=commit_root,
@@ -454,9 +471,15 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             digit="5",
             streams="commits",
             done={
-                "alpha::r0": {"lengths": _lengths()},
+                "alpha::r0": {
+                    "artifact_filename": "alpha_r0.parquet",
+                    "lengths": _lengths(),
+                },
                 "alpha::commits": {"source": "commits", "complete": True},
-                "beta::r0": {"lengths": _lengths()},
+                "beta::r0": {
+                    "artifact_filename": "beta_r0.parquet",
+                    "lengths": _lengths(),
+                },
                 "beta::commits": {"source": "commits", "complete": True},
             },
             failed={},
@@ -479,6 +502,108 @@ def _composition_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     plan_path = tmp_path / "source_composition_plan.json"
     _write_json(plan_path, plan)
     return plan_path, code_root, commit_root
+
+
+def test_manifest_allowlist_uses_recorded_case_safe_artifact_filename() -> None:
+    manifest = {
+        "done": {
+            "WindowsAppSDK::code": {
+                "artifact_filename": "%57indows%41pp%53%44%4b.parquet",
+                "lengths": _lengths(),
+            },
+            "windowsappsdk::code": {
+                "artifact_filename": "windowsappsdk.parquet",
+                "lengths": _lengths(),
+            },
+            "WindowsAppSDK::r0": {
+                "artifact_filename": "%57indows%41pp%53%44%4b_r0.parquet",
+                "lengths": _lengths(),
+            },
+            "windowsappsdk::r0": {
+                "artifact_filename": "windowsappsdk_r0.parquet",
+                "lengths": _lengths(),
+            },
+        }
+    }
+
+    allowlist = _manifest_allowlist(
+        manifest=manifest,
+        buckets=_BUCKETS,
+        run_id="case-safe",
+    )
+    names = set(allowlist[("code", 1024)])
+    assert names == {
+        "%57indows%41pp%53%44%4b.parquet",
+        "windowsappsdk.parquet",
+    }
+    assert len({name.casefold() for name in names}) == 2
+    commit_names = set(allowlist[("commits", 1024)])
+    assert commit_names == {
+        "%57indows%41pp%53%44%4b_r0.parquet",
+        "windowsappsdk_r0.parquet",
+    }
+    assert len({name.casefold() for name in commit_names}) == 2
+
+    manifest["done"]["WindowsAppSDK::code"]["artifact_filename"] = "../escape.parquet"
+    with pytest.raises(ValueError, match="canonical artifact_filename"):
+        _manifest_allowlist(
+            manifest=manifest,
+            buckets=_BUCKETS,
+            run_id="case-safe",
+        )
+
+
+def test_packed_source_inventory_receipt_is_router_ready(tmp_path: Path) -> None:
+    root = tmp_path / "code"
+    bucket_root = root / "1024"
+    bucket_root.mkdir(parents=True)
+    (root / "2048").mkdir()
+    artifact = bucket_root / "%57indows%41pp%53%44%4b.parquet"
+    pq.write_table(pa.table({"value": [1, 2]}), artifact, compression="zstd")
+    plan_path = tmp_path / "composition.json"
+    _write_json(plan_path, {"schema": "fixture"})
+    composition = SourceComposition(
+        allowlist={
+            ("code", 1024): {artifact.name: 2},
+            ("code", 2048): {},
+        },
+        receipt={"buckets": [1024, 2048], "plan_sha256": _sha256(plan_path)},
+        plan_path=plan_path,
+        dedup_receipt_path=plan_path,
+        run_files=(),
+    )
+
+    receipt = build_packed_source_inventory_receipt(
+        composition,
+        kind="code",
+        input_root=root,
+    )
+    receipt_path = tmp_path / "code_inventory.receipt.json"
+    _write_json(receipt_path, receipt)
+    _receipt_sha256, inventory_sha256, inventory, _payload = (
+        _complete_input_receipt(receipt_path)
+    )
+
+    assert receipt["schema"] == PACKED_SOURCE_INVENTORY_SCHEMA
+    assert receipt["totals"] == {
+        "files": 1,
+        "rows": 2,
+        "bytes": artifact.stat().st_size,
+    }
+    assert inventory_sha256 == receipt["source_inventory_sha256"]
+    assert inventory == receipt["source_inventory"]
+
+    pq.write_table(
+        pa.table({"value": [3]}),
+        bucket_root / "unexpected.parquet",
+        compression="zstd",
+    )
+    with pytest.raises(ValueError, match="inventory differs"):
+        build_packed_source_inventory_receipt(
+            composition,
+            kind="code",
+            input_root=root,
+        )
 
 
 def test_source_composition_resolves_revision_bound_code_repair(
@@ -534,7 +659,10 @@ def test_commit_supervisor_plan_is_accepted_by_source_composition(
     manifest_path = Path(code_run["manifest"])
     exit_path = Path(code_run["exit_receipt"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["done"]["beta::code"] = {"lengths": _lengths()}
+    manifest["done"]["beta::code"] = {
+        "artifact_filename": "beta.parquet",
+        "lengths": _lengths(),
+    }
     manifest["failed"] = {}
     _write_json(manifest_path, manifest)
     exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
@@ -664,7 +792,10 @@ def test_source_composition_rejects_duplicate_repair_output(
     repair_manifest_path = Path(plan["runs"][1]["manifest"])
     repair_exit_path = Path(plan["runs"][1]["exit_receipt"])
     repair_manifest = json.loads(repair_manifest_path.read_text(encoding="utf-8"))
-    repair_manifest["done"]["alpha::code"] = {"lengths": _lengths()}
+    repair_manifest["done"]["alpha::code"] = {
+        "artifact_filename": "alpha.parquet",
+        "lengths": _lengths(),
+    }
     _write_json(repair_manifest_path, repair_manifest)
     repair_exit = json.loads(repair_exit_path.read_text(encoding="utf-8"))
     repair_exit["done_manifest"]["sha256"] = _sha256(repair_manifest_path)
@@ -830,7 +961,10 @@ def test_source_composition_rejects_duplicate_shard_within_run(
     manifest_path = Path(plan["runs"][2]["manifest"])
     exit_path = Path(plan["runs"][2]["exit_receipt"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["done"]["alpha::r00"] = {"lengths": _lengths()}
+    manifest["done"]["alpha::r00"] = {
+        "artifact_filename": "alpha_r0.parquet",
+        "lengths": _lengths(),
+    }
     _write_json(manifest_path, manifest)
     exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
     exit_receipt["done_manifest"]["sha256"] = _sha256(manifest_path)

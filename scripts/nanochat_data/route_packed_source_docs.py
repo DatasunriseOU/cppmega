@@ -21,6 +21,11 @@ from cppmega.data import symbol_identity as symbol_identity_schema
 from cppmega.data.commit_scope import is_native_workflow_shell_path
 from cppmega.data.nanochat_pipeline import packed_rows_schema as packed
 from cppmega.data.nanochat_pipeline import tokenized_enriched_schema as enriched
+from cppmega.data.source_conveyor_composition import (
+    PACKED_SOURCE_INVENTORY_SCHEMA,
+    SourceComposition,
+    source_composition_receipt_sha256,
+)
 from scripts.nanochat_data import pack_enriched_rows as packer
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
@@ -895,9 +900,14 @@ def _parse_buckets(value: str) -> tuple[int, ...]:
 
 def _complete_input_receipt(
     path: Path,
-) -> tuple[str, str, list[dict[str, Any]]]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("status") != "complete" or value.get("unresolved_count") != 0:
+) -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != "complete"
+        or value.get("unresolved_count") != 0
+    ):
         raise ValueError(
             f"{path}: input receipt must have status=complete and unresolved_count=0"
         )
@@ -937,14 +947,14 @@ def _complete_input_receipt(
         raise ValueError(f"{path}: source_inventory must be sorted by path")
     if len({record["path"] for record in normalized}) != len(normalized):
         raise ValueError(f"{path}: source_inventory contains duplicate paths")
-    return _sha256_file(path), inventory_sha256, normalized
+    return hashlib.sha256(raw).hexdigest(), inventory_sha256, normalized, value
 
 
 def load_primary_route_receipt(
     receipt_path: Path,
     *,
     input_root: Path,
-    expected_allowlist: dict[tuple[str, int], dict[str, int]],
+    source_composition: SourceComposition,
     kind: str,
     buckets: tuple[int, ...],
 ) -> dict[str, Any]:
@@ -978,7 +988,7 @@ def load_primary_route_receipt(
 
     expected_paths: dict[str, int] = {}
     for bucket in buckets:
-        files = expected_allowlist.get((kind, bucket))
+        files = source_composition.allowlist.get((kind, bucket))
         if files is None:
             raise ValueError(f"source composition lacks {kind}/{bucket} allowlist")
         for filename, rows in files.items():
@@ -991,9 +1001,12 @@ def load_primary_route_receipt(
     if not isinstance(input_binding, dict):
         raise ValueError(f"{receipt_path}: source route input receipt is missing")
     bound_input_receipt = Path(str(input_binding.get("path"))).expanduser().resolve()
-    input_sha256, inventory_sha256, source_inventory = _complete_input_receipt(
-        bound_input_receipt
-    )
+    (
+        input_sha256,
+        inventory_sha256,
+        source_inventory,
+        input_receipt,
+    ) = _complete_input_receipt(bound_input_receipt)
     if input_binding != {
         "path": str(bound_input_receipt),
         "sha256": input_sha256,
@@ -1004,6 +1017,33 @@ def load_primary_route_receipt(
     if set(inventory_by_path) != set(expected_paths):
         raise ValueError(
             f"{receipt_path}: source route inventory differs from source composition"
+        )
+    plan_sha256 = _sha256_file(source_composition.plan_path)
+    expected_composition = {
+        "plan": {
+            "path": str(source_composition.plan_path),
+            "sha256": plan_sha256,
+        },
+        "receipt_sha256": source_composition_receipt_sha256(
+            source_composition.receipt
+        ),
+    }
+    expected_totals = {
+        "files": len(source_inventory),
+        "rows": sum(expected_paths.values()),
+        "bytes": sum(int(record["size"]) for record in source_inventory),
+    }
+    if (
+        plan_sha256 != source_composition.receipt.get("plan_sha256")
+        or input_receipt.get("schema") != PACKED_SOURCE_INVENTORY_SCHEMA
+        or input_receipt.get("kind") != kind
+        or input_receipt.get("input_root") != str(input_root)
+        or input_receipt.get("buckets") != list(buckets)
+        or input_receipt.get("source_composition") != expected_composition
+        or input_receipt.get("totals") != expected_totals
+    ):
+        raise ValueError(
+            f"{receipt_path}: source inventory provenance binding drifted"
         )
 
     raw_files = receipt.get("files")
@@ -1185,6 +1225,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         receipt_sha256,
         receipt_inventory_sha256,
         expected_inventory,
+        _input_receipt,
     ) = _complete_input_receipt(input_receipt)
     files = _discover(input_root, args.buckets)
     relative_files = [str(path.relative_to(input_root)) for path in files]

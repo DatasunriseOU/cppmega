@@ -20,6 +20,7 @@ if str(_REPO_ROOT) not in sys.path:
 from cppmega.data.source_conveyor_composition import (
     SOURCE_COMPOSITION_PLAN_SCHEMA,
     _load_run,
+    build_packed_source_inventory_receipt,
     load_source_composition,
 )
 from scripts import source_conveyor_supervisor as source_supervisor
@@ -508,6 +509,26 @@ def _run(args: argparse.Namespace) -> int:
                 code_root=code_run["code_output_root"],
                 commit_root=code_run["commit_output_root"],
             )
+            code_inventory_path = run_root / "code_packed_inventory.receipt.json"
+            commit_inventory_path = (
+                run_root / "commit_packed_inventory.receipt.json"
+            )
+            source_supervisor._atomic_json(
+                code_inventory_path,
+                build_packed_source_inventory_receipt(
+                    composition,
+                    kind="code",
+                    input_root=code_run["code_output_root"],
+                ),
+            )
+            source_supervisor._atomic_json(
+                commit_inventory_path,
+                build_packed_source_inventory_receipt(
+                    composition,
+                    kind="commits",
+                    input_root=code_run["commit_output_root"],
+                ),
+            )
         except Exception:
             source_supervisor.write_exit_receipt(
                 exit_path,
@@ -526,6 +547,8 @@ def _run(args: argparse.Namespace) -> int:
                     "run_root": str(run_root),
                     "composition_plan": str(plan_path),
                     "dedup_receipt": str(dedup_receipt),
+                    "code_inventory_receipt": str(code_inventory_path),
+                    "commit_inventory_receipt": str(commit_inventory_path),
                     "coverage": composition.receipt["coverage"],
                 },
                 indent=2,

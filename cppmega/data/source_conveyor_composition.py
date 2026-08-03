@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
 import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-
 
 SOURCE_COMPOSITION_PLAN_SCHEMA = "cppmega_source_conveyor_composition_plan_v1"
 SOURCE_COMPOSITION_SCHEMA = "cppmega_source_conveyor_composition_v1"
+PACKED_SOURCE_INVENTORY_SCHEMA = "cppmega_packed_source_inventory_v1"
 GLOBAL_DEDUP_RECEIPT_SCHEMA = "cppmega_global_dedup_store_receipt_v1"
 _FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 _FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
@@ -34,6 +34,9 @@ _PR_COMPLETION_BINDING_FIELDS = {
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_ARTIFACT_FILENAME_RE = re.compile(
+    r"^(?:(?:[a-z0-9_-])|(?:%[0-9a-f]{2}))+\.parquet$"
+)
 _MAX_PLAN_BYTES = 4 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 64 * 1024 * 1024
@@ -81,6 +84,11 @@ def _canonical_sha256(value: object) -> str:
         ensure_ascii=True,
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def source_composition_receipt_sha256(receipt: Mapping[str, object]) -> str:
+    """Return the canonical digest used to bind a validated composition."""
+    return _canonical_sha256(receipt)
 
 
 def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -140,13 +148,13 @@ def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes,
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
     if not isinstance(payload, dict):
-        raise ValueError(f"{where} must be a JSON object: {path}")
+        raise TypeError(f"{where} must be a JSON object: {path}")
     return raw, payload
 
 
 def _require_mapping(value: object, *, where: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError(f"{where} must be an object")
+        raise TypeError(f"{where} must be an object")
     return dict(value)
 
 
@@ -277,15 +285,21 @@ def _manifest_allowlist(
             continue
         if unit.endswith("::code"):
             kind = "code"
-            filename = f"{_unit_repo(unit)}.parquet"
         elif "::r" in unit:
             repo, raw_start = unit.rsplit("::r", 1)
             if not repo or not raw_start.isdecimal():
                 raise ValueError(f"{run_id} has an invalid commit range unit {unit!r}")
             kind = "commits"
-            filename = f"{repo}_r{int(raw_start)}.parquet"
         else:
             continue
+        filename = info.get("artifact_filename")
+        if (
+            not isinstance(filename, str)
+            or _ARTIFACT_FILENAME_RE.fullmatch(filename) is None
+        ):
+            raise ValueError(
+                f"{run_id} unit {unit} has no canonical artifact_filename"
+            )
         unknown_lengths = sorted(set(lengths) - {str(bucket) for bucket in buckets})
         if unknown_lengths:
             raise ValueError(
@@ -1046,7 +1060,7 @@ def _load_run(
         code_terminal,
         commit_terminal,
         {_unit_repo(str(unit)) for unit in failed},
-        set(str(unit) for unit in failed),
+        {str(unit) for unit in failed},
         archive_identity,
         input_binding,
         {
@@ -1283,10 +1297,157 @@ def load_source_composition(
     )
 
 
+def build_packed_source_inventory_receipt(
+    composition: SourceComposition,
+    *,
+    kind: str,
+    input_root: Path,
+) -> dict[str, object]:
+    """Bind one composed source stream to its exact ZSTD Parquet bytes."""
+
+    if kind not in {"code", "commits"}:
+        raise ValueError(f"unsupported source inventory kind: {kind!r}")
+    raw_buckets = composition.receipt.get("buckets")
+    if not isinstance(raw_buckets, list):
+        raise TypeError("source composition has no bucket list")
+    buckets = tuple(
+        _require_positive_int(bucket, where="source composition bucket")
+        for bucket in raw_buckets
+    )
+    if buckets != tuple(sorted(set(buckets))):
+        raise ValueError("source composition buckets are not canonical")
+
+    expanded_root = input_root.expanduser()
+    if expanded_root.is_symlink():
+        raise ValueError(f"source inventory root must not be a symlink: {expanded_root}")
+    root = expanded_root.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+
+    expected_rows: dict[str, int] = {}
+    actual_paths: dict[str, Path] = {}
+    for bucket in buckets:
+        bucket_root = root / str(bucket)
+        if bucket_root.is_symlink() or not bucket_root.is_dir():
+            raise ValueError(f"source inventory bucket is invalid: {bucket_root}")
+        allowed = composition.allowlist.get((kind, bucket))
+        if allowed is None:
+            raise ValueError(f"source composition lacks {kind}/{bucket} shards")
+        for filename, rows in allowed.items():
+            expected_rows[f"{bucket}/{filename}"] = _require_positive_int(
+                rows,
+                where=f"source composition {kind}/{bucket}/{filename} rows",
+            )
+        for path in bucket_root.glob("*.parquet"):
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"source inventory artifact is invalid: {path}")
+            actual_paths[relative] = path
+
+    if set(actual_paths) != set(expected_rows):
+        raise ValueError(
+            f"{kind} Parquet inventory differs from source composition: "
+            f"missing={sorted(set(expected_rows) - set(actual_paths))[:20]} "
+            f"unexpected={sorted(set(actual_paths) - set(expected_rows))[:20]}"
+        )
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:  # pragma: no cover - production dependency
+        raise RuntimeError("pyarrow is required to verify packed source Parquet") from error
+
+    inventory: list[dict[str, object]] = []
+    artifact_identities: dict[str, tuple[int, int, int, int]] = {}
+    total_rows = 0
+    for relative in sorted(actual_paths):
+        path = actual_paths[relative]
+        before = path.stat()
+        metadata = pq.ParquetFile(path).metadata
+        codecs = {
+            str(metadata.row_group(group).column(column).compression)
+            for group in range(metadata.num_row_groups)
+            for column in range(metadata.num_columns)
+        }
+        rows = expected_rows[relative]
+        if int(metadata.num_rows) != rows or codecs != {"ZSTD"}:
+            raise ValueError(
+                f"source artifact is not receipt-bound ZSTD Parquet: {path}"
+            )
+        sha256 = _sha256(path)
+        after = path.stat()
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if before_identity != after_identity:
+            raise RuntimeError(f"source artifact changed while hashing: {path}")
+        artifact_identities[relative] = after_identity
+        inventory.append(
+            {"path": relative, "sha256": sha256, "size": after.st_size}
+        )
+        total_rows += rows
+
+    observed_paths = {
+        path.relative_to(root).as_posix(): path
+        for bucket in buckets
+        for path in (root / str(bucket)).glob("*.parquet")
+    }
+    if set(observed_paths) != set(expected_rows):
+        raise RuntimeError("source Parquet inventory changed while it was hashed")
+    for relative, path in observed_paths.items():
+        current = path.stat()
+        if path.is_symlink() or (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        ) != artifact_identities[relative]:
+            raise RuntimeError(f"source artifact changed while hashing: {path}")
+    plan_sha256 = _sha256(composition.plan_path)
+    if plan_sha256 != composition.receipt.get("plan_sha256"):
+        raise RuntimeError("source composition plan changed while inventory was built")
+
+    return {
+        "schema": PACKED_SOURCE_INVENTORY_SCHEMA,
+        "status": "complete",
+        "kind": kind,
+        "input_root": str(root),
+        "buckets": list(buckets),
+        "source_composition": {
+            "plan": {
+                "path": str(composition.plan_path),
+                "sha256": plan_sha256,
+            },
+            "receipt_sha256": source_composition_receipt_sha256(
+                composition.receipt
+            ),
+        },
+        "source_inventory": inventory,
+        "source_inventory_sha256": _canonical_sha256(inventory),
+        "totals": {
+            "files": len(inventory),
+            "rows": total_rows,
+            "bytes": sum(int(record["size"]) for record in inventory),
+        },
+        "unresolved_count": 0,
+    }
+
+
 __all__ = [
     "GLOBAL_DEDUP_RECEIPT_SCHEMA",
+    "PACKED_SOURCE_INVENTORY_SCHEMA",
     "SOURCE_COMPOSITION_PLAN_SCHEMA",
     "SOURCE_COMPOSITION_SCHEMA",
     "SourceComposition",
+    "build_packed_source_inventory_receipt",
     "load_source_composition",
+    "source_composition_receipt_sha256",
 ]

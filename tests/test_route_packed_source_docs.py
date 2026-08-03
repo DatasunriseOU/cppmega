@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 
 from cppmega.data.nanochat_pipeline import packed_rows_schema as packed
 from cppmega.data.nanochat_pipeline import tokenized_enriched_schema as enriched
+from cppmega.data.source_conveyor_composition import (
+    SourceComposition,
+    build_packed_source_inventory_receipt,
+)
 from cppmega.data.source_identity import source_identity
 from cppmega.symbol_identity import compute_symbol_id
 from scripts.nanochat_data.pack_enriched_rows import (
@@ -257,21 +262,28 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
             "size": input_path.stat().st_size,
         }
     ]
+    plan_path = tmp_path / "source_composition_plan.json"
+    plan_path.write_text(json.dumps({"schema": "fixture"}))
+    source_composition = SourceComposition(
+        allowlist={
+            ("code", 16): {"fixture.parquet": 1},
+            ("commits", 16): {"fixture.parquet": 1},
+        },
+        receipt={
+            "buckets": [16],
+            "plan_sha256": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        },
+        plan_path=plan_path,
+        dedup_receipt_path=plan_path,
+        run_files=(),
+    )
+    input_payload = build_packed_source_inventory_receipt(
+        source_composition,
+        kind="code",
+        input_root=input_root,
+    )
     input_receipt.write_text(
-        json.dumps(
-            {
-                "status": "complete",
-                "unresolved_count": 0,
-                "source_inventory": source_inventory,
-                "source_inventory_sha256": hashlib.sha256(
-                    json.dumps(
-                        source_inventory,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode()
-                ).hexdigest(),
-            }
-        )
+        json.dumps(input_payload)
     )
     wrong_inventory = [{**source_inventory[0], "path": "16/other.parquet"}]
     wrong_receipt = tmp_path / "wrong-input.receipt.json"
@@ -334,7 +346,7 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
     primary_route = load_primary_route_receipt(
         cli_output / "route.receipt.json",
         input_root=input_root,
-        expected_allowlist={("code", 16): {"fixture.parquet": 1}},
+        source_composition=source_composition,
         kind="code",
         buckets=(16,),
     )
@@ -346,10 +358,63 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
         global_receipt["files"][0]["routes"]["primary"]["sha256"]
     )
 
+    tampered_input_receipt = tmp_path / "tampered-input.receipt.json"
+    tampered_input_payload = json.loads(json.dumps(input_payload))
+    tampered_input_payload["source_composition"]["receipt_sha256"] = "0" * 64
+    tampered_input_receipt.write_text(json.dumps(tampered_input_payload))
+    tampered_output = tmp_path / "tampered-output"
+    assert route_main(
+        [
+            "--input-root",
+            str(input_root),
+            "--input-receipt",
+            str(tampered_input_receipt),
+            "--output-root",
+            str(tampered_output),
+            "--buckets",
+            "16",
+            "--workers",
+            "1",
+        ]
+    ) == 0
+    with pytest.raises(ValueError, match="provenance binding drifted"):
+        load_primary_route_receipt(
+            tampered_output / "route.receipt.json",
+            input_root=input_root,
+            source_composition=source_composition,
+            kind="code",
+            buckets=(16,),
+        )
+
+    commit_input_receipt = tmp_path / "commit-input.receipt.json"
+    commit_input_receipt.write_text(
+        json.dumps(
+            build_packed_source_inventory_receipt(
+                source_composition,
+                kind="commits",
+                input_root=input_root,
+            )
+        )
+    )
+    commit_output = tmp_path / "commit-output"
+    assert route_main(
+        [
+            "--input-root",
+            str(input_root),
+            "--input-receipt",
+            str(commit_input_receipt),
+            "--output-root",
+            str(commit_output),
+            "--buckets",
+            "16",
+            "--workers",
+            "1",
+        ]
+    ) == 0
     commit_route = load_primary_route_receipt(
-        cli_output / "route.receipt.json",
+        commit_output / "route.receipt.json",
         input_root=input_root,
-        expected_allowlist={("commits", 16): {"fixture.parquet": 1}},
+        source_composition=source_composition,
         kind="commits",
         buckets=(16,),
     )
@@ -357,10 +422,11 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
     provenance = bundle / "provenance"
     route_provenance = provenance / "source_routes"
     route_provenance.mkdir(parents=True)
-    route_receipt_bytes = (cli_output / "route.receipt.json").read_bytes()
-    route_digest = hashlib.sha256(route_receipt_bytes).hexdigest()
     staged_routes = {}
+    snapshot_files = []
     for kind, route in (("code", primary_route), ("commits", commit_route)):
+        route_receipt_bytes = route["receipt_path"].read_bytes()
+        route_digest = hashlib.sha256(route_receipt_bytes).hexdigest()
         staged = route_provenance / f"{kind}.route.receipt.json"
         staged.write_bytes(route_receipt_bytes)
         binding = route["binding"]
@@ -372,14 +438,10 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
             "output_inventory_sha256": binding["output_inventory_sha256"],
             "primary": binding["totals"]["primary"],
         }
-    primary_artifact = global_receipt["files"][0]["routes"]["primary"]
-    primary_path = cli_output / primary_artifact["path"]
-    source_manifest = {
-        "source_routes": {
-            "code": primary_route["binding"],
-            "commits": commit_route["binding"],
-        },
-        "files": [
+        route_receipt = json.loads(route_receipt_bytes)
+        primary_artifact = route_receipt["files"][0]["routes"]["primary"]
+        primary_path = Path(route_receipt["output_root"]) / primary_artifact["path"]
+        snapshot_files.append(
             {
                 "kind": kind,
                 "source": str(primary_path.resolve()),
@@ -387,8 +449,13 @@ def test_routes_mixed_row_losslessly_and_writes_resumable_zstd(tmp_path) -> None
                 "sha256": primary_artifact["sha256"],
                 "rows": primary_artifact["rows"],
             }
-            for kind in ("code", "commits")
-        ],
+        )
+    source_manifest = {
+        "source_routes": {
+            "code": primary_route["binding"],
+            "commits": commit_route["binding"],
+        },
+        "files": snapshot_files,
     }
     source_manifest_path = provenance / "source_manifest.json"
     source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
