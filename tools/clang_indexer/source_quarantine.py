@@ -12,9 +12,9 @@ import json
 import os
 import re
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
 
 MANIFEST_SCHEMA = "cppmega.source_quarantine_manifest_v1"
 RECEIPT_SCHEMA = "cppmega.source_quarantine_receipt_v1"
@@ -218,12 +218,13 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
                 f"but the fixture is not ASCII: {exc}"
             ) from exc
+        lines = decoded.splitlines()
         compiler_contract = {
             "// RUN: not --crash %clang_cc1 %s 2>&1 | FileCheck %s",
             "// REQUIRES: crash-recovery",
             "// CHECK: prag\\",
             "// CHECK-NEXT: ma",
-        }.issubset(decoded.splitlines()) and decoded.count(
+        }.issubset(lines) and decoded.count(
             "#prag\\\nma clang __debug crash\n"
         ) == 1
         index_contract = {
@@ -236,10 +237,28 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             ),
             "// REQUIRES: crash-recovery",
             "#pragma clang __debug crash",
-        }.issubset(decoded.splitlines()) and decoded.splitlines().count(
+        }.issubset(lines) and lines.count(
             "#pragma clang __debug crash"
         ) == 1
-        if not (compiler_contract or index_contract):
+        remap_contract = {
+            "// RUN: echo env CINDEXTEST_EDITING=1 \\",
+            "// RUN:   not c-index-test -test-load-source-reparse 1 local \\",
+            (
+                '// RUN:   -remap-file="%s,%S/Inputs/'
+                'crash-recovery-code-complete-remap.c" \\'
+            ),
+            "// RUN:   %s 2> %t.err",
+            (
+                "// RUN: FileCheck < %t.err "
+                "-check-prefix=CHECK-CODE-COMPLETE-CRASH %s"
+            ),
+            (
+                "// CHECK-CODE-COMPLETE-CRASH: Unable to reparse "
+                "translation unit"
+            ),
+            "#pragma clang __debug crash",
+        }.issubset(lines) and lines.count("#pragma clang __debug crash") == 1
+        if not (compiler_contract or index_contract or remap_contract):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
                 "but the Clang crash-test contract is incomplete or ambiguous"
@@ -435,7 +454,7 @@ class ProjectSourceQuarantine:
         manifest_path: str | os.PathLike[str],
         *,
         project_id: str,
-    ) -> "ProjectSourceQuarantine":
+    ) -> ProjectSourceQuarantine:
         path = Path(manifest_path)
         try:
             payload = path.read_bytes()

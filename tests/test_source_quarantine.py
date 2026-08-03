@@ -20,6 +20,9 @@ PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
 RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
 RELATIVE_INDEX_CRASH_FIXTURE = "tools/clang/test/Index/crash-recovery.c"
+RELATIVE_INDEX_REMAP_CRASH_FIXTURE = (
+    "tools/clang/test/Index/Inputs/crash-recovery-code-complete-remap.c"
+)
 RELATIVE_PARSER_CRASH_FIXTURE = (
     "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
 )
@@ -62,6 +65,21 @@ def _clang_index_crash_fixture_bytes() -> bytes:
         b"c-index-test -test-load-source all %s\n"
         b"//\n"
         b"// REQUIRES: crash-recovery\n"
+        b"\n"
+        b"#pragma clang __debug crash\n"
+    )
+
+
+def _clang_index_remap_crash_fixture_bytes() -> bytes:
+    return (
+        b"// RUN: echo env CINDEXTEST_EDITING=1 \\\n"
+        b"// RUN:   not c-index-test -test-load-source-reparse 1 local \\\n"
+        b"// RUN:   -remap-file=\"%s,%S/Inputs/crash-recovery-code-complete-remap.c\" \\\n"
+        b"// RUN:   %s 2> %t.err\n"
+        b"// RUN: FileCheck < %t.err -check-prefix=CHECK-CODE-COMPLETE-CRASH %s\n"
+        b"// CHECK-CODE-COMPLETE-CRASH: Unable to reparse translation unit\n"
+        b"\n"
+        b"#warning parsing original file\n"
         b"\n"
         b"#pragma clang __debug crash\n"
     )
@@ -114,9 +132,9 @@ def _certificate_pair_bytes() -> bytes:
 
 def _mixed_utf8_utf16le_c_array_bytes(*, byte_count: int = 1024) -> bytes:
     prefix = (
-        "/* Copyright (c) 2026 Eclipse ThreadX contributors */\n"
-        "/* SPDX-License-Identifier: MIT */\n\n"
-    ).encode()
+        b"/* Copyright (c) 2026 Eclipse ThreadX contributors */\n"
+        b"/* SPDX-License-Identifier: MIT */\n\n"
+    )
     byte_literals = ", ".join(
         f"0x{value % 256:02X}" for value in range(byte_count)
     )
@@ -265,6 +283,10 @@ def test_quarantine_hash_mismatch_fails_without_filtering(
     [
         (RELATIVE_CRASH_FIXTURE, _clang_crash_fixture_bytes()),
         (RELATIVE_INDEX_CRASH_FIXTURE, _clang_index_crash_fixture_bytes()),
+        (
+            RELATIVE_INDEX_REMAP_CRASH_FIXTURE,
+            _clang_index_remap_crash_fixture_bytes(),
+        ),
     ],
 )
 def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
@@ -497,28 +519,37 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
 
 
 def test_checked_in_filament_index_crash_manifest_matches_reference_fixture() -> None:
-    payload = _clang_index_crash_fixture_bytes()
+    fixtures = {
+        RELATIVE_INDEX_CRASH_FIXTURE: _clang_index_crash_fixture_bytes(),
+        RELATIVE_INDEX_REMAP_CRASH_FIXTURE: _clang_index_remap_crash_fixture_bytes(),
+    }
     manifest = json.loads(
         (
             Path(__file__).parents[1]
             / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
-    entry = next(
-        item
-        for item in manifest["entries"]
-        if item["project_id"] == "google/filament"
-        and item["relative_path"].endswith(RELATIVE_INDEX_CRASH_FIXTURE)
-    )
+    entries = {
+        relative_path: next(
+            item
+            for item in manifest["entries"]
+            if item["project_id"] == "google/filament"
+            and item["relative_path"].endswith(relative_path)
+        )
+        for relative_path in fixtures
+    }
 
-    assert len(payload) == 344
-    assert hashlib.sha256(payload).hexdigest() == (
-        "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727"
-    )
-    assert entry["size_bytes"] == len(payload)
-    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
-    assert entry["classification"] == "deliberate_compiler_crash_fixture"
-    assert entry["detected_format"] == "clang_debug_crash_pragma"
+    assert len(fixtures[RELATIVE_INDEX_REMAP_CRASH_FIXTURE]) == 398
+    assert hashlib.sha256(
+        fixtures[RELATIVE_INDEX_REMAP_CRASH_FIXTURE]
+    ).hexdigest() == "4170335b0ad9450e204fcf9625e6d7f506f84308b10857b7b57eb37973b66590"
+    assert set(entries) == set(fixtures)
+    for relative_path, payload in fixtures.items():
+        entry = entries[relative_path]
+        assert entry["size_bytes"] == len(payload)
+        assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert entry["classification"] == "deliberate_compiler_crash_fixture"
+        assert entry["detected_format"] == "clang_debug_crash_pragma"
 
 
 def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None:
