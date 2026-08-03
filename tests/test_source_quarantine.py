@@ -10,6 +10,7 @@ import pytest
 
 from tools.clang_indexer import index_project as ip
 from tools.clang_indexer.source_quarantine import (
+    LEGACY_MANIFEST_SCHEMA,
     MANIFEST_SCHEMA,
     RECEIPT_SCHEMA,
     ProjectSourceQuarantine,
@@ -20,10 +21,14 @@ PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
 RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
 RELATIVE_INDEX_CRASH_FIXTURE = "tools/clang/test/Index/crash-recovery.c"
+RELATIVE_INDEX_REMAP_CRASH_FIXTURE = (
+    "tools/clang/test/Index/Inputs/crash-recovery-code-complete-remap.c"
+)
 RELATIVE_PARSER_CRASH_FIXTURE = (
     "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
 )
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
+CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
 
@@ -67,6 +72,21 @@ def _clang_index_crash_fixture_bytes() -> bytes:
     )
 
 
+def _clang_index_remap_crash_fixture_bytes() -> bytes:
+    return (
+        b"// RUN: echo env CINDEXTEST_EDITING=1 \\\n"
+        b"// RUN:   not c-index-test -test-load-source-reparse 1 local \\\n"
+        b'// RUN:   -remap-file="%s,%S/Inputs/crash-recovery-code-complete-remap.c" \\\n'
+        b"// RUN:   %s 2> %t.err\n"
+        b"// RUN: FileCheck < %t.err -check-prefix=CHECK-CODE-COMPLETE-CRASH %s\n"
+        b"// CHECK-CODE-COMPLETE-CRASH: Unable to reparse translation unit\n"
+        b"\n"
+        b"#warning parsing original file\n"
+        b"\n"
+        b"#pragma clang __debug crash\n"
+    )
+
+
 def _clang_parser_crash_fixture_bytes() -> bytes:
     return (
         b'// RUN: rm -rf "%t"\n'
@@ -102,24 +122,22 @@ def _der(tag: int, payload: bytes) -> bytes:
     return bytes([tag]) + length + payload
 
 
-def _certificate_pair_bytes() -> bytes:
+def _certificate_pair_bytes(*, wrapper_tag: int = 0xA1) -> bytes:
     certificate = _der(
         0x30,
         _der(0x30, b"\x02\x01\x01")
         + _der(0x30, b"\x06\x03\x2a\x03\x04")
         + _der(0x03, b"\x00\x01"),
     )
-    return _der(0x30, _der(0xA1, certificate))
+    return _der(0x30, _der(wrapper_tag, certificate))
 
 
 def _mixed_utf8_utf16le_c_array_bytes(*, byte_count: int = 1024) -> bytes:
     prefix = (
-        "/* Copyright (c) 2026 Eclipse ThreadX contributors */\n"
-        "/* SPDX-License-Identifier: MIT */\n\n"
-    ).encode()
-    byte_literals = ", ".join(
-        f"0x{value % 256:02X}" for value in range(byte_count)
+        b"/* Copyright (c) 2026 Eclipse ThreadX contributors */\n"
+        b"/* SPDX-License-Identifier: MIT */\n\n"
     )
+    byte_literals = ", ".join(f"0x{value % 256:02X}" for value in range(byte_count))
     generated = (
         "/* \n\n"
         "   Input ELF file: sample_threadx_module.axf\n\n"
@@ -136,12 +154,7 @@ def _self_executing_zip_bytes() -> bytes:
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, mode="w") as archive:
         archive.writestr("payload.txt", "exact fixture payload\n")
-    return (
-        b"#!/bin/sh\n"
-        b'exec java -jar "$0" "$@"\n'
-        b"exit 1\n"
-        + archive_buffer.getvalue()
-    )
+    return b'#!/bin/sh\nexec java -jar "$0" "$@"\nexit 1\n' + archive_buffer.getvalue()
 
 
 def _write_manifest(
@@ -167,6 +180,50 @@ def _write_manifest(
                         "classification": classification,
                         "detected_format": detected_format,
                         "reason": reason,
+                    }
+                ],
+                "collections": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_collection_manifest(
+    path: Path,
+    payloads: dict[str, bytes],
+    *,
+    expected_file_count: int | None = None,
+    content_set_sha256: str | None = None,
+) -> None:
+    rows = [
+        [relative_path, len(payload), hashlib.sha256(payload).hexdigest()]
+        for relative_path, payload in sorted(payloads.items())
+    ]
+    digest = hashlib.sha256(
+        json.dumps(rows, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    path.write_text(
+        json.dumps(
+            {
+                "schema": MANIFEST_SCHEMA,
+                "entries": [],
+                "collections": [
+                    {
+                        "project_id": PROJECT_ID,
+                        "relative_path_prefix": CERTIFICATE_PAIR_PREFIX,
+                        "relative_path_suffix": ".cp",
+                        "expected_file_count": (
+                            expected_file_count
+                            if expected_file_count is not None
+                            else len(payloads)
+                        ),
+                        "content_set_sha256": content_set_sha256 or digest,
+                        "classification": "mislabeled_non_cpp",
+                        "detected_format": "asn1_der_x509_certificate_pair",
+                        "reason": "DER certificate-pair fixtures stored under .cp",
                     }
                 ],
             },
@@ -260,11 +317,34 @@ def test_quarantine_hash_mismatch_fails_without_filtering(
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
+def test_legacy_point_manifest_remains_supported(tmp_path: Path) -> None:
+    payload = _xml_bytes()
+    candidate = tmp_path / RELATIVE_XML
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(manifest, payload)
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["schema"] = LEGACY_MANIFEST_SCHEMA
+    del raw["collections"]
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("relative_path", "payload"),
     [
         (RELATIVE_CRASH_FIXTURE, _clang_crash_fixture_bytes()),
         (RELATIVE_INDEX_CRASH_FIXTURE, _clang_index_crash_fixture_bytes()),
+        (
+            RELATIVE_INDEX_REMAP_CRASH_FIXTURE,
+            _clang_index_remap_crash_fixture_bytes(),
+        ),
     ],
 )
 def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
@@ -293,9 +373,7 @@ def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
     assert receipt["entries"][0]["classification"] == (
         "deliberate_compiler_crash_fixture"
     )
-    assert receipt["entries"][0]["detected_format"] == (
-        "clang_debug_crash_pragma"
-    )
+    assert receipt["entries"][0]["detected_format"] == ("clang_debug_crash_pragma")
 
 
 def test_exact_quarantine_filters_deliberate_clang_parser_crash_fixture(
@@ -351,6 +429,61 @@ def test_exact_quarantine_filters_der_x509_certificate_pair(
     )
 
 
+def test_exact_collection_quarantine_filters_complete_der_set(
+    tmp_path: Path,
+) -> None:
+    payloads = {
+        f"{CERTIFICATE_PAIR_PREFIX}forward.cp": _certificate_pair_bytes(),
+        f"{CERTIFICATE_PAIR_PREFIX}reverse.cp": _certificate_pair_bytes(
+            wrapper_tag=0xA0
+        ),
+    }
+    candidates = []
+    for relative_path, payload in payloads.items():
+        candidate = tmp_path / relative_path
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(payload)
+        candidates.append(str(candidate))
+    manifest = tmp_path / "quarantine.json"
+    _write_collection_manifest(manifest, payloads)
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, candidates)
+
+    assert kept == []
+    assert receipt["project_manifest_entry_count"] == 1
+    assert receipt["quarantined_count"] == 2
+    assert [entry["relative_path"] for entry in receipt["entries"]] == sorted(payloads)
+
+
+def test_collection_quarantine_rejects_incomplete_or_drifted_set(
+    tmp_path: Path,
+) -> None:
+    relative_path = f"{CERTIFICATE_PAIR_PREFIX}forward.cp"
+    payload = _certificate_pair_bytes()
+    candidate = tmp_path / relative_path
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_collection_manifest(
+        manifest,
+        {relative_path: payload},
+        expected_file_count=2,
+    )
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="count mismatch"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+    _write_collection_manifest(
+        manifest,
+        {relative_path: payload},
+        content_set_sha256="0" * 64,
+    )
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="content-set SHA-256 mismatch"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_exact_quarantine_filters_mixed_utf16_generated_binary_blob(
     tmp_path: Path,
 ) -> None:
@@ -397,9 +530,7 @@ def test_exact_quarantine_filters_self_executing_zip(
 
     assert kept == []
     assert receipt["quarantined_count"] == 1
-    assert receipt["entries"][0]["detected_format"] == (
-        "posix_shell_appended_zip"
-    )
+    assert receipt["entries"][0]["detected_format"] == ("posix_shell_appended_zip")
 
 
 def test_executable_archive_quarantine_rejects_invalid_zip(
@@ -472,15 +603,13 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
     payload = _clang_crash_fixture_bytes()
     manifest = json.loads(
         (
-            Path(__file__).parents[1]
-            / "configs/source_quarantine_manifest.json"
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
     entries = [
         item
         for item in manifest["entries"]
-        if item["project_id"]
-        in {"google/filament", "microsoft/DirectXShaderCompiler"}
+        if item["project_id"] in {"google/filament", "microsoft/DirectXShaderCompiler"}
         and item["relative_path"].endswith(RELATIVE_CRASH_FIXTURE)
     ]
 
@@ -497,36 +626,49 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
 
 
 def test_checked_in_filament_index_crash_manifest_matches_reference_fixture() -> None:
-    payload = _clang_index_crash_fixture_bytes()
+    fixtures = {
+        RELATIVE_INDEX_CRASH_FIXTURE: _clang_index_crash_fixture_bytes(),
+        RELATIVE_INDEX_REMAP_CRASH_FIXTURE: _clang_index_remap_crash_fixture_bytes(),
+    }
     manifest = json.loads(
         (
-            Path(__file__).parents[1]
-            / "configs/source_quarantine_manifest.json"
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
-    entry = next(
-        item
-        for item in manifest["entries"]
-        if item["project_id"] == "google/filament"
-        and item["relative_path"].endswith(RELATIVE_INDEX_CRASH_FIXTURE)
-    )
+    entries = {
+        relative_path: next(
+            item
+            for item in manifest["entries"]
+            if item["project_id"] == "google/filament"
+            and item["relative_path"].endswith(relative_path)
+        )
+        for relative_path in fixtures
+    }
 
-    assert len(payload) == 344
-    assert hashlib.sha256(payload).hexdigest() == (
-        "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727"
+    assert len(fixtures[RELATIVE_INDEX_CRASH_FIXTURE]) == 344
+    assert (
+        hashlib.sha256(fixtures[RELATIVE_INDEX_CRASH_FIXTURE]).hexdigest()
+        == "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727"
     )
-    assert entry["size_bytes"] == len(payload)
-    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
-    assert entry["classification"] == "deliberate_compiler_crash_fixture"
-    assert entry["detected_format"] == "clang_debug_crash_pragma"
+    assert len(fixtures[RELATIVE_INDEX_REMAP_CRASH_FIXTURE]) == 398
+    assert (
+        hashlib.sha256(fixtures[RELATIVE_INDEX_REMAP_CRASH_FIXTURE]).hexdigest()
+        == "4170335b0ad9450e204fcf9625e6d7f506f84308b10857b7b57eb37973b66590"
+    )
+    assert set(entries) == set(fixtures)
+    for relative_path, payload in fixtures.items():
+        entry = entries[relative_path]
+        assert entry["size_bytes"] == len(payload)
+        assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert entry["classification"] == "deliberate_compiler_crash_fixture"
+        assert entry["detected_format"] == "clang_debug_crash_pragma"
 
 
 def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None:
     payload = _clang_parser_crash_fixture_bytes()
     manifest = json.loads(
         (
-            Path(__file__).parents[1]
-            / "configs/source_quarantine_manifest.json"
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
     entry = next(
@@ -546,32 +688,35 @@ def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None
     assert entry["detected_format"] == "clang_debug_parser_crash_pragma"
 
 
-def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> None:
+def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -> None:
     manifest = json.loads(
         (
-            Path(__file__).parents[1]
-            / "configs/source_quarantine_manifest.json"
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
-    entry = next(
+    collection = next(
         item
-        for item in manifest["entries"]
+        for item in manifest["collections"]
         if item["project_id"] == "xemu-project/xemu"
     )
 
-    assert entry["size_bytes"] == 955
-    assert entry["sha256"] == (
-        "8734808c3859f30101cb1934bf7d71d153430dd85ae357d41c1641fc7a8addfe"
+    assert collection["relative_path_prefix"] == (
+        "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/"
+        "vectors/cryptography_vectors/x509/PKITS_data/certpairs/"
     )
-    assert entry["classification"] == "mislabeled_non_cpp"
-    assert entry["detected_format"] == "asn1_der_x509_certificate_pair"
+    assert collection["relative_path_suffix"] == ".cp"
+    assert collection["expected_file_count"] == 348
+    assert collection["content_set_sha256"] == (
+        "4d92e2254cef41f0a84525e6e30a1d6fcda5237d0b878522ed911cfa973c6ef7"
+    )
+    assert collection["classification"] == "mislabeled_non_cpp"
+    assert collection["detected_format"] == "asn1_der_x509_certificate_pair"
 
 
 def test_checked_in_threadx_generated_blob_manifest_matches_upstream_receipt() -> None:
     manifest = json.loads(
         (
-            Path(__file__).parents[1]
-            / "configs/source_quarantine_manifest.json"
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
     entry = next(
@@ -613,8 +758,7 @@ def test_checked_in_executable_archive_manifest_matches_archive_receipt(
 ) -> None:
     manifest = json.loads(
         (
-            Path(__file__).parents[1]
-            / "configs/source_quarantine_manifest.json"
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
     entry = next(
@@ -699,9 +843,9 @@ def test_process_project_writes_atomic_bound_receipt(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["schema"] == RECEIPT_SCHEMA
     assert receipt["project_id"] == PROJECT_ID
-    assert receipt["manifest_sha256"] == hashlib.sha256(
-        manifest.read_bytes()
-    ).hexdigest()
+    assert (
+        receipt["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    )
     assert receipt["quarantined_count"] == 1
     omission_receipt = receipt["external_reference_omissions"]
     assert omission_receipt["schema"] == "cppmega.external_reference_omissions_v1"
