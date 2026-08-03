@@ -673,9 +673,9 @@ def _promote_to_exhaustive_receipt(
     with sqlite3.connect(shard.inventory) as connection:
         last_run = connection.execute(
             """
-            SELECT created_at,repo_key,run_id,run_attempt
+            SELECT repo_key,created_at,run_id,run_attempt
             FROM runs
-            ORDER BY created_at,repo_key,run_id,run_attempt
+            ORDER BY repo_key,created_at,run_id,run_attempt
             """
         ).fetchall()
     _write_json(

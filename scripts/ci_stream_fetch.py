@@ -91,7 +91,7 @@ SCHEMA_VERSION = "cppmega_ci_stream_fetch_v4"
 PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v4"
 RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v3"
 EXHAUSTIVE_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v4"
-EXHAUSTIVE_DISCOVERY_SCHEMA = "cppmega_ci_stream_fetch_discovery_v1"
+EXHAUSTIVE_DISCOVERY_SCHEMA = "cppmega_ci_stream_fetch_discovery_v2"
 COMPLETION_MODE_THRESHOLD = "threshold"
 COMPLETION_MODE_INVENTORY_EXHAUSTIVE = "inventory-exhaustive"
 DEFAULT_TOKENIZER = str(
@@ -2215,7 +2215,7 @@ def exhaustive_discovery_sidecar_path(
     state_path: str | os.PathLike[str],
 ) -> Path:
     state = Path(state_path).expanduser().resolve()
-    return state.with_name(f"{state.name}.inventory-exhaustive.json")
+    return state.with_name(f"{state.name}.inventory-exhaustive-v2.json")
 
 
 def load_exhaustive_discovery_sidecar(
@@ -3668,7 +3668,7 @@ class FetchState:
                              typeof(metadata_blob) AS metadata_type,
                              length(metadata_blob) AS compressed_bytes
                       FROM runs
-                      ORDER BY created_at,repo_key,run_id,run_attempt
+                      ORDER BY repo_key,created_at,run_id,run_attempt
                       LIMIT ?
                     )
                     SELECT repo_key,run_id,run_attempt
@@ -3683,11 +3683,11 @@ class FetchState:
                     SELECT repo_key,run_id,run_attempt,created_at,
                            metadata_blob,metadata_sha256
                     FROM runs
-                    ORDER BY created_at,repo_key,run_id,run_attempt
+                    ORDER BY repo_key,created_at,run_id,run_attempt
                     LIMIT ?
                 """
             else:
-                created_at, repo_key, run_id, run_attempt = cursor
+                repo_key, created_at, run_id, run_attempt = cursor
                 oversized = inventory.execute(
                     """
                     WITH page AS (
@@ -3695,9 +3695,9 @@ class FetchState:
                              typeof(metadata_blob) AS metadata_type,
                              length(metadata_blob) AS compressed_bytes
                       FROM runs
-                      WHERE (created_at,repo_key,run_id,run_attempt)
+                      WHERE (repo_key,created_at,run_id,run_attempt)
                             > (?,?,?,?)
-                      ORDER BY created_at,repo_key,run_id,run_attempt
+                      ORDER BY repo_key,created_at,run_id,run_attempt
                       LIMIT ?
                     )
                     SELECT repo_key,run_id,run_attempt
@@ -3706,8 +3706,8 @@ class FetchState:
                     LIMIT 1
                     """,
                     (
-                        created_at,
                         repo_key,
+                        created_at,
                         run_id,
                         run_attempt,
                         row_limit,
@@ -3715,8 +3715,8 @@ class FetchState:
                     ),
                 ).fetchone()
                 page_parameters = (
-                    created_at,
                     repo_key,
+                    created_at,
                     run_id,
                     run_attempt,
                     row_limit,
@@ -3725,9 +3725,9 @@ class FetchState:
                     SELECT repo_key,run_id,run_attempt,created_at,
                            metadata_blob,metadata_sha256
                     FROM runs
-                    WHERE (created_at,repo_key,run_id,run_attempt)
+                    WHERE (repo_key,created_at,run_id,run_attempt)
                           > (?,?,?,?)
-                    ORDER BY created_at,repo_key,run_id,run_attempt
+                    ORDER BY repo_key,created_at,run_id,run_attempt
                     LIMIT ?
                 """
             if oversized is not None:
@@ -3898,8 +3898,8 @@ class FetchState:
         if rows:
             final_row = rows[-1]
             self._discovery_cursor = (
-                str(final_row["created_at"]),
                 str(final_row["repo_key"]),
+                str(final_row["created_at"]),
                 int(final_row["run_id"]),
                 int(final_row["run_attempt"]),
             )
@@ -4014,8 +4014,8 @@ class FetchState:
             if rows:
                 final_row = rows[-1]
                 next_sweep["cursor"] = [
-                    str(final_row["created_at"]),
                     str(final_row["repo_key"]),
+                    str(final_row["created_at"]),
                     int(final_row["run_id"]),
                     int(final_row["run_attempt"]),
                 ]
