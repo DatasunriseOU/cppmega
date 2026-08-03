@@ -3,9 +3,9 @@
   "batch_size": 192,
   "output_dir": "/Volumes/external/sources/cppmega.mlx/outputs/training_data_status",
   "source": {
-    "root": "/Volumes/external/cppmega_data/source_full501_73372dcc8fa9677e001d2d4e484f97d0eb1b51eb",
-    "completion_receipt": "/Volumes/external/cppmega_data/source_full501_73372dcc8fa9677e001d2d4e484f97d0eb1b51eb/conveyor/_done.json",
-    "launch_receipt": "/Volumes/external/cppmega_data/source_full501_73372dcc8fa9677e001d2d4e484f97d0eb1b51eb/launch_receipt.json"
+    "root": "/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5",
+    "completion_receipt": "/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/conveyor/_done.json",
+    "launch_receipt": "/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/launch_receipt.json"
   },
   "sealed_megatron": {
     "manifest": "/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/manifest.json"
