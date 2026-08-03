@@ -1308,10 +1308,14 @@ def _parity_worker_cp(
         for name, parameter in mixer.named_parameters():
             if parameter.grad is None:
                 raise RuntimeError(f"Mamba3 CP parameter gradient missing: {name}")
-            gradient = parameter.grad.detach().clone()
+            # Match Megatron DDP's BF16 training path: accumulate and reduce
+            # replicated parameter gradients in FP32.  Reducing the local
+            # BF16 partials directly introduces an extra collective-rounding
+            # step that production training does not have.
+            gradient = parameter.grad.detach().float()
             if cp_on:
                 dist.all_reduce(gradient, group=cp_group)
-            parameter_grads[name] = gradient.float().cpu()
+            parameter_grads[name] = gradient.cpu()
 
         if rank == 0:
             return_dict[(tag, "output")] = out_full.float().cpu()
