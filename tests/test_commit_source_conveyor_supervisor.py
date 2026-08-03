@@ -190,6 +190,7 @@ def test_commit_run_root_collision_and_nonzero_child_fail_closed(
 
 def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, argv = _input_fixture(tmp_path)
     base_args = source_supervisor.parse_args(argv)
@@ -208,6 +209,7 @@ def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
         attempt=1,
     )
     base_launch["status"] = "running"
+    base_launch["repository_root"] = str(repo)
     base_launch_path = base_root / "launch_receipt.json"
     source_supervisor._atomic_json(base_launch_path, base_launch)
     base_manifest = base_root / "conveyor" / "_done.json"
@@ -332,12 +334,34 @@ def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
         repair_base_code_run=repair_base["identity"],
     )
 
+    revalidated_run_roots: list[Path] = []
+    original_revalidate = source_supervisor.revalidate_recorded_inputs
+
+    def record_revalidation(
+        launch: dict[str, object],
+        *,
+        run_root: Path,
+        repo_root: Path,
+    ) -> tuple[dict[str, object], object]:
+        revalidated_run_roots.append(run_root)
+        return original_revalidate(
+            launch,
+            run_root=run_root,
+            repo_root=repo_root,
+        )
+
+    monkeypatch.setattr(
+        source_supervisor,
+        "revalidate_recorded_inputs",
+        record_revalidation,
+    )
     code_run = commit_supervisor.load_terminal_code_run(
         base_root,
         repair_run_roots=(repair_root,),
     )
     assert code_run["repositories"] == ("project",)
     assert len(code_run["identities"]) == 2
+    assert revalidated_run_roots == [base_root.resolve(), repair_root.resolve()]
 
     _source_list, store, pr_list, pr_completion = _pr_fixture(tmp_path / "pr")
     pr_inputs, _snapshot, _paths = commit_supervisor.validate_pr_inputs(

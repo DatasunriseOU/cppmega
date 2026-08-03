@@ -254,6 +254,19 @@ def load_terminal_code_run_chain(
     """Validate a failed full-code run plus targeted repairs as one final corpus."""
 
     base = source_supervisor.load_repair_base_code_run(code_run_root)
+    base_producer_root = Path(
+        _text(base["launch"].get("repository_root"), label="base repository root")
+    )
+    if base_producer_root.is_symlink():
+        raise RuntimeError(
+            f"base repository root must not be a symlink: {base_producer_root}"
+        )
+    base_producer_root = base_producer_root.resolve(strict=True)
+    source_supervisor.revalidate_recorded_inputs(
+        base["launch"],
+        run_root=base["root"],
+        repo_root=base_producer_root,
+    )
     expected_repositories = set(base["repositories"])
     base_failed = set(base["failed_repositories"])
     successful = set(base["successful_repositories"])
@@ -278,6 +291,23 @@ def load_terminal_code_run_chain(
         launch, launch_sha256 = source_supervisor._read_json_snapshot(
             launch_path,
             label=f"code repair {index} launch receipt",
+        )
+        producer_root = Path(
+            _text(
+                launch.get("repository_root"),
+                label=f"code repair {index} repository root",
+            )
+        )
+        if producer_root.is_symlink():
+            raise RuntimeError(
+                f"code repair {index} repository root must not be a symlink: "
+                f"{producer_root}"
+            )
+        producer_root = producer_root.resolve(strict=True)
+        live_inputs, validation_args = source_supervisor.revalidate_recorded_inputs(
+            launch,
+            run_root=root,
+            repo_root=producer_root,
         )
         (
             portable,
@@ -360,8 +390,8 @@ def load_terminal_code_run_chain(
             coverage = source_supervisor.verify_completion_receipt(
                 completion_path,
                 manifest_path=manifest_path,
-                args=argparse.Namespace(only_repo=sorted(selected)),
-                inputs=stored_inputs,
+                args=validation_args,
+                inputs=live_inputs,
             )
             if coverage["successful_repository_count"] != len(selected):
                 raise RuntimeError(f"code repair {index} completion coverage drifted")
@@ -412,6 +442,7 @@ def load_terminal_code_run_chain(
                 "manifest_path": manifest_path,
                 "launch": launch,
                 "inputs": stored_inputs,
+                "producer_root": producer_root,
                 "identity": identity,
             }
         )
@@ -425,19 +456,7 @@ def load_terminal_code_run_chain(
         )
 
     execution = repair_runs[-1]
-    producer_root = Path(
-        _text(execution["launch"].get("repository_root"), label="repair repository root")
-    )
-    if producer_root.is_symlink():
-        raise RuntimeError(
-            f"repair repository root must not be a symlink: {producer_root}"
-        )
-    producer_root = producer_root.resolve(strict=True)
-    source_supervisor.revalidate_recorded_inputs(
-        execution["launch"],
-        run_root=execution["root"],
-        repo_root=producer_root,
-    )
+    producer_root = execution["producer_root"]
 
     return {
         "root": base["root"],
