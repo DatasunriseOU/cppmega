@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -553,8 +554,8 @@ def scan_parquet_snapshot(
     allow_empty: bool = False,
 ) -> dict[str, object]:
     """Scan one stable physical Parquet inventory or fail loudly."""
-    last_error: RuntimeError | None = None
-    for _ in range(snapshot_retries + 1):
+    last_error: RuntimeError | OSError | pa.ArrowException | None = None
+    for attempt in range(snapshot_retries + 1):
         try:
             return _scan_parquet_snapshot_once(
                 root,
@@ -563,8 +564,10 @@ def scan_parquet_snapshot(
                 classify_documents=classify_documents,
                 allow_empty=allow_empty,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, OSError, pa.ArrowException) as exc:
             last_error = exc
+            if attempt < snapshot_retries:
+                time.sleep(0.1)
     assert last_error is not None
     raise last_error
 

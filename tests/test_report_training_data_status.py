@@ -6,9 +6,11 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from threading import Thread
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from scripts.report_training_data_status import (
     HEARTBEAT_SCHEMA,
@@ -308,6 +310,51 @@ def test_parquet_snapshot_ignores_atomic_staging_files(tmp_path: Path) -> None:
 
     assert result["files"] == 1
     assert result["valid_tokens"] == 15
+
+
+def test_parquet_snapshot_retries_atomic_publish_window(tmp_path: Path) -> None:
+    root = tmp_path / "packed"
+    target = root / "1024" / "one.parquet"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"partial")
+    replacement = tmp_path / "replacement" / "one.parquet"
+    _write_parquet(replacement)
+
+    def publish() -> None:
+        time.sleep(0.02)
+        os.replace(replacement, target)
+
+    publisher = Thread(target=publish)
+    publisher.start()
+    result = scan_parquet_snapshot(
+        root,
+        batch_size=192,
+        jobs=1,
+        classify_documents=True,
+    )
+    publisher.join(timeout=1)
+
+    assert not publisher.is_alive()
+    assert result["files"] == 1
+    assert result["valid_tokens"] == 15
+
+
+def test_parquet_snapshot_waits_between_failed_retries(tmp_path: Path) -> None:
+    target = tmp_path / "packed" / "1024" / "one.parquet"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"partial")
+
+    started = time.monotonic()
+    with pytest.raises(pa.ArrowException):
+        scan_parquet_snapshot(
+            tmp_path / "packed",
+            batch_size=192,
+            jobs=1,
+            classify_documents=True,
+            snapshot_retries=1,
+        )
+
+    assert time.monotonic() - started >= 0.09
 
 
 def test_live_source_progress_uses_archive_scope_not_mapping_superset(
