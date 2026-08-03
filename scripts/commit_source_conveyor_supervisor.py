@@ -301,6 +301,8 @@ def load_terminal_code_run_chain(
             code_root=base["code_output_root"],
             commit_root=base["commit_output_root"],
         )
+        if portable["exit"]["exit_code"] != 0:
+            raise RuntimeError(f"code repair {index} exit code is non-zero")
         selected = set(portable["selected_repositories"])
         if (
             portable["launch"]["sha256"] != launch_sha256

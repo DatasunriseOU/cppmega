@@ -800,6 +800,14 @@ def _load_run(
             _code_run_identity(value, where=f"{run_id} source code run {index}")
             for index, value in enumerate(raw_source_code_runs)
         ]
+    if "source_code_run" in launch:
+        source_code_run = _code_run_identity(
+            launch.get("source_code_run"), where=f"{run_id} source code run"
+        )
+        if source_code_runs is None:
+            source_code_runs = [source_code_run]
+        elif source_code_run != source_code_runs[0]:
+            raise ValueError(f"{run_id} source code run bindings drifted")
     command = launch.get("command")
     if not isinstance(command, list) or not command:
         raise ValueError(f"{run_id} launch command is missing")

@@ -553,11 +553,24 @@ def load_repair_base_code_run(code_run_root: Path) -> dict[str, Any]:
         path = Path(value).expanduser()
         if path.is_symlink():
             raise RuntimeError(f"repair base {name} must not be a symlink: {path}")
-        return path.resolve()
+        try:
+            return path.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"repair base {name} cannot be resolved: {path}"
+            ) from exc
 
     code_output_root = output_path("code_output_root")
     commit_output_root = output_path("commit_output_root")
     dedup_db = output_path("dedup_db")
+    for name, path in (
+        ("code_output_root", code_output_root),
+        ("commit_output_root", commit_output_root),
+    ):
+        if not path.is_dir():
+            raise RuntimeError(
+                f"repair base {name} is not a directory: {path}"
+            )
     if not dedup_db.is_file():
         raise RuntimeError(f"repair base dedup database is not a regular file: {dedup_db}")
     (

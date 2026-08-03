@@ -982,6 +982,83 @@ def test_source_composition_rejects_commit_missing_repair_identity(
         )
 
 
+def test_source_composition_rejects_drifted_singular_code_run_binding(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    commit = plan["runs"][2]
+    launch_path = Path(commit["launch_receipt"])
+    exit_path = Path(commit["exit_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["source_code_run"] = copy.deepcopy(launch["source_code_run"])
+    launch["source_code_run"]["manifest_sha256"] = "0" * 64
+    _write_json(launch_path, launch)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(ValueError, match="source code run bindings drifted"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_source_composition_accepts_singular_only_single_code_run_binding(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    base, _repair, commit = plan["runs"]
+
+    base_manifest_path = Path(base["manifest"])
+    base_exit_path = Path(base["exit_receipt"])
+    base_manifest = json.loads(base_manifest_path.read_text(encoding="utf-8"))
+    base_manifest["done"]["beta::code"] = {
+        "artifact_filename": "beta.parquet",
+        "lengths": _lengths(),
+    }
+    base_manifest["failed"] = {}
+    _write_json(base_manifest_path, base_manifest)
+    base_exit = json.loads(base_exit_path.read_text(encoding="utf-8"))
+    base_exit["status"] = "success"
+    base_exit["exit_code"] = 0
+    base_exit["done_manifest"]["sha256"] = _sha256(base_manifest_path)
+    _write_json(base_exit_path, base_exit)
+
+    base_identity = {
+        "launch_sha256": _sha256(Path(base["launch_receipt"])),
+        "exit_sha256": _sha256(base_exit_path),
+        "manifest_sha256": _sha256(base_manifest_path),
+    }
+    commit_launch_path = Path(commit["launch_receipt"])
+    commit_exit_path = Path(commit["exit_receipt"])
+    commit_launch = json.loads(commit_launch_path.read_text(encoding="utf-8"))
+    commit_launch["source_code_run"] = base_identity
+    del commit_launch["source_code_runs"]
+    _write_json(commit_launch_path, commit_launch)
+    commit_exit = json.loads(commit_exit_path.read_text(encoding="utf-8"))
+    commit_exit["launch_receipt_sha256"] = _sha256(commit_launch_path)
+    _write_json(commit_exit_path, commit_exit)
+    plan["runs"] = [base, commit]
+    _write_json(plan_path, plan)
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+
+    assert [run["run_id"] for run in composition.receipt["runs"]] == [
+        "base-code",
+        "full-commits",
+    ]
+
+
 def test_source_composition_rejects_weakened_near_dedup_receipt(
     tmp_path: Path,
 ) -> None:

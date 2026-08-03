@@ -306,6 +306,17 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
     assert exit_receipt["selected_repositories"] == ["project"]
     assert exit_receipt["repair_base_code_run"] == repair_base["identity"]
 
+    for name in ("reindexed", "reindexed-commits"):
+        output_root = base_root / name
+        output_root.rmdir()
+        with pytest.raises(RuntimeError, match="cannot be resolved"):
+            supervisor.load_repair_base_code_run(base_root)
+        output_root.write_text("not a directory", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="is not a directory"):
+            supervisor.load_repair_base_code_run(base_root)
+        output_root.unlink()
+        output_root.mkdir()
+
 
 def test_supervisor_rejects_inventory_that_does_not_bind_sha_receipt(
     tmp_path: Path,

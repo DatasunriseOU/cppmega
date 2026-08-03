@@ -406,7 +406,7 @@ def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
         selected_repositories=["project"],
         repair_base_code_run=repair_base["identity"],
     )
-    with pytest.raises(RuntimeError, match="final code-success coverage is incomplete"):
+    with pytest.raises(RuntimeError, match="code repair 1 exit code is non-zero"):
         commit_supervisor.load_terminal_code_run(
             base_root,
             repair_run_roots=(repair_root,),
