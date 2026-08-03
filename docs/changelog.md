@@ -1,5 +1,13 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-08-03: training status survives a missing live CI receipt
+
+The training-data watcher now reports a configured but missing CI progress
+receipt as an explicit blocker instead of crashing before publishing the
+ledger. Missing live receipts contribute zero tokens; the receipt-bound frozen
+CASE5 snapshot remains visible separately and cannot become training-readable
+until its atomic export completes.
+
 ## 2026-08-02: two-pool data and Nebius generation fail closed
 
 The bundle builder and publisher now accept the receipt-bound

@@ -19,6 +19,7 @@ from scripts.report_training_data_status import (
     _without_volatile,
     build_status,
     check_heartbeat,
+    collect_ci_status,
     collect_live_source,
     collect_freshness,
     publish_status,
@@ -593,6 +594,32 @@ def test_collect_freshness_treats_missing_input_as_stale(
 
     assert result["stale"] == ["source_completion_receipt"]
     assert result["upstreams"]["source_completion_receipt"]["missing"] is True
+
+
+def test_collect_ci_status_reports_missing_progress_receipt(
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "legacy"
+    _write_parquet(legacy / "1024" / "part.parquet")
+    (legacy / "manifest.json").write_text(
+        json.dumps({"source_completion": {}, "domain_kind_counts": {}}),
+        encoding="utf-8",
+    )
+    missing = tmp_path / "missing-progress.json"
+
+    result = collect_ci_status(
+        {
+            "progress_receipts": [str(missing)],
+            "legacy_parquet_root": str(legacy),
+            "batch_size": 192,
+            "jobs": 1,
+        }
+    )
+
+    assert result["stores"] == []
+    assert result["missing_progress_receipts"] == [str(missing)]
+    assert "configured CI progress receipt is missing" in result["blockers"]
+    assert result["token_accounting"]["store_local_unique_upper_bound"] == 0
 
 
 def test_freshness_block_is_excluded_from_status_hash() -> None:

@@ -1314,10 +1314,15 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
     )
     progress_paths = [Path(str(value)) for value in config["progress_receipts"]]
     stores = []
+    missing_progress_receipts = []
     store_unique_upper_bound = 0
     occurrence_tokens = 0
     for path in progress_paths:
-        progress = _read_json(path)
+        try:
+            progress = _read_json(path)
+        except FileNotFoundError:
+            missing_progress_receipts.append(str(path))
+            continue
         _require_keys(
             progress,
             (
@@ -1410,6 +1415,8 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
         "inventory fetch is not exhaustive",
         "cross-store canonical union/global dedup has not run",
     ]
+    if missing_progress_receipts:
+        blockers.append("configured CI progress receipt is missing")
     blockers.append(
         (
             "frozen threshold CASE5 export is non-production and live stores "
@@ -1428,6 +1435,7 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
         "release_ready": False,
         "blockers": blockers,
         "stores": stores,
+        "missing_progress_receipts": missing_progress_receipts,
         "frozen_case5_snapshot": frozen,
         "token_accounting": {
             "store_local_unique_upper_bound": store_unique_upper_bound,
