@@ -4,8 +4,9 @@
 The exporter is deliberately fail closed:
 
 * a fully verified content-store completion receipt is mandatory;
-* SQLite is opened read-only with ``immutable=1`` and every logical/pack digest
-  is compared with that receipt;
+* SQLite is opened read-only with ``immutable=1`` and either every logical/pack
+  digest is recomputed or an exhaustive merge receipt must hash the exact files
+  after their receipt-bound full verification;
 * a second immutable fetch-state snapshot must bind exact run metadata and the
   canonical parser sidecar for every occurrence;
 * nested ZIP members with high invalid-UTF-8 ratios are conserved in an
@@ -39,6 +40,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -197,6 +199,8 @@ BUCKETS = (1024, 2048, 4096, 8192, 16384)
 PARQUET_SHARD_ROWS = 512
 PARQUET_SHARD_TOKEN_BUDGET = 16_384
 PARQUET_ZSTD_LEVEL = 9
+PROGRESS_ROW_INTERVAL = 100_000
+PROGRESS_HEARTBEAT_SECONDS = 60.0
 SPLIT_CONTRACT = {
     "schema": "cppmega_ci_token_sequence_split_v1",
     "hash": "token_sequence_sha256",
@@ -440,12 +444,75 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
+def _progress(
+    phase: str,
+    status: str,
+    completed: int | None = None,
+    total: int | None = None,
+) -> None:
+    event: dict[str, object] = {"phase": phase, "status": status}
+    if completed is not None:
+        event["completed"] = completed
+    if total is not None:
+        event["total"] = total
+    print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True)
+
+
+def _row_progress(phase: str, completed: int, total: int) -> None:
+    if completed % PROGRESS_ROW_INTERVAL == 0 or completed == total:
+        _progress(
+            phase,
+            "running" if completed != total else "complete",
+            completed,
+            total,
+        )
+
+
+def _sha256_file(path: Path, *, progress_phase: str | None = None) -> str:
     digest = hashlib.sha256()
+    completed = 0
+    total = path.stat().st_size
+    next_heartbeat = time.monotonic() + PROGRESS_HEARTBEAT_SECONDS
     with path.open("rb") as handle:
         while block := handle.read(1024 * 1024):
             digest.update(block)
+            completed += len(block)
+            if progress_phase is not None and time.monotonic() >= next_heartbeat:
+                _progress(
+                    progress_phase,
+                    "running",
+                    completed,
+                    total,
+                )
+                next_heartbeat = time.monotonic() + PROGRESS_HEARTBEAT_SECONDS
     return digest.hexdigest()
+
+
+def _sqlite_integrity_check(
+    connection: sqlite3.Connection,
+    *,
+    phase: str,
+) -> list[str]:
+    next_heartbeat = time.monotonic() + PROGRESS_HEARTBEAT_SECONDS
+
+    def heartbeat() -> int:
+        nonlocal next_heartbeat
+        if time.monotonic() >= next_heartbeat:
+            _progress(phase, "running")
+            next_heartbeat = time.monotonic() + PROGRESS_HEARTBEAT_SECONDS
+        return 0
+
+    _progress(phase, "started")
+    connection.set_progress_handler(heartbeat, 1_000_000)
+    try:
+        result = [
+            str(row[0])
+            for row in connection.execute("PRAGMA integrity_check").fetchall()
+        ]
+    finally:
+        connection.set_progress_handler(None, 0)
+    _progress(phase, "complete")
+    return result
 
 
 def _require_mapping(value: object, *, where: str) -> Mapping[str, Any]:
@@ -538,6 +605,72 @@ def _load_receipt(path: Path) -> tuple[dict[str, Any], str]:
     return value, digest
 
 
+def _merge_bound_store_artifacts(
+    *,
+    artifacts: Mapping[str, Mapping[str, Any]],
+    store_root: Path,
+    store_receipt: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]] | None:
+    """Return exact store files only when merge v3 binds the full store set."""
+
+    prefix = f"{store_root.name}/"
+    bound = {
+        path.removeprefix(prefix): {
+            "byte_size": _require_int(
+                artifact.get("byte_size"),
+                where=f"merge artifact {path}.byte_size",
+                minimum=0,
+            ),
+            "sha256": _require_hex64(
+                artifact.get("sha256"), where=f"merge artifact {path}.sha256"
+            ),
+        }
+        for path, artifact in artifacts.items()
+        if path.startswith(prefix)
+    }
+    expected_packs: dict[str, Mapping[str, Any]] = {}
+    for index, raw_pack in enumerate(
+        _require_list(
+            store_receipt.get("pack_hashes"),
+            where="store receipt pack_hashes",
+        )
+    ):
+        pack = _require_mapping(
+            raw_pack,
+            where=f"store receipt pack_hashes[{index}]",
+        )
+        filename = _require_nonempty_string(
+            pack.get("filename"),
+            where=f"store receipt pack_hashes[{index}].filename",
+        )
+        if _PACK_RE.fullmatch(filename) is None or filename in expected_packs:
+            raise ExportError(f"store receipt has an unsafe/duplicate pack: {filename}")
+        expected_packs[filename] = pack
+
+    required = {_SQLITE_NAME, *expected_packs}
+    if not required.issubset(bound):
+        return None
+    for filename, pack in expected_packs.items():
+        artifact = bound[filename]
+        if (
+            artifact.get("byte_size")
+            != _require_int(
+                pack.get("committed_end"),
+                where=f"store receipt {filename}.committed_end",
+                minimum=len(_PACK_MAGIC),
+            )
+            or artifact.get("sha256")
+            != _require_hex64(
+                pack.get("sha256"),
+                where=f"store receipt {filename}.sha256",
+            )
+        ):
+            raise ExportError(
+                f"merge receipt pack artifact differs from store receipt: {filename}"
+            )
+    return bound
+
+
 def _verify_exhaustive_export_provenance(
     *,
     store_root: Path,
@@ -601,7 +734,11 @@ def _verify_exhaustive_export_provenance(
     if (
         state_artifact.get("path") != str(fetch_state_path)
         or state_artifact.get("byte_size") != fetch_state_path.stat().st_size
-        or state_artifact.get("sha256") != _sha256_file(fetch_state_path)
+        or state_artifact.get("sha256")
+        != _sha256_file(
+            fetch_state_path,
+            progress_phase="production-fetch-state-sha256",
+        )
     ):
         raise ExportError(
             "frozen fetch-state bytes/path differ from the v4 receipt"
@@ -732,11 +869,20 @@ def _verify_exhaustive_export_provenance(
         if (
             artifact is None
             or artifact.get("byte_size") != actual_path.stat().st_size
-            or artifact.get("sha256") != _sha256_file(actual_path)
+            or artifact.get("sha256")
+            != _sha256_file(
+                actual_path,
+                progress_phase=f"production-artifact-sha256:{relative}",
+            )
         ):
             raise ExportError(
                 f"merge receipt artifact binding differs for {relative}"
             )
+    bound_store_artifacts = _merge_bound_store_artifacts(
+        artifacts=artifacts,
+        store_root=store_root,
+        store_receipt=store_receipt,
+    )
     return {
         "completion_mode": COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
         "production_complete": True,
@@ -759,6 +905,13 @@ def _verify_exhaustive_export_provenance(
             "path": str(store_root),
             "receipt_path": str(store_receipt_path),
             "receipt_sha256": store_receipt_sha256,
+            "prior_full_verification": store_receipt["verification"],
+            "verification_mode": (
+                "merge-receipt-artifact-fast-path"
+                if bound_store_artifacts is not None
+                else "full-exporter-verification"
+            ),
+            "merge_bound_artifacts": bound_store_artifacts or {},
         },
         "merge": {
             "receipt_path": str(merge_receipt_path),
@@ -1072,12 +1225,49 @@ def _open_immutable_sqlite(
 class FrozenStore:
     """Receipt-bound, immutable/read-only view of a CI content store."""
 
-    def __init__(self, root: Path, receipt_path: Path):
+    def __init__(
+        self,
+        root: Path,
+        receipt_path: Path,
+        *,
+        merge_bound_artifacts: Mapping[str, Mapping[str, object]] | None = None,
+        merge_bound_receipt_sha256: str | None = None,
+    ):
         self.root = root.resolve()
         if root.is_symlink() or not self.root.is_dir():
             raise ExportError(f"content store is missing or unsafe: {root}")
         self.receipt_path = receipt_path.expanduser()
         self.receipt, self.receipt_sha256 = _load_receipt(self.receipt_path)
+        if merge_bound_receipt_sha256 != (
+            self.receipt_sha256 if merge_bound_artifacts is not None else None
+        ):
+            raise ExportError(
+                "merge-bound store receipt SHA-256 differs from supplied receipt"
+            )
+        self._merge_bound_artifacts: dict[str, tuple[int, str]] | None = None
+        if merge_bound_artifacts is not None:
+            self._merge_bound_artifacts = {}
+            for relative, raw_artifact in merge_bound_artifacts.items():
+                artifact = _require_mapping(
+                    raw_artifact,
+                    where=f"merge-bound store artifact {relative!r}",
+                )
+                self._merge_bound_artifacts[str(relative)] = (
+                    _require_int(
+                        artifact.get("byte_size"),
+                        where=f"merge-bound store artifact {relative!r}.byte_size",
+                        minimum=0,
+                    ),
+                    _require_hex64(
+                        artifact.get("sha256"),
+                        where=f"merge-bound store artifact {relative!r}.sha256",
+                    ),
+                )
+        self.verification_mode = (
+            "merge-receipt-artifact-fast-path"
+            if self._merge_bound_artifacts is not None
+            else "full-exporter-verification"
+        )
         self.db_path = self.root / _SQLITE_NAME
         if self.db_path.is_symlink() or not self.db_path.is_file():
             raise ExportError(
@@ -1112,8 +1302,17 @@ class FrozenStore:
                 raise ExportError(
                     "store SQLite index differs from the immutable connection"
                 )
-            self.verify()
-            after = self.snapshot_files(reuse_verified=True)
+            _progress(
+                "store-verification",
+                f"started:{self.verification_mode}",
+            )
+            if self._merge_bound_artifacts is None:
+                self.verify()
+                after = self.snapshot_files(reuse_verified=True)
+            else:
+                # Merge v3 hashes these exact bytes only after the bound store
+                # receipt records a successful full verification.
+                after = self._verify_merge_bound_snapshot()
             before_metadata = [
                 (item.relative_path, item.size, item.mtime_ns, item.inode)
                 for item in before
@@ -1125,6 +1324,12 @@ class FrozenStore:
             if before_metadata != after_metadata:
                 raise ExportError("content store changed during initial verification")
             self._initial_snapshot = after
+            _progress(
+                "store-verification",
+                f"complete:{self.verification_mode}",
+                len(after),
+                len(after),
+            )
         except BaseException:
             self._close_pack_fds()
             self.connection.close()
@@ -1176,6 +1381,25 @@ class FrozenStore:
             result[filename] = record
         return result
 
+    def _verify_merge_bound_snapshot(
+        self,
+    ) -> tuple[SnapshotFile, ...]:
+        assert self._merge_bound_artifacts is not None
+        snapshots = self.snapshot_files()
+        actual = {
+            item.relative_path: (item.size, item.sha256)
+            for item in snapshots
+        }
+        if actual != self._merge_bound_artifacts:
+            raise ExportError("content store differs from merge receipt artifacts")
+        self._verified_snapshots = {
+            item.relative_path: item for item in snapshots
+        }
+        for filename in self._pack_receipt_by_name():
+            pack_id = int(filename.removeprefix("pack-").removesuffix(".cicp"))
+            self.pack_paths[pack_id] = self.root / filename
+        return snapshots
+
     def _verify_packs(self) -> None:
         receipt_by_name = self._pack_receipt_by_name()
         rows = self.connection.execute(
@@ -1208,7 +1432,10 @@ class FrozenStore:
             if stat_before.st_size != committed_end:
                 raise ExportError(f"{filename} size differs from committed_end")
             expected = receipt_by_name[filename]
-            pack_sha256 = _sha256_file(path)
+            pack_sha256 = _sha256_file(
+                path,
+                progress_phase="store-pack-sha256",
+            )
             stat_after = path.stat()
             if (
                 stat_before.st_size,
@@ -1365,10 +1592,10 @@ class FrozenStore:
             raise ExportError("content token metadata disagrees with token_sequences")
 
     def verify(self) -> None:
-        integrity = [
-            str(row[0])
-            for row in self.connection.execute("PRAGMA integrity_check").fetchall()
-        ]
+        integrity = _sqlite_integrity_check(
+            self.connection,
+            phase="store-sqlite-integrity-check",
+        )
         if integrity != ["ok"]:
             raise ExportError(f"SQLite integrity_check failed: {integrity}")
         if self.connection.execute("PRAGMA foreign_key_check").fetchall():
@@ -1435,19 +1662,33 @@ class FrozenStore:
                 )
                 == (stat.st_size, stat.st_mtime_ns, stat.st_ino)
             )
+            sha256 = ""
+            if include_hashes:
+                sha256 = (
+                    verified.sha256
+                    if can_reuse
+                    else _sha256_file(
+                        path,
+                        progress_phase="store-snapshot-sha256",
+                    )
+                )
+                if not can_reuse:
+                    after = path.stat()
+                    if (
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ino,
+                    ) != (stat.st_size, stat.st_mtime_ns, stat.st_ino):
+                        raise ExportError(
+                            f"content-store artifact changed while hashed: {path}"
+                        )
             records.append(
                 SnapshotFile(
                     relative_path=relative_path,
                     size=stat.st_size,
                     mtime_ns=stat.st_mtime_ns,
                     inode=stat.st_ino,
-                    sha256=(
-                        ""
-                        if not include_hashes
-                        else verified.sha256
-                        if can_reuse
-                        else _sha256_file(path)
-                    ),
+                    sha256=sha256,
                 )
             )
         return tuple(records)
@@ -1863,7 +2104,10 @@ class FrozenFetchState:
                 raise ExportError(
                     "fetch-state SQLite differs from the immutable connection"
                 )
-            sha256 = _sha256_file(self.path)
+            sha256 = _sha256_file(
+                self.path,
+                progress_phase="fetch-state-sha256",
+            )
             stat_after = self.path.stat()
             final_identity = (
                 stat_after.st_size,
@@ -1889,10 +2133,10 @@ class FrozenFetchState:
         self.connection.close()
 
     def verify(self) -> None:
-        integrity = [
-            str(row[0])
-            for row in self.connection.execute("PRAGMA integrity_check").fetchall()
-        ]
+        integrity = _sqlite_integrity_check(
+            self.connection,
+            phase="fetch-state-sqlite-integrity-check",
+        )
         if integrity != ["ok"]:
             raise ExportError(f"fetch-state integrity_check failed: {integrity}")
         if self.connection.execute("PRAGMA foreign_key_check").fetchall():
@@ -4758,6 +5002,8 @@ def export_store(
         )
     production_provenance: dict[str, object] | None = None
     production_paths: tuple[Path, Path, Path, Path] | None = None
+    merge_bound_store_artifacts: Mapping[str, Any] | None = None
+    merge_bound_store_receipt_sha256: str | None = None
     if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
         if (
             inventory is None
@@ -4799,6 +5045,22 @@ def export_store(
             fetch_receipt_path=production_paths[2],
             merge_receipt_path=production_paths[3],
         )
+        store_provenance = _require_mapping(
+            production_provenance.get("store"),
+            where="production provenance store",
+        )
+        if (
+            store_provenance.get("verification_mode")
+            == "merge-receipt-artifact-fast-path"
+        ):
+            merge_bound_store_artifacts = _require_mapping(
+                store_provenance.get("merge_bound_artifacts"),
+                where="production store merge_bound_artifacts",
+            )
+            merge_bound_store_receipt_sha256 = _require_hex64(
+                store_provenance.get("receipt_sha256"),
+                where="production store receipt_sha256",
+            )
     if output_path.exists():
         raise ExportError(f"output already exists: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4828,6 +5090,10 @@ def export_store(
             FrozenStore(
                 resolved_store_root,
                 resolved_store_receipt,
+                merge_bound_artifacts=merge_bound_store_artifacts,
+                merge_bound_receipt_sha256=(
+                    merge_bound_store_receipt_sha256
+                ),
             ) as store,
             FrozenFetchState(
                 resolved_fetch_state,
@@ -5029,6 +5295,7 @@ def export_store(
             scope_policy = training_scope_policy()
             prevalidated_occurrence_count = 0
             excluded_opaque_occurrence_payload_tokens = 0
+            _progress("occurrence-prevalidation", "started")
             eligibility_connection.execute("BEGIN")
             for occurrence in store.iter_occurrences():
                 member = frozen_fetch_state.validate_occurrence(occurrence)
@@ -5140,6 +5407,11 @@ def export_store(
                         "CAS contains duplicate fetch-member chunk coverage"
                     ) from exc
                 prevalidated_occurrence_count += 1
+                _row_progress(
+                    "occurrence-prevalidation",
+                    prevalidated_occurrence_count,
+                    expected_occurrence_count,
+                )
                 if not member.opaque:
                     continue
                 if member.exclusion_reason is None:
@@ -5252,6 +5524,7 @@ def export_store(
             training_scope_occurrence_counts: Counter[str] = Counter()
             training_scope_token_counts: Counter[str] = Counter()
             excluded_training_scope_occurrence_payload_tokens = 0
+            _progress("occurrence-routing", "started")
             scope_rows = iter(
                 eligibility_connection.execute(
                     """
@@ -5350,6 +5623,11 @@ def export_store(
                         scope_decision=scope_decision,
                         source_binding_projector=source_binding_projector,
                     )
+                )
+                _row_progress(
+                    "occurrence-routing",
+                    occurrence_metadata_writer.count,
+                    expected_occurrence_count,
                 )
                 if member.opaque:
                     route_status = "excluded_opaque"
@@ -5519,8 +5797,14 @@ def export_store(
                 )
                 expected_payload += current_sequence_token_count
 
+            _progress("representative-selection", "started")
             for content in store.iter_contents(by_token_sequence=True):
                 content_count += 1
+                _row_progress(
+                    "representative-selection",
+                    content_count,
+                    expected_content_count,
+                )
                 if content.tokenizer_fingerprint != tokenizer.fingerprint:
                     raise ExportError(
                         f"content {content.sha256} tokenizer fingerprint mismatch"
@@ -5696,6 +5980,7 @@ def export_store(
             graph_by_family: Counter[str] = Counter()
             source_doc_index = 0
 
+            _progress("case5-materialization", "started")
             for ledger_record, _encoded in iter_canonical_parquet_ledger(
                 ledger_path,
                 expected_domain=(
@@ -5959,6 +6244,11 @@ def export_store(
                 if emitted_for_sequence != representative_content.token_count:
                     raise ExportError("fragmentation did not conserve payload tokens")
                 count_totals["representatives"] += 1
+                _row_progress(
+                    "case5-materialization",
+                    count_totals["representatives"],
+                    representative_count,
+                )
 
                 training = _require_mapping(
                     chunk["training_sidecars"], where="training sidecars"
