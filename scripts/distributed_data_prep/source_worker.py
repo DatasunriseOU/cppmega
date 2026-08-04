@@ -16,14 +16,16 @@ import hashlib
 import heapq
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
     _ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +67,245 @@ _SORT_FIELDS = (
     "commit_hash",
     "file_local_commit_index",
 )
+_TRANSPORT_MAX_RETRIES = 4
+_TRANSPORT_RETRY_BASE_SECONDS = 1.0
+_TRANSPORT_RETRY_MAX_SECONDS = 16.0
+_TRANSIENT_CURL_RETURN_CODES = frozenset({5, 6, 7, 18, 28, 35, 47, 52, 55, 56, 92})
+_GIT_HTTP_STATUS_RE = re.compile(
+    r"(?:\bHTTP(?:/[0-9.]+)?(?:\s+error)?\s*|\breturned error:\s*)([1-5][0-9]{2})",
+    re.IGNORECASE,
+)
+_GIT_CURL_TRANSPORT_RE = re.compile(
+    r"\bcurl\s+(5|6|7|18|28|35|47|52|55|56|92)\b", re.IGNORECASE
+)
+_TRANSIENT_GIT_MARKERS = (
+    "connection reset",
+    "connection timed out",
+    "could not resolve host",
+    "early eof",
+    "empty reply from server",
+    "internal server error",
+    "network is unreachable",
+    "operation timed out",
+    "remote end hung up",
+    "server closed the connection",
+    "temporary failure",
+    "tls connection was non-properly terminated",
+    "unexpected disconnect",
+)
+_TRANSIENT_GCLOUD_MARKERS = _TRANSIENT_GIT_MARKERS + (
+    "deadline exceeded",
+    "resource exhausted",
+    "service unavailable",
+    "unavailable",
+)
+_NONRETRYABLE_GIT_MARKERS = (
+    "authentication failed",
+    "could not read username",
+    "destination path",
+    "not found",
+    "permission denied",
+    "repository not found",
+)
+
+
+class TransientTransportError(RuntimeError):
+    """A bounded transport retry budget was exhausted and may resume later."""
+
+
+class _GcsRequestError(RuntimeError):
+    """One GCS REST request failed with an observed status and response body."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        uri: str,
+        attempt: int,
+        returncode: int,
+        status: int | None,
+        detail: str,
+        transient: bool,
+    ) -> None:
+        self.status = status
+        self.transient = transient
+        status_text = "unknown" if status is None else str(status)
+        super().__init__(
+            f"GCS {operation} failed for {uri} on attempt {attempt}: "
+            f"curl_exit={returncode} http={status_text}: {detail[-4000:]}"
+        )
+
+
+def _retry_delay_seconds(
+    retry_index: int,
+    *,
+    base_seconds: float = _TRANSPORT_RETRY_BASE_SECONDS,
+    maximum_seconds: float = _TRANSPORT_RETRY_MAX_SECONDS,
+) -> float:
+    """Return a deterministic, bounded exponential transport retry delay."""
+
+    if isinstance(retry_index, bool) or retry_index < 0:
+        raise ValueError("retry_index must be a non-negative integer")
+    if base_seconds <= 0 or maximum_seconds < base_seconds:
+        raise ValueError("invalid transport retry delay bounds")
+    return min(base_seconds * (2**retry_index), maximum_seconds)
+
+
+def _validate_retry_settings(
+    *, max_retries: int, retry_base_seconds: float, retry_max_seconds: float
+) -> None:
+    if isinstance(max_retries, bool) or max_retries < 0:
+        raise ValueError("max_retries must be a non-negative integer")
+    _retry_delay_seconds(
+        0,
+        base_seconds=retry_base_seconds,
+        maximum_seconds=retry_max_seconds,
+    )
+
+
+def _is_transient_http_status(status: int | None) -> bool:
+    return status in {408, 429} or (status is not None and 500 <= status <= 599)
+
+
+def _parse_curl_status(value: str) -> int | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"[0-9]{3}", raw) is None:
+        raise ContractError(f"curl returned an invalid HTTP status: {raw!r}")
+    return int(raw)
+
+
+def _is_transient_curl_failure(*, returncode: int, status: int | None) -> bool:
+    if status in {401, 403, 404, 409, 412}:
+        return False
+    if _is_transient_http_status(status):
+        return True
+    return returncode in _TRANSIENT_CURL_RETURN_CODES
+
+
+def _is_transient_git_failure(
+    *, returncode: int, stdout: str | None, stderr: str | None
+) -> bool:
+    """Classify only known retryable Git transport failures as transient."""
+
+    if returncode == 0:
+        return False
+    detail = f"{stdout or ''}\n{stderr or ''}".lower()
+    if any(marker in detail for marker in _NONRETRYABLE_GIT_MARKERS):
+        return False
+    statuses = [int(value) for value in _GIT_HTTP_STATUS_RE.findall(detail)]
+    if any(status in {401, 403, 404, 409, 412} for status in statuses):
+        return False
+    if any(_is_transient_http_status(status) for status in statuses):
+        return True
+    if _GIT_CURL_TRANSPORT_RE.search(detail):
+        return True
+    return any(marker in detail for marker in _TRANSIENT_GIT_MARKERS)
+
+
+def _is_transient_gcloud_failure(
+    *, returncode: int, stdout: str | None, stderr: str | None
+) -> bool:
+    if returncode == 0:
+        return False
+    detail = f"{stdout or ''}\n{stderr or ''}".lower()
+    if any(marker in detail for marker in _NONRETRYABLE_GIT_MARKERS):
+        return False
+    statuses = [int(value) for value in _GIT_HTTP_STATUS_RE.findall(detail)]
+    if any(status in {401, 403, 404, 409, 412} for status in statuses):
+        return False
+    if any(_is_transient_http_status(status) for status in statuses):
+        return True
+    return any(marker in detail for marker in _TRANSIENT_GCLOUD_MARKERS)
+
+
+def _run_git_network_command(
+    command: Sequence[str | os.PathLike[str]],
+    *,
+    operation: str,
+    before_attempt: Callable[[int], None] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sleeper: Callable[[float], None] = time.sleep,
+    max_retries: int = _TRANSPORT_MAX_RETRIES,
+    retry_base_seconds: float = _TRANSPORT_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = _TRANSPORT_RETRY_MAX_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Run a Git clone/fetch command with bounded retry for transport failures."""
+
+    _validate_retry_settings(
+        max_retries=max_retries,
+        retry_base_seconds=retry_base_seconds,
+        retry_max_seconds=retry_max_seconds,
+    )
+    argv = [str(item) for item in command]
+    environment = dict(os.environ)
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    for attempt in range(max_retries + 1):
+        if before_attempt is not None:
+            before_attempt(attempt)
+        completed = runner(
+            argv,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return completed
+        transient = _is_transient_git_failure(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+        if not transient or attempt == max_retries:
+            exception = TransientTransportError if transient else RuntimeError
+            raise exception(
+                f"Git {operation} failed after {attempt + 1} attempt(s): {argv!r}\n"
+                f"stdout:\n{(completed.stdout or '')[-8000:]}\n"
+                f"stderr:\n{(completed.stderr or '')[-8000:]}"
+            )
+        delay = _retry_delay_seconds(
+            attempt,
+            base_seconds=retry_base_seconds,
+            maximum_seconds=retry_max_seconds,
+        )
+        print(
+            f"Git {operation} transient failure; retrying in {delay:.1f}s "
+            f"({attempt + 1}/{max_retries})",
+            file=sys.stderr,
+            flush=True,
+        )
+        sleeper(delay)
+
+
+def _remove_partial_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _tail_response(path: Path, fallback: str) -> str:
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 4000))
+            payload = stream.read()
+    except OSError:
+        return fallback[-4000:]
+    text = payload.decode("utf-8", errors="replace").strip()
+    return text[-4000:] if text else fallback[-4000:]
+
+
+def _requested_generation(value: str | None, *, where: str) -> str | None:
+    if value is None:
+        return None
+    generation = str(value)
+    if not generation.isdecimal() or int(generation) < 1:
+        raise ContractError(f"{where} must be a positive GCS generation")
+    return generation
 
 
 class ObjectStore(Protocol):
@@ -82,45 +323,226 @@ class ObjectStore(Protocol):
 class GcloudObjectStore:
     """Generation-aware GCS transport without adding a Python dependency."""
 
-    def __init__(self, executable: str = "gcloud") -> None:
+    def __init__(
+        self,
+        executable: str = "gcloud",
+        *,
+        curl_executable: str = "curl",
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        sleeper: Callable[[float], None] = time.sleep,
+        max_retries: int = _TRANSPORT_MAX_RETRIES,
+        retry_base_seconds: float = _TRANSPORT_RETRY_BASE_SECONDS,
+        retry_max_seconds: float = _TRANSPORT_RETRY_MAX_SECONDS,
+    ) -> None:
         self.executable = executable
-
-    def describe(
-        self, uri: str, *, generation: str | None = None
-    ) -> dict[str, object]:
-        validate_gcs_uri(uri, where="GCS object")
-        target = f"{uri}#{generation}" if generation is not None else uri
-        completed = run_checked(
-            [
-                self.executable,
-                "storage",
-                "objects",
-                "describe",
-                target,
-                "--format=json",
-            ]
+        self.curl_executable = curl_executable
+        self.runner = runner
+        self.sleeper = sleeper
+        self.max_retries = max_retries
+        self.retry_base_seconds = retry_base_seconds
+        self.retry_max_seconds = retry_max_seconds
+        _validate_retry_settings(
+            max_retries=max_retries,
+            retry_base_seconds=retry_base_seconds,
+            retry_max_seconds=retry_max_seconds,
         )
+
+    def _access_token(self) -> str:
+        command = [self.executable, "auth", "print-access-token"]
+        for attempt in range(self.max_retries + 1):
+            completed = self.runner(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0:
+                token = (completed.stdout or "").strip()
+                if not token or any(character.isspace() for character in token):
+                    raise ContractError("gcloud returned an invalid access token")
+                return token
+            transient = _is_transient_gcloud_failure(
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+            detail = (
+                f"stdout:\n{(completed.stdout or '')[-4000:]}\n"
+                f"stderr:\n{(completed.stderr or '')[-4000:]}"
+            )
+            if not transient:
+                raise RuntimeError(
+                    f"gcloud access-token command failed after {attempt + 1} attempt(s): "
+                    f"{detail}"
+                )
+            if attempt >= self.max_retries:
+                raise TransientTransportError(
+                    "gcloud access-token command exhausted its transport retry budget: "
+                    f"{detail}"
+                )
+            delay = _retry_delay_seconds(
+                attempt,
+                base_seconds=self.retry_base_seconds,
+                maximum_seconds=self.retry_max_seconds,
+            )
+            print(
+                "gcloud access-token transient failure; "
+                f"retrying in {delay:.1f}s ({attempt + 1}/{self.max_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.sleeper(delay)
+        raise AssertionError("unreachable")
+
+    def _curl_once(
+        self,
+        *,
+        token: str,
+        endpoint: str,
+        response: Path,
+        config: str,
+        method: str = "GET",
+        upload: Path | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], int | None]:
+        command = [
+            self.curl_executable,
+            "--config",
+            "-",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--output",
+            str(response),
+            "--write-out",
+            "%{http_code}",
+        ]
+        if method != "GET":
+            command.extend(["--request", method])
+        if upload is not None:
+            command.extend(["--upload-file", str(upload)])
+        command.append(endpoint)
+        completed = self.runner(
+            command,
+            input=config.replace("__TOKEN__", token),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status = _parse_curl_status(completed.stdout or "")
+        return completed, status
+
+    def _request_with_retry(
+        self,
+        *,
+        operation: str,
+        uri: str,
+        endpoint: str,
+        response: Path,
+        config: str,
+        accepted_statuses: frozenset[int],
+    ) -> int:
+        for attempt in range(self.max_retries + 1):
+            response.unlink(missing_ok=True)
+            token = self._access_token()
+            completed, status = self._curl_once(
+                token=token,
+                endpoint=endpoint,
+                response=response,
+                config=config,
+            )
+            if completed.returncode == 0 and status in accepted_statuses:
+                return int(status)
+            transient = _is_transient_curl_failure(
+                returncode=completed.returncode,
+                status=status,
+            )
+            detail = _tail_response(response, completed.stderr or "")
+            if not transient:
+                raise _GcsRequestError(
+                    operation=operation,
+                    uri=uri,
+                    attempt=attempt + 1,
+                    returncode=completed.returncode,
+                    status=status,
+                    detail=detail,
+                    transient=False,
+                )
+            if attempt >= self.max_retries:
+                raise TransientTransportError(
+                    f"GCS {operation} exhausted {attempt + 1} transport attempt(s) for "
+                    f"{uri}: curl_exit={completed.returncode} http={status}: {detail}"
+                )
+            delay = _retry_delay_seconds(
+                attempt,
+                base_seconds=self.retry_base_seconds,
+                maximum_seconds=self.retry_max_seconds,
+            )
+            print(
+                f"GCS {operation} transient failure; retrying in {delay:.1f}s "
+                f"({attempt + 1}/{self.max_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.sleeper(delay)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _endpoint(uri: str, *, action: str, generation: str | None = None) -> str:
+        bucket, object_name = uri[len("gs://") :].split("/", 1)
+        prefix = f"{action}/" if action else ""
+        endpoint = (
+            f"https://storage.googleapis.com/{prefix}storage/v1/b/"
+            f"{urllib.parse.quote(bucket, safe='')}/o/"
+            f"{urllib.parse.quote(object_name, safe='')}"
+        )
+        query: dict[str, str] = {}
+        if generation is not None:
+            query["generation"] = generation
+        if action == "download":
+            query["alt"] = "media"
+        if query:
+            endpoint += "?" + urllib.parse.urlencode(query)
+        return endpoint
+
+    @staticmethod
+    def _metadata_from_response(
+        response: Path, *, uri: str, generation: str | None
+    ) -> dict[str, object]:
         try:
-            raw = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise ContractError(f"gcloud returned invalid object metadata for {uri}") from exc
+            raw = json.loads(response.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ContractError(f"GCS returned invalid object metadata for {uri}") from exc
         if not isinstance(raw, dict):
-            raise ContractError(f"gcloud returned non-object metadata for {uri}")
-        generation = str(raw.get("generation", ""))
-        size = raw.get("size")
-        if not generation.isdecimal() or int(generation) < 1:
+            raise ContractError(f"GCS returned non-object metadata for {uri}")
+        expected_name = uri[len("gs://") :].split("/", 1)[1]
+        if raw.get("name") != expected_name:
+            raise ContractError(f"GCS object name drifted for {uri}")
+        resolved_generation = str(raw.get("generation", ""))
+        if not resolved_generation.isdecimal() or int(resolved_generation) < 1:
             raise ContractError(f"GCS object has no valid generation: {uri}")
+        if generation is not None and resolved_generation != generation:
+            raise ContractError(f"GCS generation selector drifted for {uri}")
         try:
-            size_int = int(size)
-        except (TypeError, ValueError) as exc:
+            size_int = int(raw["size"])
+        except (KeyError, TypeError, ValueError) as exc:
             raise ContractError(f"GCS object has no valid size: {uri}") from exc
         return {
             "uri": uri,
-            "generation": generation,
+            "generation": resolved_generation,
             "size_bytes": size_int,
             "crc32c": raw.get("crc32c"),
             "md5_hash": raw.get("md5Hash"),
         }
+
+    def describe(
+        self, uri: str, *, generation: str | None = None
+    ) -> dict[str, object]:
+        validated = validate_gcs_uri(uri, where="GCS object")
+        requested = _requested_generation(generation, where="GCS generation")
+        result = self.describe_if_present(validated, generation=requested)
+        if result is None:
+            raise ContractError(f"GCS object is missing: {validated}")
+        return dict(result)
 
     def describe_if_present(
         self, uri: str, *, generation: str | None = None
@@ -133,94 +555,30 @@ class GcloudObjectStore:
         error.  A 404 is the only non-error negative result.
         """
 
-        validate_gcs_uri(uri, where="GCS object")
-        bucket, object_name = uri[len("gs://") :].split("/", 1)
-        token = run_checked(
-            [self.executable, "auth", "print-access-token"]
-        ).stdout.strip()
-        if not token or any(character.isspace() for character in token):
-            raise ContractError("gcloud returned an invalid access token")
-        query: dict[str, str] = {}
-        if generation is not None:
-            query["generation"] = str(generation)
-        endpoint = (
-            "https://storage.googleapis.com/storage/v1/b/"
-            f"{urllib.parse.quote(bucket, safe='')}/o/"
-            f"{urllib.parse.quote(object_name, safe='')}"
-        )
-        if query:
-            endpoint += "?" + urllib.parse.urlencode(query)
+        validated = validate_gcs_uri(uri, where="GCS object")
+        requested = _requested_generation(generation, where="GCS generation")
+        endpoint = self._endpoint(validated, action="", generation=requested)
         with tempfile.TemporaryDirectory(prefix="cppmega-gcs-describe-") as raw_tmp:
             response = Path(raw_tmp) / "response.json"
-            completed = subprocess.run(
-                [
-                    "curl",
-                    "--config",
-                    "-",
-                    "--silent",
-                    "--show-error",
-                    "--location",
-                    "--output",
-                    str(response),
-                    "--write-out",
-                    "%{http_code}",
-                    endpoint,
-                ],
-                input=f'header = "Authorization: Bearer {token}"\n',
-                capture_output=True,
-                text=True,
-                check=False,
+            status = self._request_with_retry(
+                operation="object metadata lookup",
+                uri=validated,
+                endpoint=endpoint,
+                response=response,
+                config='header = "Authorization: Bearer __TOKEN__"\n',
+                accepted_statuses=frozenset({200, 404}),
             )
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    f"GCS object metadata lookup failed for {uri}: "
-                    f"{completed.stderr[-4000:]}"
-                )
-            status = completed.stdout.strip()
-            if status == "404":
+            if status == 404:
                 return None
-            if status != "200":
-                detail = response.read_text(encoding="utf-8", errors="replace")
-                raise RuntimeError(
-                    f"GCS object metadata lookup returned HTTP {status} for {uri}: "
-                    f"{detail[-4000:]}"
-                )
-            try:
-                raw = json.loads(response.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise ContractError(
-                    f"GCS returned invalid object metadata for {uri}"
-                ) from exc
-        if not isinstance(raw, dict):
-            raise ContractError(f"GCS returned non-object metadata for {uri}")
-        resolved_generation = str(raw.get("generation", ""))
-        size = raw.get("size")
-        if not resolved_generation.isdecimal() or int(resolved_generation) < 1:
-            raise ContractError(f"GCS object has no valid generation: {uri}")
-        try:
-            size_int = int(size)
-        except (TypeError, ValueError) as exc:
-            raise ContractError(f"GCS object has no valid size: {uri}") from exc
-        if generation is not None and resolved_generation != str(generation):
-            raise ContractError(f"GCS generation selector drifted for {uri}")
-        return {
-            "uri": uri,
-            "generation": resolved_generation,
-            "size_bytes": size_int,
-            "crc32c": raw.get("crc32c"),
-            "md5_hash": raw.get("md5Hash"),
-        }
+            return self._metadata_from_response(
+                response, uri=validated, generation=requested
+            )
 
     def publish_if_absent(self, source: Path, uri: str) -> Mapping[str, object]:
-        validate_gcs_uri(uri, where="GCS publication URI")
+        validated = validate_gcs_uri(uri, where="GCS publication URI")
         if not source.is_file():
             raise FileNotFoundError(source)
         bucket, object_name = uri[len("gs://") :].split("/", 1)
-        token = run_checked(
-            [self.executable, "auth", "print-access-token"]
-        ).stdout.strip()
-        if not token or any(character.isspace() for character in token):
-            raise ContractError("gcloud returned an invalid access token")
         endpoint = (
             "https://storage.googleapis.com/upload/storage/v1/b/"
             f"{urllib.parse.quote(bucket, safe='')}/o?"
@@ -233,109 +591,123 @@ class GcloudObjectStore:
             )
         )
         curl_config = (
-            f'header = "Authorization: Bearer {token}"\n'
+            'header = "Authorization: Bearer __TOKEN__"\n'
             'header = "Content-Type: application/octet-stream"\n'
         )
-        command = [
-            "curl",
-            "--config",
-            "-",
-            "--fail-with-body",
-            "--silent",
-            "--show-error",
-            "--request",
-            "POST",
-            "--upload-file",
-            str(source),
-            endpoint,
-        ]
-        completed = subprocess.run(
-            command,
-            input=curl_config,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            # A retry is safe only when the immutable object already has the exact
-            # bytes.  Download and hash it; never turn an arbitrary 412/403 into a
-            # successful publication.
-            with tempfile.TemporaryDirectory(prefix="cppmega-gcs-verify-") as raw_tmp:
-                existing = Path(raw_tmp) / "existing"
-                try:
-                    metadata = self.describe(uri)
-                    self.download(
-                        uri,
-                        existing,
-                        generation=str(metadata["generation"]),
+        source_sha256 = sha256_file(source)
+        with tempfile.TemporaryDirectory(prefix="cppmega-gcs-publish-") as raw_tmp:
+            response = Path(raw_tmp) / "response.json"
+            for attempt in range(self.max_retries + 1):
+                response.unlink(missing_ok=True)
+                token = self._access_token()
+                completed, status = self._curl_once(
+                    token=token,
+                    endpoint=endpoint,
+                    response=response,
+                    config=curl_config,
+                    method="POST",
+                    upload=source,
+                )
+                if completed.returncode == 0 and status == 200:
+                    metadata = self.describe(validated)
+                    if int(metadata["size_bytes"]) != source.stat().st_size:
+                        raise ContractError(
+                            f"published GCS object size mismatch: {validated}"
+                        )
+                    return metadata
+
+                transient = _is_transient_curl_failure(
+                    returncode=completed.returncode,
+                    status=status,
+                )
+                detail = _tail_response(response, completed.stderr or "")
+                # A failed POST may have committed before the connection broke.
+                # Reconcile every transient response and HTTP 412 by hashing the
+                # immutable object before retrying or accepting it.
+                if transient or status == 412:
+                    with tempfile.TemporaryDirectory(
+                        prefix="cppmega-gcs-publish-verify-"
+                    ) as verify_tmp:
+                        existing = self.describe_if_present(validated)
+                        if existing is not None:
+                            existing_path = Path(verify_tmp) / "existing"
+                            self.download(
+                                validated,
+                                existing_path,
+                                generation=str(existing["generation"]),
+                            )
+                            if sha256_file(existing_path) != source_sha256:
+                                raise ContractError(
+                                    "immutable GCS object already exists with different "
+                                    f"bytes: {validated}"
+                                )
+                            return existing
+                if not transient:
+                    if status == 412:
+                        raise ContractError(
+                            "GCS immutable publication returned HTTP 412 but the "
+                            f"existing object was not readable: {validated}"
+                        )
+                    raise _GcsRequestError(
+                        operation="immutable publication",
+                        uri=validated,
+                        attempt=attempt + 1,
+                        returncode=completed.returncode,
+                        status=status,
+                        detail=detail,
+                        transient=False,
                     )
-                except Exception as verify_error:
-                    raise RuntimeError(
-                        f"immutable GCS publication failed for {uri}: "
-                        f"{completed.stderr[-4000:]}"
-                    ) from verify_error
-                if sha256_file(existing) != sha256_file(source):
-                    raise ContractError(
-                        f"immutable GCS object already exists with different bytes: {uri}"
+                if attempt >= self.max_retries:
+                    raise TransientTransportError(
+                        "GCS immutable publication exhausted "
+                        f"{attempt + 1} transport attempt(s) for {validated}: {detail}"
                     )
-                return metadata
-        metadata = self.describe(uri)
-        if int(metadata["size_bytes"]) != source.stat().st_size:
-            raise ContractError(f"published GCS object size mismatch: {uri}")
-        return metadata
+                delay = _retry_delay_seconds(
+                    attempt,
+                    base_seconds=self.retry_base_seconds,
+                    maximum_seconds=self.retry_max_seconds,
+                )
+                print(
+                    "GCS immutable publication transient failure; "
+                    f"retrying in {delay:.1f}s ({attempt + 1}/{self.max_retries})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.sleeper(delay)
+        raise AssertionError("unreachable")
 
     def download(
         self, uri: str, destination: Path, *, generation: str | None = None
     ) -> Mapping[str, object]:
-        validate_gcs_uri(uri, where="GCS download URI")
-        bucket, object_name = uri[len("gs://") :].split("/", 1)
-        token = run_checked(
-            [self.executable, "auth", "print-access-token"]
-        ).stdout.strip()
-        if not token or any(character.isspace() for character in token):
-            raise ContractError("gcloud returned an invalid access token")
-        query = {"alt": "media"}
-        if generation is not None:
-            query["generation"] = str(generation)
-        endpoint = (
-            "https://storage.googleapis.com/download/storage/v1/b/"
-            f"{urllib.parse.quote(bucket, safe='')}/o/"
-            f"{urllib.parse.quote(object_name, safe='')}?"
-            + urllib.parse.urlencode(query)
-        )
-        curl_config = f'header = "Authorization: Bearer {token}"\n'
+        validated = validate_gcs_uri(uri, where="GCS download URI")
+        requested = _requested_generation(generation, where="GCS generation")
+        endpoint = self._endpoint(validated, action="download", generation=requested)
+        curl_config = 'header = "Authorization: Bearer __TOKEN__"\n'
         destination.parent.mkdir(parents=True, exist_ok=True)
-        stage = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-        completed = subprocess.run(
-            [
-                "curl",
-                "--config",
-                "-",
-                "--fail-with-body",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--output",
-                str(stage),
-                endpoint,
-            ],
-            input=curl_config,
-            capture_output=True,
-            text=True,
-            check=False,
+        stage = destination.with_name(
+            f".{destination.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
         )
-        if completed.returncode != 0:
+        try:
+            with tempfile.TemporaryDirectory(prefix="cppmega-gcs-download-") as raw_tmp:
+                response = Path(raw_tmp) / "response.body"
+                self._request_with_retry(
+                    operation="exact download",
+                    uri=validated,
+                    endpoint=endpoint,
+                    response=response,
+                    config=curl_config,
+                    accepted_statuses=frozenset({200}),
+                )
+                metadata = self.describe(validated, generation=requested)
+                if response.stat().st_size != int(metadata["size_bytes"]):
+                    raise ContractError(
+                        f"downloaded GCS object size mismatch: {validated}"
+                    )
+                shutil.copyfile(response, stage)
+            os.replace(stage, destination)
+            return metadata
+        finally:
             stage.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"exact GCS download failed for {uri}: {completed.stderr[-4000:]}"
-            )
-        os.replace(stage, destination)
-        metadata = self.describe(uri, generation=generation)
-        if generation is not None and str(metadata["generation"]) != str(generation):
-            raise ContractError(f"GCS generation selector drifted for {uri}")
-        if destination.stat().st_size != int(metadata["size_bytes"]):
-            raise ContractError(f"downloaded GCS object size mismatch: {uri}")
-        return metadata
 
 
 class LocalObjectStore:
@@ -438,7 +810,12 @@ def _sorted_file_digest(source: Path, destination: Path) -> tuple[str, int, int,
 
 
 def acquire_git_mirror(
-    source: Mapping[str, object], scratch: Path
+    source: Mapping[str, object],
+    scratch: Path,
+    *,
+    git_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sleeper: Callable[[float], None] = time.sleep,
+    max_retries: int = _TRANSPORT_MAX_RETRIES,
 ) -> tuple[Path, dict[str, object]]:
     """Clone a full mirror and materialize exactly the manifest-pinned commit."""
 
@@ -448,7 +825,18 @@ def acquire_git_mirror(
     )
     mirror = scratch / "mirror.git"
     checkout = scratch / "checkout"
-    run_checked(["git", "clone", "--mirror", "--no-hardlinks", remote, mirror])
+    def reset_partial_clone(_attempt: int) -> None:
+        _remove_partial_path(mirror)
+        _remove_partial_path(checkout)
+
+    _run_git_network_command(
+        ["git", "clone", "--mirror", "--no-hardlinks", remote, mirror],
+        operation="mirror clone",
+        before_attempt=reset_partial_clone,
+        runner=git_runner,
+        sleeper=sleeper,
+        max_retries=max_retries,
+    )
     if _git(mirror, "rev-parse", "--is-bare-repository") != "true":
         raise ContractError("git clone --mirror did not create a bare repository")
     resolved_commit = _git(mirror, "rev-parse", f"{expected_commit}^{{commit}}")
@@ -1587,6 +1975,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
             memory_limit_gb=args.memory_limit_gb,
             max_tokens=args.max_tokens,
         )
+    except TransientTransportError as exc:
+        parser.exit(75, f"distributed source worker transient transport failure: {exc}\n")
     except (ContractError, RuntimeError, OSError, ValueError) as exc:
         parser.exit(2, f"distributed source worker failed: {exc}\n")
     return 0
@@ -1603,6 +1993,7 @@ __all__ = [
     "LocalObjectStore",
     "ObjectStore",
     "SOURCE_WORKER_RECEIPT_SCHEMA",
+    "TransientTransportError",
     "acquire_git_mirror",
     "assignment_completion_uri",
     "canonicalize_enriched_jsonl",

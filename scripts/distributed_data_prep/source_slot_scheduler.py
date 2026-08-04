@@ -50,6 +50,7 @@ from scripts.distributed_data_prep.source_manifest import (  # noqa: E402
 from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     GcloudObjectStore,
     ObjectStore,
+    TransientTransportError,
     validate_worker_receipt,
 )
 
@@ -736,6 +737,7 @@ def run_source_slot_scheduler(
         slots_root.mkdir(parents=True, exist_ok=True)
         resumed: list[str] = []
         completed: list[str] = []
+        transient_failures: list[str] = []
         source_receipt_count = 0
         pending: list[tuple[SlotSpec, Path]] = []
         for spec in specs:
@@ -820,6 +822,13 @@ def run_source_slot_scheduler(
                     active.remove(entry)
                     spec = entry["spec"]
                     assert isinstance(spec, SlotSpec)
+                    if code == 75:
+                        # A transiently exhausted slot has no completion receipt.
+                        # Keep other slots running so their immutable receipts are
+                        # preserved; the outer systemd service will resume only
+                        # this slot on its next attempt.
+                        transient_failures.append(spec.worker)
+                        continue
                     if code != 0:
                         raise RuntimeError(
                             f"source slot {spec.worker} failed with exit code {code}; "
@@ -852,6 +861,13 @@ def run_source_slot_scheduler(
                 if hasattr(log, "close"):
                     log.close()
             raise
+
+        if transient_failures:
+            raise TransientTransportError(
+                "source slot transport retry budget exhausted for "
+                f"{', '.join(sorted(transient_failures))}; completed slots preserved: "
+                f"{', '.join(sorted(completed)) or 'none'}"
+            )
 
         receipt = _scheduler_receipt(
             manifest=manifest,
@@ -904,6 +920,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
             python=args.python,
             source_worker=args.source_worker,
         )
+    except TransientTransportError as exc:
+        parser.exit(75, f"distributed source slot scheduler transient failure: {exc}\n")
     except (ContractError, OSError, RuntimeError, ValueError) as exc:
         parser.exit(2, f"distributed source slot scheduler failed: {exc}\n")
     return 0

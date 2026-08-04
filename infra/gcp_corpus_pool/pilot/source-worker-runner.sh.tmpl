@@ -118,7 +118,15 @@ printf '%s  %s\n' "$OVERLAY_SHA256" "$overlay" | sha256sum --check --strict
 printf '%s  %s\n' "$MANIFEST_SHA256" "$manifest" | sha256sum --check --strict
 
 code_revision="$(jq -er '.code_revision' "$manifest")"
-git clone --no-checkout "$bundle" "$repo_root"
+if [[ -e "$repo_root" ]]; then
+  if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
+    ! git -C "$repo_root" rev-parse "$code_revision^{commit}" >/dev/null 2>&1; then
+    rm -rf -- "$repo_root"
+  fi
+fi
+if [[ ! -e "$repo_root" ]]; then
+  git clone --no-checkout "$bundle" "$repo_root"
+fi
 git -C "$repo_root" bundle verify "$bundle"
 git -C "$repo_root" checkout --detach "$code_revision"
 zstd -dc -- "$overlay" | tar -xf - -C "$repo_root" --no-same-owner

@@ -36,6 +36,7 @@ from scripts.distributed_data_prep.source_slot_scheduler import (
 from scripts.distributed_data_prep.source_worker import (
     ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
     LocalObjectStore,
+    TransientTransportError,
     _load_completed_assignment,
     assignment_completion_uri,
     validate_assignment_completion_receipt,
@@ -490,3 +491,26 @@ def test_scheduler_terminates_siblings_after_slot_failure(tmp_path: Path) -> Non
     assert isinstance(manifest, dict)
     assert store.describe_if_present(slot_completion_uri(manifest, "worker-0000")) is None
     assert store.describe_if_present(slot_completion_uri(manifest, "worker-0001")) is None
+
+
+def test_scheduler_preserves_sibling_after_transient_slot_failure(tmp_path: Path) -> None:
+    fixture = _empty_slot_scheduler_fixture(tmp_path)
+    fake_worker = _fake_source_worker(
+        tmp_path / "transient-worker.py",
+        """
+        import os
+        import sys
+
+        if os.environ["CPPMEGA_SOURCE_SLOT"] == "worker-0000":
+            sys.exit(75)
+        sys.exit(0)
+        """,
+    )
+    with pytest.raises(TransientTransportError, match="worker-0000"):
+        _run_empty_slots(fixture, fake_worker)
+    store = fixture["store"]
+    manifest = fixture["manifest"]
+    assert isinstance(store, LocalObjectStore)
+    assert isinstance(manifest, dict)
+    assert store.describe_if_present(slot_completion_uri(manifest, "worker-0000")) is None
+    assert store.describe_if_present(slot_completion_uri(manifest, "worker-0001")) is not None
