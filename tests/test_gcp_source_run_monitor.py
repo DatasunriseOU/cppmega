@@ -54,6 +54,7 @@ class FakeRunClient:
         ]
         self.serial = b"cppmega-source-worker stopped\n"
         self.serial_calls: list[str] = []
+        self.serial_call_zones: list[tuple[str, str]] = []
 
     def add_json(
         self,
@@ -96,8 +97,8 @@ class FakeRunClient:
 
     def serial_output(self, *, project_id: str, zone: str, instance: str) -> bytes:
         assert project_id == "test-project"
-        assert zone == "us-central1-a"
         self.serial_calls.append(instance)
+        self.serial_call_zones.append((instance, zone))
         return self.serial
 
 
@@ -266,6 +267,54 @@ def _add_failure(client: FakeRunClient, *, worker_index: int, exit_code: int) ->
     )
 
 
+def _add_claim(
+    client: FakeRunClient,
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    job: Mapping[str, object],
+    physical_worker_index: int,
+    slot_index: int = 0,
+    attempt: int = 0,
+) -> None:
+    logical_worker = f"worker-{physical_worker_index * 2 + slot_index:04d}"
+    assignment_sha256 = str(job["assignment_sha256"])
+    client.add_json(
+        f"{RUN_ROOT}/source-assignment-claims/{manifest['manifest_sha256']}/"
+        f"{assignment_sha256}/{attempt:04d}.claim.json",
+        {
+            "schema": "cppmega.distributed_source_assignment_claim_v1",
+            "status": "claimed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": manifest_file_sha256,
+            "assignment": {
+                key: job[key]
+                for key in (
+                    "ordinal",
+                    "repo",
+                    "project_id",
+                    "worker",
+                    "assignment_sha256",
+                )
+            },
+            "attempt": attempt,
+            "executor": {
+                "physical_worker_index": physical_worker_index,
+                "physical_worker_count": 4,
+                "slots_per_worker": 2,
+                "slot_index": slot_index,
+                "worker": logical_worker,
+            },
+            "scheduler_instance": f"{PHYSICAL_WORKERS[physical_worker_index]}.test",
+            "created_unix_s": 10,
+            "expires_unix_s": 910,
+            "lease_seconds": 900,
+            "heartbeat_seconds": 120,
+            "training_ready": False,
+        },
+    )
+
+
 def _source_receipt_entry(
     manifest: Mapping[str, object], job: Mapping[str, object]
 ) -> dict[str, object]:
@@ -397,6 +446,63 @@ def test_running_run_becomes_idle_only_after_unchanged_stale_window(
     assert second["training_ready"] is False
 
 
+def test_dynamic_claims_are_counted_by_executor_not_manifest_home_worker(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    assert job["worker"] == "worker-0000"
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    client.add_json(
+        assignment_completion_uri(manifest, job),
+        {
+            "schema": ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
+            "status": "complete",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": config["manifest_file_sha256"],
+            "assignment": {
+                key: job[key]
+                for key in (
+                    "ordinal",
+                    "repo",
+                    "project_id",
+                    "worker",
+                    "assignment_sha256",
+                )
+            },
+            "source_receipt": _source_receipt_entry(manifest, job),
+            "training_ready": False,
+        },
+    )
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 100,
+    )
+
+    assert result["scheduler_mode"] == "dynamic_claim_queue"
+    assert result["counts"]["assignment_receipts"] == 1
+    assert result["counts"]["assignment_claim_receipts"] == 1
+    assert result["counts"]["claimed_assignments"] == 1
+    assert result["workers"][0]["assignment_receipts"] == 1
+    assert result["workers"][0]["claim_receipts"] == 0
+    assert result["workers"][1]["claim_receipts"] == 1
+    assert result["workers"][1]["completed_claimed_assignments"] == 1
+
+
 def test_exit_75_is_recoverable_only_after_diagnostics_publication(
     tmp_path: Path,
 ) -> None:
@@ -419,6 +525,50 @@ def test_exit_75_is_recoverable_only_after_diagnostics_publication(
     assert first["recovery_policy"]["automatic_replacement_performed"] is False
     assert client.serial_calls == [PHYSICAL_WORKERS[0]]
     assert second["workers"][0]["diagnostics"] == failed["diagnostics"]
+
+
+def test_failure_diagnostics_use_each_instances_inventory_zone(tmp_path: Path) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    worker = PHYSICAL_WORKERS[1]
+    client.instances[1]["zone"] = (
+        "https://www.googleapis.com/compute/v1/projects/test-project/"
+        "zones/us-central1-f"
+    )
+    _add_ready(client)
+    _add_failure(client, worker_index=1, exit_code=75)
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 100,
+    )
+
+    assert result["workers"][1]["zone"] == "us-central1-f"
+    assert client.serial_call_zones == [(worker, "us-central1-f")]
+
+
+def test_missing_instance_reuses_its_last_confirmed_inventory_zone(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    worker = PHYSICAL_WORKERS[1]
+    client.instances[1]["zone"] = "zones/us-central1-f"
+    _add_ready(client)
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+
+    client.instances = [row for row in client.instances if row["name"] != worker]
+    _add_failure(client, worker_index=1, exit_code=75)
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 200)
+
+    assert result["workers"][1]["instance_status"] == "MISSING"
+    assert result["workers"][1]["zone"] == "us-central1-f"
+    assert client.serial_call_zones == [(worker, "us-central1-f")]
 
 
 def test_exit_75_is_not_recoverable_when_diagnostics_publication_fails(
