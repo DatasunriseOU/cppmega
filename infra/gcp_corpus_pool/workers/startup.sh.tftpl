@@ -187,9 +187,33 @@ if [[ -n "$BOOTSTRAP_URI" ]]; then
   grep -Fqx "readonly MANIFEST_SHA256=\"$EXPECTED_MANIFEST_SHA256\"" /opt/cppmega/worker-runner
   chmod 0555 /opt/cppmega/worker-runner
   chown root:root /opt/cppmega/worker-runner
-  runuser -u cppmega -- env \
-    CPPMEGA_WORKER_CONFIG=/etc/cppmega/worker.json \
-    CPPMEGA_STAGE_ROOT="$STAGE_ROOT" \
-    CPPMEGA_RUN_ROOT="$RUN_ROOT" \
-    /opt/cppmega/worker-runner
+  cat >/etc/systemd/system/cppmega-source-worker.service <<EOF
+[Unit]
+Description=CppMega resumable source worker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cppmega
+Group=cppmega
+Environment="HOME=/home/cppmega"
+Environment="CPPMEGA_WORKER_CONFIG=/etc/cppmega/worker.json"
+Environment="CPPMEGA_STAGE_ROOT=$STAGE_ROOT"
+Environment="CPPMEGA_RUN_ROOT=$RUN_ROOT"
+ExecStart=/opt/cppmega/worker-runner
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=300s
+KillMode=mixed
+UMask=0027
+SyslogIdentifier=cppmega-source-worker
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 /etc/systemd/system/cppmega-source-worker.service
+  systemctl daemon-reload
+  systemctl enable --now cppmega-source-worker.service
 fi

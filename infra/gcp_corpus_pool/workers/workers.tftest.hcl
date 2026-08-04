@@ -86,6 +86,16 @@ run "content_addressed_v4_bootstrap" {
     condition     = strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcs_read_exact \"$BOOTSTRAP_URI\"") && !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcloud storage cp \"$BOOTSTRAP_URI\"")
     error_message = "Startup must use the v4-proven exact-object download path."
   }
+
+  assert {
+    condition = (
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "systemctl enable --now cppmega-source-worker.service") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "Restart=on-failure") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "StartLimitIntervalSec=0") &&
+      !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "runuser -u cppmega")
+    )
+    error_message = "Content-addressed workers must run under an unbounded on-failure systemd supervisor."
+  }
 }
 
 run "bounded_two_slot_profile" {
