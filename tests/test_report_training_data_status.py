@@ -312,6 +312,22 @@ def test_parquet_snapshot_ignores_atomic_staging_files(tmp_path: Path) -> None:
     assert result["valid_tokens"] == 15
 
 
+def test_parquet_snapshot_ignores_zstd_recompression_temp(tmp_path: Path) -> None:
+    root = tmp_path / "packed"
+    _write_parquet(root / "1024" / "one.parquet")
+    (root / "1024" / "one.zstd.tmp.parquet").write_bytes(b"partial")
+
+    result = scan_parquet_snapshot(
+        root,
+        batch_size=192,
+        jobs=1,
+        classify_documents=True,
+    )
+
+    assert result["files"] == 1
+    assert result["valid_tokens"] == 15
+
+
 def test_parquet_snapshot_retries_atomic_publish_window(tmp_path: Path) -> None:
     root = tmp_path / "packed"
     target = root / "1024" / "one.parquet"

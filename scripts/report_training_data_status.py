@@ -163,6 +163,7 @@ def _parquet_paths(root: Path) -> list[tuple[int, Path]]:
             (length, path)
             for path in sorted(length_dir.glob("*.parquet"))
             if not path.name.startswith(".")
+            and not path.name.endswith(".zstd.tmp.parquet")
         )
     return result
 
