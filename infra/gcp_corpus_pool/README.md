@@ -266,6 +266,52 @@ terraform -chdir=workers plan -destroy \
 terraform -chdir=workers apply lane-workers-destroy.tfplan
 ```
 
+## Parallel source-run state
+
+Do not use `terraform/workers` for a second source run while another source
+pool is live.  It would make Terraform reconcile the old VM/address set with
+the new run and can therefore plan deletes.  Use the guarded source-run helper
+instead.  It writes a new backend under
+`terraform/source-runs/<run_id>`, uses a separate `TF_DATA_DIR`, and rejects
+any plan with a delete, replacement, update, foreign state object, or foreign
+managed resource.  The helper has no `apply` mode.
+
+For the prepared dynamic `.005` payload:
+
+The GCS backend and Google provider both use Application Default Credentials.
+Before planning, `gcloud auth application-default print-access-token` must
+succeed for the intended operator identity.  An `invalid_rapt` response means
+the local ADC refresh grant has expired; reauthenticate interactively with
+`gcloud auth application-default login`.  Do not substitute an underprivileged
+worker service-account key merely to make `terraform init` pass.
+
+```bash
+python scripts/gcp_isolated_worker_rollout.py \
+  --terraform-dir infra/gcp_corpus_pool/workers \
+  --var-file /Volumes/external/cppmega_data/gcp_source_prod_20260804_005/source-prod-005.tfvars \
+  --output-root /Volumes/external/cppmega_data/gcp_source_prod_20260804_005 \
+  --bucket natural-bison-491019-t9-cppmega-corpus \
+  --run-id source-prod-20260804-005 \
+  --name-prefix cppmega-corpus \
+  --worker-count 16 \
+  --compact-placement
+```
+
+Its receipt is `isolated-terraform/<run_id>.isolated-plan-receipt.json` below
+the output root.  It binds the binary plan, its JSON form, the exact backend
+configuration, and its separate Terraform data directory.  Review that
+receipt and the plan JSON before a human runs `terraform apply` on that exact
+binary plan with the receipt's `TF_DATA_DIR`; never regenerate a plan by
+pointing `.005` at `terraform/workers`.
+
+An isolated `.005` source manifest should remain the full 482-project
+snapshot unless the `.004` completion pointers are frozen and validated as a
+separate exact primary-membership input.  Merely counting `.004` objects is
+not enough to omit projects from `.005`: its assignment identities and output
+root are different.  A 425-project follow-up manifest is appropriate only
+after a verifier records exactly which `.004` primary receipts are accepted;
+it must be a new immutable manifest and never edits either existing manifest.
+
 ## Validation
 
 ```bash
