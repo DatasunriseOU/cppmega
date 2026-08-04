@@ -29,11 +29,62 @@ overlay="$input_root/distributed-data-prep.tar.zst"
 manifest="$input_root/source-manifest.json"
 
 failure_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.failed.json"
+readonly MAX_TRANSPORT_RETRIES=4
+readonly RETRY_BASE_SECONDS=5
+readonly RETRY_MAX_SECONDS=300
+
+retry_sleep() {
+  local attempt=$1
+  local delay=$((RETRY_BASE_SECONDS << attempt))
+  if (( delay > RETRY_MAX_SECONDS )); then
+    delay=$RETRY_MAX_SECONDS
+  fi
+  echo "transient GCS failure; retrying in ${delay}s (attempt ${attempt}/${MAX_TRANSPORT_RETRIES})" >&2
+  sleep "$delay"
+}
+
+gcs_retryable_status() {
+  local status=$1
+  local curl_exit=$2
+  [[ "$status" =~ ^(408|429|5[0-9]{2})$ ]] && return 0
+  case "$curl_exit" in
+    5|6|7|18|28|35|47|52|55|56|92) return 0 ;;
+  esac
+  return 1
+}
+
+gcs_access_token() {
+  local attempt=0 token error
+  while (( attempt <= MAX_TRANSPORT_RETRIES )); do
+    error=$(mktemp)
+    if token=$(gcloud auth print-access-token 2>"$error"); then
+      rm -f "$error"
+      if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then
+        echo "gcloud returned an invalid access token" >&2
+        return 2
+      fi
+      printf '%s' "$token"
+      return 0
+    fi
+    if ! grep -Eiq '(^|[^0-9])(408|429|5[0-9]{2})([^0-9]|$)|UNAVAILABLE|RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|timed out|connection reset|temporary failure' "$error"; then
+      cat "$error" >&2
+      rm -f "$error"
+      return 2
+    fi
+    rm -f "$error"
+    if (( attempt == MAX_TRANSPORT_RETRIES )); then
+      return 75
+    fi
+    retry_sleep "$attempt"
+    attempt=$((attempt + 1))
+  done
+  return 75
+}
 
 gcs_create_if_absent() {
   local source=$1
   local uri=$2
-  local relative bucket object encoded token response status
+  local relative bucket object encoded token response status curl_exit error existing existing_status
   relative=${uri#gs://}
   bucket=${relative%%/*}
   object=${relative#*/}
@@ -44,28 +95,66 @@ gcs_create_if_absent() {
   encoded="$(python3 -c \
     'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
     "$object")"
-  token="$(gcloud auth print-access-token)"
-  response="$(mktemp)"
-  status="$(curl --silent --show-error --output "$response" \
-    --write-out '%{http_code}' --request POST \
-    --header "Authorization: Bearer $token" \
-    --header 'Content-Type: application/octet-stream' \
-    --upload-file "$source" \
-    "https://storage.googleapis.com/upload/storage/v1/b/$bucket/o?uploadType=media&name=$encoded&ifGenerationMatch=0")"
-  if [[ "$status" != 200 ]]; then
-    cat "$response" >&2
-    rm -f "$response"
-    return 1
-  fi
-  jq -e --arg expected "$object" '.name == $expected and (.generation | length > 0)' \
-    "$response" >/dev/null
-  rm -f "$response"
+  for ((attempt=0; attempt<=MAX_TRANSPORT_RETRIES; attempt++)); do
+    token=$(gcs_access_token) || return $?
+    response=$(mktemp)
+    error=$(mktemp)
+    if status=$(curl --silent --show-error --output "$response" \
+      --write-out '%{http_code}' --request POST \
+      --header "Authorization: Bearer $token" \
+      --header 'Content-Type: application/octet-stream' \
+      --upload-file "$source" \
+      "https://storage.googleapis.com/upload/storage/v1/b/$bucket/o?uploadType=media&name=$encoded&ifGenerationMatch=0" \
+      2>"$error"); then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+    if [[ "$status" == 200 && "$curl_exit" -eq 0 ]] && \
+      jq -e --arg expected "$object" '.name == $expected and (.generation | length > 0)' "$response" >/dev/null; then
+      rm -f "$response" "$error"
+      return 0
+    fi
+    if [[ "$status" == 412 ]] || gcs_retryable_status "$status" "$curl_exit"; then
+      existing="$response.existing"
+      if gcs_read_exact "$uri" "$existing"; then
+        if [[ "$(sha256sum "$existing" | awk '{print $1}')" == "$(sha256sum "$source" | awk '{print $1}')" ]]; then
+          rm -f "$response" "$error" "$existing"
+          return 0
+        fi
+        echo "immutable GCS object collision: $uri" >&2
+        rm -f "$response" "$error" "$existing"
+        return 2
+      else
+        existing_status=$?
+        rm -f "$existing"
+        if [[ "$existing_status" -ne 1 && "$existing_status" -ne 75 ]]; then
+          cat "$response" >&2 || true
+          cat "$error" >&2 || true
+          rm -f "$response" "$error"
+          return "$existing_status"
+        fi
+      fi
+    fi
+    if ! gcs_retryable_status "$status" "$curl_exit"; then
+      cat "$response" >&2 || true
+      cat "$error" >&2 || true
+      rm -f "$response" "$error"
+      return 2
+    fi
+    rm -f "$response" "$error"
+    if (( attempt == MAX_TRANSPORT_RETRIES )); then
+      return 75
+    fi
+    retry_sleep "$attempt"
+  done
+  return 75
 }
 
 gcs_read_exact() {
   local uri=$1
   local destination=$2
-  local relative bucket object encoded token stage
+  local relative bucket object encoded token stage status curl_exit error
   relative=${uri#gs://}
   bucket=${relative%%/*}
   object=${relative#*/}
@@ -76,13 +165,47 @@ gcs_read_exact() {
   encoded="$(python3 -c \
     'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
     "$object")"
-  token="$(gcloud auth print-access-token)"
   stage="$destination.$BOOT_ID.tmp"
-  curl --fail-with-body --silent --show-error --location \
-    --header "Authorization: Bearer $token" \
-    --output "$stage" \
-    "https://storage.googleapis.com/download/storage/v1/b/$bucket/o/$encoded?alt=media"
-  mv -f "$stage" "$destination"
+  for ((attempt=0; attempt<=MAX_TRANSPORT_RETRIES; attempt++)); do
+    token=$(gcs_access_token) || return $?
+    error=$(mktemp)
+    if status=$(curl --silent --show-error --location \
+      --header "Authorization: Bearer $token" \
+      --output "$stage" --write-out '%{http_code}' \
+      "https://storage.googleapis.com/download/storage/v1/b/$bucket/o/$encoded?alt=media" \
+      2>"$error"); then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+    if [[ "$status" == 200 && "$curl_exit" -eq 0 ]]; then
+      rm -f "$error"
+      mv -f "$stage" "$destination"
+      return 0
+    fi
+    rm -f "$stage"
+    if [[ "$status" == 404 ]]; then
+      cat "$error" >&2 || true
+      rm -f "$error"
+      return 1
+    fi
+    if [[ "$status" == 401 || "$status" == 403 || "$status" == 409 ]]; then
+      cat "$error" >&2 || true
+      rm -f "$error"
+      return 2
+    fi
+    if ! gcs_retryable_status "$status" "$curl_exit"; then
+      cat "$error" >&2 || true
+      rm -f "$error"
+      return 2
+    fi
+    rm -f "$error"
+    if (( attempt == MAX_TRANSPORT_RETRIES )); then
+      return 75
+    fi
+    retry_sleep "$attempt"
+  done
+  return 75
 }
 
 publish_failure() {
