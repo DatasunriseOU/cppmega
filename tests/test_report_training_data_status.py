@@ -588,6 +588,37 @@ def test_publish_status_appends_changelog_only_for_semantic_change(
     assert current["status_sha256"] == "2" * 64
 
 
+def test_publish_status_migrates_previous_snapshot_without_pr_mr_dataset(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "status"
+    previous = {
+        "schema": STATUS_SCHEMA,
+        "status_sha256": "old" * 16,
+        "datasets": {"live_source": {}, "sealed_megatron": {}, "ci": {}},
+    }
+    output.mkdir()
+    (output / "current.json").write_text(
+        json.dumps(previous),
+        encoding="utf-8",
+    )
+
+    status = _minimal_status(sha="2" * 64, live_tokens=15)
+    publish_status(status, output)
+
+    entries = [
+        json.loads(line)
+        for line in (output / "changelog.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert entries[0]["previous_status_sha256"] == "old" * 16
+    assert entries[0]["numeric_delta"] == {}
+    assert json.loads((output / "current.json").read_text(encoding="utf-8"))[
+        "status_sha256"
+    ] == "2" * 64
+
+
 def test_publish_status_accepts_live_source_before_first_parquet(
     tmp_path: Path,
 ) -> None:
