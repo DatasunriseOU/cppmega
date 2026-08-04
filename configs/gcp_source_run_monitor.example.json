@@ -1,0 +1,30 @@
+{
+  "schema": "cppmega.gcp_source_run_monitor_v1",
+  "run_id": "source-prod-20260804-003",
+  "run_root": "gs://example-cppmega-corpus/runs/source-prod-20260804-003",
+  "manifest_path": "/absolute/path/to/source-manifest.json",
+  "manifest_file_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "project_id": "example-project",
+  "zone": "us-central1-a",
+  "physical_workers": [
+    "cppmega-corpus-00-source-prod-20260804-003",
+    "cppmega-corpus-01-source-prod-20260804-003",
+    "cppmega-corpus-02-source-prod-20260804-003",
+    "cppmega-corpus-03-source-prod-20260804-003"
+  ],
+  "slots_per_worker": 2,
+  "expected_local_ssd_count": 2,
+  "resources": {
+    "parse_workers_per_slot": 6,
+    "memory_limit_gb_per_slot": 24.0,
+    "cpu_budget_vcpus": 16,
+    "memory_budget_gb": 56.0
+  },
+  "state_path": "/absolute/path/to/gcp-source-monitor.state.json",
+  "report_path": "/absolute/path/to/gcp-source-monitor.current.json",
+  "terminal_receipt_path": "/absolute/path/to/source-run-terminal.receipt.json",
+  "diagnostics_dir": "/absolute/path/to/source-run-diagnostics",
+  "diagnostics_upload_prefix": "gs://example-cppmega-corpus/runs/source-prod-20260804-003/diagnostics/gcp-source-monitor",
+  "stale_after_seconds": 7200,
+  "gcloud": "/absolute/path/to/gcloud"
+}
