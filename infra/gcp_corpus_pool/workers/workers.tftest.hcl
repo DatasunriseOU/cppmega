@@ -94,6 +94,8 @@ run "content_addressed_v4_bootstrap" {
       strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RestartPreventExitStatus=2") &&
       strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RestartSec=30min") &&
       strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "StartLimitIntervalSec=0") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "chown cppmega:cppmega \"$STAGE_ROOT\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "chmod 0770 \"$STAGE_ROOT\"") &&
       strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "MAX_TRANSPORT_RETRIES=4") &&
       strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "if status=$(curl") &&
       !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "runuser -u cppmega")

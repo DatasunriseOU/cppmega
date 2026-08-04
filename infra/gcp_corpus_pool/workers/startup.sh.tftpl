@@ -249,6 +249,9 @@ install -d -m 0755 "$STAGE_ROOT"
 if ! mountpoint -q "$STAGE_ROOT"; then
   mount -o noatime,nodiratime,discard "$RAID_DEVICE" "$STAGE_ROOT"
 fi
+# The scheduler takes its cross-slot lock in the stage root and runs as cppmega.
+chown cppmega:cppmega "$STAGE_ROOT"
+chmod 0770 "$STAGE_ROOT"
 
 if ! grep -qE '^[^#]+[[:space:]]+/mnt/cppmega-stage[[:space:]]' /etc/fstab; then
   RAID_UUID=$(blkid -s UUID -o value "$RAID_DEVICE")
