@@ -444,6 +444,18 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _bounded_utf8_sha256(value: str, *, where: str, max_bytes: int) -> str:
+    digest = hashlib.sha256()
+    encoded_size = 0
+    for offset in range(0, len(value), 16_384):
+        block = value[offset : offset + 16_384].encode("utf-8")
+        encoded_size += len(block)
+        if encoded_size > max_bytes:
+            raise ExportError(f"{where} exceeds the state JSON evidence limit")
+        digest.update(block)
+    return digest.hexdigest()
+
+
 def _progress(
     phase: str,
     status: str,
@@ -3909,11 +3921,14 @@ def _sanitize_head_commit(value: object) -> dict[str, object] | None:
     )
     message = commit.get("message")
     if message is not None:
-        message_text = _metadata_scalar(message, where="workflow.head_commit.message")
-        if not isinstance(message_text, str):
+        if not isinstance(message, str):
             raise ExportError("workflow.head_commit.message must be a string")
-        output["message_char_count"] = len(message_text)
-        output["message_sha256"] = _sha256_bytes(message_text.encode("utf-8"))
+        output["message_char_count"] = len(message)
+        output["message_sha256"] = _bounded_utf8_sha256(
+            message,
+            where="workflow.head_commit.message",
+            max_bytes=MAX_STATE_JSON_EVIDENCE_BYTES,
+        )
     for field in ("author", "committer"):
         identity = commit.get(field)
         if identity is None:
