@@ -829,7 +829,10 @@ def test_checked_in_intel_nul_diagnostic_manifest_matches_reference_fixture() ->
         ).read_text(encoding="utf-8")
     )
     entry = next(
-        item for item in manifest["entries"] if item["project_id"] == "intel/llvm"
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "intel/llvm"
+        and item["relative_path"] == RELATIVE_NUL_DIAGNOSTIC_FIXTURE
     )
 
     assert len(payload) == 398
@@ -967,6 +970,35 @@ def test_clang_embedded_nul_quarantine_requires_diagnostic_signature(
         detected_format="clang_embedded_nul_diagnostic",
         relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
         reason="forged diagnostic fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(
+        SourceQuarantineError,
+        match="embedded-NUL diagnostic contract is incomplete",
+    ):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_clang_embedded_nul_quarantine_requires_both_caret_markers(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes().replace(
+        b"// CHECK-NEXT:             ^\n",
+        b"// CHECK-NEXT:             x\n",
+        1,
+    )
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="forged diagnostic fixture missing one caret marker",
     )
 
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)

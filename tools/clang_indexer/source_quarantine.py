@@ -366,25 +366,34 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
         lines = decoded.splitlines()
         source_line = "int x[sizeof\0int];"
         rendered_source_line = "// CHECK-NEXT: int x[sizeof<U+0000>int];"
+        run_line = (
+            "// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | "
+            "FileCheck -strict-whitespace %s"
+        )
+        warning_line = "// CHECK: warning: null character ignored"
+        caret_line = "// CHECK-NEXT:             ^"
+        error_line = (
+            "// CHECK: error: expected parentheses around type name in "
+            "sizeof expression"
+        )
         required_lines = {
-            (
-                "// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | "
-                "FileCheck -strict-whitespace %s"
-            ),
+            run_line,
             source_line,
-            "// CHECK: warning: null character ignored",
+            warning_line,
             rendered_source_line,
-            (
-                "// CHECK: error: expected parentheses around type name in "
-                "sizeof expression"
-            ),
+            caret_line,
+            error_line,
             "// CHECK-NEXT:             (          )",
         }
         if (
             payload.count(b"\0") != 1
             or not required_lines.issubset(lines)
+            or lines.count(run_line) != 1
+            or lines.count(warning_line) != 1
             or lines.count(source_line) != 1
             or lines.count(rendered_source_line) != 2
+            or lines.count(caret_line) != 2
+            or lines.count(error_line) != 1
         ):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clang_embedded_nul_diagnostic "
