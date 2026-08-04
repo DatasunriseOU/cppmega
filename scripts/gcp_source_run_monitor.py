@@ -61,9 +61,12 @@ STATE_SCHEMA = "cppmega.gcp_source_run_monitor_state_v1"
 REPORT_SCHEMA = "cppmega.gcp_source_run_monitor_report_v1"
 TERMINAL_SCHEMA = "cppmega.gcp_source_run_terminal_receipt_v1"
 DIAGNOSTICS_SCHEMA = "cppmega.gcp_source_failure_diagnostics_v1"
+ASSIGNMENT_CLAIM_SCHEMA = "cppmega.distributed_source_assignment_claim_v1"
 TRANSIENT_EXIT_CODE = 75
 DETERMINISTIC_EXIT_CODE = 2
 _WORKER_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
+_ZONE_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
+_CLAIM_FILENAME_RE = re.compile(r"([0-9]{4})\.claim\.json")
 _UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
     re.IGNORECASE,
@@ -260,6 +263,14 @@ def _positive_int(value: object, *, where: str) -> int:
     return require_int(value, where=where, minimum=1)
 
 
+def _zone_name(value: object, *, where: str) -> str:
+    raw = require_nonempty(value, where=where)
+    zone = raw.rsplit("/", 1)[-1]
+    if _ZONE_NAME_RE.fullmatch(zone) is None:
+        raise MonitorError(f"{where} is invalid")
+    return zone
+
+
 def _string_list(value: object, *, where: str) -> list[str]:
     if not isinstance(value, list) or not value:
         raise MonitorError(f"{where} must be a non-empty list")
@@ -304,7 +315,7 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
     _path(value["manifest_path"], where="manifest_path")
     require_sha256(value["manifest_file_sha256"], where="manifest_file_sha256")
     require_nonempty(value["project_id"], where="project_id")
-    require_nonempty(value["zone"], where="zone")
+    value["zone"] = _zone_name(value["zone"], where="zone")
     workers = _string_list(value["physical_workers"], where="physical_workers")
     if any(_WORKER_NAME_RE.fullmatch(worker) is None for worker in workers):
         raise MonitorError("physical_workers contains an invalid instance name")
@@ -499,6 +510,175 @@ def _control_receipt(
     }
 
 
+def _assignment_claim(
+    *,
+    raw: bytes,
+    value: Mapping[str, object],
+    metadata: Mapping[str, object],
+    config: Mapping[str, object],
+    manifest: Mapping[str, object],
+    jobs_by_sha256: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    claim = dict(value)
+    require_exact_fields(
+        claim,
+        {
+            "schema",
+            "status",
+            "manifest_sha256",
+            "manifest_file_sha256",
+            "assignment",
+            "attempt",
+            "executor",
+            "scheduler_instance",
+            "created_unix_s",
+            "expires_unix_s",
+            "lease_seconds",
+            "heartbeat_seconds",
+            "training_ready",
+        },
+        where="GCP source assignment claim",
+    )
+    if (
+        claim["schema"] != ASSIGNMENT_CLAIM_SCHEMA
+        or claim["status"] != "claimed"
+        or claim["manifest_sha256"] != manifest["manifest_sha256"]
+        or claim["manifest_file_sha256"] != config["manifest_file_sha256"]
+        or claim["training_ready"] is not False
+    ):
+        raise MonitorError("GCP source assignment claim binding drifted")
+    assignment = claim["assignment"]
+    if not isinstance(assignment, Mapping):
+        raise MonitorError("GCP source assignment claim assignment is invalid")
+    assignment_sha256 = require_sha256(
+        assignment.get("assignment_sha256"),
+        where="GCP source assignment claim assignment SHA-256",
+    )
+    job = jobs_by_sha256.get(assignment_sha256)
+    expected_assignment = (
+        {
+            key: job[key]
+            for key in ("ordinal", "repo", "project_id", "worker", "assignment_sha256")
+        }
+        if job is not None
+        else None
+    )
+    if expected_assignment is None or dict(assignment) != expected_assignment:
+        raise MonitorError("GCP source assignment claim escaped the manifest")
+    attempt = require_int(claim["attempt"], where="claim attempt")
+    if attempt > 9_999:
+        raise MonitorError("GCP source assignment claim attempt exceeds its bound")
+    prefix = (
+        f"{config['run_root']}/source-assignment-claims/"
+        f"{manifest['manifest_sha256']}/"
+    )
+    uri = validate_gcs_uri(metadata.get("uri"), where="assignment claim URI")
+    relative = uri[len(prefix) :] if uri.startswith(prefix) else ""
+    parts = relative.split("/")
+    filename_match = _CLAIM_FILENAME_RE.fullmatch(parts[1]) if len(parts) == 2 else None
+    if (
+        len(parts) != 2
+        or parts[0] != assignment_sha256
+        or filename_match is None
+        or int(filename_match.group(1)) != attempt
+    ):
+        raise MonitorError("GCP source assignment claim URI binding drifted")
+    executor = claim["executor"]
+    if not isinstance(executor, Mapping):
+        raise MonitorError("GCP source assignment claim executor is invalid")
+    executor = dict(executor)
+    require_exact_fields(
+        executor,
+        {
+            "physical_worker_index",
+            "physical_worker_count",
+            "slots_per_worker",
+            "slot_index",
+            "worker",
+        },
+        where="GCP source assignment claim executor",
+    )
+    workers = config["physical_workers"]
+    assert isinstance(workers, list)
+    slots = int(config["slots_per_worker"])
+    physical_index = require_int(
+        executor["physical_worker_index"], where="claim physical worker index"
+    )
+    slot_index = require_int(executor["slot_index"], where="claim slot index")
+    if (
+        physical_index >= len(workers)
+        or slot_index >= slots
+        or executor["physical_worker_count"] != len(workers)
+        or executor["slots_per_worker"] != slots
+        or executor["worker"] != f"worker-{physical_index * slots + slot_index:04d}"
+    ):
+        raise MonitorError("GCP source assignment claim executor topology drifted")
+    scheduler_instance = require_nonempty(
+        claim["scheduler_instance"], where="claim scheduler instance"
+    )
+    if len(scheduler_instance) > 256 or not scheduler_instance.isascii():
+        raise MonitorError("GCP source assignment claim scheduler instance is invalid")
+    created = require_int(
+        claim["created_unix_s"], where="claim creation time", minimum=1
+    )
+    expires = require_int(claim["expires_unix_s"], where="claim expiry time", minimum=1)
+    lease = require_int(claim["lease_seconds"], where="claim lease", minimum=1)
+    heartbeat = require_int(
+        claim["heartbeat_seconds"], where="claim heartbeat", minimum=1
+    )
+    if heartbeat >= lease or expires != created + lease:
+        raise MonitorError("GCP source assignment claim lease drifted")
+    return {
+        "assignment_sha256": assignment_sha256,
+        "attempt": attempt,
+        "physical_worker_index": physical_index,
+        "logical_worker": executor["worker"],
+        "created_unix_s": created,
+        "expires_unix_s": expires,
+        "uri": uri,
+        "generation": str(metadata["generation"]),
+        "updated": metadata.get("updated", ""),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _cached_claim_summary(
+    cached: Mapping[str, object], metadata: Mapping[str, object]
+) -> dict[str, object] | None:
+    summary = cached.get("summary")
+    if not isinstance(summary, Mapping):
+        return None
+    value = dict(summary)
+    expected = {
+        "assignment_sha256",
+        "attempt",
+        "physical_worker_index",
+        "logical_worker",
+        "created_unix_s",
+        "expires_unix_s",
+    }
+    if set(value) != expected:
+        return None
+    try:
+        require_sha256(value["assignment_sha256"], where="cached claim assignment")
+        require_int(value["attempt"], where="cached claim attempt")
+        require_int(
+            value["physical_worker_index"], where="cached claim physical worker"
+        )
+        require_nonempty(value["logical_worker"], where="cached claim logical worker")
+        require_int(value["created_unix_s"], where="cached claim creation", minimum=1)
+        require_int(value["expires_unix_s"], where="cached claim expiry", minimum=1)
+    except ContractError:
+        return None
+    return {
+        **value,
+        "uri": metadata["uri"],
+        "generation": str(metadata["generation"]),
+        "updated": metadata.get("updated", ""),
+        "sha256": cached["sha256"],
+    }
+
+
 def _latest(rows: Sequence[Mapping[str, object]]) -> Mapping[str, object] | None:
     if not rows:
         return None
@@ -588,9 +768,10 @@ def _publish_readback_verified(
             raise MonitorError(f"published GCS object bytes drifted: {uri}")
         if destination.stat().st_size != source.stat().st_size:
             raise MonitorError(f"published GCS object size drifted: {uri}")
-        if not isinstance(readback_metadata, Mapping) or str(
-            readback_metadata.get("generation", "")
-        ) != generation:
+        if (
+            not isinstance(readback_metadata, Mapping)
+            or str(readback_metadata.get("generation", "")) != generation
+        ):
             raise MonitorError(f"published GCS object generation drifted: {uri}")
     return metadata
 
@@ -602,6 +783,7 @@ def _preserve_diagnostics(
     state: dict[str, object],
     client: RunClient,
     object_store: ObjectStore,
+    zone: str,
     now: int,
 ) -> dict[str, object]:
     fingerprint = hashlib.sha256(
@@ -700,7 +882,7 @@ def _preserve_diagnostics(
         return result
     serial = client.serial_output(
         project_id=str(config["project_id"]),
-        zone=str(config["zone"]),
+        zone=zone,
         instance=worker,
     )
     serial_sha256 = hashlib.sha256(serial).hexdigest()
@@ -847,6 +1029,58 @@ def run_monitor(
 
         jobs = manifest["repositories"]
         assert isinstance(jobs, list)
+        jobs_by_sha256 = {str(job["assignment_sha256"]): job for job in jobs}
+        claim_inventory = _metadata_map(
+            run_client.list_objects(
+                f"{checked['run_root']}/source-assignment-claims/"
+                f"{manifest['manifest_sha256']}/*/*.claim.json"
+            )
+        )
+        claim_records: list[dict[str, object]] = []
+        claim_sha256: list[str] = []
+        claim_summary_fields = (
+            "assignment_sha256",
+            "attempt",
+            "physical_worker_index",
+            "logical_worker",
+            "created_unix_s",
+            "expires_unix_s",
+        )
+        for metadata in claim_inventory.values():
+            cached = _cached_receipt(kind="claim", metadata=metadata, state=state)
+            record = (
+                _cached_claim_summary(cached, metadata) if cached is not None else None
+            )
+            if record is None:
+                raw, value = run_client.read_json(metadata)
+                record = _assignment_claim(
+                    raw=raw,
+                    value=value,
+                    metadata=metadata,
+                    config=checked,
+                    manifest=manifest,
+                    jobs_by_sha256=jobs_by_sha256,
+                )
+                cached = _remember_receipt(
+                    kind="claim", metadata=metadata, raw=raw, state=state
+                )
+                cached["summary"] = {key: record[key] for key in claim_summary_fields}
+            claim_records.append(record)
+            claim_sha256.append(str(record["sha256"]))
+        latest_claims: dict[str, dict[str, object]] = {}
+        for record in claim_records:
+            assignment_sha256 = str(record["assignment_sha256"])
+            previous = latest_claims.get(assignment_sha256)
+            if previous is None or (
+                int(record["attempt"]),
+                str(record["updated"]),
+                int(record["generation"]),
+            ) > (
+                int(previous["attempt"]),
+                str(previous["updated"]),
+                int(previous["generation"]),
+            ):
+                latest_claims[assignment_sha256] = record
         jobs_by_uri = {assignment_completion_uri(manifest, job): job for job in jobs}
         assignment_inventory = _metadata_map(
             run_client.list_objects(
@@ -876,6 +1110,9 @@ def run_monitor(
                 )
             valid_assignment_uris.add(uri)
             assignment_sha256.append(str(cached["sha256"]))
+        completed_assignment_sha256 = {
+            str(jobs_by_uri[uri]["assignment_sha256"]) for uri in valid_assignment_uris
+        }
 
         specs_by_uri = {
             gcs_join(
@@ -964,17 +1201,40 @@ def run_monitor(
                 for uri, spec in specs_by_uri.items()
                 if spec.worker in owned_workers
             )
-            progress_events = [
-                metadata
-                for uri, metadata in assignment_inventory.items()
-                if jobs_by_uri[uri]["worker"] in owned_workers
-            ] + [
-                metadata
-                for uri, metadata in slot_inventory.items()
-                if specs_by_uri[uri].worker in owned_workers
+            worker_claims = [
+                record
+                for record in claim_records
+                if record["physical_worker_index"] == physical_index
             ]
+            worker_latest_claims = [
+                record
+                for record in latest_claims.values()
+                if record["physical_worker_index"] == physical_index
+            ]
+            completed_claimed_assignments = sum(
+                str(record["assignment_sha256"]) in completed_assignment_sha256
+                for record in worker_latest_claims
+            )
+            progress_events = (
+                [
+                    metadata
+                    for uri, metadata in assignment_inventory.items()
+                    if jobs_by_uri[uri]["worker"] in owned_workers
+                ]
+                + [
+                    metadata
+                    for uri, metadata in slot_inventory.items()
+                    if specs_by_uri[uri].worker in owned_workers
+                ]
+                + worker_claims
+            )
             latest_progress_event = _latest(progress_events)
-            signature = f"{completed_assignments}/{expected_assignments}:{completed_slots}/{slots_per_worker}"
+            signature = (
+                f"{completed_assignments}/{expected_assignments}:"
+                f"{completed_slots}/{slots_per_worker}:"
+                f"{len(worker_claims)}/{len(worker_latest_claims)}/"
+                f"{completed_claimed_assignments}"
+            )
             prior = worker_state.get(worker)
             if (
                 not isinstance(prior, Mapping)
@@ -987,10 +1247,6 @@ def run_monitor(
                     where="worker progress time",
                     minimum=0,
                 )
-            worker_state[worker] = {
-                "progress_signature": signature,
-                "progress_at_unix": progress_at,
-            }
             latest_ready = _latest(ready_by_worker[worker])
             latest_failed = _latest(failed_by_worker[worker])
             latest_completed = _latest(completed_by_worker[worker])
@@ -1013,14 +1269,29 @@ def run_monitor(
             instance_status = (
                 str(instance.get("status", "MISSING")) if instance else "MISSING"
             )
+            prior_zone = prior.get("zone") if isinstance(prior, Mapping) else None
+            instance_zone = _zone_name(
+                (instance.get("zone") if instance else prior_zone or checked["zone"]),
+                where=f"instance {worker} zone",
+            )
+            worker_state[worker] = {
+                "progress_signature": signature,
+                "progress_at_unix": progress_at,
+                "zone": instance_zone,
+            }
             report: dict[str, object] = {
                 "name": worker,
                 "instance_status": instance_status,
+                "zone": instance_zone,
                 "ready_receipts": len(ready_by_worker[worker]),
                 "failed_receipts": len(failed_by_worker[worker]),
                 "completed_receipts": len(completed_by_worker[worker]),
                 "assignment_receipts": completed_assignments,
                 "expected_assignments": expected_assignments,
+                "assignment_accounting": "manifest_home_shard",
+                "claim_receipts": len(worker_claims),
+                "claimed_assignments": len(worker_latest_claims),
+                "completed_claimed_assignments": completed_claimed_assignments,
                 "slot_receipts": completed_slots,
                 "expected_slots": slots_per_worker,
                 "last_progress_at_unix": progress_at,
@@ -1054,6 +1325,7 @@ def run_monitor(
                         state=state,
                         client=run_client,
                         object_store=store,
+                        zone=instance_zone,
                         now=checked_at,
                     )
                 except (ContractError, OSError, RuntimeError, ValueError) as exc:
@@ -1109,6 +1381,8 @@ def run_monitor(
             ),
             "assignment_receipts": len(valid_assignment_uris),
             "expected_assignment_receipts": len(jobs),
+            "assignment_claim_receipts": len(claim_records),
+            "claimed_assignments": len(latest_claims),
             "slot_receipts": len(valid_slot_uris),
             "expected_slot_receipts": len(logical_specs),
         }
@@ -1122,6 +1396,9 @@ def run_monitor(
                     ),
                 }
             )
+        ).hexdigest()
+        claim_inventory_sha256 = hashlib.sha256(
+            canonical_json_bytes(sorted(claim_sha256))
         ).hexdigest()
         if counts["completed_workers"] == len(physical_workers):
             run_state = "complete"
@@ -1154,6 +1431,10 @@ def run_monitor(
             "workers": worker_reports,
             "unexpected_instances": unexpected_instances,
             "receipt_inventory_sha256": receipt_inventory_sha256,
+            "claim_inventory_sha256": claim_inventory_sha256,
+            "scheduler_mode": (
+                "dynamic_claim_queue" if claim_records else "manifest_home_shards"
+            ),
             "recovery_policy": {
                 "transient_exit_code": TRANSIENT_EXIT_CODE,
                 "deterministic_exit_code": DETERMINISTIC_EXIT_CODE,
