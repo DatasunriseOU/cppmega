@@ -24,6 +24,6 @@ output "iap_ssh_commands" {
   description = "IAP SSH commands; OS Login IAM is still required for the caller."
   value = {
     for name, instance in google_compute_instance.worker : name =>
-    "gcloud compute ssh ${instance.name} --project=${var.project_id} --zone=${var.zone} --tunnel-through-iap"
+    "gcloud compute ssh ${instance.name} --project=${var.project_id} --zone=${instance.zone} --tunnel-through-iap"
   }
 }

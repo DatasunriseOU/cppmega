@@ -200,6 +200,16 @@ run "workers_can_span_two_regional_zones" {
     )
     error_message = "Each worker must retain its explicit regional zone assignment."
   }
+
+  assert {
+    condition = (
+      strcontains(output.iap_ssh_commands["cppmega-corpus-00"], "--zone=us-central1-c") &&
+      strcontains(output.iap_ssh_commands["cppmega-corpus-01"], "--zone=us-central1-c") &&
+      strcontains(output.iap_ssh_commands["cppmega-corpus-02"], "--zone=us-central1-f") &&
+      strcontains(output.iap_ssh_commands["cppmega-corpus-03"], "--zone=us-central1-f")
+    )
+    error_message = "Every generated IAP SSH command must use its worker's actual zone."
+  }
 }
 
 run "workers_can_use_mixed_machine_types" {
