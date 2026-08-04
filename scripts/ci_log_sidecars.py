@@ -833,6 +833,23 @@ def _secret_candidates(text: str) -> list[tuple[int, int, int, str]]:
     return accepted
 
 
+def _structure_contains_secret(value: Any) -> bool:
+    """Scan JSON-like string leaves without matching across field boundaries."""
+    if isinstance(value, str):
+        return bool(_secret_candidates(value))
+    if isinstance(value, Mapping):
+        return any(
+            _structure_contains_secret(key)
+            or _structure_contains_secret(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(
+        value, (bytes, bytearray)
+    ):
+        return any(_structure_contains_secret(item) for item in value)
+    return False
+
+
 def _redact_secrets(text: str) -> tuple[str, list[dict[str, Any]]]:
     candidates = _secret_candidates(text)
     if not candidates:
@@ -4720,7 +4737,7 @@ def canonicalize_ci_log(
     )
     for chunk in chunks:
         training_sidecars = chunk["training_sidecars"]
-        if _secret_candidates(stable_json_dumps(training_sidecars)):
+        if _structure_contains_secret(training_sidecars):
             raise ValueError(
                 "chunk training sidecars retained a secret-like value"
             )
@@ -4880,8 +4897,7 @@ def canonicalize_ci_log(
     # Defense in depth: selected metadata is sanitized before it reaches the
     # sidecar.  This invariant catches a future field addition that forgets to
     # follow the same rule.
-    sidecar_json = stable_json_dumps(sidecar)
-    if _secret_candidates(sidecar_json):
+    if _structure_contains_secret(sidecar):
         raise ValueError("sidecar serialization retained a secret-like value")
 
     return {

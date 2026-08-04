@@ -28,6 +28,8 @@ from ci_log_sidecars import (  # noqa: E402
     _is_package_version,
     _path_category,
     _physical_lines,
+    _secret_candidates,
+    _structure_contains_secret,
     canonicalize_ci_log,
     extract_ci_log_sidecar,
     stable_json_dumps,
@@ -58,6 +60,26 @@ class _SuffixSliceTrackingString(str):
         ):
             self.unbounded_suffix_slices += 1
         return super().__getitem__(key)
+
+
+def test_structured_secret_scan_does_not_join_distinct_fields() -> None:
+    metadata = {
+        "a_url": "https://example.com",
+        "z_email": "user@example.org",
+    }
+
+    assert _secret_candidates(stable_json_dumps(metadata))
+    assert not _structure_contains_secret(metadata)
+
+
+def test_structured_secret_scan_still_rejects_a_secret_in_one_field() -> None:
+    metadata = {
+        "nested": [
+            {"endpoint": "https://username:actual-secret@example.com"}
+        ]
+    }
+
+    assert _structure_contains_secret(metadata)
 
 
 def test_physical_line_scan_is_linear_and_preserves_mixed_boundaries() -> None:
