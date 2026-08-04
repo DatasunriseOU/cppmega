@@ -738,6 +738,7 @@ def run_source_slot_scheduler(
         resumed: list[str] = []
         completed: list[str] = []
         transient_failures: list[str] = []
+        deterministic_failures: list[tuple[str, int, Path]] = []
         source_receipt_count = 0
         pending: list[tuple[SlotSpec, Path]] = []
         for spec in specs:
@@ -830,10 +831,12 @@ def run_source_slot_scheduler(
                         transient_failures.append(spec.worker)
                         continue
                     if code != 0:
-                        raise RuntimeError(
-                            f"source slot {spec.worker} failed with exit code {code}; "
-                            f"see {entry['attempt_root']}/source-worker.log"
+                        attempt_root = entry["attempt_root"]
+                        assert isinstance(attempt_root, Path)
+                        deterministic_failures.append(
+                            (spec.worker, code, attempt_root / "source-worker.log")
                         )
+                        continue
                     slot_receipt = _build_slot_completion(
                         manifest=manifest,
                         manifest_file_sha256=manifest_file_sha256,
@@ -861,6 +864,24 @@ def run_source_slot_scheduler(
                 if hasattr(log, "close"):
                     log.close()
             raise
+
+        if deterministic_failures:
+            details = "; ".join(
+                f"{worker} exit={code} log={log_path}"
+                for worker, code, log_path in sorted(deterministic_failures)
+            )
+            transient_detail = (
+                "; transient slots pending: "
+                f"{', '.join(sorted(transient_failures))}"
+                if transient_failures
+                else ""
+            )
+            raise RuntimeError(
+                "source slots failed deterministically: "
+                f"{details}; completed slots preserved: "
+                f"{', '.join(sorted(completed)) or 'none'}"
+                f"{transient_detail}"
+            )
 
         if transient_failures:
             raise TransientTransportError(

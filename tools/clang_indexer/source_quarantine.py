@@ -54,6 +54,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_crash_fixture",
         "clang_debug_parser_crash_pragma",
     ),
+    (
+        "binary_protocol_test_fixture",
+        "clickhouse_dollar_quoted_binary_sql",
+    ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
@@ -452,6 +456,62 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared "
                 "clang_debug_parser_crash_pragma but the Clang parser-crash "
                 "test contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "clickhouse_dollar_quoted_binary_sql":
+        payload = path.read_bytes()
+        if path.suffix.casefold() != ".sql" or payload.count(b"$$") != 2:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                "but the SQL dollar-quoted payload boundary is absent or ambiguous"
+            )
+        payload_start = payload.index(b"$$")
+        payload_end = payload.index(b"$$", payload_start + 2)
+        sql_prefix = payload[:payload_start]
+        binary_payload = payload[payload_start + 2 : payload_end]
+        sql_suffix = payload[payload_end + 2 :]
+        try:
+            decoded_prefix = sql_prefix.decode("utf-8")
+            decoded_suffix = sql_suffix.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                f"but its SQL envelope is not UTF-8/ASCII: {exc}"
+            ) from exc
+        format_match = re.match(
+            r"\A(?:[ \t]*(?:--[^\r\n]*)?\r?\n)*[ \t]*"
+            r"SELECT\s+\*\s+FROM\s+format\s*\(\s*"
+            r"((?:'(?:Native|BSONEachRow)')|(?:Native|BSONEachRow))\s*,",
+            decoded_prefix,
+            flags=re.IGNORECASE,
+        )
+        error_match = re.fullmatch(
+            r"\s*\)\s*;\s*--\s*\{\s*serverError\s+"
+            r"(TOO_LARGE_STRING_SIZE|TOO_LARGE_ARRAY_SIZE|INCORRECT_DATA)"
+            r"\s*\}\s*",
+            decoded_suffix,
+        )
+        if (
+            format_match is None
+            or not sql_prefix.rstrip().endswith(b",")
+            or not binary_payload
+            or b"\0" not in binary_payload
+            or error_match is None
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                "but the binary format regression-test contract is incomplete"
+            )
+        input_format = format_match.group(1).strip("'").casefold()
+        expected_errors = {
+            "native": {"TOO_LARGE_STRING_SIZE", "TOO_LARGE_ARRAY_SIZE"},
+            "bsoneachrow": {"INCORRECT_DATA"},
+        }
+        if error_match.group(1) not in expected_errors[input_format]:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                "but its format and expected server error disagree"
             )
         return
 

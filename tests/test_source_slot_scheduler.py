@@ -469,28 +469,48 @@ def test_scheduler_isolates_slots_and_resumes_exact_completions(tmp_path: Path) 
     assert sorted(stage.glob("slots/worker-*/attempt-*")) == attempts
 
 
-def test_scheduler_terminates_siblings_after_slot_failure(tmp_path: Path) -> None:
+def test_scheduler_preserves_and_resumes_sibling_after_slot_failure(tmp_path: Path) -> None:
     fixture = _empty_slot_scheduler_fixture(tmp_path)
     fake_worker = _fake_source_worker(
         tmp_path / "failing-worker.py",
         """
         import os
         import sys
-        import time
 
         if os.environ["CPPMEGA_SOURCE_SLOT"] == "worker-0000":
             sys.exit(7)
-        time.sleep(30)
+        sys.exit(0)
         """,
     )
-    with pytest.raises(RuntimeError, match="worker-0000 failed"):
+    with pytest.raises(RuntimeError, match=r"worker-0000 exit=7"):
         _run_empty_slots(fixture, fake_worker)
     store = fixture["store"]
     manifest = fixture["manifest"]
+    scheduler_receipt = fixture["scheduler_receipt"]
+    stage = fixture["stage"]
     assert isinstance(store, LocalObjectStore)
     assert isinstance(manifest, dict)
+    assert isinstance(scheduler_receipt, Path)
+    assert isinstance(stage, Path)
     assert store.describe_if_present(slot_completion_uri(manifest, "worker-0000")) is None
-    assert store.describe_if_present(slot_completion_uri(manifest, "worker-0001")) is None
+    assert store.describe_if_present(slot_completion_uri(manifest, "worker-0001")) is not None
+    assert not scheduler_receipt.exists()
+    first_attempts = sorted(stage.glob("slots/worker-*/attempt-*"))
+    assert len(first_attempts) == 2
+
+    repaired_worker = _fake_source_worker(
+        tmp_path / "repaired-worker.py",
+        """
+        import sys
+        sys.exit(0)
+        """,
+    )
+    receipt = _run_empty_slots(fixture, repaired_worker)
+    assert receipt["completed_slots"] == ["worker-0000", "worker-0001"]
+    assert receipt["resumed_slots"] == ["worker-0001"]
+    assert scheduler_receipt.is_file()
+    assert len(list((stage / "slots" / "worker-0000").glob("attempt-*"))) == 2
+    assert len(list((stage / "slots" / "worker-0001").glob("attempt-*"))) == 1
 
 
 def test_scheduler_preserves_sibling_after_transient_slot_failure(tmp_path: Path) -> None:

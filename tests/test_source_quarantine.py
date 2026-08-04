@@ -31,6 +31,7 @@ RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
+RELATIVE_CLICKHOUSE_BINARY_SQL = "tests/queries/0_stateless/binary_fixture.sql"
 
 
 def _xml_bytes() -> bytes:
@@ -155,6 +156,20 @@ def _self_executing_zip_bytes() -> bytes:
     with zipfile.ZipFile(archive_buffer, mode="w") as archive:
         archive.writestr("payload.txt", "exact fixture payload\n")
     return b'#!/bin/sh\nexec java -jar "$0" "$@"\nexit 1\n' + archive_buffer.getvalue()
+
+
+def _clickhouse_binary_sql_bytes(
+    *,
+    input_format: str = "Native",
+    server_error: str = "TOO_LARGE_ARRAY_SIZE",
+) -> bytes:
+    return (
+        b"-- It correctly throws a high-level exception:\n"
+        b"SELECT * FROM format("
+        + input_format.encode("ascii")
+        + b", 'value UInt64',\n$$\x00\xffbinary-protocol-fixture$$); -- { "
+        b"serverError " + server_error.encode("ascii") + b" }\n"
+    )
 
 
 def _write_manifest(
@@ -533,6 +548,71 @@ def test_exact_quarantine_filters_self_executing_zip(
     assert receipt["entries"][0]["detected_format"] == ("posix_shell_appended_zip")
 
 
+@pytest.mark.parametrize(
+    ("input_format", "server_error"),
+    [
+        ("Native", "TOO_LARGE_ARRAY_SIZE"),
+        ("BSONEachRow", "INCORRECT_DATA"),
+    ],
+)
+def test_exact_quarantine_filters_clickhouse_binary_sql_fixture(
+    tmp_path: Path,
+    input_format: str,
+    server_error: str,
+) -> None:
+    payload = _clickhouse_binary_sql_bytes(
+        input_format=input_format,
+        server_error=server_error,
+    )
+    candidate = tmp_path / RELATIVE_CLICKHOUSE_BINARY_SQL
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="binary_protocol_test_fixture",
+        detected_format="clickhouse_dollar_quoted_binary_sql",
+        relative_path=RELATIVE_CLICKHOUSE_BINARY_SQL,
+        reason="ClickHouse binary protocol exception fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == ("binary_protocol_test_fixture")
+    assert receipt["entries"][0]["detected_format"] == (
+        "clickhouse_dollar_quoted_binary_sql"
+    )
+
+
+def test_clickhouse_binary_sql_quarantine_rejects_plain_text_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = (
+        b"SELECT * FROM format(Native, 'value UInt64',\n"
+        b"$$plain text$$); -- { serverError TOO_LARGE_ARRAY_SIZE }\n"
+    )
+    candidate = tmp_path / RELATIVE_CLICKHOUSE_BINARY_SQL
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="binary_protocol_test_fixture",
+        detected_format="clickhouse_dollar_quoted_binary_sql",
+        relative_path=RELATIVE_CLICKHOUSE_BINARY_SQL,
+        reason="forged ClickHouse binary protocol fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_executable_archive_quarantine_rejects_invalid_zip(
     tmp_path: Path,
 ) -> None:
@@ -733,6 +813,45 @@ def test_checked_in_threadx_generated_blob_manifest_matches_upstream_receipt() -
     assert entry["detected_format"] == "mixed_utf8_utf16le_c_array"
 
 
+def test_checked_in_clickhouse_binary_sql_manifest_matches_diagnosis_receipts() -> None:
+    expected = {
+        "tests/queries/0_stateless/02683_native_too_large_size.sql": (
+            5742,
+            "0dd70078b534e164c86d82c27c926573745c186970189914d886aab6aa0259ea",
+        ),
+        "tests/queries/0_stateless/02685_bson2.sql": (
+            21329,
+            "e6be67fb4b042a5b0845243d3790db2230483cfeb2fd072491415aa34a106507",
+        ),
+        "tests/queries/0_stateless/02686_bson3.sql": (
+            21327,
+            "7b1b4bd8e2f641baf789ddd854f89c5c1583c5240999f494360f27fc9473e90d",
+        ),
+        "tests/queries/0_stateless/02687_native_fuzz.sql": (
+            630,
+            "e96d08c5033a3409725549d8c0909dc40b4f94a687fdd3b1e390b810db691e2c",
+        ),
+    }
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = {
+        item["relative_path"]: item
+        for item in manifest["entries"]
+        if item["project_id"] == "ClickHouse/ClickHouse"
+    }
+
+    assert set(entries) == set(expected)
+    for relative_path, (size_bytes, sha256) in expected.items():
+        entry = entries[relative_path]
+        assert entry["size_bytes"] == size_bytes
+        assert entry["sha256"] == sha256
+        assert entry["classification"] == "binary_protocol_test_fixture"
+        assert entry["detected_format"] == "clickhouse_dollar_quoted_binary_sql"
+
+
 @pytest.mark.parametrize(
     ("project_id", "relative_path", "size_bytes", "sha256"),
     [
@@ -887,3 +1006,35 @@ def test_process_project_quarantines_non_cpp_executable_archive(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["quarantined_count"] == 1
     assert receipt["entries"][0]["relative_path"] == RELATIVE_EXECUTABLE_ARCHIVE
+
+
+def test_process_project_quarantines_clickhouse_binary_sql_before_domain_discovery(
+    tmp_path: Path,
+) -> None:
+    payload = _clickhouse_binary_sql_bytes()
+    candidate = tmp_path / RELATIVE_CLICKHOUSE_BINARY_SQL
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    receipt_path = tmp_path / "receipts/source.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="binary_protocol_test_fixture",
+        detected_format="clickhouse_dollar_quoted_binary_sql",
+        relative_path=RELATIVE_CLICKHOUSE_BINARY_SQL,
+        reason="ClickHouse binary protocol exception fixture",
+    )
+
+    documents = ip.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id=PROJECT_ID,
+        source_quarantine_manifest=str(manifest),
+        source_quarantine_receipt=str(receipt_path),
+    )
+
+    assert documents == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["relative_path"] == RELATIVE_CLICKHOUSE_BINARY_SQL

@@ -81,6 +81,42 @@
       "classification": "generated_executable_archive",
       "detected_format": "posix_shell_appended_zip",
       "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02683_native_too_large_size.sql",
+      "size_bytes": 5742,
+      "sha256": "0dd70078b534e164c86d82c27c926573745c186970189914d886aab6aa0259ea",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse Native-format exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02685_bson2.sql",
+      "size_bytes": 21329,
+      "sha256": "e6be67fb4b042a5b0845243d3790db2230483cfeb2fd072491415aa34a106507",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse BSONEachRow exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02686_bson3.sql",
+      "size_bytes": 21327,
+      "sha256": "7b1b4bd8e2f641baf789ddd854f89c5c1583c5240999f494360f27fc9473e90d",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse BSONEachRow exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02687_native_fuzz.sql",
+      "size_bytes": 630,
+      "sha256": "e96d08c5033a3409725549d8c0909dc40b4f94a687fdd3b1e390b810db691e2c",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse Native-format fuzz regression fixture with a dollar-quoted binary protocol payload"
     }
   ],
   "collections": [
