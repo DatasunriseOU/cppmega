@@ -142,6 +142,7 @@ resource "google_compute_instance" "worker" {
     bootstrap_overlay_sha256  = var.bootstrap_overlay_sha256
     bootstrap_script_gcs_uri  = var.bootstrap_script_gcs_uri
     bootstrap_script_sha256   = var.bootstrap_script_sha256
+    runner_role               = var.runner_role
     bucket_name               = local.bucket_name
     gcs_prefix                = var.gcs_prefix
     local_ssd_count           = var.local_ssd_count
@@ -176,9 +177,9 @@ resource "google_compute_instance" "worker" {
     precondition {
       condition = var.bootstrap_script_gcs_uri == "" || (
         startswith(var.bootstrap_script_gcs_uri, "${local.run_root}/bootstrap/") &&
-        endswith(var.bootstrap_script_gcs_uri, "${var.bootstrap_script_sha256}.source-worker-runner")
+        endswith(var.bootstrap_script_gcs_uri, "${var.bootstrap_script_sha256}.${var.runner_role}-worker-runner")
       )
-      error_message = "bootstrap_script_gcs_uri must be the content-addressed <run_root>/bootstrap/<sha256>.source-worker-runner object."
+      error_message = "bootstrap_script_gcs_uri must be the content-addressed <run_root>/bootstrap/<sha256>.<runner_role>-worker-runner object."
     }
 
     precondition {

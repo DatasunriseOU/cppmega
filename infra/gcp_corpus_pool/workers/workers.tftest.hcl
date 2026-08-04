@@ -86,4 +86,81 @@ run "content_addressed_v4_bootstrap" {
     condition     = strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcs_read_exact \"$BOOTSTRAP_URI\"") && !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcloud storage cp \"$BOOTSTRAP_URI\"")
     error_message = "Startup must use the v4-proven exact-object download path."
   }
+  assert {
+    condition = (
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RUNNER_ROLE=\"source\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RUNNER_SERVICE=\"cppmega-$RUNNER_ROLE-worker.service\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "Restart=on-failure") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RestartPreventExitStatus=2") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RestartSec=30min") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "StartLimitIntervalSec=0") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "chown cppmega:cppmega \"$STAGE_ROOT\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "chmod 0770 \"$STAGE_ROOT\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "MAX_TRANSPORT_RETRIES=4") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "if status=$(curl") &&
+      !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "runuser -u cppmega")
+    )
+    error_message = "Content-addressed workers must run under an unbounded on-failure systemd supervisor."
+  }
+}
+
+run "bounded_two_slot_profile" {
+  command = plan
+
+  variables {
+    project_id                = "natural-bison-491019-t9"
+    run_id                    = "source-two-slot-test"
+    worker_count              = 4
+    machine_type              = "n2-standard-16"
+    slots_per_worker          = 2
+    parse_workers_per_slot    = 6
+    memory_limit_gb_per_slot  = 24
+    cpu_budget_vcpus          = 16
+    memory_budget_gb          = 56
+    bootstrap_script_gcs_uri  = ""
+    bootstrap_script_sha256   = ""
+    bootstrap_bundle_sha256   = ""
+    bootstrap_overlay_sha256  = ""
+    bootstrap_manifest_sha256 = ""
+  }
+
+  assert {
+    condition     = length(google_compute_instance.worker) == 4 && length(google_compute_address.worker) == 4
+    error_message = "Multi-slot mode must preserve the physical VM and address count."
+  }
+
+  assert {
+    condition     = alltrue([for worker in google_compute_instance.worker : strcontains(worker.metadata_startup_script, "SLOTS_PER_WORKER=2") && strcontains(worker.metadata_startup_script, "PARSE_WORKERS_PER_SLOT=6") && strcontains(worker.metadata_startup_script, "MEMORY_LIMIT_GB_PER_SLOT=24")])
+    error_message = "Startup must carry the bounded two-slot resource profile."
+  }
+
+  assert {
+    condition     = alltrue([for worker in google_compute_instance.worker : worker.metadata["cppmega-slots-per-worker"] == "2"])
+    error_message = "Worker metadata must expose the physical-to-logical slot topology."
+  }
+}
+
+run "content_addressed_cloud_lane_runner" {
+  command = plan
+
+  variables {
+    project_id                = "natural-bison-491019-t9"
+    run_id                    = "github-pr-smoke-20260804-001"
+    worker_count              = 1
+    runner_role               = "cloud-lane"
+    bootstrap_script_gcs_uri  = "gs://natural-bison-491019-t9-cppmega-corpus/runs/github-pr-smoke-20260804-001/bootstrap/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cloud-lane-worker-runner"
+    bootstrap_script_sha256   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    bootstrap_bundle_sha256   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    bootstrap_overlay_sha256  = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    bootstrap_manifest_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  }
+
+  assert {
+    condition = (
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RUNNER_ROLE=\"cloud-lane\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RUNNER_SERVICE=\"cppmega-$RUNNER_ROLE-worker.service\"") &&
+      strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "systemctl enable --now \"$RUNNER_SERVICE\"")
+    )
+    error_message = "Cloud lanes must use a distinct content-addressed runner and systemd service."
+  }
 }

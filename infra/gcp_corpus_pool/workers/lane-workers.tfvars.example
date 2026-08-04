@@ -1,0 +1,30 @@
+project_id = "natural-bison-491019-t9"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# This immutable run uses terraform/lane-workers, never the live source state.
+run_id       = "github-pr-smoke-20260804-001"
+runner_role  = "cloud-lane"
+worker_count = 1
+machine_type = "n2-standard-16"
+
+slots_per_worker         = 1
+parse_workers_per_slot   = 12
+memory_limit_gb_per_slot = 48
+cpu_budget_vcpus         = 16
+memory_budget_gb         = 56
+local_ssd_count           = 2
+
+bootstrap_script_gcs_uri    = "gs://natural-bison-491019-t9-cppmega-corpus/runs/github-pr-smoke-20260804-001/bootstrap/REPLACE.cloud-lane-worker-runner"
+bootstrap_script_sha256     = "REPLACE"
+bootstrap_bundle_sha256     = "REPLACE"
+bootstrap_overlay_sha256    = "REPLACE"
+bootstrap_manifest_sha256   = "REPLACE"
+
+use_spot = false
+
+labels = {
+  corpus-run = "github-pr-smoke-20260804-001"
+  owner      = "cppmega"
+  lane       = "github-pr"
+}
