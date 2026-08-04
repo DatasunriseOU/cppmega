@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shlex
 from typing import Callable
@@ -119,6 +121,53 @@ _COMPILE_COMMANDS_SKIP_DIRS = {
     "external",
     "deps",
 }
+_XCCONFIG_SKIP_DIRS = _COMPILE_COMMANDS_SKIP_DIRS | {
+    ".idea",
+    ".vscode",
+    "__pycache__",
+}
+_XCCONFIG_RELEVANT_SETTINGS = frozenset(
+    {
+        "SDKROOT",
+        "SUPPORTED_PLATFORMS",
+        "GCC_C_LANGUAGE_STANDARD",
+        "HEADER_SEARCH_PATHS",
+        "USER_HEADER_SEARCH_PATHS",
+        "SYSTEM_HEADER_SEARCH_PATHS",
+    }
+)
+_XCCONFIG_HEADER_SETTINGS = frozenset(
+    {
+        "HEADER_SEARCH_PATHS",
+        "USER_HEADER_SEARCH_PATHS",
+        "SYSTEM_HEADER_SEARCH_PATHS",
+    }
+)
+_XCCONFIG_ASSIGNMENT_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P<conditions>(?:\[[^\]\r\n]+\])*)\s*"
+    r"(?P<operator>\+=|\?=|=)\s*(?P<value>.*?)\s*$"
+)
+_XCCONFIG_INCLUDE_RE = re.compile(
+    r'^\s*#\s*include(?P<optional>\?)?\s+["<](?P<path>[^">]+)[">]\s*$'
+)
+_XCCONFIG_VARIABLE_RE = re.compile(
+    r"\$\([^)]+\)|\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*"
+)
+_XCCONFIG_IGNORED_BUILD_PATH_VARIABLES = (
+    "$(BUILT_PRODUCTS_DIR)",
+    "${BUILT_PRODUCTS_DIR}",
+    "$(DERIVED_FILE_DIR)",
+    "${DERIVED_FILE_DIR}",
+    "$(DERIVED_SOURCES_DIR)",
+    "${DERIVED_SOURCES_DIR}",
+)
+_MAX_XCCONFIG_FILES = 256
+_MAX_XCCONFIG_SCAN_DIRS = 4096
+_MAX_XCCONFIG_FILE_BYTES = 512 * 1024
+_MAX_XCCONFIG_TOTAL_BYTES = 8 * 1024 * 1024
+_MAX_XCCONFIG_LOGICAL_LINE_BYTES = 64 * 1024
+_MAX_MACOS_SDK_SETTINGS_BYTES = 1024 * 1024
 
 
 def is_cpp_path(path: str | None) -> bool:
@@ -173,6 +222,51 @@ class BuildDetection:
     language: str | None = None
     flags: list[str] = field(default_factory=list)
     arch: str | None = None
+
+
+class BuildContextEvidenceError(RuntimeError):
+    """Raised when build evidence exists but cannot be bound safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSSDKBinding:
+    path: str
+    settings_path: str
+    settings_sha256: str
+    canonical_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSXCConfigContext:
+    sdkroot: str
+    c_language_standard: str
+    header_search_paths: tuple[str, ...]
+    evidence_files: tuple[str, ...]
+    sdk: MacOSSDKBinding
+    compile_args: tuple[str, ...]
+
+    def platform_info(self) -> dict[str, object]:
+        return {
+            "platform": "macosx",
+            "compiler": "clang",
+            "standard": "c23",
+            "mode": "user",
+            "build_system": "xcconfig",
+            "source": "xcconfig",
+            "sdkroot": self.sdkroot,
+            "macos_sdk_path": self.sdk.path,
+            "macos_sdk_settings_sha256": self.sdk.settings_sha256,
+            "xcconfig_evidence_files": list(self.evidence_files),
+            "xcconfig_header_search_paths": list(self.header_search_paths),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _XCConfigAssignment:
+    name: str
+    conditions: str
+    value: str
+    source: Path
 
 
 def _path_candidates(path: str, directory: str | None = None) -> set[str]:
@@ -853,6 +947,586 @@ def _parse_xmake(text: str) -> BuildDetection | None:
     )
 
 
+def _is_path_within(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath((str(path), str(root))) == str(root)
+    except ValueError:
+        return False
+
+
+def _read_bounded_file(path: Path, *, max_bytes: int, label: str) -> bytes:
+    try:
+        stat_result = path.stat()
+    except OSError as exc:
+        raise BuildContextEvidenceError(f"cannot stat {label}: {path}") from exc
+    if not path.is_file():
+        raise BuildContextEvidenceError(f"{label} is not a regular file: {path}")
+    if stat_result.st_size > max_bytes:
+        raise BuildContextEvidenceError(
+            f"{label} exceeds the {max_bytes}-byte trust bound: {path}"
+        )
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise BuildContextEvidenceError(f"cannot read {label}: {path}") from exc
+    if len(payload) > max_bytes:
+        raise BuildContextEvidenceError(
+            f"{label} exceeds the {max_bytes}-byte trust bound: {path}"
+        )
+    return payload
+
+
+def normalize_macos_sdk_path_argument(
+    macos_sdk_path: str | os.PathLike[str],
+) -> str:
+    """Make a CLI SDK path absolute without dereferencing symlinks."""
+
+    raw_path = os.fspath(macos_sdk_path)
+    if not raw_path:
+        raise ValueError("macOS SDK path cannot be empty")
+    return os.path.abspath(os.path.expanduser(raw_path))
+
+
+def validate_macos_sdk_path(macos_sdk_path: str | os.PathLike[str]) -> MacOSSDKBinding:
+    """Validate an explicitly supplied SDK without consulting host discovery."""
+
+    raw_path = os.fspath(macos_sdk_path)
+    if not raw_path or not os.path.isabs(raw_path):
+        raise BuildContextEvidenceError("macOS SDK path must be explicit and absolute")
+    absolute_path = Path(normalize_macos_sdk_path_argument(raw_path))
+    try:
+        resolved_path = absolute_path.resolve(strict=True)
+    except OSError as exc:
+        raise BuildContextEvidenceError(
+            f"macOS SDK path cannot be resolved: {absolute_path}"
+        ) from exc
+    if absolute_path != resolved_path:
+        raise BuildContextEvidenceError(
+            f"macOS SDK path must not contain symlink components: {absolute_path}"
+        )
+    if not resolved_path.is_dir():
+        raise BuildContextEvidenceError(
+            f"macOS SDK path is not a directory: {resolved_path}"
+        )
+
+    json_marker = resolved_path / "SDKSettings.json"
+    if json_marker.exists():
+        try:
+            resolved_marker = json_marker.resolve(strict=True)
+        except OSError as exc:
+            raise BuildContextEvidenceError(
+                f"cannot resolve SDKSettings.json: {exc}"
+            ) from exc
+        if json_marker != resolved_marker or not _is_path_within(
+            resolved_marker, resolved_path
+        ):
+            raise BuildContextEvidenceError(
+                "SDKSettings.json must be a regular in-SDK file"
+            )
+        payload = _read_bounded_file(
+            json_marker,
+            max_bytes=_MAX_MACOS_SDK_SETTINGS_BYTES,
+            label="macOS SDK SDKSettings.json",
+        )
+        try:
+            settings = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BuildContextEvidenceError(
+                f"invalid SDKSettings.json: {exc}"
+            ) from exc
+        if not isinstance(settings, dict):
+            raise BuildContextEvidenceError(
+                "invalid SDKSettings.json: root is not a mapping"
+            )
+        canonical_name = settings.get("CanonicalName")
+        default_variant = settings.get("DefaultVariant")
+        if not isinstance(canonical_name, str) or not canonical_name.lower().startswith(
+            "macosx"
+        ):
+            raise BuildContextEvidenceError(
+                "invalid SDKSettings.json: CanonicalName is not macosx"
+            )
+        if default_variant is not None and (
+            not isinstance(default_variant, str)
+            or default_variant.lower() != "macos"
+        ):
+            raise BuildContextEvidenceError(
+                "invalid SDKSettings.json: DefaultVariant is not macos"
+            )
+        return MacOSSDKBinding(
+            path=str(resolved_path),
+            settings_path=str(json_marker),
+            settings_sha256=hashlib.sha256(payload).hexdigest(),
+            canonical_name=canonical_name,
+        )
+
+    plist_marker = resolved_path / "SDKSettings.plist"
+    if plist_marker.exists():
+        try:
+            resolved_marker = plist_marker.resolve(strict=True)
+        except OSError as exc:
+            raise BuildContextEvidenceError(
+                f"cannot resolve SDKSettings.plist: {exc}"
+            ) from exc
+        if plist_marker != resolved_marker or not _is_path_within(
+            resolved_marker, resolved_path
+        ):
+            raise BuildContextEvidenceError(
+                "SDKSettings.plist must be a regular in-SDK file"
+            )
+        payload = _read_bounded_file(
+            plist_marker,
+            max_bytes=_MAX_MACOS_SDK_SETTINGS_BYTES,
+            label="macOS SDK SDKSettings.plist",
+        )
+        # The marker is bound by its bounded bytes/hash.  Some older SDK
+        # layouts ship a plist-like marker that is not parseable by Python's
+        # plist reader, so content decoding is advisory for the fallback.
+        canonical_name = "macosx"
+        try:
+            settings = plistlib.loads(payload)
+        except (plistlib.InvalidFileException, ValueError, TypeError):
+            settings = None
+        if isinstance(settings, dict):
+            candidate_name = settings.get("CanonicalName")
+            if isinstance(candidate_name, str) and candidate_name.lower().startswith(
+                "macosx"
+            ):
+                canonical_name = candidate_name
+        return MacOSSDKBinding(
+            path=str(resolved_path),
+            settings_path=str(plist_marker),
+            settings_sha256=hashlib.sha256(payload).hexdigest(),
+            canonical_name=canonical_name,
+        )
+
+    raise BuildContextEvidenceError(
+        "macOS SDK has no valid SDKSettings.json or SDKSettings.plist"
+    )
+
+
+def _discover_xcconfig_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    scanned_dirs = 0
+    # Source archives can contain very large vendored trees.  Xcode
+    # configuration is conventionally kept at the root or in one of these
+    # small Apple/config directories, so avoid walking the entire checkout.
+    scan_roots: list[Path] = [root]
+    for relative in (
+        "OSX",
+        "OSX/config",
+        "macOS",
+        "macOS/config",
+        "config",
+        "configs",
+        "xcconfig",
+        "Xcode",
+    ):
+        candidate = root / relative
+        if candidate.is_dir() and not candidate.is_symlink():
+            scan_roots.append(candidate)
+    for child in sorted(root.iterdir(), key=lambda path: path.name):
+        if (
+            child.is_dir()
+            and not child.is_symlink()
+            and child.name.lower() in {"osx", "macos", "xcode", "config", "configs"}
+        ):
+            scan_roots.append(child)
+
+    visited_roots: set[Path] = set()
+    for scan_root in scan_roots:
+        scan_root = scan_root.resolve(strict=True)
+        if scan_root in visited_roots:
+            continue
+        visited_roots.add(scan_root)
+        for current_root, dirs, names in os.walk(scan_root, followlinks=False):
+            scanned_dirs += 1
+            if scanned_dirs > _MAX_XCCONFIG_SCAN_DIRS:
+                raise BuildContextEvidenceError(
+                    "xcconfig discovery exceeded the directory trust bound"
+                )
+            if scan_root == root:
+                # Root-level xcconfig files are authoritative candidates; the
+                # recursive Apple/config roots above cover their subtrees.
+                dirs[:] = []
+            else:
+                dirs[:] = sorted(
+                    name
+                    for name in dirs
+                    if name not in _XCCONFIG_SKIP_DIRS
+                    and not Path(current_root, name).is_symlink()
+                )
+            for name in sorted(names):
+                if not name.lower().endswith(".xcconfig"):
+                    continue
+                path = Path(current_root, name)
+                if path.is_symlink():
+                    raise BuildContextEvidenceError(
+                        f"xcconfig evidence file must not be a symlink: {path}"
+                    )
+                if path not in files:
+                    files.append(path)
+                    if len(files) > _MAX_XCCONFIG_FILES:
+                        raise BuildContextEvidenceError(
+                            "xcconfig discovery exceeded the file trust bound"
+                        )
+    return files
+
+
+def _strip_xcconfig_line_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            quote = None if quote == char else (char if quote is None else quote)
+            continue
+        if quote is None and char == "/" and line[index : index + 2] == "//":
+            return line[:index]
+    return line
+
+
+def _xcconfig_logical_lines(text: str, source: Path) -> list[str]:
+    lines: list[str] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        continued = line.endswith("\\")
+        if continued:
+            line = line[:-1]
+        pending += line
+        if len(pending.encode("utf-8")) > _MAX_XCCONFIG_LOGICAL_LINE_BYTES:
+            raise BuildContextEvidenceError(
+                f"xcconfig logical line exceeds trust bound: {source}"
+            )
+        if continued:
+            pending += " "
+            continue
+        lines.append(pending)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+def _resolve_xcconfig_include(
+    raw_path: str,
+    *,
+    source: Path,
+    root: Path,
+) -> tuple[Path | None, str | None]:
+    if _XCCONFIG_VARIABLE_RE.search(raw_path) is not None:
+        return None, f"xcconfig include has an unresolved variable: {source}: {raw_path}"
+    if "\x00" in raw_path:
+        return None, f"xcconfig include has a NUL byte: {source}"
+    raw = Path(raw_path)
+    candidates = [raw] if raw.is_absolute() else [source.parent / raw, root / raw]
+    resolved_candidates: list[Path] = []
+    outside_project = False
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            continue
+        if not _is_path_within(resolved, root):
+            outside_project = True
+            continue
+        if resolved.is_file() and resolved not in resolved_candidates:
+            resolved_candidates.append(resolved)
+    if outside_project:
+        return None, f"xcconfig include escapes project root: {source}: {raw_path}"
+    if len(resolved_candidates) > 1:
+        return None, f"xcconfig include is ambiguous: {source}: {raw_path}"
+    return (resolved_candidates[0] if resolved_candidates else None), None
+
+
+def _load_xcconfig_assignments(
+    root: Path,
+    initial_files: list[Path],
+) -> tuple[list[_XCConfigAssignment], list[str]]:
+    assignments: list[_XCConfigAssignment] = []
+    issues: list[str] = []
+    pending = list(initial_files)
+    visited: set[Path] = set()
+    total_bytes = 0
+    while pending:
+        source = pending.pop(0)
+        if source in visited:
+            continue
+        visited.add(source)
+        if len(visited) > _MAX_XCCONFIG_FILES:
+            raise BuildContextEvidenceError(
+                "xcconfig include graph exceeded the file trust bound"
+            )
+        payload = _read_bounded_file(
+            source,
+            max_bytes=_MAX_XCCONFIG_FILE_BYTES,
+            label="xcconfig evidence file",
+        )
+        total_bytes += len(payload)
+        if total_bytes > _MAX_XCCONFIG_TOTAL_BYTES:
+            raise BuildContextEvidenceError(
+                "xcconfig evidence exceeded the total-byte trust bound"
+            )
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            issues.append(f"xcconfig is not UTF-8: {source}: {exc}")
+            continue
+        for raw_line in _xcconfig_logical_lines(text, source):
+            line = _strip_xcconfig_line_comment(raw_line).strip()
+            if not line:
+                continue
+            include_match = _XCCONFIG_INCLUDE_RE.match(line)
+            if include_match is not None:
+                include_path, issue = _resolve_xcconfig_include(
+                    include_match.group("path"),
+                    source=source,
+                    root=root,
+                )
+                if issue is not None:
+                    issues.append(issue)
+                elif include_path is not None and include_path not in visited:
+                    pending.append(include_path)
+                continue
+            assignment_match = _XCCONFIG_ASSIGNMENT_RE.match(line)
+            if assignment_match is None:
+                continue
+            name = assignment_match.group("name")
+            if name not in _XCCONFIG_RELEVANT_SETTINGS:
+                continue
+            assignments.append(
+                _XCConfigAssignment(
+                    name=name,
+                    conditions=assignment_match.group("conditions"),
+                    value=assignment_match.group("value").rstrip(";").strip(),
+                    source=source,
+                )
+            )
+    return assignments, issues
+
+
+def _split_xcconfig_value(assignment: _XCConfigAssignment) -> list[str]:
+    try:
+        return [token.rstrip(";") for token in shlex.split(assignment.value)]
+    except ValueError as exc:
+        raise BuildContextEvidenceError(
+            f"cannot parse {assignment.name} in {assignment.source}: {exc}"
+        ) from exc
+
+
+def _setting_values(
+    assignments: list[_XCConfigAssignment],
+    setting: str,
+) -> tuple[set[str], list[_XCConfigAssignment]]:
+    selected = [assignment for assignment in assignments if assignment.name == setting]
+    values: set[str] = set()
+    for assignment in selected:
+        if assignment.conditions:
+            raise BuildContextEvidenceError(
+                f"conditional {setting} evidence is ambiguous: {assignment.source}"
+            )
+        for token in _split_xcconfig_value(assignment):
+            lowered = token.lower()
+            if lowered in {"$(inherited)", "${inherited}"}:
+                continue
+            if _XCCONFIG_VARIABLE_RE.search(token) is not None:
+                raise BuildContextEvidenceError(
+                    f"unresolved variable in {setting}: {assignment.source}: {token}"
+                )
+            if token:
+                values.add(lowered)
+    return values, selected
+
+
+def _resolve_xcconfig_header_path(
+    token: str,
+    *,
+    source: Path,
+    root: Path,
+) -> Path | None:
+    if token.lower() in {"$(inherited)", "${inherited}"}:
+        return None
+    if token.startswith(_XCCONFIG_IGNORED_BUILD_PATH_VARIABLES):
+        return None
+    if any(char in token for char in "*?["):
+        raise BuildContextEvidenceError(
+            f"wildcard header search path is ambiguous: {source}: {token}"
+        )
+
+    base = source.parent
+    expanded = token
+    source_root_prefixes = ("$(SRCROOT)", "${SRCROOT}", "$(SOURCE_ROOT)", "${SOURCE_ROOT}")
+    project_dir_prefixes = ("$(PROJECT_DIR)", "${PROJECT_DIR}")
+    prefix = next((item for item in project_dir_prefixes if token.startswith(item)), None)
+    if prefix is not None:
+        suffix = token[len(prefix) :]
+        if suffix and not suffix.startswith("/"):
+            raise BuildContextEvidenceError(
+                f"ambiguous PROJECT_DIR header search path: {source}: {token}"
+            )
+        expanded = str(source.parent) + suffix
+    else:
+        prefix = next((item for item in source_root_prefixes if token.startswith(item)), None)
+        if prefix is not None:
+            suffix = token[len(prefix) :]
+            if suffix and not suffix.startswith("/"):
+                raise BuildContextEvidenceError(
+                    f"ambiguous SRCROOT header search path: {source}: {token}"
+                )
+            expanded = str(root) + suffix
+            base = root
+
+    if _XCCONFIG_VARIABLE_RE.search(expanded) is not None or "$" in expanded:
+        raise BuildContextEvidenceError(
+            f"unresolved variable in header search path: {source}: {token}"
+        )
+    raw_path = Path(expanded)
+    candidate = raw_path if raw_path.is_absolute() else base / raw_path
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as exc:
+        raise BuildContextEvidenceError(
+            f"cannot resolve header search path: {source}: {token}"
+        ) from exc
+    if not _is_path_within(resolved, root):
+        raise BuildContextEvidenceError(
+            f"header search path escapes project root: {source}: {token}"
+        )
+    if not resolved.exists():
+        return None
+    if not resolved.is_dir():
+        raise BuildContextEvidenceError(
+            f"header search path is not a directory: {source}: {token}"
+        )
+    return resolved
+
+
+def detect_macos_xcconfig_context(
+    repo_dir: str | os.PathLike[str],
+    macos_sdk_path: str | os.PathLike[str] | None = None,
+) -> MacOSXCConfigContext | None:
+    """Return a bounded macOS context only for complete xcconfig evidence."""
+
+    try:
+        root = Path(repo_dir).resolve(strict=True)
+    except OSError as exc:
+        raise BuildContextEvidenceError(
+            f"project root does not resolve: {repo_dir}"
+        ) from exc
+    if not root.is_dir():
+        raise BuildContextEvidenceError(f"project root is not a directory: {root}")
+    xcconfig_files = _discover_xcconfig_files(root)
+    if not xcconfig_files:
+        return None
+    assignments, issues = _load_xcconfig_assignments(root, xcconfig_files)
+
+    macos_hint = any(
+        assignment.name in {"SDKROOT", "SUPPORTED_PLATFORMS"}
+        and re.search(r"(?<![A-Za-z0-9_])macosx(?:\.internal)?(?![A-Za-z0-9_])", assignment.value.lower())
+        is not None
+        for assignment in assignments
+    )
+    if not macos_hint:
+        return None
+    if issues:
+        raise BuildContextEvidenceError(issues[0])
+
+    sdkroots, sdkroot_assignments = _setting_values(assignments, "SDKROOT")
+    platforms, platform_assignments = _setting_values(
+        assignments, "SUPPORTED_PLATFORMS"
+    )
+    standards, standard_assignments = _setting_values(
+        assignments, "GCC_C_LANGUAGE_STANDARD"
+    )
+    if not sdkroot_assignments or not sdkroots:
+        raise BuildContextEvidenceError("macOS xcconfig evidence is missing SDKROOT")
+    if len(sdkroots) != 1 or not sdkroots <= {"macosx", "macosx.internal"}:
+        raise BuildContextEvidenceError(
+            f"macOS xcconfig SDKROOT evidence is ambiguous: {sorted(sdkroots)}"
+        )
+    if not platform_assignments or platforms != {"macosx"}:
+        raise BuildContextEvidenceError(
+            "macOS xcconfig SUPPORTED_PLATFORMS evidence must be exactly macosx"
+        )
+    if not standard_assignments or standards != {"gnu2x"}:
+        raise BuildContextEvidenceError(
+            "macOS xcconfig GCC_C_LANGUAGE_STANDARD evidence must be exactly gnu2x"
+        )
+
+    header_paths: set[Path] = set()
+    header_assignments = [
+        assignment
+        for assignment in assignments
+        if assignment.name in _XCCONFIG_HEADER_SETTINGS
+    ]
+    for assignment in header_assignments:
+        if assignment.conditions:
+            raise BuildContextEvidenceError(
+                f"conditional header search evidence is ambiguous: {assignment.source}"
+            )
+        for token in _split_xcconfig_value(assignment):
+            resolved = _resolve_xcconfig_header_path(
+                token,
+                source=assignment.source,
+                root=root,
+            )
+            if resolved is not None:
+                header_paths.add(resolved)
+    if not header_assignments or not header_paths:
+        raise BuildContextEvidenceError(
+            "macOS xcconfig evidence has no usable project-local header search paths"
+        )
+    if macos_sdk_path is None:
+        raise BuildContextEvidenceError(
+            "macOS xcconfig evidence requires an explicit macOS SDK path"
+        )
+    sdk = validate_macos_sdk_path(macos_sdk_path)
+
+    include_paths = {root, *header_paths}
+    for dirname in ("include", "src", "lib", "source"):
+        candidate = (root / dirname).resolve(strict=False)
+        if candidate.is_dir() and _is_path_within(candidate, root):
+            include_paths.add(candidate)
+    ordered_include_paths = [root, *sorted(include_paths - {root}, key=str)]
+    compile_args = (
+        "-std=gnu2x",
+        "-fblocks",
+        *(f"-I{path}" for path in ordered_include_paths),
+        "-isysroot",
+        sdk.path,
+        "-fsyntax-only",
+        "-Wno-everything",
+    )
+    evidence_assignments = (
+        sdkroot_assignments
+        + platform_assignments
+        + standard_assignments
+        + header_assignments
+    )
+    evidence_files = tuple(
+        sorted(
+            {
+                assignment.source.relative_to(root).as_posix()
+                for assignment in evidence_assignments
+            }
+        )
+    )
+    return MacOSXCConfigContext(
+        sdkroot=next(iter(sdkroots)),
+        c_language_standard="gnu2x",
+        header_search_paths=tuple(str(path) for path in ordered_include_paths),
+        evidence_files=evidence_files,
+        sdk=sdk,
+        compile_args=compile_args,
+    )
+
+
 def detect_build_context_from_loader(read_text: Callable[[str], str | None]) -> tuple[dict, list[str], CompileCommandsIndex | None]:
     compile_commands = _build_detection_from_compile_commands(read_text("compile_commands.json"))
     if compile_commands[2] is not None:
@@ -921,7 +1595,10 @@ def detect_build_context_from_loader(read_text: Callable[[str], str | None]) -> 
     }, ["-std=c++17", "-fsyntax-only", "-Wno-everything"], None
 
 
-def detect_build_context(repo_dir: str) -> tuple[dict, list[str], CompileCommandsIndex | None]:
+def detect_build_context(
+    repo_dir: str,
+    macos_sdk_path: str | os.PathLike[str] | None = None,
+) -> tuple[dict, list[str], CompileCommandsIndex | None]:
     compile_commands_path = find_compile_commands_file(repo_dir)
 
     def read_text(name: str) -> str | None:
@@ -933,5 +1610,25 @@ def detect_build_context(repo_dir: str) -> tuple[dict, list[str], CompileCommand
             return None
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
+
+    # A valid compilation database is authoritative.  Do this before any
+    # xcconfig discovery so a large or unrelated Xcode tree cannot replace
+    # per-file compiler arguments.
+    compile_context = _build_detection_from_compile_commands(
+        read_text("compile_commands.json")
+    )
+    if compile_context[2] is not None:
+        return compile_context
+
+    macos_context = detect_macos_xcconfig_context(
+        repo_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
+    if macos_context is not None:
+        return (
+            macos_context.platform_info(),
+            list(macos_context.compile_args),
+            None,
+        )
 
     return detect_build_context_from_loader(read_text)

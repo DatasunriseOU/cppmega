@@ -1056,6 +1056,43 @@ def test_lowercase_cpp_suffix_does_not_rewrite_explicit_language(
     ) == explicit_args
 
 
+def test_open_watcom_plusplus_c_suffix_uses_cpp_without_source_loss(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "bld" / "plusplus" / "bugs" / "zcc02.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "char *foo( void )\n"
+        "{\n"
+        "    return( ::new char[10] ( 'a', 'b', 'c', '\\0' ) );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-std=c11", "-std=c++20", "-fsyntax-only", "-Wno-everything"],
+        str(source),
+    )
+
+    assert adapted[:3] == ["-x", "c++", "-std=c++20"]
+    assert "-std=c11" not in adapted
+    translation_unit = index_project._load_translation_unit(
+        str(source),
+        index_project.Index.create(),
+        adapted,
+    )
+    assert translation_unit.spelling == str(source)
+
+    ordinary_c = tmp_path / "src" / "ordinary.c"
+    ordinary_c.parent.mkdir()
+    ordinary_c.write_text("int ordinary(void) { return 0; }\n", encoding="utf-8")
+    assert index_project._adapt_args_for_file(
+        ["-std=c++20", "-Wno-everything"],
+        str(ordinary_c),
+    )[:3] == ["-x", "c", "-std=c11"]
+
+
 def test_valgrind_fallback_status_is_emitted_in_source_sidecars(
     tmp_path: Path,
 ) -> None:
