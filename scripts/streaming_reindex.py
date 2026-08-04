@@ -56,6 +56,11 @@ from cppmega.data.symbol_identity import (  # noqa: E402
     SymbolIdentityError,
     require_project_identity,
 )
+from cppmega.data.build_context import (  # noqa: E402
+    BuildContextEvidenceError,
+    normalize_macos_sdk_path_argument,
+    validate_macos_sdk_path,
+)
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).
@@ -1961,6 +1966,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--macos-sdk",
+        type=normalize_macos_sdk_path_argument,
         default=None,
         help="Explicit macOS SDK root passed to every code indexer. It is used "
              "only when bounded project xcconfig evidence requires macOS.",
@@ -2026,12 +2032,15 @@ def main(argv: list[str]) -> int:
         else None
     )
     macos_sdk = (
-        Path(args.macos_sdk).expanduser().resolve()
+        Path(args.macos_sdk)
         if args.macos_sdk
         else None
     )
-    if macos_sdk is not None and not macos_sdk.is_dir():
-        raise SystemExit(f"--macos-sdk is not a directory: {macos_sdk}")
+    if macos_sdk is not None:
+        try:
+            validate_macos_sdk_path(macos_sdk)
+        except BuildContextEvidenceError as exc:
+            raise SystemExit(str(exc)) from exc
     if (
         source_quarantine_manifest is not None
         and not source_quarantine_manifest.is_file()

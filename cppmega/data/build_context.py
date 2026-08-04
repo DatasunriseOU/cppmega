@@ -976,13 +976,24 @@ def _read_bounded_file(path: Path, *, max_bytes: int, label: str) -> bytes:
     return payload
 
 
+def normalize_macos_sdk_path_argument(
+    macos_sdk_path: str | os.PathLike[str],
+) -> str:
+    """Make a CLI SDK path absolute without dereferencing symlinks."""
+
+    raw_path = os.fspath(macos_sdk_path)
+    if not raw_path:
+        raise ValueError("macOS SDK path cannot be empty")
+    return os.path.abspath(os.path.expanduser(raw_path))
+
+
 def validate_macos_sdk_path(macos_sdk_path: str | os.PathLike[str]) -> MacOSSDKBinding:
     """Validate an explicitly supplied SDK without consulting host discovery."""
 
     raw_path = os.fspath(macos_sdk_path)
     if not raw_path or not os.path.isabs(raw_path):
         raise BuildContextEvidenceError("macOS SDK path must be explicit and absolute")
-    absolute_path = Path(os.path.abspath(raw_path))
+    absolute_path = Path(normalize_macos_sdk_path_argument(raw_path))
     try:
         resolved_path = absolute_path.resolve(strict=True)
     except OSError as exc:

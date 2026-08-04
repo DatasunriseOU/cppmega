@@ -222,18 +222,27 @@ def test_sdk_binding_changes_when_settings_marker_changes(tmp_path: Path) -> Non
     assert first.settings_sha256 != second.settings_sha256
 
 
-def test_sdk_path_rejects_symlink(tmp_path: Path) -> None:
+def test_sdk_path_rejects_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cppmega.data.build_context import (
         BuildContextEvidenceError,
+        normalize_macos_sdk_path_argument,
         validate_macos_sdk_path,
     )
 
     sdk = _write_sdk(tmp_path)
     alias = tmp_path / "sdk-alias"
     alias.symlink_to(sdk, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
 
+    normalized = normalize_macos_sdk_path_argument(alias.name)
+
+    assert normalized == str(alias.absolute())
+    assert normalized != str(sdk)
     with pytest.raises(BuildContextEvidenceError, match="symlink components"):
-        validate_macos_sdk_path(alias)
+        validate_macos_sdk_path(normalized)
 
 
 def test_macos_evidence_rejects_ambiguous_sdkroot(tmp_path: Path) -> None:
