@@ -27,6 +27,7 @@ RELATIVE_INDEX_REMAP_CRASH_FIXTURE = (
 RELATIVE_PARSER_CRASH_FIXTURE = (
     "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
 )
+RELATIVE_NUL_DIAGNOSTIC_FIXTURE = "clang/test/Misc/diag-null-bytes-in-line.cpp"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
@@ -111,6 +112,24 @@ def _clang_parser_crash_fixture_bytes() -> bytes:
         b'// CHECKSH: "-cc1"\n'
         b'// CHECKSH: "-main-file-name" "crash report spaces.c"\n'
         b'// CHECKSH: "crash report spaces-{{[^ ]*}}.c"\n'
+    )
+
+
+def _clang_embedded_nul_diagnostic_bytes() -> bytes:
+    return (
+        b"// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | "
+        b"FileCheck -strict-whitespace %s\n"
+        b"\n"
+        b"int x[sizeof\0int];\n"
+        b"// CHECK: warning: null character ignored\n"
+        b"// CHECK-NEXT: int x[sizeof<U+0000>int];\n"
+        b"// CHECK-NEXT:             ^\n"
+        b"\n"
+        b"// CHECK: error: expected parentheses around type name in "
+        b"sizeof expression\n"
+        b"// CHECK-NEXT: int x[sizeof<U+0000>int];\n"
+        b"// CHECK-NEXT:             ^\n"
+        b"// CHECK-NEXT:             (          )\n"
     )
 
 
@@ -487,6 +506,36 @@ def test_exact_quarantine_filters_deliberate_clang_parser_crash_fixture(
     )
 
 
+def test_exact_quarantine_filters_clang_embedded_nul_diagnostic(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes()
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="fixture intentionally embeds a NUL for Clang diagnostics",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == (
+        "deliberate_compiler_diagnostic_fixture"
+    )
+    assert receipt["entries"][0]["detected_format"] == (
+        "clang_embedded_nul_diagnostic"
+    )
+
+
 def test_exact_quarantine_filters_der_x509_certificate_pair(
     tmp_path: Path,
 ) -> None:
@@ -772,6 +821,31 @@ def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None
     assert entry["detected_format"] == "clang_debug_parser_crash_pragma"
 
 
+def test_checked_in_intel_nul_diagnostic_manifest_matches_reference_fixture() -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "intel/llvm"
+        and item["relative_path"] == RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    )
+
+    assert len(payload) == 398
+    assert hashlib.sha256(payload).hexdigest() == (
+        "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a"
+    )
+    assert entry["relative_path"] == RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
+    assert entry["detected_format"] == "clang_embedded_nul_diagnostic"
+
+
 def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -> None:
     manifest = json.loads(
         (
@@ -881,6 +955,60 @@ def test_clang_crash_quarantine_requires_independent_fixture_signature(
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
+def test_clang_embedded_nul_quarantine_requires_diagnostic_signature(
+    tmp_path: Path,
+) -> None:
+    payload = b"int x[sizeof\0int];\n"
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="forged diagnostic fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(
+        SourceQuarantineError,
+        match="embedded-NUL diagnostic contract is incomplete",
+    ):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_clang_embedded_nul_quarantine_requires_both_caret_markers(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes().replace(
+        b"// CHECK-NEXT:             ^\n",
+        b"// CHECK-NEXT:             x\n",
+        1,
+    )
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="forged diagnostic fixture missing one caret marker",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(
+        SourceQuarantineError,
+        match="embedded-NUL diagnostic contract is incomplete",
+    ):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_quarantine_entry_must_be_discovered_and_cannot_hide_parse_errors(
     tmp_path: Path,
 ) -> None:
@@ -939,6 +1067,34 @@ def test_process_project_writes_atomic_bound_receipt(
     assert omission_receipt["unique_reference_count"] == 0
     assert omission_receipt["location_count"] == 0
     assert omission_receipt["locations"] == []
+
+
+def test_process_project_quarantines_clang_embedded_nul_diagnostic(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes()
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+    receipt_path = tmp_path / "receipts/source.json"
+
+    documents = ip.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="intel/llvm",
+        source_quarantine_manifest=str(manifest),
+        source_quarantine_receipt=str(receipt_path),
+    )
+
+    assert documents == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["project_id"] == "intel/llvm"
+    assert receipt["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["relative_path"] == (
+        RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    )
 
 
 def test_process_project_quarantines_non_cpp_executable_archive(
