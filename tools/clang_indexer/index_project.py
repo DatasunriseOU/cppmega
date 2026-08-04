@@ -5252,6 +5252,11 @@ def _is_sane_compile_args(args: list[str]) -> bool:
         return False
 
     machine_width_flags: set[str] = set()
+    target_values: dict[str, set[str]] = {
+        "target": set(),
+        "march": set(),
+        "mcpu": set(),
+    }
     language_values: set[str] = set()
     standard_values: set[str] = set()
     standard_families: set[str] = set()
@@ -5284,6 +5289,7 @@ def _is_sane_compile_args(args: list[str]) -> bool:
             elif value_kind == "target":
                 if _TARGET_VALUE_RE.fullmatch(operand) is None:
                     return False
+                target_values["target"].add(operand)
             index += 2
             continue
 
@@ -5321,6 +5327,13 @@ def _is_sane_compile_args(args: list[str]) -> bool:
                     _TARGET_VALUE_RE.fullmatch(value) is None
                 ):
                     return False
+                target_key = {
+                    "--target=": "target",
+                    "-march=": "march",
+                    "-mcpu=": "mcpu",
+                }.get(prefix)
+                if target_key is not None:
+                    target_values[target_key].add(value)
 
         for prefix in _JOINED_PATH_ARG_PREFIXES:
             if arg.startswith(prefix) and arg != prefix:
@@ -5338,6 +5351,8 @@ def _is_sane_compile_args(args: list[str]) -> bool:
         index += 1
 
     if {"-m32", "-m64"}.issubset(machine_width_flags):
+        return False
+    if any(len(values) > 1 for values in target_values.values()):
         return False
     if len(language_values) > 1 or len(standard_values) > 1:
         return False

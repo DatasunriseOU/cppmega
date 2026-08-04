@@ -330,6 +330,13 @@ def test_no_linkage_parameter_in_spaced_repository_path_parses(
             "-isysroot=/sdk2",
             "-resource-dir=/res",
         ],
+        [
+            "-xc++",
+            "-march=armv8-a",
+            "-march=armv8-a",
+            "-mcpu=cortex-a76",
+            "-mcpu=cortex-a76",
+        ],
     ),
 )
 def test_sane_compile_arg_matrix_is_accepted(
@@ -366,6 +373,9 @@ def test_sane_compile_arg_matrix_is_accepted(
         ["-march=bad]"],
         ["-mcpu="],
         ["-mcpu=bad]"],
+        ["-march=armv8-a", "-march=armv8.2-a+fp16"],
+        ["-mcpu=cortex-a55", "-mcpu=cortex-a76"],
+        ["-target", "x86_64-linux-gnu", "--target=aarch64-linux-gnu"],
         ["-m32", "-m64"],
         ["-x", "c++", "-std=iso9899:199x"],
         ["-x", "c++", "-std=c++17", "-std=c++20"],
@@ -445,6 +455,43 @@ def test_valgrind_autoconf_args_fall_back_atomically(tmp_path: Path) -> None:
         "compile_args_status": "fallback_unusable_detected_args",
     }
     assert index_project.get_default_compile_args(str(tmp_path)) == default_args
+
+
+def test_compute_library_conflicting_architectures_fall_back_atomically(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    detected_args = [
+        "-x",
+        "c++",
+        "-march=armv8-a",
+        "-march=armv8.2-a+fp16",
+        "-march=armv8.6-a+sve2+fp16+dotprod",
+        "-march=armv8.2-a+sve+fp16+dotprod",
+        "-fsyntax-only",
+        "-Wno-everything",
+    ]
+
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            {
+                "build_system": "bazel",
+                "source": "build_files",
+                "compiler": "g++",
+            },
+            detected_args,
+        )
+    )
+
+    assert default_args[:2] == ["-fsyntax-only", "-Wno-everything"]
+    assert not any(arg.startswith("-march=") for arg in default_args)
+    assert default_build_info == {
+        "build_system": "bazel",
+        "source": "build_files",
+        "compile_args_status": "fallback_unusable_detected_args",
+    }
 
 
 @pytest.mark.parametrize(
