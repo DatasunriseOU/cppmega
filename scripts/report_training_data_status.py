@@ -1944,6 +1944,21 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _has_status_summary_shape(status: object) -> bool:
+    if not isinstance(status, Mapping):
+        return False
+    datasets = status.get("datasets")
+    if not isinstance(datasets, Mapping):
+        return False
+    return {
+        "live_source",
+        "sealed_megatron",
+        "validation_bundle",
+        "pr_mr",
+        "ci",
+    }.issubset(datasets)
+
+
 def _numeric_delta(current: object, previous: object) -> object:
     if (
         isinstance(current, int)
@@ -1972,16 +1987,15 @@ def publish_status(status: Mapping[str, object], output_dir: Path) -> dict[str, 
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         previous = _read_json(current_json) if current_json.is_file() else None
-
-        _atomic_write(current_json, _canonical_bytes(status))
-        _atomic_write(
-            current_markdown, (render_markdown(status) + "\n").encode("utf-8")
-        )
-
         previous_sha = previous.get("status_sha256") if previous else None
+        previous_summary = (
+            _status_summary(previous)
+            if _has_status_summary_shape(previous)
+            else {}
+        )
+        summary = _status_summary(status)
+        entry = None
         if previous_sha != status["status_sha256"]:
-            summary = _status_summary(status)
-            previous_summary = _status_summary(previous) if previous else {}
             entry = {
                 "schema": CHANGELOG_SCHEMA,
                 "recorded_at": status["generated_at"],
@@ -1990,6 +2004,13 @@ def publish_status(status: Mapping[str, object], output_dir: Path) -> dict[str, 
                 "summary": summary,
                 "numeric_delta": _numeric_delta(summary, previous_summary),
             }
+
+        _atomic_write(current_json, _canonical_bytes(status))
+        _atomic_write(
+            current_markdown, (render_markdown(status) + "\n").encode("utf-8")
+        )
+
+        if entry is not None:
             with changelog.open("ab") as handle:
                 handle.write(_canonical_bytes(entry))
                 handle.flush()
