@@ -202,6 +202,36 @@ run "workers_can_span_two_regional_zones" {
   }
 }
 
+run "workers_can_use_mixed_machine_types" {
+  command = plan
+
+  variables {
+    project_id   = "natural-bison-491019-t9"
+    run_id       = "source-mixed-machine-test"
+    worker_count = 4
+    machine_type = "n2-standard-16"
+    worker_machine_types = {
+      cppmega-corpus-02 = "n2d-standard-16"
+      cppmega-corpus-03 = "n2d-standard-16"
+    }
+    bootstrap_script_gcs_uri  = ""
+    bootstrap_script_sha256   = ""
+    bootstrap_bundle_sha256   = ""
+    bootstrap_overlay_sha256  = ""
+    bootstrap_manifest_sha256 = ""
+  }
+
+  assert {
+    condition = (
+      google_compute_instance.worker["cppmega-corpus-00"].machine_type == "n2-standard-16" &&
+      google_compute_instance.worker["cppmega-corpus-01"].machine_type == "n2-standard-16" &&
+      google_compute_instance.worker["cppmega-corpus-02"].machine_type == "n2d-standard-16" &&
+      google_compute_instance.worker["cppmega-corpus-03"].machine_type == "n2d-standard-16"
+    )
+    error_message = "Per-worker machine types must override only the selected workers."
+  }
+}
+
 run "content_addressed_cloud_lane_runner" {
   command = plan
 

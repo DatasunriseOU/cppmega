@@ -11,6 +11,9 @@ locals {
   worker_zones = {
     for name in keys(local.worker_names) : name => lookup(var.worker_zones, name, var.zone)
   }
+  worker_machine_types = {
+    for name in keys(local.worker_names) : name => lookup(var.worker_machine_types, name, var.machine_type)
+  }
 }
 
 data "google_compute_network" "corpus" {
@@ -72,7 +75,7 @@ resource "google_compute_instance" "worker" {
   project                   = var.project_id
   name                      = "${each.key}-${var.run_id}"
   zone                      = local.worker_zones[each.key]
-  machine_type              = var.machine_type
+  machine_type              = local.worker_machine_types[each.key]
   allow_stopping_for_update = true
   can_ip_forward            = false
   deletion_protection       = false
@@ -207,6 +210,11 @@ resource "google_compute_instance" "worker" {
         alltrue([for zone in values(local.worker_zones) : startswith(zone, "${var.region}-")])
       )
       error_message = "worker_zones may name only configured workers and every selected zone must belong to the configured region."
+    }
+
+    precondition {
+      condition     = length(setsubtract(toset(keys(var.worker_machine_types)), toset(keys(local.worker_names)))) == 0
+      error_message = "worker_machine_types may name only configured workers."
     }
 
     precondition {

@@ -131,9 +131,20 @@ variable "memory_budget_gb" {
 }
 
 variable "machine_type" {
-  description = "Worker machine type. n2-standard-16 is 16 vCPU, 64 GB, and up to 32 Gbps default egress."
+  description = "Default worker machine type. n2-standard-16 is 16 vCPU, 64 GB, and up to 32 Gbps default egress."
   type        = string
   default     = "n2-standard-16"
+}
+
+variable "worker_machine_types" {
+  description = "Optional per-worker machine type overrides. Keys must be generated worker names."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for machine_type in values(var.worker_machine_types) : can(regex("^[a-z0-9]+(?:-[a-z0-9]+)+$", machine_type))])
+    error_message = "worker_machine_types values must be non-empty canonical machine type names."
+  }
 }
 
 variable "local_ssd_count" {

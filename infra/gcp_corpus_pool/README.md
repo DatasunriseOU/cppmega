@@ -183,6 +183,12 @@ preserving worker names, static regional IPs, and the immutable logical-worker
 manifest. Keep a selected worker's zone stable once it exists: changing it
 requires replacement and the guarded rollout rejects replacement plans.
 
+`worker_machine_types` can select a capacity-compatible shape only for workers
+that do not exist yet. Keep existing workers on their recorded type; changing
+one requires replacement and is rejected by the guarded rollout. A mixed N2
+and N2D pool is safe only when both profiles satisfy the same slot CPU, memory,
+Local SSD, and architecture contracts.
+
 Recommended object layout:
 
 ```text
