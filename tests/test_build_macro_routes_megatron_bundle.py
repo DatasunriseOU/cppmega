@@ -632,6 +632,45 @@ def test_ci_objective_source_manifest_uses_repaired_train_shards_only(
     assert "production_complete" not in completion
 
 
+def test_ci_objective_source_manifest_accepts_full_large_context_ladder(
+    tmp_path: Path,
+) -> None:
+    buckets = builder.SUPPORTED_CI_BUCKETS
+    original_ci_root = tmp_path / "original-ci"
+    receipt_path = _write_content_store_ci_export(
+        original_ci_root,
+        buckets=buckets,
+    )
+    snapshot_root = tmp_path / "snapshot"
+    repaired_manifest_path = _write_repaired_ci_snapshot(
+        receipt_path,
+        snapshot_root=snapshot_root,
+    )
+    seed = snapshot_root / "code" / "1024" / "code.parquet"
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"value": [1]}), seed, compression="zstd")
+
+    manifest = objective_manifest.build_source_pool_manifest(
+        ci_root=snapshot_root / "ci",
+        ci_receipt_path=receipt_path,
+        repaired_manifest_path=repaired_manifest_path,
+        objective_seed_root=snapshot_root,
+        seed_globs=("code/1024/*.parquet",),
+        buckets=buckets,
+        producer={"script": "fixture"},
+    )
+
+    assert manifest["sequence_lengths"] == list(buckets)
+    assert set(manifest["primary_ci"]["files_by_sequence_length"]) == {
+        str(bucket) for bucket in buckets
+    }
+    assert objective_manifest._parse_buckets(
+        ",".join(str(bucket) for bucket in buckets)
+    ) == buckets
+    with pytest.raises(ValueError, match="exactly one of"):
+        objective_manifest._parse_buckets("1024,2048,4096,8192,16384,32768")
+
+
 def test_ci_objective_source_manifest_rejects_repaired_byte_drift(
     tmp_path: Path,
 ) -> None:
@@ -1017,6 +1056,37 @@ def test_content_store_export_allowlist_binds_all_split_shards(
     assert metadata["source_completion"][
         "cas_reserve_exact_unique_payload_tokens"
     ] == 200_000_000
+
+
+def test_content_store_export_allowlist_accepts_explicit_32k_64k_ladder(
+    tmp_path: Path,
+) -> None:
+    buckets = builder.SUPPORTED_CI_BUCKETS
+    ci_root = tmp_path / "ci-large-context"
+    manifest_path = _write_content_store_ci_export(ci_root, buckets=buckets)
+
+    allowed, metadata = _load_ci_manifest_allowlist(
+        manifest_path,
+        ci_root,
+        buckets,
+        cppmega_mlx_commit="unused-for-content-store-export",
+        cppmega_mlx_tree_sha256="unused-for-content-store-export",
+    )
+
+    assert set(allowed) == {("ci", bucket) for bucket in buckets}
+    assert all(len(files) == 2 for files in allowed.values())
+    assert metadata["allowlist_counts"] == {
+        f"ci/{bucket}": 2 for bucket in buckets
+    }
+
+    with pytest.raises(RuntimeError, match="unsupported CI export CASE5 bucket contract"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused-for-content-store-export",
+            cppmega_mlx_tree_sha256="unused-for-content-store-export",
+        )
 
 
 def test_content_store_export_accepts_only_reviewed_primary_equivalent_transition(
