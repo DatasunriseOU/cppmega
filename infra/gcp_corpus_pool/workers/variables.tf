@@ -176,6 +176,17 @@ variable "compact_placement" {
   default     = true
 }
 
+variable "runner_role" {
+  description = "Runner/service role. Source remains the default; cloud-lane uses an independent state and runner suffix."
+  type        = string
+  default     = "source"
+
+  validation {
+    condition     = contains(["source", "cloud-lane"], var.runner_role)
+    error_message = "runner_role must be either source or cloud-lane."
+  }
+}
+
 variable "bootstrap_script_gcs_uri" {
   description = "Optional immutable content-addressed gs:// URI for the worker runner. Blank provisions ready workers without starting a job."
   type        = string

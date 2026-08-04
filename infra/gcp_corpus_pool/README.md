@@ -212,6 +212,36 @@ For a temporary pause that keeps static addresses, use
 the workload must already be checkpointed. Setting `worker_count = 0` and
 applying the workers state is equivalent to returning the pool.
 
+## Independent PR/MR/CI pool state
+
+PR, MR, and CI workers reuse the same network, service account, bucket, gVNIC,
+and Local SSD module, but never reuse the live source Terraform state. Keep a
+separate Terraform data directory and backend prefix for every lane pool:
+
+```bash
+export TF_DATA_DIR="$PWD/.terraform-lane-workers"
+terraform -chdir=workers init -reconfigure \
+  -backend-config=lane-workers.backend.hcl
+terraform -chdir=workers plan \
+  -var-file=lane-workers.tfvars -out=lane-workers.tfplan
+terraform -chdir=workers apply lane-workers.tfplan
+```
+
+Create the two untracked files from `lane-workers.backend.hcl.example` and
+`lane-workers.tfvars.example`, then replace every payload digest with the
+verified smoke payload. `runner_role = "cloud-lane"` requires the runner URI
+suffix `<sha256>.cloud-lane-worker-runner` and creates
+`cppmega-cloud-lane-worker.service`. The existing source default still creates
+`cppmega-source-worker.service` and accepts only `.source-worker-runner`.
+
+Return only this lane pool with the same `TF_DATA_DIR` and backend:
+
+```bash
+terraform -chdir=workers plan -destroy \
+  -var-file=lane-workers.tfvars -out=lane-workers-destroy.tfplan
+terraform -chdir=workers apply lane-workers-destroy.tfplan
+```
+
 ## Validation
 
 ```bash

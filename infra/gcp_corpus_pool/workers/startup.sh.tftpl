@@ -20,6 +20,7 @@ BOOTSTRAP_SHA256=${jsonencode(bootstrap_script_sha256)}
 EXPECTED_BUNDLE_SHA256=${jsonencode(bootstrap_bundle_sha256)}
 EXPECTED_OVERLAY_SHA256=${jsonencode(bootstrap_overlay_sha256)}
 EXPECTED_MANIFEST_SHA256=${jsonencode(bootstrap_manifest_sha256)}
+RUNNER_ROLE=${jsonencode(runner_role)}
 STAGE_ROOT=/mnt/cppmega-stage
 RUN_ROOT="gs://$BUCKET/$GCS_PREFIX/$RUN_ID"
 BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)
@@ -315,9 +316,14 @@ if [[ -n "$BOOTSTRAP_URI" ]]; then
   grep -Fqx "readonly MANIFEST_SHA256=\"$EXPECTED_MANIFEST_SHA256\"" /opt/cppmega/worker-runner
   chmod 0555 /opt/cppmega/worker-runner
   chown root:root /opt/cppmega/worker-runner
-  cat >/etc/systemd/system/cppmega-source-worker.service <<EOF
+  case "$RUNNER_ROLE" in
+    source|cloud-lane) ;;
+    *) echo "unsupported runner role: $RUNNER_ROLE" >&2; exit 2 ;;
+  esac
+  RUNNER_SERVICE="cppmega-$RUNNER_ROLE-worker.service"
+  cat >"/etc/systemd/system/$RUNNER_SERVICE" <<EOF
 [Unit]
-Description=CppMega resumable source worker
+Description=CppMega resumable $RUNNER_ROLE worker
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
@@ -337,12 +343,12 @@ RestartSec=30min
 TimeoutStopSec=300s
 KillMode=mixed
 UMask=0027
-SyslogIdentifier=cppmega-source-worker
+SyslogIdentifier=cppmega-$RUNNER_ROLE-worker
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 0644 /etc/systemd/system/cppmega-source-worker.service
+  chmod 0644 "/etc/systemd/system/$RUNNER_SERVICE"
   systemctl daemon-reload
-  systemctl enable --now cppmega-source-worker.service
+  systemctl enable --now "$RUNNER_SERVICE"
 fi
