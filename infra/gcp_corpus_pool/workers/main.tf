@@ -45,6 +45,12 @@ resource "google_compute_resource_policy" "compact" {
   group_placement_policy {
     collocation = "COLLOCATED"
   }
+
+  # GCP does not support renaming a placement policy. Keep the pool-level
+  # policy identity stable while run-scoped workers are replaced.
+  lifecycle {
+    ignore_changes = [name]
+  }
 }
 
 resource "google_compute_address" "worker" {
