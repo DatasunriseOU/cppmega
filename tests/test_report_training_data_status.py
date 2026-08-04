@@ -669,6 +669,161 @@ def test_collect_ci_status_reports_missing_progress_receipt(
     assert result["token_accounting"]["store_local_unique_upper_bound"] == 0
 
 
+def test_collect_ci_status_marks_cached_full_summary_in_heartbeat_progress(
+    tmp_path: Path,
+) -> None:
+    progress_path = tmp_path / "fetch.progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_ci_stream_fetch_progress_v4",
+                "generated_at": "2026-08-04T02:00:00Z",
+                "inventory": {
+                    "interval": {"start": "2026-01-01", "end": "2026-01-02"},
+                    "repos_closed": 1,
+                    "repos_total": 2,
+                    "runs": 3,
+                },
+                "fetch": {
+                    "summary_kind": "heartbeat",
+                    "full_summary_generated_at": "2026-08-04T01:30:00Z",
+                    "attempt_statuses": {"processing": 1},
+                    "occurrence_tokens": 7,
+                    "members": 2,
+                    "chunks": 3,
+                    "sidecar_set_sha256": "a" * 64,
+                    "binding_upgrades": [
+                        {"binding_key": "fetcher_script_sha256"}
+                    ],
+                    "binding_upgrades_truncated": True,
+                    "exhaustive_discovery": {
+                        "expected_run_count": 4,
+                        "expected_attempt_count": 5,
+                        "rows_seen": 6,
+                        "discovery_eof": False,
+                    },
+                },
+                "content_store": {
+                    "counters": {"exact_unique_payload_tokens": 8},
+                    "schema": "cppmega_ci_content_store_v1",
+                    "policy": {"compression": "zstd"},
+                    "pack_count": 1,
+                    "committed_pack_bytes": 9,
+                    "quarantined_orphan_count": 0,
+                },
+                "token_accounting": {"tokenizer_contract": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_root = tmp_path / "legacy"
+    _write_parquet(legacy_root / "1024" / "one.parquet")
+    (legacy_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_completion": "legacy",
+                "domain_kind_counts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = collect_ci_status(
+        {
+            "progress_receipts": [str(progress_path)],
+            "legacy_parquet_root": str(legacy_root),
+            "batch_size": 192,
+            "jobs": 1,
+        }
+    )
+
+    store = result["stores"][0]
+    assert store["fetch_summary_kind"] == "heartbeat"
+    assert store["full_fetch_summary_generated_at"] == "2026-08-04T01:30:00Z"
+    assert store["binding_upgrades_truncated"] is True
+
+
+def test_collect_ci_status_rejects_unknown_fetch_summary_kind(
+    tmp_path: Path,
+) -> None:
+    progress_path = tmp_path / "fetch.progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_ci_stream_fetch_progress_v4",
+                "generated_at": "2026-08-04T02:00:00Z",
+                "inventory": {},
+                "fetch": {"summary_kind": "forged"},
+                "content_store": {"counters": {"exact_unique_payload_tokens": 1}},
+                "token_accounting": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported CI fetch summary kind"):
+        collect_ci_status(
+            {
+                "progress_receipts": [str(progress_path)],
+                "legacy_parquet_root": str(tmp_path / "unused"),
+            }
+        )
+
+
+def test_collect_ci_status_rejects_null_fetch_summary_kind(
+    tmp_path: Path,
+) -> None:
+    progress_path = tmp_path / "fetch.progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_ci_stream_fetch_progress_v4",
+                "generated_at": "2026-08-04T02:00:00Z",
+                "inventory": {},
+                "fetch": {"summary_kind": None},
+                "content_store": {"counters": {"exact_unique_payload_tokens": 1}},
+                "token_accounting": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported CI fetch summary kind"):
+        collect_ci_status(
+            {
+                "progress_receipts": [str(progress_path)],
+                "legacy_parquet_root": str(tmp_path / "unused"),
+            }
+        )
+
+
+def test_collect_ci_status_rejects_heartbeat_without_full_timestamp(
+    tmp_path: Path,
+) -> None:
+    progress_path = tmp_path / "fetch.progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_ci_stream_fetch_progress_v4",
+                "generated_at": "2026-08-04T02:00:00Z",
+                "inventory": {},
+                "fetch": {"summary_kind": "heartbeat"},
+                "content_store": {"counters": {"exact_unique_payload_tokens": 1}},
+                "token_accounting": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="lacks its full summary timestamp"):
+        collect_ci_status(
+            {
+                "progress_receipts": [str(progress_path)],
+                "legacy_parquet_root": str(tmp_path / "unused"),
+            }
+        )
+
+
 def test_freshness_block_is_excluded_from_status_hash() -> None:
     first = _minimal_status(sha="0" * 64, live_tokens=15)
     second = _minimal_status(sha="0" * 64, live_tokens=15)
