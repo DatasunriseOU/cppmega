@@ -1078,6 +1078,7 @@ def stage_index_source(
     index_timeout_s: int | None = None,
     index_stall_timeout_s: int | None = None,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.gz.
 
@@ -1123,6 +1124,8 @@ def stage_index_source(
             "--source-quarantine-receipt",
             str(quarantine_receipt),
         ]
+    if macos_sdk is not None:
+        cmd += ["--macos-sdk", str(macos_sdk)]
     log_path = work / f"{repo}.index.log"
     run_checked(
         repo,
@@ -1727,6 +1730,7 @@ def process_one_repo(
     project_id: str,
     promote_dedup_on_success: bool = True,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
@@ -1757,7 +1761,7 @@ def process_one_repo(
                 repo, project_id, repo_dir, work, dedup_db, dedup_near,
                 stage_id, stage_db, global_symbol_index, memory_limit_gb,
                 parse_workers, index_timeout_s, index_stall_timeout_s,
-                source_quarantine_manifest,
+                source_quarantine_manifest, macos_sdk,
             )
         except RepoNoTrainingDocs as exc:
             timings["index_project_s"] = round(time.monotonic() - started, 6)
@@ -1955,6 +1959,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "under C/C++ suffixes. Passed to every code indexing subprocess; "
              f"default {DEFAULT_SOURCE_QUARANTINE_MANIFEST}.",
     )
+    p.add_argument(
+        "--macos-sdk",
+        default=None,
+        help="Explicit macOS SDK root passed to every code indexer. It is used "
+             "only when bounded project xcconfig evidence requires macOS.",
+    )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
@@ -2015,6 +2025,13 @@ def main(argv: list[str]) -> int:
         if args.source_quarantine_manifest
         else None
     )
+    macos_sdk = (
+        Path(args.macos_sdk).expanduser().resolve()
+        if args.macos_sdk
+        else None
+    )
+    if macos_sdk is not None and not macos_sdk.is_dir():
+        raise SystemExit(f"--macos-sdk is not a directory: {macos_sdk}")
     if (
         source_quarantine_manifest is not None
         and not source_quarantine_manifest.is_file()
@@ -2190,7 +2207,8 @@ def main(argv: list[str]) -> int:
                                             project_id=project_id,
                                             source_quarantine_manifest=(
                                                 source_quarantine_manifest
-                                            ))
+                                            ),
+                                            macos_sdk=macos_sdk)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

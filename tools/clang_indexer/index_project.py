@@ -5488,9 +5488,16 @@ def _harmonize_build_info_with_compile_args(
     return harmonized
 
 
-def get_default_compile_args(project_dir: str) -> list[str]:
+def get_default_compile_args(
+    project_dir: str,
+    *,
+    macos_sdk_path: str | None = None,
+) -> list[str]:
     """Generate default compile args for projects without compile_commands.json."""
-    platform_info, args, _compile_index = detect_build_context(project_dir)
+    platform_info, args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     result, _build_info = _resolve_default_compile_context(
         project_dir,
         platform_info,
@@ -5499,10 +5506,18 @@ def get_default_compile_args(project_dir: str) -> list[str]:
     return result
 
 
+def _is_legacy_cpp_c_path(filepath: str) -> bool:
+    """Return whether an upstream path explicitly declares a .c file as C++."""
+
+    parts = tuple(part.casefold() for part in Path(filepath).parts)
+    return any(
+        parts[index : index + 2] == ("bld", "plusplus")
+        for index in range(len(parts) - 1)
+    )
+
+
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
-    """Adapt compile args based on file extension — .c files need C mode, not C++,
-    and headers need an explicit header language (otherwise libclang can infer
-    the wrong mode for a standalone .h/.hpp translation unit)."""
+    """Adapt compile args to the file's extension or explicit path dialect."""
     raw_ext = os.path.splitext(filepath)[1]
     ext = raw_ext.lower()
     if ext in HEADER_EXTENSIONS:
@@ -5561,7 +5576,9 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
+        force_cpp = _is_legacy_cpp_c_path(filepath)
         has_c_standard = False
+        has_cpp_standard = False
         for arg in args:
             if skip_next:
                 skip_next = False
@@ -5582,12 +5599,22 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 else None
             )
             if standard_context is not None:
-                if standard_context[1] == 'c':
+                if standard_context[1] == 'c' and not force_cpp:
                     adapted.append(arg)
                     has_c_standard = True
-                # A non-C standard cannot describe the C translation unit.
+                elif standard_context[1] == 'c++' and force_cpp:
+                    adapted.append(arg)
+                    has_cpp_standard = True
+                # A standard for the other language cannot describe this TU.
                 continue
             adapted.append(arg)
+        if force_cpp:
+            # Open Watcom keeps C++ regression inputs under bld/plusplus with
+            # .c suffixes. Parsing those as C can make libclang loop forever.
+            prefix = ['-x', 'c++']
+            if not has_cpp_standard:
+                prefix.append('-std=c++17')
+            return prefix + adapted
         # Ensure C mode is set, and use the established parser fallback only
         # when the build context did not supply a valid C dialect.
         prefix = ['-x', 'c']
@@ -10692,6 +10719,7 @@ def process_project(
     skip_invalid_domain_inputs: bool = False,
     source_quarantine_manifest: str | None = None,
     source_quarantine_receipt: str | None = None,
+    macos_sdk_path: str | None = None,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -10840,7 +10868,10 @@ def process_project(
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
     compile_db = load_compile_commands(project_dir)
-    _platform_info, _raw_args, _compile_index = detect_build_context(project_dir)
+    _platform_info, _raw_args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     default_args, default_build_info = _resolve_default_compile_context(
         project_dir,
         _platform_info,
@@ -11109,6 +11140,14 @@ def main() -> int:
                         help='Number of parallel parse workers within each project (default: 8)')
     parser.add_argument('--libclang-path', type=str, default=None,
                         help='Path to libclang.so (auto-detected if not set)')
+    parser.add_argument(
+        '--macos-sdk',
+        type=str,
+        default=None,
+        help='Explicit macOS SDK root used only for projects whose bounded '
+             '.xcconfig evidence requires a macOS build context. No ambient '
+             'SDK lookup is performed.',
+    )
     parser.add_argument('--append', action='store_true',
                         help='Append to output file instead of overwriting')
     parser.add_argument('--enriched', action='store_true',
@@ -11376,6 +11415,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         ): (pd, project_id)
                         for pd, project_id in project_specs
                     }
@@ -11405,6 +11445,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         )
                         for doc in docs:
                             _write_doc(doc)

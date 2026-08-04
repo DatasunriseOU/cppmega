@@ -130,6 +130,12 @@ def _input_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
     )
     quarantine = inputs / "quarantine.json"
     _write_json(quarantine, {"entries": []})
+    macos_sdk = inputs / "MacOSX.sdk"
+    macos_sdk.mkdir()
+    _write_json(
+        macos_sdk / "SDKSettings.json",
+        {"CanonicalName": "macosx"},
+    )
     argv = [
         "--run-root",
         str(run_root),
@@ -151,6 +157,8 @@ def _input_fixture(tmp_path: Path) -> tuple[Path, list[str]]:
         sys.executable,
         "--libclang",
         sys.executable,
+        "--macos-sdk",
+        str(macos_sdk),
         "--minimum-free-bytes",
         "0",
     ]
