@@ -22,6 +22,7 @@ from scripts.report_training_data_status import (
     build_status,
     check_heartbeat,
     collect_ci_status,
+    collect_gitlab_mr_status,
     collect_live_source,
     collect_freshness,
     publish_status,
@@ -42,9 +43,7 @@ def _write_parquet(path: Path) -> None:
             "source_build_kinds": pa.array(
                 [[None, "python"]], type=pa.list_(pa.string())
             ),
-            "source_doc_token_lengths": pa.array(
-                [[10, 5]], type=pa.list_(pa.int32())
-            ),
+            "source_doc_token_lengths": pa.array([[10, 5]], type=pa.list_(pa.int32())),
         }
     )
     pq.write_table(table, path, compression="zstd")
@@ -173,9 +172,7 @@ def test_frozen_ci_ready_tokens_include_only_train_split(
     root = tmp_path / "frozen"
     export_path = _write_content_store_ci_export(root / "case5")
     export = json.loads(export_path.read_text(encoding="utf-8"))
-    parser_sha256 = export["input_fetch_state"]["settings"][
-        "parser_script_sha256"
-    ]
+    parser_sha256 = export["input_fetch_state"]["settings"]["parser_script_sha256"]
     progress, tokenizer, store, fetch = _write_frozen_ci_receipts(
         root,
         tmp_path / "live",
@@ -218,12 +215,14 @@ def test_frozen_ci_ready_tokens_include_only_train_split(
 
     assert result["ready_valid_tokens"] == 31_739
     assert result["ready_trained_tokens"] == 31_734
-    assert result["ready_valid_tokens"] == result["export"]["splits"]["train"][
-        "valid_tokens"
-    ]
-    assert result["ready_valid_tokens"] != result["export"]["all_split_counts"][
-        "valid_tokens"
-    ]
+    assert (
+        result["ready_valid_tokens"]
+        == result["export"]["splits"]["train"]["valid_tokens"]
+    )
+    assert (
+        result["ready_valid_tokens"]
+        != result["export"]["all_split_counts"]["valid_tokens"]
+    )
     assert result["export"]["splits"]["validation"]["valid_tokens"] == 31_734
     zero_counts = {
         "files": 0,
@@ -239,12 +238,13 @@ def test_frozen_ci_ready_tokens_include_only_train_split(
         for counts in result["export"]["splits"].values()
     )
     assert result["export"]["splits"]["test"] == zero_counts
-    assert result["export"]["buckets"]["1024"]["splits"]["train"][
-        "valid_tokens"
-    ] == 1_023
-    assert result["export"]["buckets"]["1024"]["splits"]["validation"][
-        "valid_tokens"
-    ] == 1_022
+    assert (
+        result["export"]["buckets"]["1024"]["splits"]["train"]["valid_tokens"] == 1_023
+    )
+    assert (
+        result["export"]["buckets"]["1024"]["splits"]["validation"]["valid_tokens"]
+        == 1_022
+    )
     assert set(result["export"]["buckets"]) == {
         "1024",
         "2048",
@@ -255,8 +255,7 @@ def test_frozen_ci_ready_tokens_include_only_train_split(
     for bucket in result["export"]["buckets"].values():
         assert set(bucket["splits"]) == {"train", "validation", "test"}
         assert all(
-            set(counts) == set(zero_counts)
-            for counts in bucket["splits"].values()
+            set(counts) == set(zero_counts) for counts in bucket["splits"].values()
         )
         assert bucket["splits"]["test"] == zero_counts
 
@@ -534,11 +533,28 @@ def _minimal_status(*, sha: str, live_tokens: int) -> dict[str, object]:
                 "version": {"bundle_id": "mini"},
                 "totals": {"valid_tokens": 2, "trained_tokens": 1},
             },
-            "pr_mr": {
+            "github_pr": {
                 "state": "verified_store_not_materialized",
                 "release_ready": False,
                 "version": {"scan_id": "scan", "store_sha256": "store"},
                 "records": {"stored_prs": 3},
+            },
+            "gitlab_mr": {
+                "state": "verified_inventory_not_materialized",
+                "release_ready": False,
+                "blockers": ["exact primary GitLab MR membership is not verified"],
+                "version": {"scan_id": "gitlab-scan"},
+                "records": {
+                    "declared_mrs": 7,
+                    "candidate_mrs": 2,
+                    "primary_stored_mrs": 0,
+                    "ancillary_stored_mrs": 1,
+                },
+                "stores": {
+                    "primary": {"sha256": "primary-store"},
+                    "ancillary": {"sha256": "ancillary-store"},
+                },
+                "sidecars": {"files": 8},
             },
             "ci": {
                 "state": "cas_staged_not_exported",
@@ -548,9 +564,7 @@ def _minimal_status(*, sha: str, live_tokens: int) -> dict[str, object]:
                     {
                         "interval": {"start": "a", "end": "b"},
                         "sidecar_set_sha256": "sidecars",
-                        "tokenizer": {
-                            "tokenizer_contract_sha256": "tokenizer"
-                        },
+                        "tokenizer": {"tokenizer_contract_sha256": "tokenizer"},
                     }
                 ],
                 "legacy_sample": {
@@ -639,9 +653,7 @@ def test_publish_status_accepts_live_source_before_first_parquet(
     assert entry["summary"]["live_source"]["tokenizer_contract_sha256"] is None
 
 
-def _freshness_config(
-    source_receipt: Path, ci_receipt: Path
-) -> dict[str, object]:
+def _freshness_config(source_receipt: Path, ci_receipt: Path) -> dict[str, object]:
     return {
         "source": {"completion_receipt": str(source_receipt)},
         "ci": {"progress_receipts": [str(ci_receipt)]},
@@ -908,9 +920,98 @@ def test_publish_status_writes_heartbeat_and_check_detects_staleness(
     assert stale["age_seconds"] == 3600
 
 
+def test_collect_gitlab_mr_status_keeps_stores_separate_and_unready(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary.sqlite"
+    ancillary = tmp_path / "ancillary.sqlite"
+    manifest = tmp_path / "manifest.json"
+    repo_list = tmp_path / "repo_list.json"
+    primary.write_bytes(b"primary")
+    ancillary.write_bytes(b"ancillary")
+    manifest.write_text("{}\n", encoding="utf-8")
+    repo_list.write_text("{}\n", encoding="utf-8")
+    (tmp_path / "sidecars").mkdir()
+
+    def binding(path: Path, *, include_size: bool) -> dict[str, object]:
+        result: dict[str, object] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        if include_size:
+            result["size"] = path.stat().st_size
+        return result
+
+    receipt = {
+        "schema": "cppmega_gitlab_mr_completion_v1",
+        "status": "verified",
+        "platform": "gitlab",
+        "scan_id": "scan",
+        "contract_sha256": "1" * 64,
+        "manifest": binding(manifest, include_size=False),
+        "repo_list": binding(repo_list, include_size=False),
+        "expected_host_count": 1,
+        "expected_hosts": ["gitlab.example"],
+        "expected_repo_count": 1,
+        "expected_repos": ["gitlab.example/acme%2Frepo"],
+        "declared_mr_count": 5,
+        "candidate_mr_count": 2,
+        "noncandidate_mr_count": 3,
+        "route_counts": {
+            "primary": 0,
+            "ancillary": 1,
+            "terminal": 1,
+            "excluded": 0,
+        },
+        "pr_store": binding(primary, include_size=True),
+        "stored_pr_count": 0,
+        "unverified_store_pr_count": 0,
+        "ancillary_store": binding(ancillary, include_size=True),
+        "ancillary_stored_count": 1,
+        "ancillary_unverified_store_count": 0,
+        "sidecars": {
+            "root": str(tmp_path / "sidecars"),
+            "files": 5,
+            "format": "canonical-json-gzip",
+            "logical_byte_size": 10,
+            "physical_byte_size": 8,
+            "logical_set_sha256": "2" * 64,
+            "physical_set_sha256": "3" * 64,
+        },
+        "validation": {
+            "candidate_route_conservation": True,
+            "deterministic_gzip_sidecars": True,
+            "exact_primary_membership_verified": False,
+            "immutable_artifact_hashes": True,
+            "inventory_complete": True,
+            "primary_ancillary_physical_separation": True,
+            "store_counts_match_manifest": True,
+            "terminal_http_statuses_preserved": True,
+        },
+        "required_training_gate": "exact_primary_pr_membership_receipt",
+    }
+    completion = tmp_path / "completion.json"
+    completion.write_text(json.dumps(receipt), encoding="utf-8")
+
+    result = collect_gitlab_mr_status({"completion_receipt": str(completion)})
+
+    assert result["state"] == "verified_inventory_not_materialized"
+    assert result["release_ready"] is False
+    assert result["records"]["declared_mrs"] == 5
+    assert result["records"]["primary_stored_mrs"] == 0
+    assert result["records"]["ancillary_stored_mrs"] == 1
+    assert result["stores"]["primary"]["path"] == str(primary)
+    assert result["stores"]["ancillary"]["path"] == str(ancillary)
+    assert "exact primary GitLab MR membership is not verified" in result["blockers"]
+
+    primary.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="size drifted"):
+        collect_gitlab_mr_status({"completion_receipt": str(completion)})
+
+
 def _minimal_config(tmp_path: Path) -> dict[str, object]:
     return {
-        "schema": "cppmega_training_data_status_config_v1",
+        "schema": "cppmega_training_data_status_config_v2",
         "batch_size": 192,
         "output_dir": str(tmp_path / "out"),
         "source": {
@@ -920,13 +1021,14 @@ def _minimal_config(tmp_path: Path) -> dict[str, object]:
         },
         "sealed_megatron": {"manifest": str(tmp_path / "sealed.json")},
         "validation_bundle": {"manifest": str(tmp_path / "validation.json")},
-        "pr": {
+        "github_pr": {
             "completion_receipt": str(tmp_path / "pr_completion.json"),
             "gap_completion_receipt": str(tmp_path / "pr_gap.json"),
             "export_launch_receipt": str(tmp_path / "pr_launch.json"),
             "export_cancellation_receipt": str(tmp_path / "pr_cancel.json"),
             "quarantine_receipt": str(tmp_path / "pr_quarantine.json"),
         },
+        "gitlab_mr": {"completion_receipt": str(tmp_path / "gitlab_completion.json")},
         "ci": {
             "progress_receipts": [str(tmp_path / "ci_progress.json")],
             "legacy_parquet_root": str(tmp_path / "ci_legacy"),
@@ -967,7 +1069,9 @@ def _write_minimal_config_files(tmp_path: Path) -> None:
         "pr_cancel.json",
         "pr_quarantine.json",
     ):
-        (tmp_path / name).write_text(json.dumps({"status": "verified"}), encoding="utf-8")
+        (tmp_path / name).write_text(
+            json.dumps({"status": "verified"}), encoding="utf-8"
+        )
     (tmp_path / "pr_launch.json").write_text(
         json.dumps({"status": "verified", "output_root": str(tmp_path / "pr_out")}),
         encoding="utf-8",
@@ -979,9 +1083,7 @@ def _write_minimal_config_files(tmp_path: Path) -> None:
                 "generated_at": _utc_now(),
                 "inventory": {},
                 "fetch": {"occurrence_tokens": 0},
-                "content_store": {
-                    "counters": {"exact_unique_payload_tokens": 0}
-                },
+                "content_store": {"counters": {"exact_unique_payload_tokens": 0}},
                 "token_accounting": {},
             }
         ),
@@ -1015,6 +1117,10 @@ def test_build_status_includes_heartbeat_freshness_when_path_provided(
         lambda _p: {"state": "verified_store_not_materialized"},
     )
     monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_gitlab_mr_status",
+        lambda _p: {"state": "verified_inventory_not_materialized"},
+    )
+    monkeypatch.setattr(
         "scripts.report_training_data_status.collect_ci_status",
         lambda _c: {"state": "cas_staged_not_exported"},
     )
@@ -1034,9 +1140,7 @@ def test_build_status_includes_heartbeat_freshness_when_path_provided(
         encoding="utf-8",
     )
 
-    status = build_status(
-        config, jobs=1, stale_minutes=30.0, heartbeat_path=heartbeat
-    )
+    status = build_status(config, jobs=1, stale_minutes=30.0, heartbeat_path=heartbeat)
     assert "heartbeat" in status["freshness"]
     assert status["freshness"]["heartbeat"]["stale"] is True
     assert status["freshness"]["heartbeat"]["pid"] == 12345
@@ -1060,9 +1164,49 @@ def test_build_status_omits_heartbeat_when_path_not_provided(
         lambda _p: {"state": "verified_store_not_materialized"},
     )
     monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_gitlab_mr_status",
+        lambda _p: {"state": "verified_inventory_not_materialized"},
+    )
+    monkeypatch.setattr(
         "scripts.report_training_data_status.collect_ci_status",
         lambda _c: {"state": "cas_staged_not_exported"},
     )
 
     status = build_status(config, jobs=1, stale_minutes=30.0)
+    assert "heartbeat" not in status["freshness"]
+
+
+def test_build_status_allows_first_publish_before_heartbeat_exists(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _write_minimal_config_files(tmp_path)
+    config = _minimal_config(tmp_path)
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_live_source",
+        lambda _s, **_: {"state": "packed_unsealed", "release_ready": False},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_megatron_bundle",
+        lambda _m, **_: {"state": "sealed_megatron", "release_ready": True},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_pr_status",
+        lambda _p: {"state": "verified_store_not_materialized"},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_gitlab_mr_status",
+        lambda _p: {"state": "verified_inventory_not_materialized"},
+    )
+    monkeypatch.setattr(
+        "scripts.report_training_data_status.collect_ci_status",
+        lambda _c: {"state": "cas_staged_not_exported"},
+    )
+
+    status = build_status(
+        config,
+        jobs=1,
+        stale_minutes=30.0,
+        heartbeat_path=tmp_path / "missing-heartbeat.json",
+    )
+
     assert "heartbeat" not in status["freshness"]

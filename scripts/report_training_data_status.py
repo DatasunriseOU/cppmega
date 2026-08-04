@@ -30,9 +30,8 @@ from typing import Any, Iterable, Mapping
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
-STATUS_SCHEMA = "cppmega_training_data_status_v1"
-CONFIG_SCHEMA = "cppmega_training_data_status_config_v1"
+STATUS_SCHEMA = "cppmega_training_data_status_v2"
+CONFIG_SCHEMA = "cppmega_training_data_status_config_v2"
 CHANGELOG_SCHEMA = "cppmega_training_data_status_change_v1"
 HEARTBEAT_SCHEMA = "cppmega_training_data_status_heartbeat_v1"
 DEFAULT_STALE_MINUTES = 30.0
@@ -71,6 +70,30 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _verify_file_binding(
+    value: object, *, where: str, require_size: bool = False
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where}: expected a file binding object")
+    required = ("path", "sha256", "size") if require_size else ("path", "sha256")
+    _require_keys(value, required, where=where)
+    path = Path(str(value["path"]))
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{where}: bound artifact is not a regular file: {path}")
+    size = path.stat().st_size
+    if require_size and size != int(value["size"]):
+        raise ValueError(f"{where}: bound artifact size drifted: {path}")
+    digest = _sha256_file(path)
+    if digest != value["sha256"]:
+        raise ValueError(f"{where}: bound artifact SHA-256 drifted: {path}")
+    return {"path": str(path), "sha256": digest, "size": size}
+
+
 def _read_source_completion_summary(path: Path) -> dict[str, Any]:
     """Read only the bounded fields needed from the large conveyor receipt."""
     query = """
@@ -102,7 +125,9 @@ def _read_source_completion_summary(path: Path) -> dict[str, Any]:
             "without unbounded Python memory"
         ) from exc
     except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"{path}: jq receipt projection failed: {exc.stderr}") from exc
+        raise RuntimeError(
+            f"{path}: jq receipt projection failed: {exc.stderr}"
+        ) from exc
     value = json.loads(result.stdout)
     if not isinstance(value, dict):
         raise ValueError(f"{path}: projected completion receipt is not an object")
@@ -149,11 +174,7 @@ def _parquet_paths(root: Path) -> list[tuple[int, Path]]:
         raise FileNotFoundError(f"Parquet root does not exist: {root}")
     result: list[tuple[int, Path]] = []
     for length_dir in sorted(
-        (
-            path
-            for path in root.iterdir()
-            if path.is_dir() and path.name.isdigit()
-        ),
+        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
         key=lambda path: int(path.name),
     ):
         length = int(length_dir.name)
@@ -207,9 +228,7 @@ def _schema_descriptor(schema: object) -> dict[str, object]:
 def _decoded_schema_metadata(schema: object) -> dict[str, str]:
     metadata = getattr(schema, "metadata", None) or {}
     return {
-        key.decode("utf-8", errors="strict"): value.decode(
-            "utf-8", errors="strict"
-        )
+        key.decode("utf-8", errors="strict"): value.decode("utf-8", errors="strict")
         for key, value in sorted(metadata.items())
     }
 
@@ -360,9 +379,7 @@ def _scan_parquet_file(
         "classified_valid_tokens": classified_valid_tokens,
         "classified_trained_tokens": classified_trained_tokens,
         "categories": dict(categories),
-        "subkinds": {
-            category: dict(values) for category, values in subkinds.items()
-        },
+        "subkinds": {category: dict(values) for category, values in subkinds.items()},
     }
 
 
@@ -496,13 +513,10 @@ def _scan_parquet_snapshot_once(
         name: sum(int(counts[name]) for counts in categories.values())
         for name in ("documents", "valid_tokens", "trained_tokens")
     }
-    classification_conserved = (
-        not classify_documents
-        or (
-            classified["documents"] == totals["documents"]
-            and classified["valid_tokens"] == totals["valid_tokens"]
-            and classified["trained_tokens"] == totals["trained_tokens"]
-        )
+    classification_conserved = not classify_documents or (
+        classified["documents"] == totals["documents"]
+        and classified["valid_tokens"] == totals["valid_tokens"]
+        and classified["trained_tokens"] == totals["trained_tokens"]
     )
     return {
         "root": str(root),
@@ -709,12 +723,16 @@ def collect_live_source(
     if expected_repository_count <= 0:
         raise ValueError(f"{launch_path}: expected_repository_count must be positive")
     if int(archive_inventory["repository_count"]) != expected_repository_count:
-        raise ValueError(f"{launch_path}: archive repository count does not match launch")
+        raise ValueError(
+            f"{launch_path}: archive repository count does not match launch"
+        )
     if (
         Path(str(launch_outputs["conveyor_manifest"])).resolve()
         != completion_path.resolve()
     ):
-        raise ValueError(f"{launch_path}: conveyor manifest does not match source config")
+        raise ValueError(
+            f"{launch_path}: conveyor manifest does not match source config"
+        )
     if Path(str(launch_outputs["run_root"])).resolve() != root.resolve():
         raise ValueError(f"{launch_path}: run root does not match source config")
     if launch_repo_list["sha256"] != source_repo_list["sha256"]:
@@ -729,12 +747,10 @@ def collect_live_source(
     )
     receipt_totals = _receipt_totals(done)
     physical_totals = {
-        name: int(parquet[name])
-        for name in ("rows", "capacity_tokens", "valid_tokens")
+        name: int(parquet[name]) for name in ("rows", "capacity_tokens", "valid_tokens")
     }
     receipt_minus_physical = {
-        name: receipt_totals[name] - physical_totals[name]
-        for name in receipt_totals
+        name: receipt_totals[name] - physical_totals[name] for name in receipt_totals
     }
     collisions = _casefold_collisions(done)
     mapping_count = int(source_repo_list["mapping_count"])
@@ -769,7 +785,8 @@ def collect_live_source(
 
     return {
         "state": "packed_unsealed",
-        "training_readable": bool(parquet["files"]) and not any(
+        "training_readable": bool(parquet["files"])
+        and not any(
             blocker
             for blocker in blockers
             if blocker
@@ -906,8 +923,8 @@ def collect_megatron_bundle(
         graph_sidecars.update(value["graph_sidecar_paths"])
         source_platform_schemas.add(value["source_platform_sidecar"]["schema"])
 
-    source_manifest_path = (
-        manifest_path.parent / str(manifest["source_snapshot"]["manifest"])
+    source_manifest_path = manifest_path.parent / str(
+        manifest["source_snapshot"]["manifest"]
     )
     source_manifest = _read_json(source_manifest_path)
     parquet_roots = sorted(
@@ -1072,6 +1089,181 @@ def collect_pr_status(config: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def collect_gitlab_mr_status(config: Mapping[str, object]) -> dict[str, object]:
+    _require_keys(config, ("completion_receipt",), where="GitLab MR config")
+    completion_path = Path(str(config["completion_receipt"]))
+    completion = _read_json(completion_path)
+    _require_keys(
+        completion,
+        (
+            "schema",
+            "status",
+            "platform",
+            "scan_id",
+            "contract_sha256",
+            "manifest",
+            "repo_list",
+            "expected_host_count",
+            "expected_hosts",
+            "expected_repo_count",
+            "expected_repos",
+            "declared_mr_count",
+            "candidate_mr_count",
+            "noncandidate_mr_count",
+            "route_counts",
+            "pr_store",
+            "stored_pr_count",
+            "unverified_store_pr_count",
+            "ancillary_store",
+            "ancillary_stored_count",
+            "ancillary_unverified_store_count",
+            "sidecars",
+            "validation",
+            "required_training_gate",
+        ),
+        where=str(completion_path),
+    )
+    if (
+        completion["schema"] != "cppmega_gitlab_mr_completion_v1"
+        or completion["status"] != "verified"
+        or completion["platform"] != "gitlab"
+    ):
+        raise ValueError(f"{completion_path}: GitLab MR completion is not verified")
+
+    validation = completion["validation"]
+    if not isinstance(validation, Mapping):
+        raise ValueError(f"{completion_path}: GitLab validation is not an object")
+    verified_gates = (
+        "candidate_route_conservation",
+        "deterministic_gzip_sidecars",
+        "immutable_artifact_hashes",
+        "inventory_complete",
+        "primary_ancillary_physical_separation",
+        "store_counts_match_manifest",
+        "terminal_http_statuses_preserved",
+    )
+    _require_keys(
+        validation,
+        (*verified_gates, "exact_primary_membership_verified"),
+        where=f"{completion_path}: validation",
+    )
+    failed_gates = [name for name in verified_gates if validation[name] is not True]
+    if failed_gates:
+        raise ValueError(
+            f"{completion_path}: GitLab verified gates are false: {failed_gates}"
+        )
+
+    routes = completion["route_counts"]
+    if not isinstance(routes, Mapping):
+        raise ValueError(f"{completion_path}: GitLab route counts are not an object")
+    _require_keys(
+        routes,
+        ("primary", "ancillary", "terminal", "excluded"),
+        where=f"{completion_path}: route_counts",
+    )
+    route_counts = {name: int(routes[name]) for name in routes}
+    candidate_count = int(completion["candidate_mr_count"])
+    declared_count = int(completion["declared_mr_count"])
+    noncandidate_count = int(completion["noncandidate_mr_count"])
+    if sum(route_counts.values()) != candidate_count:
+        raise ValueError(
+            f"{completion_path}: GitLab candidate route conservation drifted"
+        )
+    if candidate_count + noncandidate_count != declared_count:
+        raise ValueError(f"{completion_path}: GitLab inventory conservation drifted")
+    if route_counts["primary"] != int(completion["stored_pr_count"]):
+        raise ValueError(f"{completion_path}: GitLab primary store count drifted")
+    if route_counts["ancillary"] != int(completion["ancillary_stored_count"]):
+        raise ValueError(f"{completion_path}: GitLab ancillary store count drifted")
+    if len(completion["expected_hosts"]) != int(completion["expected_host_count"]):
+        raise ValueError(f"{completion_path}: GitLab host scope count drifted")
+    if len(completion["expected_repos"]) != int(completion["expected_repo_count"]):
+        raise ValueError(f"{completion_path}: GitLab repository scope count drifted")
+
+    primary = _verify_file_binding(
+        completion["pr_store"], where="GitLab primary store", require_size=True
+    )
+    ancillary = _verify_file_binding(
+        completion["ancillary_store"],
+        where="GitLab ancillary store",
+        require_size=True,
+    )
+    if Path(str(primary["path"])).resolve() == Path(str(ancillary["path"])).resolve():
+        raise ValueError(
+            f"{completion_path}: GitLab stores are not physically separate"
+        )
+    manifest = _verify_file_binding(completion["manifest"], where="GitLab manifest")
+    repo_list = _verify_file_binding(
+        completion["repo_list"], where="GitLab repository list"
+    )
+    sidecars = completion["sidecars"]
+    if not isinstance(sidecars, Mapping):
+        raise ValueError(f"{completion_path}: GitLab sidecars are not an object")
+    _require_keys(
+        sidecars,
+        (
+            "root",
+            "files",
+            "format",
+            "logical_byte_size",
+            "physical_byte_size",
+            "logical_set_sha256",
+            "physical_set_sha256",
+        ),
+        where=f"{completion_path}: sidecars",
+    )
+    sidecar_root = Path(str(sidecars["root"]))
+    if sidecar_root.is_symlink() or not sidecar_root.is_dir():
+        raise ValueError(f"{completion_path}: GitLab sidecar root is unavailable")
+
+    exact_membership = validation["exact_primary_membership_verified"] is True
+    blockers = ["GitLab primary MR Parquet has not been materialized"]
+    if not exact_membership:
+        blockers.insert(0, "exact primary GitLab MR membership is not verified")
+    return {
+        "state": "verified_inventory_not_materialized",
+        "training_readable": False,
+        "release_ready": False,
+        "blockers": blockers,
+        "version": {
+            "platform": "gitlab",
+            "scan_id": completion["scan_id"],
+            "schema": completion["schema"],
+            "contract_sha256": completion["contract_sha256"],
+            "completion_receipt": str(completion_path),
+            "completion_receipt_sha256": _sha256_file(completion_path),
+            "manifest": manifest,
+            "repo_list": repo_list,
+        },
+        "scope": {
+            "hosts": list(completion["expected_hosts"]),
+            "repositories": list(completion["expected_repos"]),
+        },
+        "records": {
+            "declared_mrs": declared_count,
+            "candidate_mrs": candidate_count,
+            "noncandidate_mrs": noncandidate_count,
+            "routes": route_counts,
+            "primary_stored_mrs": int(completion["stored_pr_count"]),
+            "primary_unverified_mrs": int(completion["unverified_store_pr_count"]),
+            "ancillary_stored_mrs": int(completion["ancillary_stored_count"]),
+            "ancillary_unverified_mrs": int(
+                completion["ancillary_unverified_store_count"]
+            ),
+        },
+        "stores": {"primary": primary, "ancillary": ancillary},
+        "sidecars": dict(sidecars),
+        "validation": dict(validation),
+        "required_training_gate": completion["required_training_gate"],
+        "eligible_parquet": {
+            "files": 0,
+            "rows": 0,
+            "valid_tokens": 0,
+            "trained_tokens": 0,
+        },
+    }
+
+
 def _collect_frozen_ci_case5(
     root: Path,
     *,
@@ -1143,8 +1335,7 @@ def _collect_frozen_ci_case5(
         "sidecar_set_sha256": summary["sidecar_set_sha256"],
         "lineage": {
             "cut": {
-                key: cut_binding[key]
-                for key in ("source_root", "source_code_commit")
+                key: cut_binding[key] for key in ("source_root", "source_code_commit")
             },
             "store_receipt_sha256": hashlib.sha256(store_path.read_bytes()).hexdigest(),
             "store": {
@@ -1223,15 +1414,11 @@ def _collect_frozen_ci_case5(
         "valid_tokens": 0,
         "trained_tokens": 0,
     }
-    split_counts = {
-        split: Counter(zero_counts) for split in split_names
-    }
+    split_counts = {split: Counter(zero_counts) for split in split_names}
     buckets = {
         str(bucket): {
             "total": Counter(zero_counts),
-            "splits": {
-                split: Counter(zero_counts) for split in split_names
-            },
+            "splits": {split: Counter(zero_counts) for split in split_names},
         }
         for bucket in TARGET_LENGTHS
     }
@@ -1268,12 +1455,8 @@ def _collect_frozen_ci_case5(
                 **result["lineage"],
                 "export": {
                     "source_binding": normalized["source_binding"],
-                    "parser_generation_policy": export[
-                        "parser_generation_policy"
-                    ],
-                    "source_binding_projection": export[
-                        "source_binding_projection"
-                    ],
+                    "parser_generation_policy": export["parser_generation_policy"],
+                    "source_binding_projection": export["source_binding_projection"],
                 },
             },
             "export": {
@@ -1289,17 +1472,14 @@ def _collect_frozen_ci_case5(
                     "receipt_records_sha256": _sha256(export["artifacts"]),
                 },
                 "splits": {
-                    key: dict(value)
-                    for key, value in sorted(split_counts.items())
+                    key: dict(value) for key, value in sorted(split_counts.items())
                 },
                 "buckets": {
                     key: {
                         **dict(value["total"]),
                         "splits": {
                             split: dict(counts)
-                            for split, counts in sorted(
-                                value["splits"].items()
-                            )
+                            for split, counts in sorted(value["splits"].items())
                         },
                     }
                     for key, value in sorted(buckets.items())
@@ -1402,9 +1582,7 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
                     "repos_total": int(progress["inventory"]["repos_total"]),
                     "runs": int(progress["inventory"]["runs"]),
                     "expected_runs": int(
-                        progress["fetch"]["exhaustive_discovery"][
-                            "expected_run_count"
-                        ]
+                        progress["fetch"]["exhaustive_discovery"]["expected_run_count"]
                     ),
                     "expected_attempts": int(
                         progress["fetch"]["exhaustive_discovery"][
@@ -1431,9 +1609,7 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
                 "tokenizer": progress["token_accounting"]["tokenizer_contract"],
                 "content_store": {
                     "schema": progress["content_store"]["schema"],
-                    "compression": progress["content_store"]["policy"][
-                        "compression"
-                    ],
+                    "compression": progress["content_store"]["policy"]["compression"],
                     "pack_count": int(progress["content_store"]["pack_count"]),
                     "committed_pack_bytes": int(
                         progress["content_store"]["committed_pack_bytes"]
@@ -1503,15 +1679,9 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
                 "store-local exact counters may overlap across intervals"
             ),
             "occurrence_payload_tokens": occurrence_tokens,
-            "ready_payload_tokens": (
-                frozen["ready_payload_tokens"] if frozen else 0
-            ),
-            "ready_valid_tokens": (
-                frozen["ready_valid_tokens"] if frozen else 0
-            ),
-            "ready_trained_tokens": (
-                frozen["ready_trained_tokens"] if frozen else 0
-            ),
+            "ready_payload_tokens": (frozen["ready_payload_tokens"] if frozen else 0),
+            "ready_valid_tokens": (frozen["ready_valid_tokens"] if frozen else 0),
+            "ready_trained_tokens": (frozen["ready_trained_tokens"] if frozen else 0),
         },
         "sidecars": {
             "training_schema": "cppmega_ci_chunk_training_sidecars_v2",
@@ -1547,9 +1717,7 @@ def _live_upstream_inputs(config: Mapping[str, object]) -> dict[str, Path]:
     expected to change, so their age carries no signal.
     """
     inputs = {
-        "source_completion_receipt": Path(
-            str(config["source"]["completion_receipt"])
-        ),
+        "source_completion_receipt": Path(str(config["source"]["completion_receipt"])),
     }
     for path in config["ci"]["progress_receipts"]:
         inputs[f"ci_progress_receipt:{path}"] = Path(str(path))
@@ -1626,7 +1794,8 @@ def _validate_config(config: Mapping[str, object]) -> None:
         "source",
         "sealed_megatron",
         "validation_bundle",
-        "pr",
+        "github_pr",
+        "gitlab_mr",
         "ci",
     }
     if set(config) != expected:
@@ -1684,7 +1853,8 @@ def build_status(
         batch_size=batch_size,
         role="validation",
     )
-    pr = collect_pr_status(config["pr"])
+    github_pr = collect_pr_status(config["github_pr"])
+    gitlab_mr = collect_gitlab_mr_status(config["gitlab_mr"])
     ci_config = dict(config["ci"])
     ci_config["batch_size"] = batch_size
     ci_config["jobs"] = jobs
@@ -1712,12 +1882,13 @@ def build_status(
             "live_source": source,
             "sealed_megatron": sealed,
             "validation_bundle": validation,
-            "pr_mr": pr,
+            "github_pr": github_pr,
+            "gitlab_mr": gitlab_mr,
             "ci": ci,
         },
     }
     freshness = collect_freshness(config, stale_minutes=stale_minutes)
-    if heartbeat_path is not None:
+    if heartbeat_path is not None and heartbeat_path.is_file():
         freshness["heartbeat"] = check_heartbeat(
             heartbeat_path,
             stale_after_seconds=stale_minutes * 60.0,
@@ -1763,12 +1934,11 @@ def render_markdown(status: Mapping[str, object]) -> str:
     datasets = status["datasets"]
     source = datasets["live_source"]
     sealed = datasets["sealed_megatron"]
-    pr = datasets["pr_mr"]
+    github_pr = datasets["github_pr"]
+    gitlab_mr = datasets["gitlab_mr"]
     ci = datasets["ci"]
     ci_tokens = ci["token_accounting"]
-    frozen_ci_tokens = ci_tokens.get(
-        "frozen_snapshot_exact_unique_payload_tokens"
-    ) or 0
+    frozen_ci_tokens = ci_tokens.get("frozen_snapshot_exact_unique_payload_tokens") or 0
     lines = [
         "# Current Training-Data Status",
         "",
@@ -1795,8 +1965,12 @@ def render_markdown(status: Mapping[str, object]) -> str:
             f"{str(sealed['release_ready']).lower()} |"
         ),
         (
-            f"| PR/MR | {pr['state']} | 0 | 0 | "
-            f"{str(pr['release_ready']).lower()} |"
+            f"| GitHub PR | {github_pr['state']} | 0 | 0 | "
+            f"{str(github_pr['release_ready']).lower()} |"
+        ),
+        (
+            f"| GitLab MR | {gitlab_mr['state']} | 0 | 0 | "
+            f"{str(gitlab_mr['release_ready']).lower()} |"
         ),
         (
             f"| CI | {ci['state']} | "
@@ -1818,9 +1992,7 @@ def render_markdown(status: Mapping[str, object]) -> str:
         "| category | documents | valid | trained |",
         "|---|---:|---:|---:|",
     ]
-    for category, counts in source["parquet"]["classification"][
-        "by_category"
-    ].items():
+    for category, counts in source["parquet"]["classification"]["by_category"].items():
         lines.append(
             f"| {category} | {_int(counts['documents'])} | "
             f"{_int(counts['valid_tokens'])} | {_int(counts['trained_tokens'])} |"
@@ -1838,12 +2010,30 @@ def render_markdown(status: Mapping[str, object]) -> str:
             "",
             *_bucket_markdown(sealed["buckets"]),
             "",
-            "## PR/MR",
+            "## GitHub PR",
             "",
             (
-                f"Verified records: {_int(pr['records']['stored_prs'])}; "
+                f"Verified records: {_int(github_pr['records']['stored_prs'])}; "
                 "eligible packed Parquet tokens: 0."
             ),
+            "",
+            "## GitLab MR",
+            "",
+            (
+                f"Inventory records: {_int(gitlab_mr['records']['declared_mrs'])}; "
+                f"candidates: {_int(gitlab_mr['records']['candidate_mrs'])}; "
+                "primary/ancillary stores: "
+                f"{_int(gitlab_mr['records']['primary_stored_mrs'])}/"
+                f"{_int(gitlab_mr['records']['ancillary_stored_mrs'])}."
+            ),
+            (
+                f"Deterministic gzip sidecars: {_int(gitlab_mr['sidecars']['files'])}; "
+                "eligible packed Parquet tokens: 0."
+            ),
+            "",
+            "Blockers:",
+            "",
+            *[f"- {value}" for value in gitlab_mr["blockers"]],
             "",
             "## CI",
             "",
@@ -1874,10 +2064,13 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
     source = datasets["live_source"]
     sealed = datasets["sealed_megatron"]
     validation = datasets["validation_bundle"]
-    pr = datasets["pr_mr"]
+    github_pr = datasets.get("github_pr", datasets.get("pr_mr"))
+    if not isinstance(github_pr, Mapping):
+        raise ValueError("status has no GitHub PR dataset")
+    gitlab_mr = datasets.get("gitlab_mr")
     ci = datasets["ci"]
     legacy = ci["legacy_sample"]["parquet"]
-    return {
+    summary = {
         "live_source": {
             "state": source["state"],
             "files": source["parquet"]["files"],
@@ -1890,9 +2083,7 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
                 iter(source["parquet"]["schema"]["metadata_by_sha256"].values()),
                 {},
             ).get("cppmega.tokenizer_contract_sha256"),
-            "source_repo_list_sha256": source["version"]["source_repo_list"][
-                "sha256"
-            ],
+            "source_repo_list_sha256": source["version"]["source_repo_list"]["sha256"],
         },
         "sealed_megatron": {
             "state": sealed["state"],
@@ -1910,11 +2101,11 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
             "valid_tokens": validation["totals"]["valid_tokens"],
             "trained_tokens": validation["totals"]["trained_tokens"],
         },
-        "pr_mr": {
-            "state": pr["state"],
-            "scan_id": pr["version"]["scan_id"],
-            "store_sha256": pr["version"]["store_sha256"],
-            "stored_records": pr["records"]["stored_prs"],
+        "github_pr": {
+            "state": github_pr["state"],
+            "scan_id": github_pr["version"]["scan_id"],
+            "store_sha256": github_pr["version"]["store_sha256"],
+            "stored_records": github_pr["records"]["stored_prs"],
             "ready_tokens": 0,
         },
         "ci": {
@@ -1922,9 +2113,7 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
             "store_local_unique_upper_bound": ci["token_accounting"][
                 "store_local_unique_upper_bound"
             ],
-            "ready_valid_tokens": ci["token_accounting"].get(
-                "ready_valid_tokens", 0
-            ),
+            "ready_valid_tokens": ci["token_accounting"].get("ready_valid_tokens", 0),
             "ready_trained_tokens": ci["token_accounting"].get(
                 "ready_trained_tokens", 0
             ),
@@ -1942,6 +2131,18 @@ def _status_summary(status: Mapping[str, object]) -> dict[str, object]:
             ],
         },
     }
+    if isinstance(gitlab_mr, Mapping):
+        summary["gitlab_mr"] = {
+            "state": gitlab_mr["state"],
+            "scan_id": gitlab_mr["version"]["scan_id"],
+            "primary_store_sha256": gitlab_mr["stores"]["primary"]["sha256"],
+            "ancillary_store_sha256": gitlab_mr["stores"]["ancillary"]["sha256"],
+            "declared_records": gitlab_mr["records"]["declared_mrs"],
+            "primary_records": gitlab_mr["records"]["primary_stored_mrs"],
+            "ancillary_records": gitlab_mr["records"]["ancillary_stored_mrs"],
+            "ready_tokens": 0,
+        }
+    return summary
 
 
 def _has_status_summary_shape(status: object) -> bool:
