@@ -99,12 +99,12 @@ On first boot, the startup script:
 7. optionally downloads a SHA-256-pinned runner from GCS and starts it as the
    unprivileged `cppmega` user under `cppmega-source-worker.service`.
 
-The systemd unit restarts only failed runner attempts, with a 30-second delay
-and no start-rate cutoff. Each attempt reuses the same immutable manifest and
+The systemd unit restarts only transiently failed runner attempts, with a
+30-minute delay and no start-rate cutoff. Exit `75` means the bounded transport
+retry budget was exhausted; exit `2` is a contract or artifact failure and is
+explicitly not restarted. Each attempt reuses the same immutable manifest and
 GCS assignment pointers, so already verified repository assignments are
-skipped. A successful runner exit remains stopped. This protects transient
-network and process failures without turning a contract or artifact mismatch
-into a different workload.
+skipped. A successful runner exit remains stopped.
 
 When a runner is configured, Terraform requires the complete five-part
 binding: runner URI, runner SHA-256, bundle SHA-256, overlay SHA-256, and raw
