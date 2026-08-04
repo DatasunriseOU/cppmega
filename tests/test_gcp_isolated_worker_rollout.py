@@ -9,6 +9,7 @@ from scripts.distributed_data_prep._common import ContractError, atomic_write_js
 from scripts.gcp_isolated_worker_rollout import (
     ROLL_OUT_RECEIPT_SCHEMA,
     _main,
+    _plan_environment,
     _validate_backend_metadata,
     backend_hcl,
     build_rollout_spec,
@@ -130,6 +131,30 @@ def test_backend_metadata_must_bind_the_same_run(tmp_path: Path) -> None:
     )
     with pytest.raises(ContractError, match="not bound"):
         _validate_backend_metadata(tmp_path, spec=spec)
+
+
+def test_gcloud_token_mode_overrides_ambient_credential_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/underprivileged.json")
+    monkeypatch.setenv("GOOGLE_CREDENTIALS", "underprivileged")
+    monkeypatch.setenv("GOOGLE_BACKEND_CREDENTIALS", "underprivileged")
+    monkeypatch.setenv("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT", "wrong@example.invalid")
+    monkeypatch.setenv("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "/tmp/wrong.json")
+    monkeypatch.setattr(
+        "scripts.gcp_isolated_worker_rollout._gcloud_access_token",
+        lambda: "ya29.test-token",
+    )
+
+    environment, auth_mode = _plan_environment(use_gcloud_access_token=True)
+
+    assert auth_mode == "gcloud-active-token"
+    assert environment["GOOGLE_OAUTH_ACCESS_TOKEN"] == "ya29.test-token"
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in environment
+    assert "GOOGLE_CREDENTIALS" not in environment
+    assert "GOOGLE_BACKEND_CREDENTIALS" not in environment
+    assert "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT" not in environment
+    assert "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" not in environment
 
 
 def test_plan_accepts_exact_target_creates_only() -> None:
