@@ -23,7 +23,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, cast
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
     _ROOT = Path(__file__).resolve().parents[2]
@@ -51,7 +51,14 @@ from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     GcloudObjectStore,
     ObjectStore,
     TransientTransportError,
+    _load_completed_assignment,
     validate_worker_receipt,
+)
+from scripts.distributed_data_prep.source_work_queue import (  # noqa: E402
+    AssignmentLease,
+    claim_assignment,
+    publish_assignment_heartbeat,
+    publish_assignment_outcome,
 )
 
 
@@ -59,6 +66,13 @@ SLOT_COMPLETION_RECEIPT_SCHEMA = (
     "cppmega.distributed_source_slot_completion_receipt_v1"
 )
 SCHEDULER_RECEIPT_SCHEMA = "cppmega.distributed_source_slot_scheduler_receipt_v1"
+DYNAMIC_SCHEDULER_RECEIPT_SCHEMA = (
+    "cppmega.distributed_source_dynamic_scheduler_receipt_v1"
+)
+DYNAMIC_INCOMPLETE_RECEIPT_SCHEMA = (
+    "cppmega.distributed_source_dynamic_scheduler_incomplete_receipt_v1"
+)
+DYNAMIC_SCHEDULER_MODE = "immutable_assignment_work_stealing_v1"
 
 
 @dataclass(frozen=True)
@@ -494,14 +508,15 @@ def _build_worker_command(
     receipt_root: Path,
     python: Path,
     resources: Mapping[str, int | float],
+    job: Mapping[str, object] | None = None,
 ) -> list[str]:
-    return [
+    command = [
         str(python),
         str(source_worker),
         "--manifest",
         str(manifest),
         "--worker",
-        spec.worker,
+        str(job["worker"]) if job is not None else spec.worker,
         "--scratch-root",
         str(scratch_root),
         "--receipt-root",
@@ -515,6 +530,9 @@ def _build_worker_command(
         "--memory-limit-gb",
         str(resources["memory_limit_gb_per_slot"]),
     ]
+    if job is not None:
+        command.extend(["--assignment-sha256", str(job["assignment_sha256"])])
+    return command
 
 
 def _build_slot_completion(
@@ -667,6 +685,650 @@ def _scheduler_receipt(
     }
 
 
+def _dynamic_scheduler_receipt(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    specs: Sequence[SlotSpec],
+    resources: Mapping[str, int | float],
+    completed: Sequence[str],
+    resumed: Sequence[str],
+    source_receipt_count: int,
+    scheduler_instance: str,
+    executed_assignment_count: int,
+) -> dict[str, object]:
+    receipt = _scheduler_receipt(
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        specs=specs,
+        resources=resources,
+        completed=completed,
+        resumed=resumed,
+        source_receipt_count=source_receipt_count,
+    )
+    receipt.update(
+        {
+            "schema": DYNAMIC_SCHEDULER_RECEIPT_SCHEMA,
+            "scheduler_mode": DYNAMIC_SCHEDULER_MODE,
+            "scheduler_instance": scheduler_instance,
+            "executed_assignment_count": executed_assignment_count,
+        }
+    )
+    return receipt
+
+
+def dynamic_incomplete_receipt_uri(
+    manifest: Mapping[str, object], physical_worker_index: int
+) -> str:
+    return gcs_join(
+        str(manifest["gcs_output_prefix"]),
+        "source-dynamic-scheduler-incomplete-receipts",
+        str(manifest["manifest_sha256"]),
+        f"physical-worker-{physical_worker_index:04d}.incomplete.json",
+    )
+
+
+def _dynamic_incomplete_receipt(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    specs: Sequence[SlotSpec],
+    resources: Mapping[str, int | float],
+    completed_assignments: set[str],
+    terminal_assignments: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    jobs_by_sha256 = {
+        str(job["assignment_sha256"]): dict(job)
+        for job in manifest["repositories"]
+    }
+    known_assignments = set(jobs_by_sha256)
+    terminal_keys = set(terminal_assignments)
+    unknown_completed = completed_assignments - known_assignments
+    unknown_terminal = terminal_keys - known_assignments
+    overlap = completed_assignments & terminal_keys
+    if unknown_completed or unknown_terminal:
+        raise ContractError("dynamic scheduler accounting escaped the source manifest")
+    if overlap:
+        raise ContractError("dynamic scheduler assignment accounting overlaps")
+    terminal_entries: list[dict[str, object]] = []
+    for assignment_sha256, outcome in terminal_assignments.items():
+        job = jobs_by_sha256.get(assignment_sha256)
+        if job is None:
+            raise ContractError(
+                "terminal assignment is outside the source manifest: "
+                f"{assignment_sha256}"
+            )
+        terminal_entries.append(
+            {
+                "assignment": {
+                    key: job[key]
+                    for key in (
+                        "ordinal",
+                        "repo",
+                        "project_id",
+                        "worker",
+                        "assignment_sha256",
+                    )
+                },
+                "outcome": dict(outcome),
+            }
+        )
+    terminal_entries.sort(key=lambda entry: int(entry["assignment"]["ordinal"]))
+    unresolved_assignments = known_assignments - completed_assignments - terminal_keys
+    assignment_count = len(known_assignments)
+    completed_count = len(completed_assignments)
+    terminal_count = len(terminal_entries)
+    unresolved_count = len(unresolved_assignments)
+    return {
+        "schema": DYNAMIC_INCOMPLETE_RECEIPT_SCHEMA,
+        "status": "incomplete",
+        "scheduler_mode": DYNAMIC_SCHEDULER_MODE,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest_file_sha256": manifest_file_sha256,
+        "physical_worker_index": specs[0].physical_worker_index,
+        "physical_worker_count": specs[0].physical_worker_count,
+        "slots_per_worker": specs[0].slots_per_worker,
+        "workers": [spec.worker for spec in specs],
+        "assignment_count": assignment_count,
+        "completed_assignment_count": completed_count,
+        "terminal_assignment_count": terminal_count,
+        "unresolved_assignment_count": unresolved_count,
+        "terminal_assignments": terminal_entries,
+        "resources": dict(resources),
+        "training_ready": False,
+    }
+
+
+def _publish_dynamic_incomplete_receipt(
+    *,
+    receipt: Mapping[str, object],
+    manifest: Mapping[str, object],
+    spec: SlotSpec,
+    scheduler_receipt_path: Path,
+    object_store: ObjectStore,
+    verification_root: Path,
+) -> None:
+    atomic_write_json(scheduler_receipt_path, receipt)
+    uri = dynamic_incomplete_receipt_uri(manifest, spec.physical_worker_index)
+    metadata = object_store.publish_if_absent(scheduler_receipt_path, uri)
+    generation = str(metadata.get("generation", ""))
+    if str(metadata.get("uri")) != uri or not generation.isdecimal():
+        raise ContractError(
+            f"dynamic incomplete receipt publication metadata drifted: {uri}"
+        )
+    verification_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="dynamic-incomplete-readback-", dir=verification_root
+    ) as raw_tmp:
+        path = Path(raw_tmp) / "incomplete.json"
+        downloaded = object_store.download(uri, path, generation=generation)
+        if (
+            str(downloaded.get("generation")) != generation
+            or path.stat().st_size != scheduler_receipt_path.stat().st_size
+            or sha256_file(path) != sha256_file(scheduler_receipt_path)
+        ):
+            raise ContractError(
+                f"dynamic incomplete receipt publication readback drifted: {uri}"
+            )
+
+
+def _assignment_order(
+    manifest: Mapping[str, object], spec: SlotSpec
+) -> tuple[dict[str, object], ...]:
+    """Prefer an executor's home shard, then rotate through steal candidates."""
+
+    jobs = [dict(job) for job in manifest["repositories"]]
+    home = [job for job in jobs if job["worker"] == spec.worker]
+    steal = [job for job in jobs if job["worker"] != spec.worker]
+    if steal:
+        logical_index = (
+            spec.physical_worker_index * spec.slots_per_worker + spec.slot_index
+        )
+        offset = logical_index % len(steal)
+        steal = steal[offset:] + steal[:offset]
+    return tuple(home + steal)
+
+
+def _claim_next_assignment(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    spec: SlotSpec,
+    scheduler_instance: str,
+    completed_assignments: set[str],
+    terminal_assignments: dict[str, dict[str, object]],
+    active_assignments: set[str],
+    object_store: ObjectStore,
+    verification_root: Path,
+    now_unix_s: int,
+    claim_lease_seconds: int,
+    claim_heartbeat_seconds: int,
+    max_claim_attempts: int,
+) -> tuple[AssignmentLease | None, bool]:
+    outstanding = False
+    for job in _assignment_order(manifest, spec):
+        assignment_sha256 = str(job["assignment_sha256"])
+        if assignment_sha256 in completed_assignments:
+            continue
+        if assignment_sha256 in active_assignments:
+            outstanding = True
+            continue
+        resumed = _load_completed_assignment(
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            job=job,
+            object_store=object_store,
+            scratch_root=verification_root,
+        )
+        if resumed is not None:
+            completed_assignments.add(assignment_sha256)
+            terminal_assignments.pop(assignment_sha256, None)
+            continue
+        decision = claim_assignment(
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            job=job,
+            executor=_slot_topology(spec),
+            scheduler_instance=scheduler_instance,
+            now_unix_s=now_unix_s,
+            lease_seconds=claim_lease_seconds,
+            heartbeat_seconds=claim_heartbeat_seconds,
+            max_attempts=max_claim_attempts,
+            object_store=object_store,
+            verification_root=verification_root,
+        )
+        if decision.state == "complete":
+            resumed = _load_completed_assignment(
+                manifest=manifest,
+                manifest_file_sha256=manifest_file_sha256,
+                job=job,
+                object_store=object_store,
+                scratch_root=verification_root,
+            )
+            if resumed is None:
+                raise ContractError(
+                    "assignment completion pointer disappeared during queue scan"
+                )
+            completed_assignments.add(assignment_sha256)
+            terminal_assignments.pop(assignment_sha256, None)
+            continue
+        if decision.state == "busy":
+            terminal_assignments.pop(assignment_sha256, None)
+            outstanding = True
+            continue
+        if decision.state == "deterministic":
+            if decision.outcome is None:
+                raise ContractError(
+                    "deterministic assignment decision omitted its outcome"
+                )
+            terminal_assignments[assignment_sha256] = decision.outcome
+            continue
+        if decision.state != "claimed" or decision.lease is None:
+            raise ContractError(f"unsupported assignment claim state: {decision.state}")
+        terminal_assignments.pop(assignment_sha256, None)
+        return decision.lease, True
+    return None, outstanding
+
+
+def _start_dynamic_assignment(
+    *,
+    manifest_path: Path,
+    source_worker: Path,
+    python: Path,
+    spec: SlotSpec,
+    executor: Mapping[str, object],
+    lease: AssignmentLease,
+    resources: Mapping[str, int | float],
+) -> dict[str, object]:
+    attempt_root = executor["attempt_root"]
+    repo_root = executor["repo_root"]
+    scratch_root = executor["scratch_root"]
+    receipt_root = executor["receipt_root"]
+    assert isinstance(attempt_root, Path)
+    assert isinstance(repo_root, Path)
+    assert isinstance(scratch_root, Path)
+    assert isinstance(receipt_root, Path)
+    logs = attempt_root / "assignment-logs"
+    logs.mkdir(exist_ok=True)
+    job = lease.job
+    log_path = logs / (
+        f"{int(job['ordinal']):05d}-{job['repo']}-"
+        f"attempt-{int(lease.claim['attempt']):04d}.log"
+    )
+    log = log_path.open("ab")
+    command = _build_worker_command(
+        source_worker=source_worker,
+        manifest=manifest_path,
+        spec=spec,
+        repo_root=repo_root,
+        scratch_root=scratch_root,
+        receipt_root=receipt_root,
+        python=python,
+        resources=resources,
+        job=job,
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "CPPMEGA_SOURCE_SLOT": spec.worker,
+            "CPPMEGA_SOURCE_ASSIGNMENT_OWNER": str(job["worker"]),
+            "CPPMEGA_SOURCE_ASSIGNMENT_SHA256": str(job["assignment_sha256"]),
+        }
+    )
+    process = subprocess.Popen(
+        command,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    return {
+        "spec": spec,
+        "lease": lease,
+        "process": process,
+        "log": log,
+        "log_path": log_path,
+        "last_heartbeat_index": 0,
+    }
+
+
+def _finalize_dynamic_slots(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    specs: Sequence[SlotSpec],
+    resources: Mapping[str, int | float],
+    slot_roots: Mapping[str, Path],
+    resumable: Mapping[str, Mapping[str, object]],
+    object_store: ObjectStore,
+) -> tuple[list[str], list[str], int]:
+    completed: list[str] = []
+    resumed = sorted(resumable)
+    source_receipt_count = 0
+    for spec in specs:
+        existing = resumable.get(spec.worker)
+        if existing is not None:
+            completed.append(spec.worker)
+            source_receipt_count += len(existing["source_receipts"])
+            continue
+        slot_root = slot_roots[spec.worker]
+        with tempfile.TemporaryDirectory(
+            prefix="dynamic-slot-receipts-", dir=slot_root
+        ) as raw_receipts:
+            receipt_root = Path(raw_receipts)
+            for job in repositories_for_worker(manifest, spec.worker):
+                worker_receipt = _load_completed_assignment(
+                    manifest=manifest,
+                    manifest_file_sha256=manifest_file_sha256,
+                    job=job,
+                    object_store=object_store,
+                    scratch_root=slot_root / "verify",
+                )
+                if worker_receipt is None:
+                    raise ContractError(
+                        "dynamic queue ended before an owned assignment completed: "
+                        f"{job['assignment_sha256']}"
+                    )
+                atomic_write_json(
+                    receipt_root / f"{int(job['ordinal']):05d}-{job['repo']}.json",
+                    worker_receipt,
+                )
+            slot_receipt = _build_slot_completion(
+                manifest=manifest,
+                manifest_file_sha256=manifest_file_sha256,
+                spec=spec,
+                resources=resources,
+                receipt_root=receipt_root,
+                object_store=object_store,
+                verification_root=slot_root / "verify",
+            )
+        _publish_slot_completion(
+            receipt=slot_receipt,
+            manifest=manifest,
+            spec=spec,
+            slot_root=slot_root,
+            object_store=object_store,
+        )
+        completed.append(spec.worker)
+        source_receipt_count += len(slot_receipt["source_receipts"])
+    return sorted(completed), resumed, source_receipt_count
+
+
+def _run_dynamic_source_scheduler(
+    *,
+    manifest: Mapping[str, object],
+    manifest_path: Path,
+    manifest_file_sha256: str,
+    bundle: Path,
+    overlay: Path,
+    slots_root: Path,
+    scheduler_receipt_path: Path,
+    specs: Sequence[SlotSpec],
+    resources: Mapping[str, int | float],
+    python: Path,
+    source_worker: Path,
+    object_store: ObjectStore,
+    scheduler_instance: str,
+    poll_interval: float,
+    queue_poll_interval: float,
+    claim_lease_seconds: int,
+    claim_heartbeat_seconds: int,
+    max_claim_attempts: int,
+) -> dict[str, object]:
+    """Continuously refill VM-local slots from the global immutable queue."""
+
+    if (
+        not scheduler_instance
+        or len(scheduler_instance) > 256
+        or not scheduler_instance.isascii()
+    ):
+        raise ContractError("dynamic scheduler instance must be 1-256 ASCII characters")
+    if queue_poll_interval <= 0 or not math.isfinite(queue_poll_interval):
+        raise ValueError("queue_poll_interval must be positive and finite")
+    if claim_heartbeat_seconds >= claim_lease_seconds:
+        raise ContractError("claim heartbeat interval must be shorter than its lease")
+
+    resumable: dict[str, Mapping[str, object]] = {}
+    slot_roots: dict[str, Path] = {}
+    executors: dict[str, dict[str, object]] = {}
+    for spec in specs:
+        slot_root = slots_root / spec.worker
+        slot_root.mkdir(parents=True, exist_ok=True)
+        slot_roots[spec.worker] = slot_root
+        existing = load_resumable_slot_receipt(
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            spec=spec,
+            resources=resources,
+            object_store=object_store,
+            verification_root=slot_root / "verify",
+        )
+        if existing is not None:
+            resumable[spec.worker] = existing
+        attempt_root, repo_root, scratch_root = _prepare_slot_repository(
+            bundle=bundle,
+            overlay=overlay,
+            code_revision=str(manifest["code_revision"]),
+            slot_root=slot_root,
+        )
+        executors[spec.worker] = {
+            "attempt_root": attempt_root,
+            "repo_root": repo_root,
+            "scratch_root": scratch_root,
+            "receipt_root": attempt_root / "receipts",
+        }
+
+    jobs = [dict(job) for job in manifest["repositories"]]
+    completed_assignments: set[str] = set()
+    terminal_assignments: dict[str, dict[str, object]] = {}
+    active_assignments: set[str] = set()
+    active: list[dict[str, object]] = []
+    transient_failures: list[tuple[str, Path]] = []
+    deterministic_failures: list[tuple[str, int, Path]] = []
+    executed_assignment_count = 0
+    next_queue_scan = 0.0
+
+    try:
+        while True:
+            now_unix_s = int(time.time())
+            process_finished = False
+            for entry in list(active):
+                process = cast(subprocess.Popen[bytes], entry["process"])
+                entry_spec = cast(SlotSpec, entry["spec"])
+                code = process.poll()
+                if code is None:
+                    lease = entry["lease"]
+                    assert isinstance(lease, AssignmentLease)
+                    heartbeat_index = max(
+                        0,
+                        (now_unix_s - int(lease.claim["created_unix_s"]))
+                        // int(lease.claim["heartbeat_seconds"]),
+                    )
+                    if heartbeat_index > int(entry["last_heartbeat_index"]):
+                        published_index = publish_assignment_heartbeat(
+                            manifest=manifest,
+                            lease=lease,
+                            now_unix_s=now_unix_s,
+                            object_store=object_store,
+                            verification_root=slot_roots[entry_spec.worker] / "verify",
+                        )
+                        if published_index is not None:
+                            entry["last_heartbeat_index"] = published_index
+                    continue
+
+                log = entry["log"]
+                assert hasattr(log, "close")
+                log.close()
+                active.remove(entry)
+                lease = entry["lease"]
+                assert isinstance(lease, AssignmentLease)
+                assignment_sha256 = str(lease.job["assignment_sha256"])
+                active_assignments.remove(assignment_sha256)
+                process_finished = True
+                receipt = _load_completed_assignment(
+                    manifest=manifest,
+                    manifest_file_sha256=manifest_file_sha256,
+                    job=lease.job,
+                    object_store=object_store,
+                    scratch_root=slot_roots[entry_spec.worker] / "verify",
+                )
+                if code == 0:
+                    if receipt is None:
+                        raise ContractError(
+                            "source worker exited successfully without an immutable "
+                            f"assignment completion: {assignment_sha256}"
+                        )
+                    completed_assignments.add(assignment_sha256)
+                    continue
+                if receipt is not None:
+                    completed_assignments.add(assignment_sha256)
+                    terminal_assignments.pop(assignment_sha256, None)
+                    continue
+                outcome = publish_assignment_outcome(
+                    manifest=manifest,
+                    lease=lease,
+                    worker_exit_code=code,
+                    now_unix_s=now_unix_s,
+                    object_store=object_store,
+                    verification_root=slot_roots[entry_spec.worker] / "verify",
+                )
+                log_path = entry["log_path"]
+                assert isinstance(log_path, Path)
+                if code == 75:
+                    transient_failures.append((assignment_sha256, log_path))
+                else:
+                    terminal_assignments[assignment_sha256] = outcome
+                    deterministic_failures.append((assignment_sha256, code, log_path))
+
+            if process_finished:
+                next_queue_scan = 0.0
+            if transient_failures and not active:
+                break
+
+            launched = False
+            if not transient_failures:
+                idle_specs = [
+                    spec
+                    for spec in specs
+                    if all(entry["spec"] != spec for entry in active)
+                ]
+                if idle_specs and time.monotonic() >= next_queue_scan:
+                    for spec in idle_specs:
+                        lease, _outstanding = _claim_next_assignment(
+                            manifest=manifest,
+                            manifest_file_sha256=manifest_file_sha256,
+                            spec=spec,
+                            scheduler_instance=scheduler_instance,
+                            completed_assignments=completed_assignments,
+                            terminal_assignments=terminal_assignments,
+                            active_assignments=active_assignments,
+                            object_store=object_store,
+                            verification_root=slot_roots[spec.worker] / "verify",
+                            now_unix_s=now_unix_s,
+                            claim_lease_seconds=claim_lease_seconds,
+                            claim_heartbeat_seconds=claim_heartbeat_seconds,
+                            max_claim_attempts=max_claim_attempts,
+                        )
+                        if lease is None:
+                            continue
+                        active.append(
+                            _start_dynamic_assignment(
+                                manifest_path=manifest_path,
+                                source_worker=source_worker,
+                                python=python,
+                                spec=spec,
+                                executor=executors[spec.worker],
+                                lease=lease,
+                                resources=resources,
+                            )
+                        )
+                        active_assignments.add(str(lease.job["assignment_sha256"]))
+                        executed_assignment_count += 1
+                        launched = True
+                    next_queue_scan = time.monotonic() + queue_poll_interval
+
+            if (
+                len(completed_assignments) + len(terminal_assignments) == len(jobs)
+                and not active
+                and not transient_failures
+            ):
+                break
+            if active:
+                time.sleep(poll_interval)
+            elif not launched:
+                time.sleep(queue_poll_interval)
+    except BaseException:
+        _terminate_processes(active)
+        for entry in active:
+            log = entry["log"]
+            if hasattr(log, "close"):
+                log.close()
+        raise
+
+    if transient_failures:
+        raise TransientTransportError(
+            "source assignment transport retry budget exhausted: "
+            + "; ".join(
+                f"{assignment} log={log_path}"
+                for assignment, log_path in transient_failures
+            )
+        )
+    if terminal_assignments:
+        incomplete = _dynamic_incomplete_receipt(
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            specs=specs,
+            resources=resources,
+            completed_assignments=completed_assignments,
+            terminal_assignments=terminal_assignments,
+        )
+        if incomplete["unresolved_assignment_count"] != 0:
+            raise ContractError(
+                "dynamic queue stopped before all runnable assignments drained"
+            )
+        _publish_dynamic_incomplete_receipt(
+            receipt=incomplete,
+            manifest=manifest,
+            spec=specs[0],
+            scheduler_receipt_path=scheduler_receipt_path,
+            object_store=object_store,
+            verification_root=slot_roots[specs[0].worker] / "verify",
+        )
+        local_details = "; ".join(
+            f"{assignment} worker_exit={code} log={log_path}"
+            for assignment, code, log_path in deterministic_failures
+        )
+        raise RuntimeError(
+            f"source queue drained with {len(terminal_assignments)} deterministic "
+            "assignment failure(s)"
+            + (f": {local_details}" if local_details else "")
+        )
+
+    completed, resumed, source_receipt_count = _finalize_dynamic_slots(
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        specs=specs,
+        resources=resources,
+        slot_roots=slot_roots,
+        resumable=resumable,
+        object_store=object_store,
+    )
+    receipt = _dynamic_scheduler_receipt(
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        specs=specs,
+        resources=resources,
+        completed=completed,
+        resumed=resumed,
+        source_receipt_count=source_receipt_count,
+        scheduler_instance=scheduler_instance,
+        executed_assignment_count=executed_assignment_count,
+    )
+    atomic_write_json(scheduler_receipt_path, receipt)
+    return receipt
+
+
 def run_source_slot_scheduler(
     *,
     manifest_path: Path,
@@ -688,6 +1350,12 @@ def run_source_slot_scheduler(
     object_store: ObjectStore | None = None,
     check_host: bool = True,
     poll_interval: float = 0.2,
+    dynamic_queue: bool = False,
+    scheduler_instance: str | None = None,
+    queue_poll_interval: float = 15.0,
+    claim_lease_seconds: int = 900,
+    claim_heartbeat_seconds: int = 120,
+    max_claim_attempts: int = 100,
 ) -> dict[str, object]:
     """Run all slots owned by one VM and publish exact completion receipts."""
 
@@ -735,6 +1403,31 @@ def run_source_slot_scheduler(
             raise ContractError("another source slot scheduler is already running") from exc
         slots_root = stage_root / "slots"
         slots_root.mkdir(parents=True, exist_ok=True)
+        if dynamic_queue:
+            if scheduler_instance is None:
+                raise ContractError(
+                    "--scheduler-instance is required with --dynamic-queue"
+                )
+            return _run_dynamic_source_scheduler(
+                manifest=manifest,
+                manifest_path=manifest_path.resolve(),
+                manifest_file_sha256=manifest_file_sha256,
+                bundle=bundle,
+                overlay=overlay,
+                slots_root=slots_root,
+                scheduler_receipt_path=scheduler_receipt_path,
+                specs=specs,
+                resources=resources,
+                python=python.resolve(),
+                source_worker=source_worker_path,
+                object_store=store,
+                scheduler_instance=scheduler_instance,
+                poll_interval=poll_interval,
+                queue_poll_interval=queue_poll_interval,
+                claim_lease_seconds=claim_lease_seconds,
+                claim_heartbeat_seconds=claim_heartbeat_seconds,
+                max_claim_attempts=max_claim_attempts,
+            )
         resumed: list[str] = []
         completed: list[str] = []
         transient_failures: list[str] = []
@@ -921,6 +1614,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--memory-budget-gb", type=float, default=56.0)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--source-worker", type=Path)
+    parser.add_argument("--dynamic-queue", action="store_true")
+    parser.add_argument("--scheduler-instance")
+    parser.add_argument("--queue-poll-interval", type=float, default=15.0)
+    parser.add_argument("--claim-lease-seconds", type=int, default=900)
+    parser.add_argument("--claim-heartbeat-seconds", type=int, default=120)
+    parser.add_argument("--max-claim-attempts", type=int, default=100)
     args = parser.parse_args(argv)
     try:
         run_source_slot_scheduler(
@@ -940,6 +1639,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
             memory_budget_gb=args.memory_budget_gb,
             python=args.python,
             source_worker=args.source_worker,
+            dynamic_queue=args.dynamic_queue,
+            scheduler_instance=args.scheduler_instance,
+            queue_poll_interval=args.queue_poll_interval,
+            claim_lease_seconds=args.claim_lease_seconds,
+            claim_heartbeat_seconds=args.claim_heartbeat_seconds,
+            max_claim_attempts=args.max_claim_attempts,
         )
     except TransientTransportError as exc:
         parser.exit(75, f"distributed source slot scheduler transient failure: {exc}\n")
@@ -953,9 +1658,13 @@ if __name__ == "__main__":  # pragma: no cover - CLI wrapper
 
 
 __all__ = [
+    "DYNAMIC_INCOMPLETE_RECEIPT_SCHEMA",
+    "DYNAMIC_SCHEDULER_MODE",
+    "DYNAMIC_SCHEDULER_RECEIPT_SCHEMA",
     "SCHEDULER_RECEIPT_SCHEMA",
     "SLOT_COMPLETION_RECEIPT_SCHEMA",
     "SlotSpec",
+    "dynamic_incomplete_receipt_uri",
     "logical_worker_count",
     "load_resumable_slot_receipt",
     "run_source_slot_scheduler",

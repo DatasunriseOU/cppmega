@@ -1733,8 +1733,9 @@ def run_source_worker(
     parse_workers: int = 4,
     memory_limit_gb: float = 14.0,
     max_tokens: int | None = None,
+    assignment_sha256: str | None = None,
 ) -> tuple[dict[str, object], ...]:
-    """Run every assignment for one worker; publish data before each receipt."""
+    """Run one selected assignment or every assignment owned by a worker."""
 
     plan = validate_source_manifest(manifest)
     require_sha256(manifest_file_sha256, where="manifest_file_sha256")
@@ -1751,6 +1752,16 @@ def run_source_worker(
         raise ContractError("worker max_tokens drifted from the source manifest")
     if parse_workers < 1 or memory_limit_gb <= 0:
         raise ValueError("worker resource/index limits must be positive")
+    jobs = repositories_for_worker(plan, worker)
+    if assignment_sha256 is not None:
+        selected_sha256 = require_sha256(
+            assignment_sha256, where="selected assignment_sha256"
+        )
+        jobs = tuple(job for job in jobs if job["assignment_sha256"] == selected_sha256)
+        if len(jobs) != 1:
+            raise ContractError(
+                "selected assignment is not owned by the requested manifest worker"
+            )
     _verify_pipeline_files(
         plan,
         repo_root=repo_root,
@@ -1758,7 +1769,6 @@ def run_source_worker(
         tokenizer=tokenizer,
         quarantine_manifest=quarantine_manifest,
     )
-    jobs = repositories_for_worker(plan, worker)
     scratch_root.mkdir(parents=True, exist_ok=True)
     receipt_root.mkdir(parents=True, exist_ok=True)
     receipts: list[dict[str, object]] = []
@@ -1950,6 +1960,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--parse-workers", type=int, default=4)
     parser.add_argument("--memory-limit-gb", type=float, default=14.0)
     parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--assignment-sha256")
     args = parser.parse_args(argv)
     try:
         manifest, raw_sha256 = load_source_manifest(args.manifest)
@@ -1974,6 +1985,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             parse_workers=args.parse_workers,
             memory_limit_gb=args.memory_limit_gb,
             max_tokens=args.max_tokens,
+            assignment_sha256=args.assignment_sha256,
         )
     except TransientTransportError as exc:
         parser.exit(75, f"distributed source worker transient transport failure: {exc}\n")

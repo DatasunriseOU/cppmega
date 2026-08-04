@@ -69,6 +69,7 @@ def _build_overlay(repo_root: Path, destination: Path) -> None:
         "scripts/distributed_data_prep/_common.py",
         "scripts/distributed_data_prep/source_manifest.py",
         "scripts/distributed_data_prep/source_slot_scheduler.py",
+        "scripts/distributed_data_prep/source_work_queue.py",
         "scripts/distributed_data_prep/source_worker.py",
     ]
     for member in members:
@@ -213,6 +214,7 @@ def prepare_pilot(
             "physical_worker_count": worker_count,
             "slots_per_worker": slots_per_worker,
             "logical_worker_count": logical_count,
+            "scheduler_mode": "immutable_assignment_work_stealing_v1",
             "resources": resources,
             "gcs_output_prefix": gcs_output_prefix,
             "source_manifest_sha256": source_manifest["manifest_sha256"],

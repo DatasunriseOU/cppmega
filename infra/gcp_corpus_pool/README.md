@@ -136,6 +136,26 @@ the source worker also publishes an immutable assignment pointer, so a crash
 can skip assignments already confirmed in GCS. No worker-local dedup database
 is shared or enabled.
 
+Newly rendered source runners use
+`immutable_assignment_work_stealing_v1`. The manifest's logical worker remains
+part of each immutable assignment identity, but it is an ownership label, not
+an execution constraint: an idle physical slot first consumes its home shard,
+then claims unfinished assignments from other shards. Claim, heartbeat, and
+attempt-outcome objects are create-only. A live long-running assignment renews
+its lease with immutable heartbeats; an expired claim can be taken over without
+changing the assignment digest. The assignment completion pointer remains the
+only completion fact and is still published with create-if-absent semantics.
+
+Worker `exit 75` publishes a transient attempt outcome and is the only path
+that opens another claim attempt. Any other nonzero worker exit publishes a
+terminal deterministic outcome for that assignment while its lease is still
+valid; a stale owner is fenced and treated as transient instead. The failed
+assignment is excluded from further claims while every unrelated assignment
+continues to drain. After the runnable complement closes, each physical
+scheduler publishes an exact immutable incomplete receipt and exits nonzero. A
+single parser defect therefore cannot strand the rest of a VM's queue or
+masquerade as a complete run.
+
 For `n2-standard-16` (16 vCPU, 64 GB), the recommended first production
 profile is four VMs with `slots_per_worker = 2`,
 `parse_workers_per_slot = 6`, `memory_limit_gb_per_slot = 24`,
@@ -144,6 +164,10 @@ with the same physical count and `--slots-per-worker 2`; this creates eight
 logical manifest workers. Keep the default one-slot profile for the existing
 smoke run and use a new run ID and new content-addressed payload for a two-slot
 run.
+
+Do not switch an active static run to this scheduler. Finish or explicitly
+adjudicate that run, then build a new content-addressed payload and run ID; this
+prevents dynamic claims from racing static workers that do not publish claims.
 
 Recommended object layout:
 

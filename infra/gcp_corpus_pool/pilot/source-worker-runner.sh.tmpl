@@ -273,7 +273,9 @@ python3 "$repo_root/scripts/distributed_data_prep/source_slot_scheduler.py" \
   --cpu-budget-vcpus "$cpu_budget_vcpus" \
   --memory-budget-gb "$memory_budget_gb" \
   --python /usr/bin/python3 \
-  --source-worker "$repo_root/scripts/distributed_data_prep/source_worker.py"
+  --source-worker "$repo_root/scripts/distributed_data_prep/source_worker.py" \
+  --dynamic-queue \
+  --scheduler-instance "$worker_name.$BOOT_ID"
 
 receipt_count="$(jq -er '.source_receipt_count' "$scheduler_receipt")"
 slot_count="$(jq -er '.slots_per_worker' "$scheduler_receipt")"

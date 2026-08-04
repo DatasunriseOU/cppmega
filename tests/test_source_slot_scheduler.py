@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import subprocess
 import sys
 import tarfile
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.distributed_data_prep import source_slot_scheduler as scheduler_module
 from scripts.distributed_data_prep._common import (
     ContractError,
     atomic_write_json,
@@ -22,6 +24,8 @@ from scripts.distributed_data_prep.source_manifest import (
     build_source_manifest,
 )
 from scripts.distributed_data_prep.source_slot_scheduler import (
+    DYNAMIC_SCHEDULER_MODE,
+    dynamic_incomplete_receipt_uri,
     SLOT_COMPLETION_RECEIPT_SCHEMA,
     SlotSpec,
     load_resumable_slot_receipt,
@@ -32,6 +36,7 @@ from scripts.distributed_data_prep.source_slot_scheduler import (
     validate_manifest_topology,
     validate_slot_completion_receipt,
     validate_slot_resources,
+    source_receipt_uri,
 )
 from scripts.distributed_data_prep.source_worker import (
     ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
@@ -69,9 +74,15 @@ def _manifest(*, worker_count: int = 2) -> tuple[dict[str, object], str]:
     return manifest, "6" * 64
 
 
-def _worker_receipt(manifest: dict[str, object], manifest_file_sha: str) -> dict[str, object]:
-    job = manifest["repositories"][0]
-    assert isinstance(job, dict)
+def _worker_receipt(
+    manifest: dict[str, object],
+    manifest_file_sha: str,
+    job: dict[str, object] | None = None,
+) -> dict[str, object]:
+    selected = job or manifest["repositories"][0]
+    assert isinstance(selected, dict)
+    job = selected
+    stem = f"{int(job['ordinal']):05d}-{job['repo']}"
     compressed_sha = "7" * 64
     quarantine_sha = "8" * 64
     return {
@@ -96,7 +107,7 @@ def _worker_receipt(manifest: dict[str, object], manifest_file_sha: str) -> dict
                 str(manifest["gcs_output_prefix"]),
                 "source-candidates",
                 str(manifest["manifest_sha256"]),
-                "00000-project",
+                stem,
                 f"{compressed_sha}.jsonl.zst",
             ),
             "generation": "1",
@@ -118,7 +129,7 @@ def _worker_receipt(manifest: dict[str, object], manifest_file_sha: str) -> dict
                 str(manifest["gcs_output_prefix"]),
                 "source-quarantine-receipts",
                 str(manifest["manifest_sha256"]),
-                "00000-project",
+                stem,
                 f"{quarantine_sha}.quarantine.json",
             ),
             "generation": "1",
@@ -129,7 +140,7 @@ def _worker_receipt(manifest: dict[str, object], manifest_file_sha: str) -> dict
         },
         "indexer": {
             "mode": "single_project_pre_global_enriched_v1",
-            "project_id": "owner/project",
+            "project_id": job["project_id"],
             "enriched": True,
             "max_tokens": LOSSLESS_INDEX_MAX_TOKENS,
             "parse_workers": 6,
@@ -142,6 +153,53 @@ def _worker_receipt(manifest: dict[str, object], manifest_file_sha: str) -> dict
         },
         "training_ready": False,
     }
+
+
+def _publish_worker_completion(
+    *,
+    manifest: dict[str, object],
+    manifest_file_sha: str,
+    job: dict[str, object],
+    store: LocalObjectStore,
+    root: Path,
+) -> None:
+    receipt = _worker_receipt(manifest, manifest_file_sha, job)
+    receipt_path = root / f"{int(job['ordinal']):05d}-{job['repo']}.json"
+    atomic_write_json(receipt_path, receipt)
+    receipt_uri = source_receipt_uri(manifest, job, receipt)
+    metadata = store.publish_if_absent(receipt_path, receipt_uri)
+    pointer = {
+        "schema": ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
+        "status": "complete",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest_file_sha256": manifest_file_sha,
+        "assignment": {
+            key: job[key]
+            for key in (
+                "ordinal",
+                "repo",
+                "project_id",
+                "worker",
+                "assignment_sha256",
+            )
+        },
+        "source_receipt": {
+            "uri": receipt_uri,
+            "generation": metadata["generation"],
+            "size_bytes": metadata["size_bytes"],
+            "sha256": sha256_file(receipt_path),
+        },
+        "training_ready": False,
+    }
+    validate_assignment_completion_receipt(
+        pointer,
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha,
+        job=job,
+    )
+    pointer_path = root / f"{job['assignment_sha256']}.complete.json"
+    atomic_write_json(pointer_path, pointer)
+    store.publish_if_absent(pointer_path, assignment_completion_uri(manifest, job))
 
 
 def test_slot_topology_is_contiguous_and_manifest_bound() -> None:
@@ -351,7 +409,11 @@ def test_empty_logical_slot_is_valid() -> None:
     )
 
 
-def _empty_slot_scheduler_fixture(tmp_path: Path) -> dict[str, object]:
+def _empty_slot_scheduler_fixture(
+    tmp_path: Path,
+    *,
+    repositories: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     repo = tmp_path / "bundle-source"
     repo.mkdir()
     for command in (
@@ -389,7 +451,7 @@ def _empty_slot_scheduler_fixture(tmp_path: Path) -> dict[str, object]:
         capture_output=True,
     )
     manifest = build_source_manifest(
-        [],
+        repositories or [],
         worker_count=2,
         gcs_output_prefix="gs://outputs/empty-slots",
         code_revision=revision,
@@ -409,6 +471,24 @@ def _empty_slot_scheduler_fixture(tmp_path: Path) -> dict[str, object]:
         "scheduler_receipt": tmp_path / "scheduler-receipt.json",
         "store": LocalObjectStore(tmp_path / "objects"),
     }
+
+
+def _queue_repositories(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "repo": f"project-{index}",
+            "project_id": f"owner/project-{index}",
+            "source": {
+                "kind": "immutable_gcs_tar",
+                "uri": f"gs://inputs/project-{index}.tar.zst",
+                "generation": "1",
+                "sha256": f"{index + 1:x}" * 64,
+                "archive_format": "tar.zst",
+                "strip_components": 1,
+            },
+        }
+        for index in range(count)
+    ]
 
 
 def _fake_source_worker(path: Path, body: str) -> Path:
@@ -442,6 +522,117 @@ def _run_empty_slots(fixture: dict[str, object], fake_worker: Path) -> dict[str,
         object_store=fixture["store"],
         check_host=False,
         poll_interval=0.01,
+    )
+
+
+def _install_fake_dynamic_launcher(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: dict[str, object],
+    poll_delays: dict[int, int],
+    exit_codes: dict[int, int],
+    started: list[tuple[str, str, int]],
+) -> None:
+    manifest = fixture["manifest"]
+    store = fixture["store"]
+    stage = fixture["stage"]
+    assert isinstance(manifest, dict)
+    assert isinstance(store, LocalObjectStore)
+    assert isinstance(stage, Path)
+    publication_root = stage / "fake-worker-publications"
+
+    class FakeProcess:
+        def __init__(self, job: dict[str, object]) -> None:
+            self.job = job
+            self.remaining = poll_delays.get(int(job["ordinal"]), 0)
+            self.returncode = exit_codes.get(int(job["ordinal"]), 0)
+            self.finished = False
+
+        def poll(self) -> int | None:
+            if self.finished:
+                return self.returncode
+            if self.remaining > 0:
+                self.remaining -= 1
+                return None
+            if self.returncode == 0:
+                _publish_worker_completion(
+                    manifest=manifest,
+                    manifest_file_sha=str(fixture["manifest_file_sha"]),
+                    job=self.job,
+                    store=store,
+                    root=publication_root,
+                )
+            self.finished = True
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = 2
+            self.finished = True
+
+        def kill(self) -> None:
+            self.terminate()
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            self.finished = True
+            return self.returncode
+
+    def fake_start(**kwargs: object) -> dict[str, object]:
+        spec = kwargs["spec"]
+        lease = kwargs["lease"]
+        executor = kwargs["executor"]
+        assert isinstance(spec, SlotSpec)
+        assert isinstance(lease, scheduler_module.AssignmentLease)
+        assert isinstance(executor, dict)
+        job = lease.job
+        started.append((spec.worker, str(job["worker"]), int(job["ordinal"])))
+        attempt_root = executor["attempt_root"]
+        assert isinstance(attempt_root, Path)
+        log_path = attempt_root / f"fake-{int(job['ordinal']):05d}.log"
+        log = log_path.open("ab")
+        return {
+            "spec": spec,
+            "lease": lease,
+            "process": FakeProcess(job),
+            "log": log,
+            "log_path": log_path,
+            "last_heartbeat_index": 0,
+        }
+
+    monkeypatch.setattr(scheduler_module, "_start_dynamic_assignment", fake_start)
+
+
+def _run_dynamic_slots(
+    fixture: dict[str, object], fake_worker: Path, *, scheduler_instance: str
+) -> dict[str, object]:
+    manifest = fixture["manifest"]
+    assert isinstance(manifest, dict)
+    return run_source_slot_scheduler(
+        manifest_path=fixture["manifest_path"],
+        manifest_file_sha256=str(fixture["manifest_file_sha"]),
+        run_root=str(manifest["gcs_output_prefix"]),
+        bundle=fixture["bundle"],
+        overlay=fixture["overlay"],
+        stage_root=fixture["stage"],
+        scheduler_receipt_path=fixture["scheduler_receipt"],
+        physical_worker_index=0,
+        physical_worker_count=1,
+        slots_per_worker=2,
+        parse_workers_per_slot=6,
+        memory_limit_gb_per_slot=24,
+        cpu_budget_vcpus=16,
+        memory_budget_gb=56,
+        python=Path(sys.executable),
+        source_worker=fake_worker,
+        object_store=fixture["store"],
+        check_host=False,
+        poll_interval=0.001,
+        dynamic_queue=True,
+        scheduler_instance=scheduler_instance,
+        queue_poll_interval=0.001,
+        claim_lease_seconds=30,
+        claim_heartbeat_seconds=5,
+        max_claim_attempts=10,
     )
 
 
@@ -534,3 +725,137 @@ def test_scheduler_preserves_sibling_after_transient_slot_failure(tmp_path: Path
     assert isinstance(manifest, dict)
     assert store.describe_if_present(slot_completion_uri(manifest, "worker-0000")) is None
     assert store.describe_if_present(slot_completion_uri(manifest, "worker-0001")) is not None
+
+
+def test_dynamic_scheduler_refills_fast_slot_and_steals_slow_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _empty_slot_scheduler_fixture(
+        tmp_path, repositories=_queue_repositories(4)
+    )
+    fake_worker = _fake_source_worker(tmp_path / "unused-worker.py", "import sys\n")
+    started: list[tuple[str, str, int]] = []
+    _install_fake_dynamic_launcher(
+        monkeypatch=monkeypatch,
+        fixture=fixture,
+        poll_delays={0: 40},
+        exit_codes={},
+        started=started,
+    )
+
+    receipt = _run_dynamic_slots(fixture, fake_worker, scheduler_instance="vm-0.boot-a")
+
+    assert receipt["scheduler_mode"] == DYNAMIC_SCHEDULER_MODE
+    assert receipt["executed_assignment_count"] == 4
+    assert receipt["source_receipt_count"] == 4
+    assert receipt["completed_slots"] == ["worker-0000", "worker-0001"]
+    assert ("worker-0001", "worker-0000", 2) in started
+    assert [ordinal for _executor, _owner, ordinal in started] == [0, 1, 3, 2]
+
+    second = _run_dynamic_slots(fixture, fake_worker, scheduler_instance="vm-0.boot-a")
+    assert second["executed_assignment_count"] == 0
+    assert second["resumed_slots"] == ["worker-0000", "worker-0001"]
+    assert len(started) == 4
+
+
+def test_dynamic_scheduler_preserves_sibling_and_publishes_deterministic_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _empty_slot_scheduler_fixture(
+        tmp_path, repositories=_queue_repositories(4)
+    )
+    fake_worker = _fake_source_worker(tmp_path / "unused-worker.py", "import sys\n")
+    started: list[tuple[str, str, int]] = []
+    _install_fake_dynamic_launcher(
+        monkeypatch=monkeypatch,
+        fixture=fixture,
+        poll_delays={1: 8},
+        exit_codes={0: 2},
+        started=started,
+    )
+
+    with pytest.raises(RuntimeError, match="queue drained with 1 deterministic"):
+        _run_dynamic_slots(fixture, fake_worker, scheduler_instance="vm-0.boot-a")
+
+    manifest = fixture["manifest"]
+    store = fixture["store"]
+    assert isinstance(manifest, dict)
+    assert isinstance(store, LocalObjectStore)
+    failed_job = manifest["repositories"][0]
+    assert isinstance(failed_job, dict)
+    assert (
+        _load_completed_assignment(
+            manifest=manifest,
+            manifest_file_sha256=str(fixture["manifest_file_sha"]),
+            job=failed_job,
+            object_store=store,
+            scratch_root=tmp_path / "failed-check",
+        )
+        is None
+    )
+    for sibling_job in manifest["repositories"][1:]:
+        assert isinstance(sibling_job, dict)
+        assert (
+            _load_completed_assignment(
+                manifest=manifest,
+                manifest_file_sha256=str(fixture["manifest_file_sha"]),
+                job=sibling_job,
+                object_store=store,
+                scratch_root=tmp_path / f"sibling-{sibling_job['ordinal']}-check",
+            )
+            is not None
+        )
+    assert len(started) == 4
+    assert any(ordinal == 2 for _executor, _owner, ordinal in started)
+    scheduler_receipt = fixture["scheduler_receipt"]
+    assert isinstance(scheduler_receipt, Path)
+    incomplete = json.loads(scheduler_receipt.read_text(encoding="utf-8"))
+    assert incomplete["status"] == "incomplete"
+    assert incomplete["assignment_count"] == 4
+    assert incomplete["completed_assignment_count"] == 3
+    assert incomplete["terminal_assignment_count"] == 1
+    assert incomplete["unresolved_assignment_count"] == 0
+    assert incomplete["terminal_assignments"][0]["assignment"]["ordinal"] == 0
+    assert (
+        store.describe_if_present(dynamic_incomplete_receipt_uri(manifest, 0))
+        is not None
+    )
+
+    with pytest.raises(RuntimeError, match="queue drained with 1 deterministic"):
+        _run_dynamic_slots(fixture, fake_worker, scheduler_instance="vm-0.boot-b")
+    assert len(started) == 4
+
+
+def test_dynamic_incomplete_accounting_rejects_completion_terminal_overlap(
+    tmp_path: Path,
+) -> None:
+    fixture = _empty_slot_scheduler_fixture(
+        tmp_path, repositories=_queue_repositories(1)
+    )
+    manifest = fixture["manifest"]
+    assert isinstance(manifest, dict)
+    job = manifest["repositories"][0]
+    assert isinstance(job, dict)
+    assignment_sha256 = str(job["assignment_sha256"])
+    specs = slot_specs(
+        physical_worker_index=0,
+        physical_worker_count=1,
+        slots_per_worker=2,
+    )
+    resources = validate_slot_resources(
+        slots_per_worker=2,
+        parse_workers_per_slot=6,
+        memory_limit_gb_per_slot=24,
+        cpu_budget_vcpus=16,
+        memory_budget_gb=56,
+    )
+
+    with pytest.raises(ContractError, match="accounting overlaps"):
+        scheduler_module._dynamic_incomplete_receipt(
+            manifest=manifest,
+            manifest_file_sha256=str(fixture["manifest_file_sha"]),
+            specs=specs,
+            resources=resources,
+            completed_assignments={assignment_sha256},
+            terminal_assignments={assignment_sha256: {}},
+        )
