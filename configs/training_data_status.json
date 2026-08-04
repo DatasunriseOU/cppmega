@@ -1,5 +1,5 @@
 {
-  "schema": "cppmega_training_data_status_config_v1",
+  "schema": "cppmega_training_data_status_config_v2",
   "batch_size": 192,
   "output_dir": "/Volumes/external/sources/cppmega.mlx/outputs/training_data_status",
   "source": {
@@ -13,12 +13,15 @@
   "validation_bundle": {
     "manifest": "/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/case5_v4_20260714_093120_mini9/manifest.json"
   },
-  "pr": {
+  "github_pr": {
     "completion_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/pr_completion.verify7.json",
     "gap_completion_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/graphql_gap_completion.verify6.json",
     "export_launch_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/primary_pr_export_e25dd481.launch_receipt.json",
     "export_cancellation_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/primary_pr_export_e25dd481.cancelled.20260729T191649Z.json",
     "quarantine_receipt": "/Volumes/external/sources/cppmega.mlx/outputs/pr_ingest/exact_29c6869/unverified_store_quarantine_227.receipt.json"
+  },
+  "gitlab_mr": {
+    "completion_receipt": "/Volumes/external/cppmega_data/gitlab_mr_stream_prod_v1_20260804/completion_receipt.json"
   },
   "ci": {
     "progress_receipts": [
