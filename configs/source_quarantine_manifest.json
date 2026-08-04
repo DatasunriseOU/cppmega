@@ -56,6 +56,15 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug parser_crash"
     },
     {
+      "project_id": "intel/llvm",
+      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
+      "size_bytes": 398,
+      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_diagnostic",
+      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token"
+    },
+    {
       "project_id": "eclipse-threadx/threadx",
       "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
       "size_bytes": 61551,

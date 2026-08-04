@@ -1,4 +1,4 @@
-"""Exact, receipt-bound quarantine for non-parser inputs and crash fixtures.
+"""Exact, receipt-bound quarantine for non-parser inputs and compiler fixtures.
 
 The quarantine is deliberately narrow: it only accepts files whose relative
 path, byte size, SHA-256 digest, and independently verifiable format match an
@@ -53,6 +53,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     (
         "deliberate_compiler_crash_fixture",
         "clang_debug_parser_crash_pragma",
+    ),
+    (
+        "deliberate_compiler_diagnostic_fixture",
+        "clang_embedded_nul_diagnostic",
     ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
@@ -350,6 +354,44 @@ def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
 
 
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
+    if entry.detected_format == "clang_embedded_nul_diagnostic":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_diagnostic "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        source_line = "int x[sizeof\0int];"
+        rendered_source_line = "// CHECK-NEXT: int x[sizeof<U+0000>int];"
+        required_lines = {
+            (
+                "// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | "
+                "FileCheck -strict-whitespace %s"
+            ),
+            source_line,
+            "// CHECK: warning: null character ignored",
+            rendered_source_line,
+            (
+                "// CHECK: error: expected parentheses around type name in "
+                "sizeof expression"
+            ),
+            "// CHECK-NEXT:             (          )",
+        }
+        if (
+            payload.count(b"\0") != 1
+            or not required_lines.issubset(lines)
+            or lines.count(source_line) != 1
+            or lines.count(rendered_source_line) != 2
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_diagnostic "
+                "but the embedded-NUL diagnostic contract is incomplete or ambiguous"
+            )
+        return
+
     if entry.detected_format == "nul_ff_binary_blob":
         seen_values: set[int] = set()
         with path.open("rb") as source:
