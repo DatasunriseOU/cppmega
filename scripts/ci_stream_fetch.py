@@ -5177,15 +5177,82 @@ class FetchState:
                 ),
             )
 
+    def _status_counts_locked(self) -> dict[str, int]:
+        return {
+            str(row["status"]): int(row["n"])
+            for row in self._connection.execute(
+                "SELECT status,COUNT(*) AS n FROM attempts GROUP BY status"
+            )
+        }
+
+    def _binding_upgrades_locked(self) -> list[dict[str, str]]:
+        return [
+            self._binding_upgrade_record(row)
+            for row in self._connection.execute(
+                """
+                SELECT binding_key,from_sha256,to_sha256,
+                       reason,upgraded_at
+                FROM binding_upgrades
+                ORDER BY id
+                """
+            )
+        ]
+
+    @staticmethod
+    def _binding_upgrade_record(row: sqlite3.Row) -> dict[str, str]:
+        return {
+            "binding_key": str(row["binding_key"]),
+            "from_sha256": str(row["from_sha256"]),
+            "to_sha256": str(row["to_sha256"]),
+            "reason": str(row["reason"]),
+            "upgraded_at": str(row["upgraded_at"]),
+        }
+
+    def _latest_binding_upgrade_locked(
+        self,
+    ) -> tuple[list[dict[str, str]], bool]:
+        rows = self._connection.execute(
+            """
+            SELECT binding_key,from_sha256,to_sha256,
+                   reason,upgraded_at
+            FROM binding_upgrades
+            ORDER BY id DESC
+            LIMIT 2
+            """
+        ).fetchall()
+        return (
+            [] if not rows else [self._binding_upgrade_record(rows[0])],
+            len(rows) > 1,
+        )
+
+    def heartbeat_summary(self) -> dict[str, object]:
+        """Return the bounded state needed for a live progress heartbeat."""
+
+        with self._lock:
+            status_counts = self._status_counts_locked()
+            binding_upgrades, binding_upgrades_truncated = (
+                self._latest_binding_upgrade_locked()
+            )
+            return {
+                "attempt_statuses": status_counts,
+                "attempts_terminal": sum(
+                    status_counts.get(status, 0)
+                    for status in (
+                        "done",
+                        "empty",
+                        "terminal_404",
+                        "terminal_410",
+                    )
+                ),
+                "binding_upgrades": binding_upgrades,
+                "binding_upgrades_truncated": binding_upgrades_truncated,
+                "exhaustive_discovery": self.exhaustive_discovery_summary(),
+            }
+
     def summary(self) -> dict[str, object]:
         with self._lock:
             exhaustive_discovery = self.exhaustive_discovery_summary()
-            status_counts = {
-                str(row["status"]): int(row["n"])
-                for row in self._connection.execute(
-                    "SELECT status,COUNT(*) AS n FROM attempts GROUP BY status"
-                )
-            }
+            status_counts = self._status_counts_locked()
             totals = self._connection.execute(
                 """
                 SELECT COUNT(*) AS attempts,
@@ -5253,23 +5320,6 @@ class FetchState:
                         f"{row['archive_member']}\t{row['sidecar_sha256']}\n"
                     ).encode()
                 )
-            binding_upgrades = [
-                {
-                    "binding_key": str(row["binding_key"]),
-                    "from_sha256": str(row["from_sha256"]),
-                    "to_sha256": str(row["to_sha256"]),
-                    "reason": str(row["reason"]),
-                    "upgraded_at": str(row["upgraded_at"]),
-                }
-                for row in self._connection.execute(
-                    """
-                    SELECT binding_key,from_sha256,to_sha256,
-                           reason,upgraded_at
-                    FROM binding_upgrades
-                    ORDER BY id
-                    """
-                )
-            ]
             return {
                 "attempt_statuses": status_counts,
                 "attempts_terminal": int(totals["attempts"]),
@@ -5289,7 +5339,8 @@ class FetchState:
                     ),
                     "content_attempts_without_exact_metadata": 0,
                 },
-                "binding_upgrades": binding_upgrades,
+                "binding_upgrades": self._binding_upgrades_locked(),
+                "binding_upgrades_truncated": False,
                 "exhaustive_discovery": exhaustive_discovery,
             }
 
@@ -6618,6 +6669,10 @@ class CIStreamFetcher:
             )
         self.progress_path = Path(progress_path).expanduser().resolve()
         self.receipt_path = Path(receipt_path).expanduser().resolve()
+        (
+            self._last_full_fetch_summary,
+            self._last_full_summary_generated_at,
+        ) = self._load_last_full_fetch_summary(self.progress_path)
         self.state_path = _fetch_state_lease_path(state_path)[0]
         self.work_path = (
             Path(work_path).expanduser().resolve()
@@ -7125,7 +7180,85 @@ class CIStreamFetcher:
                 else:
                     temporary.unlink()
 
-    def progress(self) -> dict[str, object]:
+    @staticmethod
+    def _load_last_full_fetch_summary(
+        progress_path: Path,
+    ) -> tuple[dict[str, object] | None, str | None]:
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(progress, Mapping):
+            return None, None
+        fetch = progress.get("fetch")
+        generated_at = progress.get("generated_at")
+        if (
+            not isinstance(fetch, Mapping)
+            or not isinstance(generated_at, str)
+            or not generated_at
+        ):
+            return None, None
+        if "summary_kind" not in fetch:
+            # Legacy v4 records only carried a complete fetch summary.
+            summary_kind = "full"
+        else:
+            summary_kind = fetch["summary_kind"]
+            if (
+                not isinstance(summary_kind, str)
+                or summary_kind not in {"full", "heartbeat"}
+            ):
+                return None, None
+        required = (
+            "members",
+            "chunks",
+            "occurrence_tokens",
+            "requests",
+            "sidecar_set_sha256",
+            "run_metadata",
+        )
+        if any(key not in fetch for key in required):
+            return None, None
+        full_summary_generated_at = (
+            fetch.get("full_summary_generated_at")
+            if summary_kind == "heartbeat"
+            else fetch.get("full_summary_generated_at", generated_at)
+        )
+        if (
+            not isinstance(full_summary_generated_at, str)
+            or not full_summary_generated_at
+        ):
+            return None, None
+        return dict(fetch), full_summary_generated_at
+
+    def _fetch_progress_summary(
+        self,
+        *,
+        heartbeat: bool,
+        generated_at: str,
+    ) -> dict[str, object]:
+        if not heartbeat:
+            summary = self.state.summary()
+            self._last_full_fetch_summary = dict(summary)
+            self._last_full_summary_generated_at = generated_at
+            return {
+                **summary,
+                "summary_kind": "full",
+                "full_summary_generated_at": generated_at,
+            }
+        heartbeat_summary = self.state.heartbeat_summary()
+        if self._last_full_fetch_summary is None:
+            return self._fetch_progress_summary(
+                heartbeat=False,
+                generated_at=generated_at,
+            )
+        return {
+            **self._last_full_fetch_summary,
+            **heartbeat_summary,
+            "summary_kind": "heartbeat",
+            "full_summary_generated_at": self._last_full_summary_generated_at,
+        }
+
+    def progress(self, *, heartbeat: bool = False) -> dict[str, object]:
         store_status = self.store.status()
         inventory_progress = None
         candidate = self.inventory_path.with_suffix(".progress.json")
@@ -7136,15 +7269,19 @@ class CIStreamFetcher:
                 )
             except (OSError, UnicodeError, json.JSONDecodeError):
                 inventory_progress = None
+        generated_at = _utc_now()
         return {
             "schema": PROGRESS_SCHEMA,
-            "generated_at": _utc_now(),
+            "generated_at": generated_at,
             "inventory": (
                 {"path": str(self.inventory_path)}
                 if inventory_progress is None
                 else inventory_progress
             ),
-            "fetch": self.state.summary(),
+            "fetch": self._fetch_progress_summary(
+                heartbeat=heartbeat,
+                generated_at=generated_at,
+            ),
             "content_store": store_status,
             "token_accounting": {
                 "semantics": (
@@ -7173,6 +7310,11 @@ class CIStreamFetcher:
 
     def write_progress(self) -> dict[str, object]:
         value = self.progress()
+        atomic_write_json(self.progress_path, value)
+        return value
+
+    def write_heartbeat(self) -> dict[str, object]:
+        value = self.progress(heartbeat=True)
         atomic_write_json(self.progress_path, value)
         return value
 
@@ -7270,7 +7412,7 @@ class CIStreamFetcher:
                         return_when=FIRST_COMPLETED,
                     )
                     if not completed:
-                        self.write_progress()
+                        self.write_heartbeat()
                         last_progress_at = time.monotonic()
                         continue
                     for future in completed:
@@ -7278,7 +7420,7 @@ class CIStreamFetcher:
                         futures.pop(future)
                         processed += 1
                     if time.monotonic() - last_progress_at >= progress_interval:
-                        self.write_progress()
+                        self.write_heartbeat()
                         last_progress_at = time.monotonic()
                 if (
                     completion_mode == COMPLETION_MODE_THRESHOLD
