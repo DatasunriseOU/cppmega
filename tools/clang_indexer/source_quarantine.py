@@ -57,6 +57,7 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
+    ("mislabeled_non_cpp", "nul_ff_binary_blob"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
 }
 
@@ -349,6 +350,24 @@ def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
 
 
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
+    if entry.detected_format == "nul_ff_binary_blob":
+        seen_values: set[int] = set()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                values = set(chunk)
+                if not values <= {0x00, 0xFF}:
+                    raise SourceQuarantineError(
+                        f"{entry.relative_path}: declared nul_ff_binary_blob but the "
+                        "payload is not a non-empty mixture of only 0x00 and 0xff bytes"
+                    )
+                seen_values.update(values)
+        if seen_values != {0x00, 0xFF}:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared nul_ff_binary_blob but the "
+                "payload is not a non-empty mixture of only 0x00 and 0xff bytes"
+            )
+        return
+
     if entry.detected_format == "xml_utf16le":
         with path.open("rb") as source:
             prefix = source.read(8192)

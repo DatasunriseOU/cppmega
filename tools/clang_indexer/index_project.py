@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import codecs
 import ctypes.util
 import glob
 import gzip
@@ -2590,20 +2591,45 @@ def _sanitize_compile_args_for_clang(args: list[str] | None) -> list[str]:
     return sanitized
 
 
+_WIDE_SOURCE_BOM_CODECS = (
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+_WIDE_SOURCE_CODECS = frozenset(
+    encoding for _bom, encoding in _WIDE_SOURCE_BOM_CODECS
+)
+
+
+def _wide_source_codec(raw: bytes) -> str | None:
+    for bom, encoding in _WIDE_SOURCE_BOM_CODECS:
+        if raw.startswith(bom):
+            return encoding
+    return None
+
+
 def _decode_source_bytes(raw: bytes, filename: str) -> tuple[str, str]:
     """Decode source with a byte-exact fallback for mixed legacy text."""
 
-    try:
-        text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
-    except UnicodeDecodeError:
+    encoding = _wide_source_codec(raw)
+    if encoding is not None:
+        # Use the explicit endian codec so the decoded U+FEFF round-trips to
+        # the original BOM. Malformed BOM-declared input must fail closed
+        # instead of falling through to a single-byte codec.
+        text = raw.decode(encoding, errors="strict")
+    else:
         try:
-            text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
+            text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
         except UnicodeDecodeError:
-            # Historical source trees can mix Shift-JIS comments with raw
-            # single-byte font tables in one translation unit. No semantic
-            # codec covers that mixture; ISO-8859-1 preserves every byte and
-            # keeps libclang byte offsets exact.
-            text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
+            try:
+                text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
+            except UnicodeDecodeError:
+                # Historical source trees can mix Shift-JIS comments with raw
+                # single-byte font tables in one translation unit. No semantic
+                # codec covers that mixture; ISO-8859-1 preserves every byte and
+                # keeps libclang byte offsets exact.
+                text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
     if "\0" in text and "\0" in _mask_non_code(text):
         raise ValueError(f"source contains NUL byte: {filename}")
     return text, encoding
@@ -2615,6 +2641,12 @@ def _read_source_file(filename: str) -> tuple[str, bytes, str]:
     source, source_encoding = _decode_source_bytes(source_bytes, filename)
     if source.encode(source_encoding, errors="strict") != source_bytes:
         raise ValueError(f"source decoding did not round-trip exactly: {filename}")
+    if source_encoding in _WIDE_SOURCE_CODECS:
+        # libclang rejects UTF-16/32 source files even when they carry a BOM.
+        # Parse an equivalent UTF-8 unsaved buffer and make every offset mapper
+        # and text extractor use those same parser bytes.
+        source_bytes = source.encode("utf-8", errors="strict")
+        source_encoding = "utf-8"
     return source, source_bytes, source_encoding
 
 
@@ -4864,9 +4896,20 @@ def _load_translation_unit(
     index: Index,
     compile_args: Sequence[str],
 ) -> TranslationUnit:
+    with open(filepath, "rb") as source_file:
+        prefix = source_file.read(4)
+    unsaved_files = None
+    if _wide_source_codec(prefix) is not None:
+        source, _parser_bytes, parser_encoding = _read_source_file(filepath)
+        if parser_encoding != "utf-8":
+            raise ValueError(
+                f"wide source was not normalized for libclang: {filepath}"
+            )
+        unsaved_files = [(filepath, source)]
     return index.parse(
         filepath,
         args=list(compile_args),
+        unsaved_files=unsaved_files,
         # Corpus indexing parses each translation unit once. PCH preamble
         # caches are a native-memory win only for repeated reparses; here they
         # make many parallel clang workers retain large buffers.
