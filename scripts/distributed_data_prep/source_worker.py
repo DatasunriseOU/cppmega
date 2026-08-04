@@ -63,6 +63,21 @@ _SORT_FIELDS = (
     "file_local_commit_index",
 )
 
+_GCLOUD_UPLOAD_ENV = {
+    # Keep retries finite while allowing interrupted large uploads to resume
+    # from gcloud's persistent tracker instead of restarting from byte zero.
+    "CLOUDSDK_STORAGE_MAX_RETRIES": "5",
+    "CLOUDSDK_STORAGE_BASE_RETRY_DELAY": "1",
+    "CLOUDSDK_STORAGE_MAX_RETRY_DELAY": "16",
+    "CLOUDSDK_STORAGE_RESUMABLE_THRESHOLD": "8Mi",
+    "CLOUDSDK_STORAGE_UPLOAD_CHUNK_SIZE": "64Mi",
+    # Bound local resource use while still filling a high-bandwidth GCS path.
+    "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED": "true",
+    "CLOUDSDK_STORAGE_PROCESS_COUNT": "1",
+    "CLOUDSDK_STORAGE_THREAD_COUNT": "8",
+    "CLOUDSDK_STORAGE_CHECK_HASHES": "always",
+}
+
 
 class ObjectStore(Protocol):
     def publish_if_absent(self, source: Path, uri: str) -> Mapping[str, object]: ...
@@ -119,43 +134,21 @@ class GcloudObjectStore:
         validate_gcs_uri(uri, where="GCS publication URI")
         if not source.is_file():
             raise FileNotFoundError(source)
-        bucket, object_name = uri[len("gs://") :].split("/", 1)
-        token = run_checked(
-            [self.executable, "auth", "print-access-token"]
-        ).stdout.strip()
-        if not token or any(character.isspace() for character in token):
-            raise ContractError("gcloud returned an invalid access token")
-        endpoint = (
-            "https://storage.googleapis.com/upload/storage/v1/b/"
-            f"{urllib.parse.quote(bucket, safe='')}/o?"
-            + urllib.parse.urlencode(
-                {
-                    "uploadType": "media",
-                    "name": object_name,
-                    "ifGenerationMatch": "0",
-                }
-            )
-        )
-        curl_config = (
-            f'header = "Authorization: Bearer {token}"\n'
-            'header = "Content-Type: application/octet-stream"\n'
-        )
+        upload_env = dict(os.environ)
+        upload_env.update(_GCLOUD_UPLOAD_ENV)
         command = [
-            "curl",
-            "--config",
-            "-",
-            "--fail-with-body",
-            "--silent",
-            "--show-error",
-            "--request",
-            "POST",
-            "--upload-file",
+            self.executable,
+            "storage",
+            "cp",
             str(source),
-            endpoint,
+            uri,
+            "--if-generation-match=0",
+            "--content-type=application/octet-stream",
+            "--quiet",
         ]
         completed = subprocess.run(
             command,
-            input=curl_config,
+            env=upload_env,
             capture_output=True,
             text=True,
             check=False,
