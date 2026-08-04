@@ -9,6 +9,11 @@ RUN_ID=${jsonencode(run_id)}
 WORKER_NAME=${jsonencode(worker_name)}
 WORKER_INDEX=${worker_index}
 WORKER_COUNT=${worker_count}
+SLOTS_PER_WORKER=${slots_per_worker}
+PARSE_WORKERS_PER_SLOT=${parse_workers_per_slot}
+MEMORY_LIMIT_GB_PER_SLOT=${memory_limit_gb_per_slot}
+CPU_BUDGET_VCPUS=${cpu_budget_vcpus}
+MEMORY_BUDGET_GB=${memory_budget_gb}
 EXPECTED_LOCAL_SSDS=${local_ssd_count}
 BOOTSTRAP_URI=${jsonencode(bootstrap_script_gcs_uri)}
 BOOTSTRAP_SHA256=${jsonencode(bootstrap_script_sha256)}
@@ -141,9 +146,19 @@ jq -n \
   --arg worker_name "$WORKER_NAME" \
   --argjson worker_index "$WORKER_INDEX" \
   --argjson worker_count "$WORKER_COUNT" \
+  --argjson slots_per_worker "$SLOTS_PER_WORKER" \
+  --argjson parse_workers_per_slot "$PARSE_WORKERS_PER_SLOT" \
+  --argjson memory_limit_gb_per_slot "$MEMORY_LIMIT_GB_PER_SLOT" \
+  --argjson cpu_budget_vcpus "$CPU_BUDGET_VCPUS" \
+  --argjson memory_budget_gb "$MEMORY_BUDGET_GB" \
   '{bucket: $bucket, gcs_prefix: $gcs_prefix, run_id: $run_id,
     run_root: $run_root, stage_root: $stage_root, worker_name: $worker_name,
-    worker_index: $worker_index, worker_count: $worker_count}' \
+    worker_index: $worker_index, worker_count: $worker_count,
+    slots_per_worker: $slots_per_worker,
+    parse_workers_per_slot: $parse_workers_per_slot,
+    memory_limit_gb_per_slot: $memory_limit_gb_per_slot,
+    cpu_budget_vcpus: $cpu_budget_vcpus,
+    memory_budget_gb: $memory_budget_gb}' \
   >/etc/cppmega/worker.json
 chmod 0644 /etc/cppmega/worker.json
 

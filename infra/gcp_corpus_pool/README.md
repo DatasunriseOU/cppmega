@@ -112,6 +112,32 @@ state to GCS, upload output to a temporary object name, validate hashes and
 row/token receipts, and only then publish its completion receipt. Never rely
 on Local SSD surviving stop, deletion, host failure, or Spot preemption.
 
+### Bounded slots per VM
+
+`worker_count` remains the physical VM count. `slots_per_worker` derives the
+logical manifest worker count (`worker_count * slots_per_worker`), and VM `v`
+owns contiguous logical IDs `v * slots_per_worker .. v * slots_per_worker +
+slots_per_worker - 1`. The default is one slot, preserving the original smoke
+payload. Terraform caps the supported profile at two slots per VM and checks
+aggregate parser and memory limits before apply.
+
+Each slot gets a separate Git checkout, scratch tree, log, and receipt root.
+The scheduler refuses a manifest whose logical worker list does not exactly
+match the VM topology, and refuses aggregate resource overcommit. It publishes
+an immutable slot receipt only after every source receipt has been read back;
+the source worker also publishes an immutable assignment pointer, so a crash
+can skip assignments already confirmed in GCS. No worker-local dedup database
+is shared or enabled.
+
+For `n2-standard-16` (16 vCPU, 64 GB), the recommended first production
+profile is four VMs with `slots_per_worker = 2`,
+`parse_workers_per_slot = 6`, `memory_limit_gb_per_slot = 24`,
+`cpu_budget_vcpus = 16`, and `memory_budget_gb = 56`. Build the source payload
+with the same physical count and `--slots-per-worker 2`; this creates eight
+logical manifest workers. Keep the default one-slot profile for the existing
+smoke run and use a new run ID and new content-addressed payload for a two-slot
+run.
+
 Recommended object layout:
 
 ```text

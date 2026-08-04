@@ -128,12 +128,13 @@ resource "google_compute_instance" "worker" {
   }
 
   metadata = {
-    block-project-ssh-keys = "TRUE"
-    enable-oslogin         = "TRUE"
-    serial-port-enable     = "TRUE"
-    cppmega-run-root       = local.run_root
-    cppmega-worker-index   = tostring(each.value)
-    cppmega-worker-count   = tostring(var.worker_count)
+    block-project-ssh-keys   = "TRUE"
+    enable-oslogin           = "TRUE"
+    serial-port-enable       = "TRUE"
+    cppmega-run-root         = local.run_root
+    cppmega-worker-index     = tostring(each.value)
+    cppmega-worker-count     = tostring(var.worker_count)
+    cppmega-slots-per-worker = tostring(var.slots_per_worker)
   }
 
   metadata_startup_script = templatefile("${path.module}/startup.sh.tftpl", {
@@ -149,6 +150,11 @@ resource "google_compute_instance" "worker" {
     worker_count              = var.worker_count
     worker_index              = each.value
     worker_name               = "${each.key}-${var.run_id}"
+    slots_per_worker          = var.slots_per_worker
+    parse_workers_per_slot    = var.parse_workers_per_slot
+    memory_limit_gb_per_slot  = var.memory_limit_gb_per_slot
+    cpu_budget_vcpus          = var.cpu_budget_vcpus
+    memory_budget_gb          = var.memory_budget_gb
   })
 
   lifecycle {
@@ -189,6 +195,16 @@ resource "google_compute_instance" "worker" {
     precondition {
       condition     = !var.compact_placement || var.worker_count <= 22
       error_message = "Google compact placement policies support at most 22 instances; disable compact_placement for a larger pool."
+    }
+
+    precondition {
+      condition     = var.slots_per_worker * var.parse_workers_per_slot <= var.cpu_budget_vcpus
+      error_message = "aggregate parser workers per VM exceed cpu_budget_vcpus."
+    }
+
+    precondition {
+      condition     = var.slots_per_worker * var.memory_limit_gb_per_slot <= var.memory_budget_gb
+      error_message = "aggregate slot memory limits per VM exceed memory_budget_gb."
     }
   }
 }

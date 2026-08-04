@@ -15,6 +15,11 @@ readonly BOOT_ID
 worker_name="$(jq -er '.worker_name' "$WORKER_CONFIG")"
 worker_index="$(jq -er '.worker_index' "$WORKER_CONFIG")"
 worker_id="$(printf 'worker-%04d' "$worker_index")"
+slots_per_worker="$(jq -er '.slots_per_worker // 1' "$WORKER_CONFIG")"
+parse_workers_per_slot="$(jq -er '.parse_workers_per_slot // 8' "$WORKER_CONFIG")"
+memory_limit_gb_per_slot="$(jq -er '.memory_limit_gb_per_slot // 48' "$WORKER_CONFIG")"
+cpu_budget_vcpus="$(jq -er '.cpu_budget_vcpus // 16' "$WORKER_CONFIG")"
+memory_budget_gb="$(jq -er '.memory_budget_gb // 56' "$WORKER_CONFIG")"
 input_root="$STAGE_ROOT/input"
 work_root="$STAGE_ROOT/work"
 receipt_root="$STAGE_ROOT/receipts/source"
@@ -118,21 +123,32 @@ git -C "$repo_root" bundle verify "$bundle"
 git -C "$repo_root" checkout --detach "$code_revision"
 zstd -dc -- "$overlay" | tar -xf - -C "$repo_root" --no-same-owner
 
-python3 "$repo_root/scripts/distributed_data_prep/source_worker.py" \
+export PYTHONDONTWRITEBYTECODE=1
+export GIT_OPTIONAL_LOCKS=0
+scheduler_receipt="$receipt_root/$worker_name.slot-scheduler.json"
+python3 "$repo_root/scripts/distributed_data_prep/source_slot_scheduler.py" \
   --manifest "$manifest" \
-  --worker "$worker_id" \
-  --scratch-root "$work_root/source" \
-  --receipt-root "$receipt_root" \
-  --repo-root "$repo_root" \
+  --manifest-file-sha256 "$MANIFEST_SHA256" \
+  --run-root "$RUN_ROOT" \
+  --bundle "$bundle" \
+  --overlay "$overlay" \
+  --stage-root "$STAGE_ROOT" \
+  --scheduler-receipt "$scheduler_receipt" \
+  --physical-worker-index "$worker_index" \
+  --physical-worker-count "$(jq -er '.worker_count' "$WORKER_CONFIG")" \
+  --slots-per-worker "$slots_per_worker" \
+  --parse-workers-per-slot "$parse_workers_per_slot" \
+  --memory-limit-gb-per-slot "$memory_limit_gb_per_slot" \
+  --cpu-budget-vcpus "$cpu_budget_vcpus" \
+  --memory-budget-gb "$memory_budget_gb" \
   --python /usr/bin/python3 \
-  --parse-workers 8 \
-  --memory-limit-gb 48
+  --source-worker "$repo_root/scripts/distributed_data_prep/source_worker.py"
 
-receipt_count="$(find "$receipt_root" -maxdepth 1 -type f -name '*.json' | wc -l)"
-if [[ "$receipt_count" -lt 1 ]]; then
-  echo "worker emitted no source receipt" >&2
-  exit 1
-fi
+receipt_count="$(jq -er '.source_receipt_count' "$scheduler_receipt")"
+slot_count="$(jq -er '.slots_per_worker' "$scheduler_receipt")"
+completed_slots="$(jq -c '.completed_slots' "$scheduler_receipt")"
+resumed_slots="$(jq -c '.resumed_slots' "$scheduler_receipt")"
+logical_worker_count="$(jq -er '.physical_worker_count * .slots_per_worker' "$scheduler_receipt")"
 
 completion_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.complete.json"
 jq -n \
@@ -142,9 +158,15 @@ jq -n \
   --arg worker "$worker_id" \
   --arg worker_name "$worker_name" \
   --argjson receipt_count "$receipt_count" \
+  --argjson slot_count "$slot_count" \
+  --argjson logical_worker_count "$logical_worker_count" \
+  --argjson completed_slots "$completed_slots" \
+  --argjson resumed_slots "$resumed_slots" \
   '{schema_version: 1, state: "complete", worker: $worker,
     worker_name: $worker_name, boot_id: $boot_id, created_at: $created_at,
-    manifest_file_sha256: $manifest_sha256, receipt_count: $receipt_count}' \
+    manifest_file_sha256: $manifest_sha256, receipt_count: $receipt_count,
+    slots_per_worker: $slot_count, logical_worker_count: $logical_worker_count,
+    completed_slots: $completed_slots, resumed_slots: $resumed_slots}' \
   >"$completion_receipt"
 gcs_create_if_absent "$completion_receipt" \
   "$RUN_ROOT/control/completed/$worker_name.$BOOT_ID.json"

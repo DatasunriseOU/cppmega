@@ -87,3 +87,39 @@ run "content_addressed_v4_bootstrap" {
     error_message = "Startup must use the v4-proven exact-object download path."
   }
 }
+
+run "bounded_two_slot_profile" {
+  command = plan
+
+  variables {
+    project_id                = "natural-bison-491019-t9"
+    run_id                    = "source-two-slot-test"
+    worker_count              = 4
+    machine_type              = "n2-standard-16"
+    slots_per_worker          = 2
+    parse_workers_per_slot    = 6
+    memory_limit_gb_per_slot  = 24
+    cpu_budget_vcpus          = 16
+    memory_budget_gb          = 56
+    bootstrap_script_gcs_uri  = ""
+    bootstrap_script_sha256   = ""
+    bootstrap_bundle_sha256   = ""
+    bootstrap_overlay_sha256  = ""
+    bootstrap_manifest_sha256 = ""
+  }
+
+  assert {
+    condition     = length(google_compute_instance.worker) == 4 && length(google_compute_address.worker) == 4
+    error_message = "Multi-slot mode must preserve the physical VM and address count."
+  }
+
+  assert {
+    condition     = alltrue([for worker in google_compute_instance.worker : strcontains(worker.metadata_startup_script, "SLOTS_PER_WORKER=2") && strcontains(worker.metadata_startup_script, "PARSE_WORKERS_PER_SLOT=6") && strcontains(worker.metadata_startup_script, "MEMORY_LIMIT_GB_PER_SLOT=24")])
+    error_message = "Startup must carry the bounded two-slot resource profile."
+  }
+
+  assert {
+    condition     = alltrue([for worker in google_compute_instance.worker : worker.metadata["cppmega-slots-per-worker"] == "2"])
+    error_message = "Worker metadata must expose the physical-to-logical slot topology."
+  }
+}

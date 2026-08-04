@@ -53,6 +53,9 @@ from scripts.distributed_data_prep.source_manifest import (  # noqa: E402
 )
 
 SOURCE_WORKER_RECEIPT_SCHEMA = "cppmega.distributed_source_worker_receipt_v2"
+ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA = (
+    "cppmega.distributed_source_assignment_completion_receipt_v1"
+)
 CANONICAL_DOCUMENT_ORDER = "canonical_enriched_json_v1"
 _SORT_FIELDS = (
     "repo",
@@ -70,6 +73,10 @@ class ObjectStore(Protocol):
     def download(
         self, uri: str, destination: Path, *, generation: str | None = None
     ) -> Mapping[str, object]: ...
+
+    def describe_if_present(
+        self, uri: str, *, generation: str | None = None
+    ) -> Mapping[str, object] | None: ...
 
 
 class GcloudObjectStore:
@@ -110,6 +117,95 @@ class GcloudObjectStore:
         return {
             "uri": uri,
             "generation": generation,
+            "size_bytes": size_int,
+            "crc32c": raw.get("crc32c"),
+            "md5_hash": raw.get("md5Hash"),
+        }
+
+    def describe_if_present(
+        self, uri: str, *, generation: str | None = None
+    ) -> dict[str, object] | None:
+        """Return exact metadata for one known object without listing a bucket.
+
+        Slot completion receipts have deterministic names.  The worker service
+        account is deliberately unable to list objects, so resume has to make a
+        single object GET and distinguish an absent receipt from an operational
+        error.  A 404 is the only non-error negative result.
+        """
+
+        validate_gcs_uri(uri, where="GCS object")
+        bucket, object_name = uri[len("gs://") :].split("/", 1)
+        token = run_checked(
+            [self.executable, "auth", "print-access-token"]
+        ).stdout.strip()
+        if not token or any(character.isspace() for character in token):
+            raise ContractError("gcloud returned an invalid access token")
+        query: dict[str, str] = {}
+        if generation is not None:
+            query["generation"] = str(generation)
+        endpoint = (
+            "https://storage.googleapis.com/storage/v1/b/"
+            f"{urllib.parse.quote(bucket, safe='')}/o/"
+            f"{urllib.parse.quote(object_name, safe='')}"
+        )
+        if query:
+            endpoint += "?" + urllib.parse.urlencode(query)
+        with tempfile.TemporaryDirectory(prefix="cppmega-gcs-describe-") as raw_tmp:
+            response = Path(raw_tmp) / "response.json"
+            completed = subprocess.run(
+                [
+                    "curl",
+                    "--config",
+                    "-",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--output",
+                    str(response),
+                    "--write-out",
+                    "%{http_code}",
+                    endpoint,
+                ],
+                input=f'header = "Authorization: Bearer {token}"\n',
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"GCS object metadata lookup failed for {uri}: "
+                    f"{completed.stderr[-4000:]}"
+                )
+            status = completed.stdout.strip()
+            if status == "404":
+                return None
+            if status != "200":
+                detail = response.read_text(encoding="utf-8", errors="replace")
+                raise RuntimeError(
+                    f"GCS object metadata lookup returned HTTP {status} for {uri}: "
+                    f"{detail[-4000:]}"
+                )
+            try:
+                raw = json.loads(response.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ContractError(
+                    f"GCS returned invalid object metadata for {uri}"
+                ) from exc
+        if not isinstance(raw, dict):
+            raise ContractError(f"GCS returned non-object metadata for {uri}")
+        resolved_generation = str(raw.get("generation", ""))
+        size = raw.get("size")
+        if not resolved_generation.isdecimal() or int(resolved_generation) < 1:
+            raise ContractError(f"GCS object has no valid generation: {uri}")
+        try:
+            size_int = int(size)
+        except (TypeError, ValueError) as exc:
+            raise ContractError(f"GCS object has no valid size: {uri}") from exc
+        if generation is not None and resolved_generation != str(generation):
+            raise ContractError(f"GCS generation selector drifted for {uri}")
+        return {
+            "uri": uri,
+            "generation": resolved_generation,
             "size_bytes": size_int,
             "crc32c": raw.get("crc32c"),
             "md5_hash": raw.get("md5Hash"),
@@ -283,6 +379,22 @@ class LocalObjectStore:
             "uri": uri,
             "generation": "1",
             "size_bytes": destination.stat().st_size,
+            "crc32c": None,
+            "md5_hash": None,
+        }
+
+    def describe_if_present(
+        self, uri: str, *, generation: str | None = None
+    ) -> Mapping[str, object] | None:
+        if generation not in {None, "1"}:
+            raise ContractError(f"unknown local object generation for {uri}")
+        source = self._path(uri)
+        if not source.is_file():
+            return None
+        return {
+            "uri": uri,
+            "generation": "1",
+            "size_bytes": source.stat().st_size,
             "crc32c": None,
             "md5_hash": None,
         }
@@ -969,6 +1081,254 @@ def validate_worker_receipt(
     return value
 
 
+def assignment_completion_uri(
+    manifest: Mapping[str, object], job: Mapping[str, object]
+) -> str:
+    """Return the deterministic resume pointer for one manifest assignment."""
+
+    assignment_sha256 = require_sha256(
+        job.get("assignment_sha256"), where="assignment_sha256"
+    )
+    return gcs_join(
+        str(manifest["gcs_output_prefix"]),
+        "source-assignment-completions",
+        str(manifest["manifest_sha256"]),
+        f"{assignment_sha256}.complete.json",
+    )
+
+
+def _source_receipt_uri(
+    manifest: Mapping[str, object],
+    job: Mapping[str, object],
+    receipt: Mapping[str, object],
+) -> str:
+    artifact = receipt.get("artifact")
+    if not isinstance(artifact, Mapping):
+        raise ContractError("source worker receipt has no artifact")
+    compression = artifact.get("compression")
+    if not isinstance(compression, Mapping):
+        raise ContractError("source worker receipt has no compression metadata")
+    compressed_sha256 = require_sha256(
+        compression.get("sha256"), where="source receipt compressed sha256"
+    )
+    return gcs_join(
+        str(manifest["gcs_output_prefix"]),
+        "source-receipts",
+        str(manifest["manifest_sha256"]),
+        f"{int(job['ordinal']):05d}-{job['repo']}",
+        f"{compressed_sha256}.receipt.json",
+    )
+
+
+def validate_assignment_completion_receipt(
+    receipt: Mapping[str, object],
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    job: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the immutable pointer that makes one job safely resumable."""
+
+    value = dict(receipt)
+    require_exact_fields(
+        value,
+        {
+            "schema",
+            "status",
+            "manifest_sha256",
+            "manifest_file_sha256",
+            "assignment",
+            "source_receipt",
+            "training_ready",
+        },
+        where="source assignment completion receipt",
+    )
+    if (
+        value["schema"] != ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA
+        or value["status"] != "complete"
+        or value["manifest_sha256"] != manifest["manifest_sha256"]
+        or value["manifest_file_sha256"] != manifest_file_sha256
+        or value["training_ready"] is not False
+    ):
+        raise ContractError("source assignment completion receipt binding drifted")
+    expected_assignment = {
+        key: job[key]
+        for key in ("ordinal", "repo", "project_id", "worker", "assignment_sha256")
+    }
+    assignment = value["assignment"]
+    if not isinstance(assignment, Mapping) or dict(assignment) != expected_assignment:
+        raise ContractError("source assignment completion assignment drifted")
+    source_receipt = value["source_receipt"]
+    if not isinstance(source_receipt, Mapping):
+        raise ContractError("source assignment completion source receipt is missing")
+    source = dict(source_receipt)
+    require_exact_fields(
+        source,
+        {"uri", "generation", "size_bytes", "sha256"},
+        where="source assignment completion source receipt",
+    )
+    validate_gcs_uri(source["uri"], where="source assignment completion receipt URI")
+    generation = str(source["generation"])
+    if not generation.isdecimal() or int(generation) < 1:
+        raise ContractError("source assignment completion receipt generation is invalid")
+    require_int(
+        source["size_bytes"],
+        where="source assignment completion receipt size",
+        minimum=1,
+    )
+    require_sha256(source["sha256"], where="source assignment completion receipt sha256")
+    return value
+
+
+def _load_completed_assignment(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    job: Mapping[str, object],
+    object_store: ObjectStore,
+    scratch_root: Path,
+) -> dict[str, object] | None:
+    """Return a read-back source receipt for a confirmed assignment, if any."""
+
+    pointer_uri = assignment_completion_uri(manifest, job)
+    pointer_metadata = object_store.describe_if_present(pointer_uri)
+    if pointer_metadata is None:
+        return None
+    pointer_generation = str(pointer_metadata.get("generation", ""))
+    if not pointer_generation.isdecimal() or int(pointer_generation) < 1:
+        raise ContractError(f"assignment completion pointer has invalid generation: {pointer_uri}")
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="assignment-resume-", dir=scratch_root) as raw_tmp:
+        temporary = Path(raw_tmp)
+        pointer_path = temporary / "pointer.json"
+        downloaded_pointer = object_store.download(
+            pointer_uri, pointer_path, generation=pointer_generation
+        )
+        if (
+            str(downloaded_pointer.get("uri")) != pointer_uri
+            or str(downloaded_pointer.get("generation")) != pointer_generation
+            or pointer_path.stat().st_size != int(pointer_metadata.get("size_bytes", -1))
+        ):
+            raise ContractError("assignment completion pointer readback drifted")
+        _pointer_raw, pointer = load_json_object(
+            pointer_path, where="source assignment completion receipt"
+        )
+        validated_pointer = validate_assignment_completion_receipt(
+            pointer,
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            job=job,
+        )
+        source = validated_pointer["source_receipt"]
+        assert isinstance(source, Mapping)
+        source_uri = validate_gcs_uri(source["uri"], where="source receipt URI")
+        source_generation = str(source["generation"])
+        source_metadata = object_store.describe_if_present(
+            source_uri, generation=source_generation
+        )
+        if source_metadata is None:
+            raise ContractError("assignment pointer references a missing source receipt")
+        source_path = temporary / "source-receipt.json"
+        downloaded_source = object_store.download(
+            source_uri, source_path, generation=source_generation
+        )
+        if (
+            str(downloaded_source.get("uri")) != source_uri
+            or str(downloaded_source.get("generation")) != source_generation
+            or source_path.stat().st_size != int(source["size_bytes"])
+            or sha256_file(source_path) != source["sha256"]
+        ):
+            raise ContractError("assignment completion source receipt readback drifted")
+        _source_raw, source_receipt = load_json_object(
+            source_path, where="source worker receipt"
+        )
+        validate_worker_receipt(source_receipt, manifest=manifest, job=job)
+        if _source_receipt_uri(manifest, job, source_receipt) != source_uri:
+            raise ContractError("assignment pointer source receipt URI drifted")
+        return source_receipt
+
+
+def _publish_assignment_completion(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    job: Mapping[str, object],
+    source_receipt: Mapping[str, object],
+    source_receipt_path: Path,
+    object_store: ObjectStore,
+    scratch_root: Path,
+) -> None:
+    """Publish and read back a deterministic pointer after the source receipt."""
+
+    receipt_uri = _source_receipt_uri(manifest, job, source_receipt)
+    metadata = object_store.describe_if_present(receipt_uri)
+    if metadata is None:
+        raise ContractError("source receipt disappeared before assignment completion")
+    generation = str(metadata.get("generation", ""))
+    if not generation.isdecimal() or int(generation) < 1:
+        raise ContractError("source receipt has invalid generation")
+    source_sha256 = sha256_file(source_receipt_path)
+    with tempfile.TemporaryDirectory(prefix="assignment-publish-", dir=scratch_root) as raw_tmp:
+        temporary = Path(raw_tmp)
+        verified_source = temporary / "source-receipt.json"
+        downloaded = object_store.download(
+            receipt_uri, verified_source, generation=generation
+        )
+        if (
+            str(downloaded.get("uri")) != receipt_uri
+            or str(downloaded.get("generation")) != generation
+            or verified_source.stat().st_size != source_receipt_path.stat().st_size
+            or sha256_file(verified_source) != source_sha256
+        ):
+            raise ContractError("published source receipt readback drifted")
+        pointer: dict[str, object] = {
+            "schema": ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
+            "status": "complete",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": manifest_file_sha256,
+            "assignment": {
+                key: job[key]
+                for key in (
+                    "ordinal",
+                    "repo",
+                    "project_id",
+                    "worker",
+                    "assignment_sha256",
+                )
+            },
+            "source_receipt": {
+                "uri": receipt_uri,
+                "generation": generation,
+                "size_bytes": source_receipt_path.stat().st_size,
+                "sha256": source_sha256,
+            },
+            "training_ready": False,
+        }
+        validate_assignment_completion_receipt(
+            pointer,
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            job=job,
+        )
+        pointer_path = temporary / "assignment-completion.json"
+        atomic_write_json(pointer_path, pointer)
+        pointer_uri = assignment_completion_uri(manifest, job)
+        published = object_store.publish_if_absent(pointer_path, pointer_uri)
+        pointer_generation = str(published.get("generation", ""))
+        if str(published.get("uri")) != pointer_uri or not pointer_generation.isdecimal():
+            raise ContractError("assignment completion pointer publication drifted")
+        verified_pointer = temporary / "assignment-completion.verify.json"
+        pointer_download = object_store.download(
+            pointer_uri, verified_pointer, generation=pointer_generation
+        )
+        if (
+            str(pointer_download.get("generation")) != pointer_generation
+            or verified_pointer.stat().st_size != pointer_path.stat().st_size
+            or sha256_file(verified_pointer) != sha256_file(pointer_path)
+        ):
+            raise ContractError("assignment completion pointer readback drifted")
+
+
 def run_source_worker(
     manifest: Mapping[str, object],
     *,
@@ -1015,6 +1375,18 @@ def run_source_worker(
     receipt_root.mkdir(parents=True, exist_ok=True)
     receipts: list[dict[str, object]] = []
     for job in jobs:
+        resumed = _load_completed_assignment(
+            manifest=plan,
+            manifest_file_sha256=manifest_file_sha256,
+            job=job,
+            object_store=object_store,
+            scratch_root=scratch_root,
+        )
+        if resumed is not None:
+            local_receipt = receipt_root / f"{int(job['ordinal']):05d}-{job['repo']}.json"
+            atomic_write_json(local_receipt, resumed)
+            receipts.append(resumed)
+            continue
         with tempfile.TemporaryDirectory(
             prefix=f"source-{job['ordinal']:05d}-{job['repo']}-", dir=scratch_root
         ) as raw_scratch:
@@ -1150,17 +1522,20 @@ def run_source_worker(
             validate_worker_receipt(receipt, manifest=plan, job=job)
             local_receipt = receipt_root / f"{int(job['ordinal']):05d}-{job['repo']}.json"
             atomic_write_json(local_receipt, receipt)
-            receipt_uri = gcs_join(
-                str(plan["gcs_output_prefix"]),
-                "source-receipts",
-                str(plan["manifest_sha256"]),
-                f"{int(job['ordinal']):05d}-{job['repo']}",
-                f"{compression['sha256']}.receipt.json",
-            )
+            receipt_uri = _source_receipt_uri(plan, job, receipt)
             # Publication order is intentional: an uploaded candidate without a
             # receipt is garbage-collectable; a receipt can never point to missing
             # data because it is uploaded last.
             object_store.publish_if_absent(local_receipt, receipt_uri)
+            _publish_assignment_completion(
+                manifest=plan,
+                manifest_file_sha256=manifest_file_sha256,
+                job=job,
+                source_receipt=receipt,
+                source_receipt_path=local_receipt,
+                object_store=object_store,
+                scratch_root=scratch,
+            )
             receipts.append(receipt)
     return tuple(receipts)
 
@@ -1222,16 +1597,19 @@ if __name__ == "__main__":  # pragma: no cover - CLI wrapper
 
 
 __all__ = [
+    "ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA",
     "CANONICAL_DOCUMENT_ORDER",
     "GcloudObjectStore",
     "LocalObjectStore",
     "ObjectStore",
     "SOURCE_WORKER_RECEIPT_SCHEMA",
     "acquire_git_mirror",
+    "assignment_completion_uri",
     "canonicalize_enriched_jsonl",
     "compress_zstd",
     "extract_immutable_tar_zst",
     "run_source_worker",
+    "validate_assignment_completion_receipt",
     "validate_worker_receipt",
     "validate_quarantine_receipt_file",
 ]

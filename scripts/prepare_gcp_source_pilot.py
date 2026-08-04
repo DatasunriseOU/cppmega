@@ -27,6 +27,10 @@ from scripts.distributed_data_prep._common import (
 from scripts.distributed_data_prep.source_manifest import (
     build_source_manifest,
 )
+from scripts.distributed_data_prep.source_slot_scheduler import (
+    logical_worker_count,
+    validate_slot_resources,
+)
 
 RUNNER_PLACEHOLDERS = {
     "__CPPMEGA_BUNDLE_SHA256__": "bundle",
@@ -64,6 +68,7 @@ def _build_overlay(repo_root: Path, destination: Path) -> None:
         "scripts/distributed_data_prep/__init__.py",
         "scripts/distributed_data_prep/_common.py",
         "scripts/distributed_data_prep/source_manifest.py",
+        "scripts/distributed_data_prep/source_slot_scheduler.py",
         "scripts/distributed_data_prep/source_worker.py",
     ]
     for member in members:
@@ -105,10 +110,23 @@ def prepare_pilot(
     output_root: Path,
     gcs_output_prefix: str,
     worker_count: int,
+    slots_per_worker: int = 1,
+    parse_workers_per_slot: int = 8,
+    memory_limit_gb_per_slot: float = 48.0,
+    cpu_budget_vcpus: int = 16,
+    memory_budget_gb: float = 56.0,
 ) -> dict[str, object]:
     """Create immutable bundle, overlay, source manifest, and rendered runner."""
 
     repo_root = repo_root.resolve()
+    resources = validate_slot_resources(
+        slots_per_worker=slots_per_worker,
+        parse_workers_per_slot=parse_workers_per_slot,
+        memory_limit_gb_per_slot=memory_limit_gb_per_slot,
+        cpu_budget_vcpus=cpu_budget_vcpus,
+        memory_budget_gb=memory_budget_gb,
+    )
+    logical_count = logical_worker_count(worker_count, slots_per_worker)
     revision = _tracked_clean(repo_root)
     if output_root.exists():
         raise ContractError(f"pilot output already exists: {output_root}")
@@ -153,7 +171,7 @@ def prepare_pilot(
         )
         source_manifest = build_source_manifest(
             repositories,
-            worker_count=worker_count,
+            worker_count=logical_count,
             gcs_output_prefix=gcs_output_prefix,
             code_revision=revision,
             indexer_sha256=sha256_file(indexer),
@@ -192,6 +210,10 @@ def prepare_pilot(
             "status": "ready",
             "code_revision": revision,
             "worker_count": worker_count,
+            "physical_worker_count": worker_count,
+            "slots_per_worker": slots_per_worker,
+            "logical_worker_count": logical_count,
+            "resources": resources,
             "gcs_output_prefix": gcs_output_prefix,
             "source_manifest_sha256": source_manifest["manifest_sha256"],
             "artifacts": artifacts,
@@ -209,6 +231,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--gcs-output-prefix", required=True)
     parser.add_argument("--worker-count", type=int, default=4)
+    parser.add_argument("--slots-per-worker", type=int, default=1)
+    parser.add_argument("--parse-workers-per-slot", type=int, default=8)
+    parser.add_argument("--memory-limit-gb-per-slot", type=float, default=48.0)
+    parser.add_argument("--cpu-budget-vcpus", type=int, default=16)
+    parser.add_argument("--memory-budget-gb", type=float, default=56.0)
     args = parser.parse_args(argv)
     try:
         prepare_pilot(
@@ -218,6 +245,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
             output_root=args.output_root,
             gcs_output_prefix=args.gcs_output_prefix,
             worker_count=args.worker_count,
+            slots_per_worker=args.slots_per_worker,
+            parse_workers_per_slot=args.parse_workers_per_slot,
+            memory_limit_gb_per_slot=args.memory_limit_gb_per_slot,
+            cpu_budget_vcpus=args.cpu_budget_vcpus,
+            memory_budget_gb=args.memory_budget_gb,
         )
     except (ContractError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         parser.exit(2, f"GCP source pilot preparation failed: {exc}\n")
