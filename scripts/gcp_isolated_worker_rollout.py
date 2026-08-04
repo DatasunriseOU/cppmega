@@ -404,12 +404,57 @@ def _run_checked(
     return completed
 
 
+_GOOGLE_CREDENTIAL_ENV_VARS = (
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CREDENTIALS",
+    "GOOGLE_BACKEND_CREDENTIALS",
+    "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+    "GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+)
+
+
+def _gcloud_access_token() -> str:
+    """Read one short-lived token from the active gcloud account in memory."""
+
+    environment = dict(os.environ)
+    environment.pop("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", None)
+    completed = subprocess.run(
+        ["gcloud", "auth", "print-access-token"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "gcloud auth print-access-token failed:\n"
+            f"{(completed.stderr or '')[-4000:]}"
+        )
+    token = completed.stdout.strip()
+    if not token or any(character.isspace() for character in token):
+        raise ContractError("gcloud returned an empty or malformed OAuth token")
+    return token
+
+
+def _plan_environment(*, use_gcloud_access_token: bool) -> tuple[dict[str, str], str]:
+    environment = dict(os.environ)
+    if not use_gcloud_access_token:
+        return environment, "ambient"
+    token = _gcloud_access_token()
+    for variable in _GOOGLE_CREDENTIAL_ENV_VARS:
+        environment.pop(variable, None)
+    environment["GOOGLE_OAUTH_ACCESS_TOKEN"] = token
+    return environment, "gcloud-active-token"
+
+
 def run_guarded_plan(
     *,
     terraform_dir: Path,
     var_file: Path,
     output_root: Path,
     spec: RolloutSpec,
+    use_gcloud_access_token: bool = False,
 ) -> dict[str, object]:
     """Initialize an isolated backend, create a binary plan, and attest it."""
 
@@ -431,7 +476,9 @@ def run_guarded_plan(
     _empty_target(receipt_path, where="isolated Terraform plan receipt")
     tf_data_dir.mkdir(parents=True, exist_ok=True)
 
-    environment = dict(os.environ)
+    environment, auth_mode = _plan_environment(
+        use_gcloud_access_token=use_gcloud_access_token
+    )
     environment["TF_DATA_DIR"] = str(tf_data_dir)
     init = _run_checked(
         [
@@ -482,6 +529,7 @@ def run_guarded_plan(
                 "backend_config_path": str(backend_path),
                 "backend_config_sha256": sha256_file(backend_path),
                 "tf_data_dir": str(tf_data_dir),
+                "auth_mode": auth_mode,
             }
         )
         atomic_write_json(receipt_path, receipt)
@@ -502,6 +550,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--name-prefix", default="cppmega-corpus")
     parser.add_argument("--worker-count", required=True, type=int)
+    parser.add_argument(
+        "--use-gcloud-access-token",
+        action="store_true",
+        help=(
+            "use a short-lived token from the active gcloud account for both "
+            "the GCS backend and provider; the token is not written to the receipt"
+        ),
+    )
     parser.add_argument(
         "--compact-placement",
         action=argparse.BooleanOptionalAction,
@@ -527,6 +583,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             var_file=args.var_file,
             output_root=args.output_root,
             spec=spec,
+            use_gcloud_access_token=args.use_gcloud_access_token,
         )
     except (ContractError, OSError, RuntimeError, ValueError) as exc:
         parser.exit(2, f"Isolated GCP worker rollout failed: {exc}\n")

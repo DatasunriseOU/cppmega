@@ -294,8 +294,16 @@ python scripts/gcp_isolated_worker_rollout.py \
   --run-id source-prod-20260804-005 \
   --name-prefix cppmega-corpus \
   --worker-count 16 \
-  --compact-placement
+  --compact-placement \
+  --use-gcloud-access-token
 ```
+
+`--use-gcloud-access-token` reads a short-lived token from the active
+`gcloud` account in memory and supplies it to both Terraform's GCS backend and
+the Google provider.  It removes competing credential-path environment
+variables for that child process and does not write the token to the receipt;
+the smoke plan was verified to leave `access_token` absent from Terraform's
+local backend metadata.
 
 Its receipt is `isolated-terraform/<run_id>.isolated-plan-receipt.json` below
 the output root.  It binds the binary plan, its JSON form, the exact backend
