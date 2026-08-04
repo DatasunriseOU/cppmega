@@ -1,0 +1,46 @@
+{
+  "schema": "cppmega.pipeline_watchdog_v1",
+  "state_path": "/var/tmp/cppmega-pipeline-watchdog/state.json",
+  "report_path": "/var/tmp/cppmega-pipeline-watchdog/report.json",
+  "lanes": [
+    {
+      "name": "ci-example",
+      "process_contains": [
+        "scripts/ci_stream_fetch.py",
+        "--state",
+        "/absolute/path/to/fetch_state.sqlite3"
+      ],
+      "transient_429": {
+        "kind": "sqlite_request_ledger",
+        "path": "/absolute/path/to/fetch_state.sqlite3"
+      },
+      "resume": {
+        "argv": [
+          "/absolute/path/to/python",
+          "-u",
+          "scripts/ci_stream_fetch.py",
+          "--resume"
+        ],
+        "cwd": "/absolute/path/to/cppmega-worktree",
+        "stdout": "/absolute/path/to/ci-fetch.resume.log"
+      },
+      "resume_guard": {
+        "unlocked_files": [
+          "/absolute/path/to/fetch_state.sqlite3.lease"
+        ]
+      }
+    },
+    {
+      "name": "gitlab-terminal-example",
+      "process_contains": [
+        "scripts/pr_ingest/gitlab_mr_stream.py",
+        "--manifest",
+        "/absolute/path/to/manifest.json"
+      ],
+      "terminal_receipt": {
+        "path": "/absolute/path/to/completion_receipt.json",
+        "status_values": ["verified", "complete"]
+      }
+    }
+  ]
+}
