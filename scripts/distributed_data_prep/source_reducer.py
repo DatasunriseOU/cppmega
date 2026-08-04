@@ -54,6 +54,9 @@ from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     validate_quarantine_receipt_file,
     validate_worker_receipt,
 )
+from scripts.distributed_data_prep.source_quarantine_projection import (  # noqa: E402
+    validate_pinned_tree_quarantine_projection,
+)
 
 SOURCE_REDUCER_RECEIPT_SCHEMA = "cppmega.distributed_source_reducer_receipt_v1"
 DEDUP_POLICY = {
@@ -526,11 +529,58 @@ def reduce_source_candidates(
                 assert isinstance(artifact, Mapping)
                 quarantine_artifact = receipt["quarantine_artifact"]
                 assert isinstance(quarantine_artifact, Mapping)
+                projection_artifact = receipt.get("quarantine_projection_artifact")
+                projection_payload: dict[str, object] | None = None
                 with tempfile.TemporaryDirectory(
                     prefix=f"reduce-{ordinal:05d}-{job['repo']}-", dir=scratch_root
                 ) as raw_tmp:
                     candidate_path = Path(raw_tmp) / "candidate.jsonl.zst"
                     quarantine_path = Path(raw_tmp) / "source-quarantine.json"
+                    if projection_artifact is not None:
+                        if not isinstance(projection_artifact, Mapping):
+                            raise ContractError(
+                                f"quarantine projection artifact is malformed for {job['repo']}"
+                            )
+                        projection_path = Path(raw_tmp) / "source-quarantine-projection.json"
+                        projection_download = object_store.download(
+                            str(projection_artifact["uri"]),
+                            projection_path,
+                            generation=str(projection_artifact["generation"]),
+                        )
+                        if (
+                            str(projection_download.get("uri"))
+                            != str(projection_artifact["uri"])
+                            or str(projection_download.get("generation"))
+                            != str(projection_artifact["generation"])
+                            or projection_path.stat().st_size
+                            != int(projection_artifact["size_bytes"])
+                            or sha256_file(projection_path)
+                            != projection_artifact["sha256"]
+                        ):
+                            raise ContractError(
+                                f"downloaded quarantine projection drifted for {job['repo']}"
+                            )
+                        _projection_raw, projection_value = load_json_object(
+                            projection_path,
+                            where="source quarantine projection",
+                        )
+                        projection_payload = validate_pinned_tree_quarantine_projection(
+                            projection_value,
+                            project_id=str(job["project_id"]),
+                            base_manifest_sha256=str(
+                                pipeline["quarantine_manifest_sha256"]
+                            ),
+                            source_snapshot=receipt["source_snapshot"],
+                        )
+                        projected_manifest = projection_payload["projected_manifest"]
+                        assert isinstance(projected_manifest, Mapping)
+                        effective_quarantine_manifest_sha256 = str(
+                            projected_manifest["sha256"]
+                        )
+                    else:
+                        effective_quarantine_manifest_sha256 = str(
+                            pipeline["quarantine_manifest_sha256"]
+                        )
                     object_store.download(
                         str(quarantine_artifact["uri"]),
                         quarantine_path,
@@ -548,7 +598,7 @@ def reduce_source_candidates(
                     quarantine_payload = validate_quarantine_receipt_file(
                         quarantine_path,
                         project_id=str(job["project_id"]),
-                        manifest_sha256=str(pipeline["quarantine_manifest_sha256"]),
+                        manifest_sha256=effective_quarantine_manifest_sha256,
                     )
                     object_store.download(
                         str(artifact["uri"]),
@@ -605,6 +655,27 @@ def reduce_source_candidates(
                         ),
                     }
                 )
+                if projection_payload is not None:
+                    receipt_bindings[-1].update(
+                        {
+                            "quarantine_projection_sha256": projection_artifact["sha256"],
+                            "quarantine_projection_generation": str(
+                                projection_artifact["generation"]
+                            ),
+                            "quarantine_projection_summary_sha256": canonical_sha256(
+                                {
+                                    key: projection_payload[key]
+                                    for key in (
+                                        "project_id",
+                                        "base_manifest_sha256",
+                                        "source",
+                                        "projected_manifest",
+                                        "selection",
+                                    )
+                                }
+                            ),
+                        }
+                    )
         finally:
             dedup.close()
 

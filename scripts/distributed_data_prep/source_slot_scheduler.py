@@ -50,6 +50,7 @@ from scripts.distributed_data_prep.source_manifest import (  # noqa: E402
 from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     GcloudObjectStore,
     ObjectStore,
+    QUARANTINE_PROJECTION_MODE_OFF,
     TransientTransportError,
     _load_completed_assignment,
     validate_worker_receipt,
@@ -508,6 +509,7 @@ def _build_worker_command(
     receipt_root: Path,
     python: Path,
     resources: Mapping[str, int | float],
+    quarantine_projection_mode: str,
     job: Mapping[str, object] | None = None,
 ) -> list[str]:
     command = [
@@ -529,6 +531,8 @@ def _build_worker_command(
         str(resources["parse_workers_per_slot"]),
         "--memory-limit-gb",
         str(resources["memory_limit_gb_per_slot"]),
+        "--quarantine-projection-mode",
+        quarantine_projection_mode,
     ]
     if job is not None:
         command.extend(["--assignment-sha256", str(job["assignment_sha256"])])
@@ -939,6 +943,7 @@ def _start_dynamic_assignment(
     executor: Mapping[str, object],
     lease: AssignmentLease,
     resources: Mapping[str, int | float],
+    quarantine_projection_mode: str,
 ) -> dict[str, object]:
     attempt_root = executor["attempt_root"]
     repo_root = executor["repo_root"]
@@ -965,6 +970,7 @@ def _start_dynamic_assignment(
         receipt_root=receipt_root,
         python=python,
         resources=resources,
+        quarantine_projection_mode=quarantine_projection_mode,
         job=job,
     )
     environment = os.environ.copy()
@@ -1075,6 +1081,7 @@ def _run_dynamic_source_scheduler(
     claim_lease_seconds: int,
     claim_heartbeat_seconds: int,
     max_claim_attempts: int,
+    quarantine_projection_mode: str,
 ) -> dict[str, object]:
     """Continuously refill VM-local slots from the global immutable queue."""
 
@@ -1241,6 +1248,7 @@ def _run_dynamic_source_scheduler(
                                 executor=executors[spec.worker],
                                 lease=lease,
                                 resources=resources,
+                                quarantine_projection_mode=quarantine_projection_mode,
                             )
                         )
                         active_assignments.add(str(lease.job["assignment_sha256"]))
@@ -1356,6 +1364,7 @@ def run_source_slot_scheduler(
     claim_lease_seconds: int = 900,
     claim_heartbeat_seconds: int = 120,
     max_claim_attempts: int = 100,
+    quarantine_projection_mode: str = QUARANTINE_PROJECTION_MODE_OFF,
 ) -> dict[str, object]:
     """Run all slots owned by one VM and publish exact completion receipts."""
 
@@ -1427,6 +1436,7 @@ def run_source_slot_scheduler(
                 claim_lease_seconds=claim_lease_seconds,
                 claim_heartbeat_seconds=claim_heartbeat_seconds,
                 max_claim_attempts=max_claim_attempts,
+                quarantine_projection_mode=quarantine_projection_mode,
             )
         resumed: list[str] = []
         completed: list[str] = []
@@ -1477,6 +1487,7 @@ def run_source_slot_scheduler(
                     receipt_root=receipt_root,
                     python=python.resolve(),
                     resources=resources,
+                    quarantine_projection_mode=quarantine_projection_mode,
                 )
                 environment = os.environ.copy()
                 environment.update(
@@ -1620,6 +1631,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--claim-lease-seconds", type=int, default=900)
     parser.add_argument("--claim-heartbeat-seconds", type=int, default=120)
     parser.add_argument("--max-claim-attempts", type=int, default=100)
+    parser.add_argument(
+        "--quarantine-projection-mode",
+        default=QUARANTINE_PROJECTION_MODE_OFF,
+    )
     args = parser.parse_args(argv)
     try:
         run_source_slot_scheduler(
@@ -1645,6 +1660,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             claim_lease_seconds=args.claim_lease_seconds,
             claim_heartbeat_seconds=args.claim_heartbeat_seconds,
             max_claim_attempts=args.max_claim_attempts,
+            quarantine_projection_mode=args.quarantine_projection_mode,
         )
     except TransientTransportError as exc:
         parser.exit(75, f"distributed source slot scheduler transient failure: {exc}\n")

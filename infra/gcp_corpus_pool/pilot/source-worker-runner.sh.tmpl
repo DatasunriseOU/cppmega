@@ -275,6 +275,7 @@ python3 "$repo_root/scripts/distributed_data_prep/source_slot_scheduler.py" \
   --python /usr/bin/python3 \
   --source-worker "$repo_root/scripts/distributed_data_prep/source_worker.py" \
   --dynamic-queue \
+  --quarantine-projection-mode pinned_source_tree_v1 \
   --scheduler-instance "$worker_name.$BOOT_ID"
 
 receipt_count="$(jq -er '.source_receipt_count' "$scheduler_receipt")"

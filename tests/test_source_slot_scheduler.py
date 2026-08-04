@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import subprocess
 import sys
@@ -41,10 +42,12 @@ from scripts.distributed_data_prep.source_slot_scheduler import (
 from scripts.distributed_data_prep.source_worker import (
     ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
     LocalObjectStore,
+    PINNED_TREE_PROJECTION_MODE,
     TransientTransportError,
     _load_completed_assignment,
     assignment_completion_uri,
     validate_assignment_completion_receipt,
+    validate_worker_receipt,
 )
 
 
@@ -200,6 +203,78 @@ def _publish_worker_completion(
     pointer_path = root / f"{job['assignment_sha256']}.complete.json"
     atomic_write_json(pointer_path, pointer)
     store.publish_if_absent(pointer_path, assignment_completion_uri(manifest, job))
+
+
+def test_worker_projection_artifact_and_scheduler_command_are_namespace_bound(
+    tmp_path: Path,
+) -> None:
+    manifest, manifest_file_sha = _manifest()
+    job = manifest["repositories"][0]
+    assert isinstance(job, dict)
+    receipt = _worker_receipt(manifest, manifest_file_sha, job)
+    projection_sha = "b" * 64
+    stem = f"{int(job['ordinal']):05d}-{job['repo']}"
+    receipt["quarantine_projection_artifact"] = {
+        "uri": gcs_join(
+            str(manifest["gcs_output_prefix"]),
+            "source-quarantine-projections",
+            str(manifest["manifest_sha256"]),
+            stem,
+            f"{projection_sha}.projection.json",
+        ),
+        "generation": "1",
+        "size_bytes": 7,
+        "crc32c": None,
+        "md5_hash": None,
+        "sha256": projection_sha,
+    }
+    assert validate_worker_receipt(receipt, manifest=manifest, job=job) == receipt
+
+    escaped = copy.deepcopy(receipt)
+    escaped["quarantine_projection_artifact"]["uri"] = (
+        "gs://other-bucket/projection.json"
+    )
+    with pytest.raises(ContractError, match="projection artifact URI"):
+        validate_worker_receipt(escaped, manifest=manifest, job=job)
+
+    command = scheduler_module._build_worker_command(
+        source_worker=tmp_path / "source-worker.py",
+        manifest=tmp_path / "manifest.json",
+        spec=SlotSpec(0, 1, 1, 0, "worker-0000"),
+        repo_root=tmp_path / "repo",
+        scratch_root=tmp_path / "scratch",
+        receipt_root=tmp_path / "receipts",
+        python=Path(sys.executable),
+        resources={"parse_workers_per_slot": 1, "memory_limit_gb_per_slot": 1.0},
+        quarantine_projection_mode=PINNED_TREE_PROJECTION_MODE,
+    )
+    mode_index = command.index("--quarantine-projection-mode")
+    assert command[mode_index + 1] == PINNED_TREE_PROJECTION_MODE
+
+
+def test_gcp_overlay_and_runner_ship_pinned_projection_support(
+    tmp_path: Path,
+) -> None:
+    from scripts.prepare_gcp_source_pilot import _build_overlay
+
+    repo_root = Path(__file__).parents[1]
+    overlay = tmp_path / "distributed-data-prep.tar.zst"
+    _build_overlay(repo_root, overlay)
+    tar_bytes = subprocess.run(
+        ["zstd", "-dc", "--", str(overlay)],
+        check=True,
+        capture_output=True,
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+        names = set(archive.getnames())
+    assert (
+        "scripts/distributed_data_prep/source_quarantine_projection.py" in names
+    )
+
+    runner = (
+        repo_root / "infra/gcp_corpus_pool/pilot/source-worker-runner.sh.tmpl"
+    ).read_text(encoding="utf-8")
+    assert "--quarantine-projection-mode pinned_source_tree_v1" in runner
 
 
 def test_slot_topology_is_contiguous_and_manifest_bound() -> None:

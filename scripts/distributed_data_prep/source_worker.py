@@ -53,6 +53,10 @@ from scripts.distributed_data_prep.source_manifest import (  # noqa: E402
     repositories_for_worker,
     validate_source_manifest,
 )
+from scripts.distributed_data_prep.source_quarantine_projection import (  # noqa: E402
+    PINNED_TREE_PROJECTION_MODE,
+    build_pinned_tree_quarantine_projection,
+)
 
 SOURCE_WORKER_RECEIPT_SCHEMA = "cppmega.distributed_source_worker_receipt_v2"
 ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA = (
@@ -106,6 +110,10 @@ _NONRETRYABLE_GIT_MARKERS = (
     "not found",
     "permission denied",
     "repository not found",
+)
+QUARANTINE_PROJECTION_MODE_OFF = "off"
+_QUARANTINE_PROJECTION_MODES = frozenset(
+    {QUARANTINE_PROJECTION_MODE_OFF, PINNED_TREE_PROJECTION_MODE}
 )
 
 
@@ -1332,23 +1340,23 @@ def validate_worker_receipt(
     job: Mapping[str, object],
 ) -> dict[str, object]:
     value = dict(receipt)
-    require_exact_fields(
-        value,
-        {
-            "schema",
-            "status",
-            "manifest_sha256",
-            "manifest_file_sha256",
-            "assignment",
-            "source_snapshot",
-            "candidate",
-            "artifact",
-            "quarantine_artifact",
-            "indexer",
-            "training_ready",
-        },
-        where="source worker receipt",
-    )
+    expected_fields = {
+        "schema",
+        "status",
+        "manifest_sha256",
+        "manifest_file_sha256",
+        "assignment",
+        "source_snapshot",
+        "candidate",
+        "artifact",
+        "quarantine_artifact",
+        "indexer",
+        "training_ready",
+    }
+    has_projection = "quarantine_projection_artifact" in value
+    if has_projection:
+        expected_fields.add("quarantine_projection_artifact")
+    require_exact_fields(value, expected_fields, where="source worker receipt")
     if value["schema"] != SOURCE_WORKER_RECEIPT_SCHEMA or value["status"] != "complete":
         raise ContractError("source worker receipt schema/status is unsupported")
     if value["manifest_sha256"] != manifest["manifest_sha256"]:
@@ -1466,6 +1474,44 @@ def validate_worker_receipt(
     )
     if indexer.get("quarantine_receipt_sha256") != quarantine_sha256:
         raise ContractError("indexer quarantine receipt publication drifted")
+    if has_projection:
+        projection_artifact = value["quarantine_projection_artifact"]
+        if not isinstance(projection_artifact, Mapping):
+            raise ContractError(
+                "source worker quarantine projection artifact receipt is missing"
+            )
+        require_exact_fields(
+            projection_artifact,
+            {"uri", "generation", "size_bytes", "crc32c", "md5_hash", "sha256"},
+            where="source worker quarantine projection artifact",
+        )
+        projection_sha256 = require_sha256(
+            projection_artifact.get("sha256"),
+            where="quarantine projection artifact sha256",
+        )
+        projection_uri = validate_gcs_uri(
+            projection_artifact.get("uri"),
+            where="quarantine projection artifact URI",
+        )
+        expected_projection_uri = gcs_join(
+            str(manifest["gcs_output_prefix"]),
+            "source-quarantine-projections",
+            str(manifest["manifest_sha256"]),
+            f"{int(job['ordinal']):05d}-{job['repo']}",
+            f"{projection_sha256}.projection.json",
+        )
+        if projection_uri != expected_projection_uri:
+            raise ContractError(
+                "quarantine projection artifact URI escaped its manifest namespace"
+            )
+        projection_generation = str(projection_artifact.get("generation", ""))
+        if not projection_generation.isdecimal() or int(projection_generation) < 1:
+            raise ContractError("quarantine projection artifact generation is invalid")
+        require_int(
+            projection_artifact.get("size_bytes"),
+            where="quarantine projection artifact size",
+            minimum=1,
+        )
     return value
 
 
@@ -1734,6 +1780,7 @@ def run_source_worker(
     memory_limit_gb: float = 14.0,
     max_tokens: int | None = None,
     assignment_sha256: str | None = None,
+    quarantine_projection_mode: str = QUARANTINE_PROJECTION_MODE_OFF,
 ) -> tuple[dict[str, object], ...]:
     """Run one selected assignment or every assignment owned by a worker."""
 
@@ -1752,6 +1799,11 @@ def run_source_worker(
         raise ContractError("worker max_tokens drifted from the source manifest")
     if parse_workers < 1 or memory_limit_gb <= 0:
         raise ValueError("worker resource/index limits must be positive")
+    if quarantine_projection_mode not in _QUARANTINE_PROJECTION_MODES:
+        raise ValueError(
+            "unsupported quarantine projection mode: "
+            f"{quarantine_projection_mode!r}"
+        )
     jobs = repositories_for_worker(plan, worker)
     if assignment_sha256 is not None:
         selected_sha256 = require_sha256(
@@ -1800,6 +1852,20 @@ def run_source_worker(
             else:  # validate_source_manifest already rejects this.
                 raise ContractError(f"unsupported source kind: {source['kind']}")
 
+            effective_quarantine_manifest = quarantine_manifest
+            projection_receipt_path: Path | None = None
+            if quarantine_projection_mode == PINNED_TREE_PROJECTION_MODE:
+                effective_quarantine_manifest = scratch / "projected-quarantine.json"
+                projection_receipt_path = scratch / "quarantine-projection.json"
+                build_pinned_tree_quarantine_projection(
+                    base_manifest_path=quarantine_manifest,
+                    source_root=checkout,
+                    project_id=str(job["project_id"]),
+                    source_snapshot=source_snapshot,
+                    projected_manifest_path=effective_quarantine_manifest,
+                    receipt_path=projection_receipt_path,
+                )
+
             raw_output = scratch / "pre-global.enriched.jsonl"
             quarantine_receipt = scratch / "source-quarantine-receipt.json"
             indexer_receipt = _run_indexer(
@@ -1808,7 +1874,7 @@ def run_source_worker(
                 source_root=checkout,
                 project_id=str(job["project_id"]),
                 raw_output=raw_output,
-                quarantine_manifest=quarantine_manifest,
+                quarantine_manifest=effective_quarantine_manifest,
                 quarantine_receipt=quarantine_receipt,
                 parse_workers=parse_workers,
                 memory_limit_gb=memory_limit_gb,
@@ -1817,13 +1883,47 @@ def run_source_worker(
             validated_quarantine = validate_quarantine_receipt_file(
                 quarantine_receipt,
                 project_id=str(job["project_id"]),
-                manifest_sha256=str(pipeline["quarantine_manifest_sha256"]),
+                manifest_sha256=sha256_file(effective_quarantine_manifest),
             )
             if (
                 validated_quarantine["receipt_sha256"]
                 != indexer_receipt["quarantine_receipt_sha256"]
             ):
                 raise ContractError("indexer quarantine receipt digest drifted")
+            projection_artifact: dict[str, object] | None = None
+            if projection_receipt_path is not None:
+                projection_sha256 = sha256_file(projection_receipt_path)
+                projection_uri = gcs_join(
+                    str(plan["gcs_output_prefix"]),
+                    "source-quarantine-projections",
+                    str(plan["manifest_sha256"]),
+                    f"{int(job['ordinal']):05d}-{job['repo']}",
+                    f"{projection_sha256}.projection.json",
+                )
+                projection_artifact = dict(
+                    object_store.publish_if_absent(
+                        projection_receipt_path,
+                        projection_uri,
+                    )
+                )
+                projection_generation = str(projection_artifact.get("generation", ""))
+                projection_verified = scratch / "published-projection.verify"
+                projection_metadata = object_store.download(
+                    projection_uri,
+                    projection_verified,
+                    generation=projection_generation,
+                )
+                if (
+                    str(projection_metadata.get("generation")) != projection_generation
+                    or projection_verified.stat().st_size
+                    != projection_receipt_path.stat().st_size
+                    or sha256_file(projection_verified) != projection_sha256
+                ):
+                    raise ContractError(
+                        "published quarantine projection content verification failed"
+                    )
+                projection_verified.unlink()
+                projection_artifact["sha256"] = projection_sha256
             canonical_output = scratch / "canonical.enriched.jsonl"
             candidate = canonicalize_enriched_jsonl(
                 raw_output,
@@ -1917,6 +2017,8 @@ def run_source_worker(
                 "indexer": indexer_receipt,
                 "training_ready": False,
             }
+            if projection_artifact is not None:
+                receipt["quarantine_projection_artifact"] = projection_artifact
             validate_worker_receipt(receipt, manifest=plan, job=job)
             local_receipt = receipt_root / f"{int(job['ordinal']):05d}-{job['repo']}.json"
             atomic_write_json(local_receipt, receipt)
@@ -1961,6 +2063,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--memory-limit-gb", type=float, default=14.0)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--assignment-sha256")
+    parser.add_argument(
+        "--quarantine-projection-mode",
+        choices=sorted(_QUARANTINE_PROJECTION_MODES),
+        default=QUARANTINE_PROJECTION_MODE_OFF,
+    )
     args = parser.parse_args(argv)
     try:
         manifest, raw_sha256 = load_source_manifest(args.manifest)
@@ -1986,6 +2093,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             memory_limit_gb=args.memory_limit_gb,
             max_tokens=args.max_tokens,
             assignment_sha256=args.assignment_sha256,
+            quarantine_projection_mode=args.quarantine_projection_mode,
         )
     except TransientTransportError as exc:
         parser.exit(75, f"distributed source worker transient transport failure: {exc}\n")
@@ -2002,6 +2110,8 @@ __all__ = [
     "ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA",
     "CANONICAL_DOCUMENT_ORDER",
     "GcloudObjectStore",
+    "PINNED_TREE_PROJECTION_MODE",
+    "QUARANTINE_PROJECTION_MODE_OFF",
     "LocalObjectStore",
     "ObjectStore",
     "SOURCE_WORKER_RECEIPT_SCHEMA",

@@ -26,6 +26,9 @@ from scripts.distributed_data_prep.source_reducer import (
     load_worker_receipts,
     reduce_source_candidates,
 )
+from scripts.distributed_data_prep.source_quarantine_projection import (
+    build_pinned_tree_quarantine_projection,
+)
 from scripts.distributed_data_prep.source_worker import (
     CANONICAL_DOCUMENT_ORDER,
     LocalObjectStore,
@@ -247,22 +250,59 @@ class _SqliteExactDedup:
         self.connection.close()
 
 
-def _reducer_fixture(tmp_path: Path):
+def _reducer_fixture(tmp_path: Path, *, with_projection: bool = False):
     source_sha = "3" * 64
-    repositories = [
-        {
-            "repo": "project",
-            "project_id": "owner/project",
-            "source": {
-                "kind": "immutable_gcs_tar",
-                "uri": "gs://snapshots/project.tar.zst",
-                "generation": "7",
-                "sha256": source_sha,
-                "archive_format": "tar.zst",
-                "strip_components": 1,
+    base_quarantine_sha256 = "6" * 64
+    source_root: Path | None = None
+    base_quarantine: Path | None = None
+    if with_projection:
+        payload = (
+            '<?xml version="1.0" encoding="utf-16"?>\r\n'
+            "<license><name>fixture</name></license>\r\n"
+        ).encode("utf-16")
+        source_root = tmp_path / "projection-checkout"
+        present = source_root / "sdk/present.cc"
+        present.parent.mkdir(parents=True)
+        present.write_bytes(payload)
+        base_quarantine = tmp_path / "base-quarantine.json"
+        entries = []
+        for relative_path in ("sdk/present.cc", "sdk/removed.cc"):
+            entries.append(
+                {
+                    "project_id": "owner/project",
+                    "relative_path": relative_path,
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "classification": "mislabeled_non_cpp",
+                    "detected_format": "xml_utf16le",
+                    "reason": "exact projection fixture",
+                }
+            )
+        atomic_write_json(
+            base_quarantine,
+            {
+                "schema": "cppmega.source_quarantine_manifest_v2",
+                "entries": entries,
+                "collections": [],
             },
+        )
+        base_quarantine_sha256 = sha256_file(base_quarantine)
+        source = {
+            "kind": "git_mirror",
+            "remote_url": "https://github.com/owner/project.git",
+            "expected_commit": "a" * 40,
+            "expected_tree": "b" * 40,
         }
-    ]
+    else:
+        source = {
+            "kind": "immutable_gcs_tar",
+            "uri": "gs://snapshots/project.tar.zst",
+            "generation": "7",
+            "sha256": source_sha,
+            "archive_format": "tar.zst",
+            "strip_components": 1,
+        }
+    repositories = [{"repo": "project", "project_id": "owner/project", "source": source}]
     tokenizer = tmp_path / "tokenizer.json"
     tokenizer.write_text("{}\n", encoding="utf-8")
     manifest = build_source_manifest(
@@ -272,7 +312,7 @@ def _reducer_fixture(tmp_path: Path):
         code_revision="4" * 40,
         indexer_sha256="5" * 64,
         tokenizer_sha256=sha256_file(tokenizer),
-        quarantine_manifest_sha256="6" * 64,
+        quarantine_manifest_sha256=base_quarantine_sha256,
     )
     manifest_file_sha = "7" * 64
     raw = tmp_path / "candidate.jsonl"
@@ -298,11 +338,60 @@ def _reducer_fixture(tmp_path: Path):
         f"{compression['sha256']}.jsonl.zst",
     )
     published = dict(store.publish_if_absent(compressed, artifact_uri))
+    if with_projection:
+        assert source_root is not None
+        assert base_quarantine is not None
+        source_snapshot = {
+            "kind": "git_mirror",
+            "remote_url": source["remote_url"],
+            "expected_commit": source["expected_commit"],
+            "resolved_commit": source["expected_commit"],
+            "tree": source["expected_tree"],
+            "head_ref": "refs/heads/main",
+            "head_commit": source["expected_commit"],
+            "refs": {"count": 1, "sha256": "8" * 64},
+            "objects": {
+                "count": 3,
+                "logical_bytes": 1,
+                "types": {"blob": 1, "commit": 1, "tree": 1},
+                "inventory_sha256": "9" * 64,
+            },
+            "gitlink_count": 0,
+            "fsck": "ok",
+        }
+        projected_manifest = tmp_path / "projected-quarantine.json"
+        projection_path = tmp_path / "source-quarantine-projection.json"
+        projection = build_pinned_tree_quarantine_projection(
+            base_manifest_path=base_quarantine,
+            source_root=source_root,
+            project_id="owner/project",
+            source_snapshot=source_snapshot,
+            projected_manifest_path=projected_manifest,
+            receipt_path=projection_path,
+        )
+        effective_quarantine_sha256 = str(projection["projected_manifest"]["sha256"])
+    else:
+        source_snapshot = {
+            "kind": "immutable_gcs_tar",
+            "object": {
+                "uri": repositories[0]["source"]["uri"],
+                "generation": repositories[0]["source"]["generation"],
+                "sha256": source_sha,
+                "size_bytes": 1,
+            },
+            "archive_format": "tar.zst",
+            "strip_components": 1,
+            "file_count": 1,
+            "extracted_bytes": 1,
+        }
+        projection_path = None
+        projection = None
+        effective_quarantine_sha256 = base_quarantine_sha256
     quarantine = {
         "schema": "cppmega.source_quarantine_receipt_v1",
         "project_id": "owner/project",
         "manifest_path": "/fixture/source_quarantine_manifest.json",
-        "manifest_sha256": "6" * 64,
+        "manifest_sha256": effective_quarantine_sha256,
         "manifest_entry_count": 0,
         "project_manifest_entry_count": 0,
         "candidate_count_before_quarantine": 3,
@@ -346,19 +435,7 @@ def _reducer_fixture(tmp_path: Path):
                 "assignment_sha256",
             )
         },
-        "source_snapshot": {
-            "kind": "immutable_gcs_tar",
-            "object": {
-                "uri": repositories[0]["source"]["uri"],
-                "generation": repositories[0]["source"]["generation"],
-                "sha256": source_sha,
-                "size_bytes": 1,
-            },
-            "archive_format": "tar.zst",
-            "strip_components": 1,
-            "file_count": 1,
-            "extracted_bytes": 1,
-        },
+        "source_snapshot": source_snapshot,
         "candidate": candidate,
         "artifact": {
             **published,
@@ -384,6 +461,24 @@ def _reducer_fixture(tmp_path: Path):
         },
         "training_ready": False,
     }
+    if with_projection:
+        assert projection_path is not None
+        assert projection is not None
+        projection_sha256 = sha256_file(projection_path)
+        projection_uri = gcs_join(
+            str(manifest["gcs_output_prefix"]),
+            "source-quarantine-projections",
+            str(manifest["manifest_sha256"]),
+            "00000-project",
+            f"{projection_sha256}.projection.json",
+        )
+        published_projection = dict(
+            store.publish_if_absent(projection_path, projection_uri)
+        )
+        receipt["quarantine_projection_artifact"] = {
+            **published_projection,
+            "sha256": projection_sha256,
+        }
     receipt_path = tmp_path / "worker-receipt.json"
     atomic_write_json(receipt_path, receipt)
     return manifest, manifest_file_sha, tokenizer, store, receipt_path
@@ -433,6 +528,33 @@ def test_reducer_requires_exact_receipt_coverage_and_dedups_before_pack(
     assert not (tmp_path / "reduced" / "global_dedup.sqlite-shm").exists()
     accepted = next((tmp_path / "reduced" / "accepted").glob("*.jsonl.gz"))
     assert accepted.is_file()
+
+
+def test_reducer_readbacks_and_binds_pinned_tree_quarantine_projection(
+    tmp_path: Path,
+) -> None:
+    manifest, manifest_file_sha, tokenizer, store, receipt_path = _reducer_fixture(
+        tmp_path,
+        with_projection=True,
+    )
+
+    receipt = reduce_source_candidates(
+        manifest,
+        [receipt_path],
+        manifest_file_sha256=manifest_file_sha,
+        output_root=tmp_path / "reduced",
+        scratch_root=tmp_path / "scratch",
+        tokenizer_path=tokenizer,
+        object_store=store,
+        dedup_factory=_SqliteExactDedup,
+        tokenizer_factory=lambda _path: _Tokenizer(),
+        pack=False,
+    )
+
+    binding = receipt["worker_receipts"][0]
+    assert binding["quarantine_projection_sha256"]
+    assert binding["quarantine_projection_generation"] == "1"
+    assert len(binding["quarantine_projection_summary_sha256"]) == 64
 
 
 def test_worker_receipt_tampering_is_rejected(tmp_path: Path) -> None:

@@ -68,6 +68,7 @@ def _build_overlay(repo_root: Path, destination: Path) -> None:
         "scripts/distributed_data_prep/__init__.py",
         "scripts/distributed_data_prep/_common.py",
         "scripts/distributed_data_prep/source_manifest.py",
+        "scripts/distributed_data_prep/source_quarantine_projection.py",
         "scripts/distributed_data_prep/source_slot_scheduler.py",
         "scripts/distributed_data_prep/source_work_queue.py",
         "scripts/distributed_data_prep/source_worker.py",
