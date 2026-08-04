@@ -8,6 +8,9 @@ locals {
   worker_names = {
     for index in range(var.worker_count) : format("%s-%02d", var.name_prefix, index) => index
   }
+  worker_zones = {
+    for name in keys(local.worker_names) : name => lookup(var.worker_zones, name, var.zone)
+  }
 }
 
 data "google_compute_network" "corpus" {
@@ -68,14 +71,18 @@ resource "google_compute_instance" "worker" {
 
   project                   = var.project_id
   name                      = "${each.key}-${var.run_id}"
-  zone                      = var.zone
+  zone                      = local.worker_zones[each.key]
   machine_type              = var.machine_type
   allow_stopping_for_update = true
   can_ip_forward            = false
   deletion_protection       = false
   enable_display            = false
-  resource_policies         = var.compact_placement ? [google_compute_resource_policy.compact[0].self_link] : []
-  tags                      = [local.worker_tag]
+  resource_policies = (
+    var.compact_placement && var.attach_compact_placement_policy
+    ? [google_compute_resource_policy.compact[0].self_link]
+    : []
+  )
+  tags = [local.worker_tag]
 
   labels = merge(
     {
@@ -195,13 +202,21 @@ resource "google_compute_instance" "worker" {
     }
 
     precondition {
-      condition     = startswith(var.zone, "${var.region}-")
-      error_message = "zone must belong to region so workers and the canonical bucket remain colocated."
+      condition = (
+        length(setsubtract(toset(keys(var.worker_zones)), toset(keys(local.worker_names)))) == 0 &&
+        alltrue([for zone in values(local.worker_zones) : startswith(zone, "${var.region}-")])
+      )
+      error_message = "worker_zones may name only configured workers and every selected zone must belong to the configured region."
     }
 
     precondition {
       condition     = !var.compact_placement || var.worker_count <= 22
       error_message = "Google compact placement policies support at most 22 instances; disable compact_placement for a larger pool."
+    }
+
+    precondition {
+      condition     = !var.attach_compact_placement_policy || var.compact_placement
+      error_message = "attach_compact_placement_policy requires compact_placement to retain the managed policy."
     }
 
     precondition {

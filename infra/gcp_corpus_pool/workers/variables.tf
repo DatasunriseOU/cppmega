@@ -15,9 +15,15 @@ variable "region" {
 }
 
 variable "zone" {
-  description = "Single worker zone. Keep it in region and near the regional bucket."
+  description = "Default worker zone. worker_zones can override selected workers within the same region."
   type        = string
   default     = "us-central1-a"
+}
+
+variable "worker_zones" {
+  description = "Optional per-worker zone overrides. Keys must be generated worker names and zones must remain in region."
+  type        = map(string)
+  default     = {}
 }
 
 variable "name_prefix" {
@@ -171,7 +177,13 @@ variable "use_spot" {
 }
 
 variable "compact_placement" {
-  description = "Request compact placement for lower worker-to-worker latency. Disable if capacity is scarce."
+  description = "Manage a compact placement policy for this run. Keep true to retain an existing policy in state."
+  type        = bool
+  default     = true
+}
+
+variable "attach_compact_placement_policy" {
+  description = "Attach the managed compact placement policy to new workers. Set false to relieve capacity pressure while retaining the policy in state."
   type        = bool
   default     = true
 }

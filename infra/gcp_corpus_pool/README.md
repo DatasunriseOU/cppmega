@@ -169,6 +169,20 @@ Do not switch an active static run to this scheduler. Finish or explicitly
 adjudicate that run, then build a new content-addressed payload and run ID; this
 prevents dynamic claims from racing static workers that do not publish claims.
 
+### Capacity relief without state deletion
+
+`compact_placement = true` keeps the run-scoped placement policy managed in
+Terraform. When a region cannot allocate a compact group, set
+`attach_compact_placement_policy = false` for a new, reviewed plan. New VMs no
+longer request collocation, while the policy remains in the same state for
+normal teardown. Do not change `compact_placement` to `false` on a partially
+provisioned run: that plans deletion of the retained policy.
+
+`worker_zones` can spread new workers across zones in the same region while
+preserving worker names, static regional IPs, and the immutable logical-worker
+manifest. Keep a selected worker's zone stable once it exists: changing it
+requires replacement and the guarded rollout rejects replacement plans.
+
 Recommended object layout:
 
 ```text
