@@ -326,6 +326,40 @@ def test_exact_quarantine_filters_nul_ff_binary_blob(tmp_path: Path) -> None:
     assert receipt["entries"][0]["detected_format"] == "nul_ff_binary_blob"
 
 
+def test_nul_ff_binary_blob_verification_streams_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"\0" * (1024 * 1024) + b"\xff" * (1024 * 1024)
+    candidate = tmp_path / RELATIVE_NUL_FF_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="nul_ff_binary_blob",
+        relative_path=RELATIVE_NUL_FF_BLOB,
+        reason="binary 0x00/0xff payload stored under a header suffix",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    original_read_bytes = Path.read_bytes
+
+    def reject_candidate_read_bytes(path: Path) -> bytes:
+        if path == candidate:
+            raise AssertionError("nul_ff_binary_blob verification must stream input")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_candidate_read_bytes)
+
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+
+
 @pytest.mark.parametrize(
     "payload",
     [b"", b"\0" * 4, b"\xff" * 4, b"\0\xff\x01"],

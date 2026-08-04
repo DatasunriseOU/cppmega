@@ -351,8 +351,17 @@ def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
 
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
     if entry.detected_format == "nul_ff_binary_blob":
-        payload = path.read_bytes()
-        if not payload or set(payload) != {0x00, 0xFF}:
+        seen_values: set[int] = set()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                values = set(chunk)
+                if not values <= {0x00, 0xFF}:
+                    raise SourceQuarantineError(
+                        f"{entry.relative_path}: declared nul_ff_binary_blob but the "
+                        "payload is not a non-empty mixture of only 0x00 and 0xff bytes"
+                    )
+                seen_values.update(values)
+        if seen_values != {0x00, 0xFF}:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared nul_ff_binary_blob but the "
                 "payload is not a non-empty mixture of only 0x00 and 0xff bytes"

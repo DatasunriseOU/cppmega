@@ -387,12 +387,12 @@ def _decode_euc_tw(payload: bytes, *, path: Path) -> str:
             )
         except OSError as exc:
             raise ValueError(
-                f"cannot run iconv for filename-declared EUC-TW input {path}: {exc}"
+                f"cannot run iconv for path-declared EUC-TW input {path}: {exc}"
             ) from exc
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", errors="replace").strip()[:512]
             raise ValueError(
-                f"invalid filename-declared EUC-TW domain input {path}: {detail}"
+                f"invalid path-declared EUC-TW domain input {path}: {detail}"
             )
         return result.stdout
 
@@ -400,7 +400,7 @@ def _decode_euc_tw(payload: bytes, *, path: Path) -> str:
     text = utf8.decode("utf-8", errors="strict")
     if convert("UTF-8", "EUC-TW", utf8) != payload:
         raise ValueError(
-            f"filename-declared EUC-TW input does not round-trip exactly: {path}"
+            f"path-declared EUC-TW input does not round-trip exactly: {path}"
         )
     return text
 
@@ -414,7 +414,7 @@ def _validate_euc_tw_stream(
 ) -> _ValidatedDomainText:
     if expected_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
         raise ValueError(
-            "filename-declared EUC-TW input exceeds the bounded native iconv "
+            "path-declared EUC-TW input exceeds the bounded native iconv "
             f"decoder limit of {DOMAIN_INPUT_SIZE_LIMIT_BYTES} bytes: {path}"
         )
     stream.seek(0)
@@ -753,7 +753,7 @@ def _validate_domain_stream(
                 )
             except UnicodeDecodeError as declared_exc:
                 raise ValueError(
-                    f"invalid UTF-8 or filename-declared {source_encoding} "
+                    f"invalid UTF-8 or path-declared {source_encoding} "
                     f"domain input {path}: utf-8={utf8_exc}; "
                     f"{source_encoding}={declared_exc}"
                 ) from declared_exc
@@ -865,8 +865,8 @@ def _is_domain_text_integrity_error(exc: ValueError) -> bool:
         or message.startswith("invalid UTF-16")
         or message.startswith("invalid UTF-32")
         or message.startswith("invalid windows-1252")
-        or message.startswith("invalid filename-declared")
-        or message.startswith("filename-declared")
+        or message.startswith("invalid path-declared")
+        or message.startswith("path-declared")
     )
 
 
@@ -1153,7 +1153,7 @@ def decode_domain_prefix(
                     )
                 except UnicodeDecodeError as declared_exc:
                     raise ValueError(
-                        f"invalid UTF-8 or filename-declared {source_encoding} "
+                        f"invalid UTF-8 or path-declared {source_encoding} "
                         f"domain input {path_obj}: utf-8={utf8_exc}; "
                         f"{source_encoding}={declared_exc}"
                     ) from declared_exc
@@ -1268,7 +1268,7 @@ def iter_domain_file_chunks(
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
-    UTF-8, BOM-marked UTF-16/32, filename-declared legacy SQL encodings, and
+    UTF-8, BOM-marked UTF-16/32, path-declared legacy SQL encodings, and
     strict Windows-1252 are decoded without replacement. Syntax-confined
     RowBinary SQL literals and explicit POSIX invalid-byte test sections use a
     one-byte ISO-8859-1 round trip; structural NULs and unmarked invalid shell
