@@ -558,6 +558,56 @@ def _posix_shell_invalid_byte_test_is_byte_preserving(payload: bytes) -> bool:
     return found_invalid_fixture
 
 
+def _posix_shell_gb18030_heredoc_is_byte_preserving(payload: bytes) -> bool:
+    """Recognize shell tests with a filename fixture encoded as GB18030."""
+
+    if (
+        not payload.startswith((b"#!/bin/sh\n", b"#! /bin/sh\n"))
+        or b"\0" in payload
+        or b"--to-code=GB18030" not in payload
+    ):
+        return False
+    lines = payload.splitlines(keepends=True)
+    in_heredoc = False
+    heredoc_lines: list[bytes] = []
+    found_gb18030_fixture = False
+    for line in lines:
+        content = line.rstrip(b"\r\n")
+        if not in_heredoc:
+            try:
+                line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return False
+            if re.fullmatch(rb"cat[ \t]+<<\\EOF(?:[ \t]+.*)?", content):
+                in_heredoc = True
+                heredoc_lines = []
+            continue
+        if content == b"EOF":
+            heredoc = b"".join(heredoc_lines)
+            invalid_utf8_lines: list[bytes] = []
+            for heredoc_line in heredoc_lines:
+                try:
+                    heredoc_line.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    invalid_utf8_lines.append(heredoc_line)
+            if invalid_utf8_lines:
+                if b"charset=GB18030" not in heredoc:
+                    return False
+                for invalid_line in invalid_utf8_lines:
+                    try:
+                        decoded = invalid_line.decode("gb18030", errors="strict")
+                    except UnicodeDecodeError:
+                        return False
+                    if decoded.encode("gb18030", errors="strict") != invalid_line:
+                        return False
+                found_gb18030_fixture = True
+            in_heredoc = False
+            heredoc_lines = []
+            continue
+        heredoc_lines.append(line)
+    return found_gb18030_fixture and not in_heredoc
+
+
 def _validate_byte_preserving_domain_stream(
     stream: BinaryIO,
     *,
@@ -582,6 +632,7 @@ def _validate_byte_preserving_domain_stream(
         suffix == ".sql"
         and _sql_rowbinary_literal_is_byte_preserving(payload)
     )
+    source_encoding = "iso-8859-1"
     if allow_embedded_nul:
         accepted = True
     else:
@@ -589,6 +640,11 @@ def _validate_byte_preserving_domain_stream(
             suffix == ".sh"
             and _posix_shell_invalid_byte_test_is_byte_preserving(payload)
         )
+        if not accepted and _posix_shell_gb18030_heredoc_is_byte_preserving(
+            payload
+        ):
+            accepted = True
+            source_encoding = "mixed-utf-8-gb18030-byte-preserving"
     if not accepted:
         return None
     text = payload.decode("latin-1", errors="strict")
@@ -596,7 +652,7 @@ def _validate_byte_preserving_domain_stream(
         raise ValueError(f"byte-preserving domain input did not round-trip: {path}")
     return _ValidatedDomainText(
         codec="latin-1",
-        source_encoding="iso-8859-1",
+        source_encoding=source_encoding,
         bom=b"",
         signature_text=text[:DOMAIN_SIGNATURE_READ_BYTES],
         trailing_nul_bytes=trailing_nul_bytes,
@@ -2097,7 +2153,16 @@ def discover_project_domain_files(
                 try:
                     prefix_text = decode_domain_prefix(prefix, path=path)
                 except ValueError:
-                    continue
+                    if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+                        continue
+                    try:
+                        validated = _validate_domain_path(
+                            path,
+                            expected_size=source_size,
+                        )
+                    except ValueError:
+                        continue
+                    prefix_text = validated.signature_text
                 prefix_adapter = resolve_domain_parser(path, prefix_text)
                 implicit_typed = prefix_adapter.name != "raw-output"
                 if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES and not implicit_typed:

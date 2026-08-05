@@ -55,6 +55,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "clang_debug_parser_crash_pragma",
     ),
     (
+        "compiler_regression_fixture",
+        "gcc_c_flexible_array_union_initializer_regression",
+    ),
+    (
         "binary_protocol_test_fixture",
         "clickhouse_dollar_quoted_binary_sql",
     ),
@@ -459,6 +463,47 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             )
         return
 
+    if (
+        entry.detected_format
+        == "gcc_c_flexible_array_union_initializer_regression"
+    ):
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "gcc_c_flexible_array_union_initializer_regression but the "
+                f"fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        required_lines = {
+            "/* PR c/119001 */",
+            "/* { dg-do run } */",
+            '/* { dg-options "" } */',
+            "union U { char a[]; int i; };",
+            "union U u = { \"12345\" };",
+            "union U v = { .a = \"6789\" };",
+            "union U w = { { 1, 2, 3, 4, 5, 6 } };",
+            "union U x = { .a = { 7, 8, 9 } };",
+            "union V { int i; char a[]; };",
+            "union V y = { .a = \"abcdefghijk\" };",
+            "union V z = { .a = { 10, 11, 12, 13, 14, 15, 16, 17 } };",
+        }
+        if (
+            path.suffix.casefold() != ".c"
+            or not required_lines.issubset(lines)
+            or decoded.count("__builtin_abort ();") != 6
+            or decoded.count("char a[];") != 2
+            or decoded.count("int\nmain ()\n{") != 1
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "gcc_c_flexible_array_union_initializer_regression but the "
+                "GCC PR119001 DejaGNU run-test contract is incomplete or ambiguous"
+            )
+        return
+
     if entry.detected_format == "clickhouse_dollar_quoted_binary_sql":
         payload = path.read_bytes()
         if path.suffix.casefold() != ".sql" or payload.count(b"$$") != 2:
@@ -488,7 +533,12 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
         )
         error_match = re.fullmatch(
             r"\s*\)\s*;\s*--\s*\{\s*serverError\s+"
-            r"(TOO_LARGE_STRING_SIZE|TOO_LARGE_ARRAY_SIZE|INCORRECT_DATA)"
+            r"(?P<errors>"
+            r"(?:TOO_LARGE_STRING_SIZE|TOO_LARGE_ARRAY_SIZE|INCORRECT_DATA|"
+            r"UNKNOWN_TYPE|CANNOT_READ_ALL_DATA)"
+            r"(?:\s*,\s*(?:TOO_LARGE_STRING_SIZE|TOO_LARGE_ARRAY_SIZE|"
+            r"INCORRECT_DATA|UNKNOWN_TYPE|CANNOT_READ_ALL_DATA))*"
+            r")"
             r"\s*\}\s*",
             decoded_suffix,
         )
@@ -504,11 +554,29 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "but the binary format regression-test contract is incomplete"
             )
         input_format = format_match.group(1).strip("'").casefold()
-        expected_errors = {
+        allowed_errors = {
             "native": {"TOO_LARGE_STRING_SIZE", "TOO_LARGE_ARRAY_SIZE"},
-            "bsoneachrow": {"INCORRECT_DATA"},
+            "bsoneachrow": {
+                "INCORRECT_DATA",
+                "UNKNOWN_TYPE",
+                "CANNOT_READ_ALL_DATA",
+            },
         }
-        if error_match.group(1) not in expected_errors[input_format]:
+        observed_errors = [
+            value.strip() for value in error_match.group("errors").split(",")
+        ]
+        valid_native_errors = (
+            input_format == "native"
+            and len(observed_errors) == 1
+            and observed_errors[0] in allowed_errors[input_format]
+        )
+        valid_bson_errors = (
+            input_format == "bsoneachrow"
+            and observed_errors[0] == "INCORRECT_DATA"
+            and len(observed_errors) == len(set(observed_errors))
+            and set(observed_errors) <= allowed_errors[input_format]
+        )
+        if not (valid_native_errors or valid_bson_errors):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
                 "but its format and expected server error disagree"

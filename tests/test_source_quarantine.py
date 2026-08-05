@@ -32,6 +32,7 @@ CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
 RELATIVE_CLICKHOUSE_BINARY_SQL = "tests/queries/0_stateless/binary_fixture.sql"
+RELATIVE_GCC_PR119001 = "gcc/testsuite/gcc.dg/pr119001-1.c"
 
 
 def _xml_bytes() -> bytes:
@@ -111,6 +112,36 @@ def _clang_parser_crash_fixture_bytes() -> bytes:
         b'// CHECKSH: "-cc1"\n'
         b'// CHECKSH: "-main-file-name" "crash report spaces.c"\n'
         b'// CHECKSH: "crash report spaces-{{[^ ]*}}.c"\n'
+    )
+
+
+def _gcc_pr119001_fixture_bytes() -> bytes:
+    return (
+        b"/* PR c/119001 */\n"
+        b"/* { dg-do run } */\n"
+        b"/* { dg-options \"\" } */\n\n"
+        b"union U { char a[]; int i; };\n"
+        b"union U u = { \"12345\" };\n"
+        b"union U v = { .a = \"6789\" };\n"
+        b"union U w = { { 1, 2, 3, 4, 5, 6 } };\n"
+        b"union U x = { .a = { 7, 8, 9 } };\n"
+        b"union V { int i; char a[]; };\n"
+        b"union V y = { .a = \"abcdefghijk\" };\n"
+        b"union V z = { .a = { 10, 11, 12, 13, 14, 15, 16, 17 } };\n\n"
+        b"int\nmain ()\n{\n"
+        b"  for (int i = 0; i < 6; ++i)\n"
+        b"    if (u.a[i] != \"12345\"[i])\n      __builtin_abort ();\n"
+        b"  for (int i = 0; i < 5; ++i)\n"
+        b"    if (v.a[i] != \"6789\"[i])\n      __builtin_abort ();\n"
+        b"  for (int i = 0; i < 6; ++i)\n"
+        b"    if (w.a[i] != i + 1)\n      __builtin_abort ();\n"
+        b"  for (int i = 0; i < 3; ++i)\n"
+        b"    if (x.a[i] != i + 7)\n      __builtin_abort ();\n"
+        b"  for (int i = 0; i < 12; ++i)\n"
+        b"    if (y.a[i] != \"abcdefghijk\"[i])\n      __builtin_abort ();\n"
+        b"  for (int i = 0; i < 8; ++i)\n"
+        b"    if (z.a[i] != i + 10)\n      __builtin_abort ();\n"
+        b"}\n"
     )
 
 
@@ -418,6 +449,61 @@ def test_exact_quarantine_filters_deliberate_clang_parser_crash_fixture(
     )
 
 
+def test_exact_quarantine_filters_gcc_pr119001_regression_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = _gcc_pr119001_fixture_bytes()
+    candidate = tmp_path / RELATIVE_GCC_PR119001
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="compiler_regression_fixture",
+        detected_format="gcc_c_flexible_array_union_initializer_regression",
+        relative_path=RELATIVE_GCC_PR119001,
+        reason="GCC PR119001 crashes the pinned libclang parser",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == (
+        "compiler_regression_fixture"
+    )
+    assert receipt["entries"][0]["detected_format"] == (
+        "gcc_c_flexible_array_union_initializer_regression"
+    )
+
+
+def test_gcc_pr119001_quarantine_rejects_unrelated_flexible_array_source(
+    tmp_path: Path,
+) -> None:
+    payload = _gcc_pr119001_fixture_bytes().replace(
+        b"/* PR c/119001 */",
+        b"/* unrelated  */",
+    )
+    candidate = tmp_path / RELATIVE_GCC_PR119001
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="compiler_regression_fixture",
+        detected_format="gcc_c_flexible_array_union_initializer_regression",
+        relative_path=RELATIVE_GCC_PR119001,
+        reason="forged GCC regression fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_exact_quarantine_filters_der_x509_certificate_pair(
     tmp_path: Path,
 ) -> None:
@@ -553,6 +639,10 @@ def test_exact_quarantine_filters_self_executing_zip(
     [
         ("Native", "TOO_LARGE_ARRAY_SIZE"),
         ("BSONEachRow", "INCORRECT_DATA"),
+        (
+            "BSONEachRow",
+            "INCORRECT_DATA, UNKNOWN_TYPE, CANNOT_READ_ALL_DATA",
+        ),
     ],
 )
 def test_exact_quarantine_filters_clickhouse_binary_sql_fixture(
@@ -610,6 +700,31 @@ def test_clickhouse_binary_sql_quarantine_rejects_plain_text_fixture(
 
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
     with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_clickhouse_binary_sql_quarantine_rejects_mismatched_error_list(
+    tmp_path: Path,
+) -> None:
+    payload = _clickhouse_binary_sql_bytes(
+        input_format="Native",
+        server_error="TOO_LARGE_ARRAY_SIZE, CANNOT_READ_ALL_DATA",
+    )
+    candidate = tmp_path / RELATIVE_CLICKHOUSE_BINARY_SQL
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="binary_protocol_test_fixture",
+        detected_format="clickhouse_dollar_quoted_binary_sql",
+        relative_path=RELATIVE_CLICKHOUSE_BINARY_SQL,
+        reason="forged ClickHouse error-list fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="expected server error disagree"):
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
@@ -768,6 +883,32 @@ def test_checked_in_minix_parser_crash_manifest_matches_archive_member() -> None
     assert entry["detected_format"] == "clang_debug_parser_crash_pragma"
 
 
+def test_checked_in_gcc_pr119001_manifest_matches_pinned_fixture() -> None:
+    payload = _gcc_pr119001_fixture_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "gcc-mirror/gcc"
+    )
+
+    assert len(payload) == 867
+    assert hashlib.sha256(payload).hexdigest() == (
+        "a01d63621d40ce04f9d95341d6a3931d38da7168eace62765970d8f4f382c178"
+    )
+    assert entry["relative_path"] == RELATIVE_GCC_PR119001
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "compiler_regression_fixture"
+    assert entry["detected_format"] == (
+        "gcc_c_flexible_array_union_initializer_regression"
+    )
+
+
 def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -> None:
     manifest = json.loads(
         (
@@ -818,6 +959,10 @@ def test_checked_in_clickhouse_binary_sql_manifest_matches_diagnosis_receipts() 
         "tests/queries/0_stateless/02683_native_too_large_size.sql": (
             5742,
             "0dd70078b534e164c86d82c27c926573745c186970189914d886aab6aa0259ea",
+        ),
+        "tests/queries/0_stateless/02684_bson.sql": (
+            9071,
+            "52a2ea38b7ee657f6ad8b7c4ce4ca9f652ec032dc5af0415852c6d515b858137",
         ),
         "tests/queries/0_stateless/02685_bson2.sql": (
             21329,
