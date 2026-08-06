@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import subprocess
+import urllib.error
 from pathlib import Path
 from typing import Mapping
 
 import pytest
 
-from scripts.distributed_data_prep._common import atomic_write_json, sha256_file
+from scripts.distributed_data_prep._common import (
+    atomic_write_json,
+    canonical_sha256,
+    sha256_file,
+)
 from scripts.distributed_data_prep.source_manifest import (
     build_source_manifest,
     repositories_for_worker,
@@ -16,6 +22,10 @@ from scripts.distributed_data_prep.source_manifest import (
 from scripts.distributed_data_prep.source_slot_scheduler import (
     SLOT_COMPLETION_RECEIPT_SCHEMA,
     slot_specs,
+)
+from scripts.distributed_data_prep.source_work_queue import (
+    ASSIGNMENT_HEARTBEAT_SCHEMA,
+    assignment_heartbeat_uri,
 )
 from scripts.distributed_data_prep.source_worker import (
     ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
@@ -55,6 +65,7 @@ class FakeRunClient:
         self.serial = b"cppmega-source-worker stopped\n"
         self.serial_calls: list[str] = []
         self.serial_call_zones: list[tuple[str, str]] = []
+        self.batch_calls: list[list[str]] = []
 
     def add_json(
         self,
@@ -87,6 +98,12 @@ class FakeRunClient:
         stored, raw, value = self.objects[str(metadata["uri"])]
         assert stored["generation"] == metadata["generation"]
         return raw, dict(value)
+
+    def read_json_many(
+        self, metadata_rows: list[Mapping[str, object]]
+    ) -> list[tuple[bytes, dict[str, object]]]:
+        self.batch_calls.append([str(row["uri"]) for row in metadata_rows])
+        return [self.read_json(metadata) for metadata in metadata_rows]
 
     def list_instances(
         self, *, project_id: str, run_id: str
@@ -133,24 +150,165 @@ class FailSecondPublishOnceStore:
 
 def test_gcloud_empty_object_pattern_is_an_empty_inventory() -> None:
     def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.CompletedProcess(
-            argv,
-            1,
-            b"",
-            b"ERROR: (gcloud.storage.ls) One or more URLs matched no objects.\n",
-        )
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
 
-    client = GcloudRunClient("gcloud", runner=runner)
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    client = GcloudRunClient(
+        "gcloud", runner=runner, urlopen=lambda *_args, **_kwargs: Response()
+    )
     assert client.list_objects(f"{RUN_ROOT}/control/failed/*.json") == []
 
 
 def test_gcloud_object_listing_does_not_hide_other_exit_one_errors() -> None:
     def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.CompletedProcess(argv, 1, b"", b"permission denied\n")
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
 
-    client = GcloudRunClient("gcloud", runner=runner)
-    with pytest.raises(MonitorError, match="permission denied"):
+    def urlopen(request: object, *, timeout: int) -> object:
+        raise urllib.error.HTTPError(
+            str(request.full_url), 403, "permission denied", {}, None
+        )
+
+    client = GcloudRunClient("gcloud", runner=runner, urlopen=urlopen)
+    with pytest.raises(MonitorError, match="HTTP 403"):
         client.list_objects(f"{RUN_ROOT}/control/failed/*.json")
+
+
+def test_gcloud_object_listing_retries_transient_http_statuses() -> None:
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    calls = 0
+    sleeps: list[float] = []
+
+    def urlopen(request: object, *, timeout: int) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                str(request.full_url), 429, "too many requests", {}, None
+            )
+        return Response()
+
+    client = GcloudRunClient(
+        "gcloud",
+        runner=runner,
+        urlopen=urlopen,
+        sleeper=sleeps.append,
+    )
+    assert client.list_objects(f"{RUN_ROOT}/control/failed/*.json") == []
+    assert calls == 2
+    assert sleeps == [1.0]
+
+
+def test_gcloud_batch_json_read_preserves_generation_and_byte_boundaries() -> None:
+    first = b'{"assignment_sha256":"' + b"a" * 64 + b'"}\n'
+    second = b'{"heartbeat_index":17,"training_ready":false}\n'
+    rows = [
+        {
+            "uri": f"{RUN_ROOT}/first.json",
+            "generation": "101",
+            "size_bytes": len(first),
+        },
+        {
+            "uri": f"{RUN_ROOT}/second.json",
+            "generation": "202",
+            "size_bytes": len(second),
+        },
+    ]
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        assert argv == ["gcloud", "auth", "print-access-token"]
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
+
+    class Response:
+        status = 200
+
+        def __init__(self, raw: bytes) -> None:
+            self.raw = raw
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.raw
+
+    requested: list[str] = []
+
+    def urlopen(request: object, *, timeout: int) -> Response:
+        assert timeout == 180
+        assert request.get_header("Authorization") == "Bearer test-access-token"
+        url = str(request.full_url)
+        requested.append(url)
+        return Response(first if "first.json" in url else second)
+
+    result = GcloudRunClient("gcloud", runner=runner, urlopen=urlopen).read_json_many(
+        rows
+    )
+
+    assert result[0] == (first, {"assignment_sha256": "a" * 64})
+    assert result[1] == (second, {"heartbeat_index": 17, "training_ready": False})
+    assert len(requested) == 2
+    assert any("first.json?alt=media&generation=101" in url for url in requested)
+    assert any("second.json?alt=media&generation=202" in url for url in requested)
+
+
+def test_gcloud_batch_json_read_rejects_boundary_drift() -> None:
+    raw = b'{"training_ready":false}\n'
+    rows = [
+        {
+            "uri": f"{RUN_ROOT}/receipt.json",
+            "generation": "303",
+            "size_bytes": len(raw),
+        }
+    ]
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return raw + b"x"
+
+    def urlopen(_request: object, *, timeout: int) -> Response:
+        assert timeout == 180
+        return Response()
+
+    with pytest.raises(MonitorError, match="generation size drifted"):
+        GcloudRunClient("gcloud", runner=runner, urlopen=urlopen).read_json_many(rows)
 
 
 def test_ready_receipt_requires_the_configured_local_ssd_count(tmp_path: Path) -> None:
@@ -276,43 +434,95 @@ def _add_claim(
     physical_worker_index: int,
     slot_index: int = 0,
     attempt: int = 0,
-) -> None:
+    created_unix_s: int = 10,
+    lease_seconds: int = 900,
+    heartbeat_seconds: int = 120,
+) -> tuple[dict[str, object], str]:
     logical_worker = f"worker-{physical_worker_index * 2 + slot_index:04d}"
     assignment_sha256 = str(job["assignment_sha256"])
-    client.add_json(
+    uri = (
         f"{RUN_ROOT}/source-assignment-claims/{manifest['manifest_sha256']}/"
-        f"{assignment_sha256}/{attempt:04d}.claim.json",
+        f"{assignment_sha256}/{attempt:04d}.claim.json"
+    )
+    claim: dict[str, object] = {
+        "schema": "cppmega.distributed_source_assignment_claim_v1",
+        "status": "claimed",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest_file_sha256": manifest_file_sha256,
+        "assignment": {
+            key: job[key]
+            for key in (
+                "ordinal",
+                "repo",
+                "project_id",
+                "worker",
+                "assignment_sha256",
+            )
+        },
+        "attempt": attempt,
+        "executor": {
+            "physical_worker_index": physical_worker_index,
+            "physical_worker_count": 4,
+            "slots_per_worker": 2,
+            "slot_index": slot_index,
+            "worker": logical_worker,
+        },
+        "scheduler_instance": f"{PHYSICAL_WORKERS[physical_worker_index]}.test",
+        "created_unix_s": created_unix_s,
+        "expires_unix_s": created_unix_s + lease_seconds,
+        "lease_seconds": lease_seconds,
+        "heartbeat_seconds": heartbeat_seconds,
+        "training_ready": False,
+    }
+    client.add_json(
+        uri,
+        claim,
+    )
+    _metadata, raw, _value = client.objects[uri]
+    claim_sha256 = canonical_sha256(claim)
+    assert claim_sha256 != hashlib.sha256(raw).hexdigest()
+    return claim, claim_sha256
+
+
+def _add_heartbeat(
+    client: FakeRunClient,
+    *,
+    manifest: Mapping[str, object],
+    job: Mapping[str, object],
+    claim: Mapping[str, object],
+    claim_sha256: str,
+    heartbeat_index: int,
+    updated: str = "2026-08-04T12:00:00Z",
+) -> str:
+    scheduled = int(claim["created_unix_s"]) + heartbeat_index * int(
+        claim["heartbeat_seconds"]
+    )
+    uri = assignment_heartbeat_uri(
+        manifest,
+        job,
+        int(claim["attempt"]),
+        claim_sha256,
+        heartbeat_index,
+    )
+    client.add_json(
+        uri,
         {
-            "schema": "cppmega.distributed_source_assignment_claim_v1",
-            "status": "claimed",
+            "schema": ASSIGNMENT_HEARTBEAT_SCHEMA,
+            "status": "active",
             "manifest_sha256": manifest["manifest_sha256"],
-            "manifest_file_sha256": manifest_file_sha256,
-            "assignment": {
-                key: job[key]
-                for key in (
-                    "ordinal",
-                    "repo",
-                    "project_id",
-                    "worker",
-                    "assignment_sha256",
-                )
-            },
-            "attempt": attempt,
-            "executor": {
-                "physical_worker_index": physical_worker_index,
-                "physical_worker_count": 4,
-                "slots_per_worker": 2,
-                "slot_index": slot_index,
-                "worker": logical_worker,
-            },
-            "scheduler_instance": f"{PHYSICAL_WORKERS[physical_worker_index]}.test",
-            "created_unix_s": 10,
-            "expires_unix_s": 910,
-            "lease_seconds": 900,
-            "heartbeat_seconds": 120,
+            "assignment_sha256": job["assignment_sha256"],
+            "attempt": claim["attempt"],
+            "claim_sha256": claim_sha256,
+            "executor": claim["executor"],
+            "scheduler_instance": claim["scheduler_instance"],
+            "heartbeat_index": heartbeat_index,
+            "scheduled_unix_s": scheduled,
+            "lease_through_unix_s": scheduled + int(claim["lease_seconds"]),
             "training_ready": False,
         },
+        updated=updated,
     )
+    return uri
 
 
 def _source_receipt_entry(
@@ -328,6 +538,38 @@ def _source_receipt_entry(
         "size_bytes": 100,
         "sha256": "b" * 64,
     }
+
+
+def _add_completion(
+    client: FakeRunClient,
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    job: Mapping[str, object],
+    updated: str = "2026-08-04T12:00:00Z",
+) -> None:
+    client.add_json(
+        assignment_completion_uri(manifest, job),
+        {
+            "schema": ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
+            "status": "complete",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": manifest_file_sha256,
+            "assignment": {
+                key: job[key]
+                for key in (
+                    "ordinal",
+                    "repo",
+                    "project_id",
+                    "worker",
+                    "assignment_sha256",
+                )
+            },
+            "source_receipt": _source_receipt_entry(manifest, job),
+            "training_ready": False,
+        },
+        updated=updated,
+    )
 
 
 def _add_all_completions(
@@ -457,6 +699,7 @@ def test_dynamic_claims_are_counted_by_executor_not_manifest_home_worker(
     assert isinstance(jobs, list)
     job = jobs[0]
     assert job["worker"] == "worker-0000"
+    completion_uri = assignment_completion_uri(manifest, job)
     _add_claim(
         client,
         manifest=manifest,
@@ -465,7 +708,7 @@ def test_dynamic_claims_are_counted_by_executor_not_manifest_home_worker(
         physical_worker_index=1,
     )
     client.add_json(
-        assignment_completion_uri(manifest, job),
+        completion_uri,
         {
             "schema": ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
             "status": "complete",
@@ -501,6 +744,352 @@ def test_dynamic_claims_are_counted_by_executor_not_manifest_home_worker(
     assert result["workers"][0]["claim_receipts"] == 0
     assert result["workers"][1]["claim_receipts"] == 1
     assert result["workers"][1]["completed_claimed_assignments"] == 1
+    assert [completion_uri] in client.batch_calls
+
+
+def test_fresh_exact_assignment_heartbeat_keeps_executor_worker_live(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    config["stale_after_seconds"] = 60
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    first = run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    second = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    assert first["counts"]["assignment_heartbeat_receipts"] == 1
+    assert first["counts"]["fresh_heartbeat_assignments"] == 0
+    worker = second["workers"][1]
+    assert worker["state"] == "running"
+    assert worker["last_progress_at_unix"] == 1930
+    assert worker["fresh_heartbeat_assignments"] == 1
+    assert worker["fresh_assignment_heartbeats"] == [
+        {
+            "repo": job["repo"],
+            "assignment_sha256": job["assignment_sha256"],
+            "attempt": 0,
+            "logical_worker": "worker-0002",
+            "heartbeat_index": 16,
+            "scheduled_unix_s": 1930,
+            "lease_through_unix_s": 2830,
+        }
+    ]
+    assert second["training_ready"] is False
+
+
+def test_current_claim_lease_prevents_a_false_idle_report(tmp_path: Path) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    config["stale_after_seconds"] = 60
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=jobs[0],
+        physical_worker_index=1,
+        created_unix_s=100,
+        lease_seconds=900,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    leased = run_monitor(config, client=client, object_store=store, now=lambda: 500)
+    expired = run_monitor(config, client=client, object_store=store, now=lambda: 1100)
+
+    assert leased["workers"][1]["state"] == "running"
+    assert leased["workers"][1]["current_claimed_assignments"] == 1
+    assert expired["workers"][1]["state"] == "idle_suspected_manual_review"
+
+
+def test_superseded_claim_heartbeat_does_not_keep_executor_worker_live(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+        attempt=1,
+        created_unix_s=50,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    worker = result["workers"][1]
+    assert result["counts"]["assignment_heartbeat_receipts"] == 1
+    assert result["counts"]["fresh_heartbeat_assignments"] == 0
+    assert worker["current_claim_heartbeat_receipts"] == 0
+    assert worker["state"] == "idle_suspected_manual_review"
+
+
+def test_completed_assignment_does_not_make_executor_worker_look_idle(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    _add_completion(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    worker = result["workers"][1]
+    assert result["counts"]["fresh_heartbeat_assignments"] == 0
+    assert worker["current_claim_heartbeat_receipts"] == 0
+    assert worker["current_claimed_assignments"] == 0
+    assert worker["state"] == "running"
+
+
+def test_assignment_heartbeat_uri_is_bound_to_its_exact_index(tmp_path: Path) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    uri = _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    metadata, raw, value = client.objects.pop(uri)
+    wrong_uri = uri.replace("00000016.heartbeat.json", "00000015.heartbeat.json")
+    metadata["uri"] = wrong_uri
+    client.objects[wrong_uri] = (metadata, raw, value)
+
+    with pytest.raises(MonitorError, match="heartbeat URI binding drifted"):
+        run_monitor(
+            config,
+            client=client,
+            object_store=LocalObjectStore(tmp_path / "gcs"),
+            now=lambda: 2000,
+        )
+
+
+def test_cached_assignment_heartbeat_is_rebound_to_the_exact_claim(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    uri = _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+    state_path = Path(str(config["state_path"]))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["validated_receipts"][uri]["summary"]["physical_worker_index"] = 0
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 2100)
+
+    assert result["workers"][0]["fresh_heartbeat_assignments"] == 0
+    assert result["workers"][1]["fresh_heartbeat_assignments"] == 1
+    repaired = json.loads(state_path.read_text(encoding="utf-8"))
+    assert repaired["validated_receipts"][uri]["summary"]["physical_worker_index"] == 1
+
+
+def test_assignment_heartbeat_generation_is_immutable(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    uri = _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+    _metadata, _raw, value = client.objects[uri]
+    value["manifest_sha256"] = "f" * 64
+    client.add_json(uri, value, generation="999")
+
+    with pytest.raises(MonitorError, match="heartbeat receipt generation drifted"):
+        run_monitor(config, client=client, object_store=store, now=lambda: 2100)
+
+
+def test_validated_assignment_completion_cannot_disappear(tmp_path: Path) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    uri = assignment_completion_uri(manifest, job)
+    _add_completion(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    client.objects.pop(uri)
+
+    with pytest.raises(MonitorError, match="assignment receipt disappeared"):
+        run_monitor(config, client=client, object_store=store, now=lambda: 200)
+
+
+def test_fresh_heartbeat_cannot_override_a_later_deterministic_failure(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+        updated="2026-08-04T11:20:00Z",
+    )
+    _add_failure(client, worker_index=1, exit_code=2)
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 2000,
+    )
+
+    worker = result["workers"][1]
+    assert worker["fresh_heartbeat_assignments"] == 1
+    assert worker["state"] == "deterministic_failure_manual_review"
+    assert worker["replacement_permitted"] is False
+    assert result["state"] == "blocked_deterministic"
 
 
 def test_exit_75_is_recoverable_only_after_diagnostics_publication(
@@ -592,6 +1181,33 @@ def test_exit_75_is_not_recoverable_when_diagnostics_publication_fails(
     assert failed["state"] == "transient_failure_recovery_blocked"
     assert failed["replacement_permitted"] is False
     assert "diagnostics upload unavailable" in failed["diagnostics_error"]
+
+
+def test_cached_diagnostics_are_reverified_before_retry_is_permitted(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    _add_failure(client, worker_index=0, exit_code=75)
+    store = LocalObjectStore(tmp_path / "gcs")
+    first = run_monitor(config, client=client, object_store=store, now=lambda: 100)
+
+    second = run_monitor(
+        config,
+        client=client,
+        object_store=FailingObjectStore(),
+        now=lambda: 200,
+    )
+
+    assert first["workers"][0]["replacement_permitted"] is True
+    assert second["workers"][0]["state"] == "transient_failure_recovery_blocked"
+    assert second["workers"][0]["replacement_permitted"] is False
+    assert "diagnostics upload unavailable" in second["workers"][0][
+        "diagnostics_error"
+    ]
+    assert client.serial_calls == [PHYSICAL_WORKERS[0]]
 
 
 def test_diagnostics_receipt_resume_reuses_frozen_serial_snapshot(

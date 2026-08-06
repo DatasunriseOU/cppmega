@@ -11,6 +11,7 @@ GCS object-store transport.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import hashlib
 import json
@@ -19,7 +20,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Protocol, Sequence
@@ -33,6 +38,7 @@ from scripts.distributed_data_prep._common import (  # noqa: E402
     ContractError,
     atomic_write_json,
     canonical_json_bytes,
+    canonical_sha256,
     gcs_join,
     load_json_object,
     require_exact_fields,
@@ -49,6 +55,10 @@ from scripts.distributed_data_prep.source_slot_scheduler import (  # noqa: E402
     slot_specs,
     validate_slot_completion_receipt,
 )
+from scripts.distributed_data_prep.source_work_queue import (  # noqa: E402
+    ASSIGNMENT_CLAIM_SCHEMA,
+    ASSIGNMENT_HEARTBEAT_SCHEMA,
+)
 from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     GcloudObjectStore,
     ObjectStore,
@@ -61,12 +71,16 @@ STATE_SCHEMA = "cppmega.gcp_source_run_monitor_state_v1"
 REPORT_SCHEMA = "cppmega.gcp_source_run_monitor_report_v1"
 TERMINAL_SCHEMA = "cppmega.gcp_source_run_terminal_receipt_v1"
 DIAGNOSTICS_SCHEMA = "cppmega.gcp_source_failure_diagnostics_v1"
-ASSIGNMENT_CLAIM_SCHEMA = "cppmega.distributed_source_assignment_claim_v1"
 TRANSIENT_EXIT_CODE = 75
 DETERMINISTIC_EXIT_CODE = 2
 _WORKER_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
 _ZONE_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
 _CLAIM_FILENAME_RE = re.compile(r"([0-9]{4})\.claim\.json")
+_HEARTBEAT_CLAIM_DIR_RE = re.compile(r"([0-9]{4})-([0-9a-f]{64})")
+_HEARTBEAT_FILENAME_RE = re.compile(r"([0-9]{8})\.heartbeat\.json")
+_JSON_READ_BATCH_SIZE = 1_024
+_JSON_READ_MAX_WORKERS = 64
+_JSON_READ_MAX_RETRIES = 3
 _UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
     re.IGNORECASE,
@@ -75,6 +89,10 @@ _HTTP_429_RE = re.compile(
     r"(?:^|[^0-9])429(?:[^0-9]|$)|too many requests|resource_exhausted",
     re.IGNORECASE,
 )
+
+
+def _is_transient_http_status(status: int) -> bool:
+    return status in {408, 429, 500, 502, 503, 504}
 
 
 class MonitorError(ContractError):
@@ -115,9 +133,15 @@ class GcloudRunClient:
         executable: str = "gcloud",
         *,
         runner: CommandRunner = _default_command_runner,
+        urlopen: Callable[..., object] = urllib.request.urlopen,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.executable = executable
         self.runner = runner
+        self.urlopen = urlopen
+        self.sleeper = sleeper
+        self._cached_access_token: str | None = None
+        self._access_token_lock = threading.Lock()
 
     def _run(self, argv: Sequence[str], *, where: str) -> bytes:
         completed = self.runner([self.executable, *argv])
@@ -128,72 +152,143 @@ class GcloudRunClient:
             )
         return completed.stdout
 
+    def _access_token(self) -> str:
+        with self._access_token_lock:
+            if self._cached_access_token is not None:
+                return self._cached_access_token
+            completed = self.runner([self.executable, "auth", "print-access-token"])
+            if completed.returncode != 0:
+                detail = completed.stderr.decode("utf-8", errors="replace")[-4000:]
+                raise MonitorError(
+                    "GCS monitor access-token request failed with exit "
+                    f"{completed.returncode}: {detail}"
+                )
+            try:
+                token = completed.stdout.decode("ascii", errors="strict").strip()
+            except UnicodeDecodeError as exc:
+                raise MonitorError("GCS monitor access token is invalid") from exc
+            if not token or any(character.isspace() for character in token):
+                raise MonitorError("GCS monitor access token is invalid")
+            self._cached_access_token = token
+            return token
+
+    def _expire_access_token(self, token: str) -> None:
+        with self._access_token_lock:
+            if self._cached_access_token == token:
+                self._cached_access_token = None
+
     def list_objects(self, pattern: str) -> list[dict[str, object]]:
         validate_gcs_uri(
             pattern.replace("**", "object").replace("*", "object"),
             where="GCS list pattern",
         )
-        completed = self.runner([self.executable, "storage", "ls", "--json", pattern])
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", errors="replace")
-            if (
-                completed.returncode == 1
-                and not completed.stdout.strip()
-                and "matched no objects" in detail.lower()
-            ):
-                return []
-            raise MonitorError(
-                f"listing {pattern} failed with exit {completed.returncode}: "
-                f"{detail[-4000:]}"
-            )
-        raw = completed.stdout
-        try:
-            rows = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise MonitorError(
-                f"gcloud returned invalid JSON while listing {pattern}"
-            ) from exc
-        if not isinstance(rows, list):
-            raise MonitorError(f"gcloud returned a non-list inventory for {pattern}")
+        bucket, object_pattern = pattern[len("gs://") :].split("/", 1)
+        wildcard_at = min(
+            (index for index in (object_pattern.find("*"),) if index >= 0),
+            default=len(object_pattern),
+        )
+        prefix = object_pattern[:wildcard_at]
         result: list[dict[str, object]] = []
         seen: set[str] = set()
-        for index, row in enumerate(rows):
-            if not isinstance(row, Mapping) or row.get("type") != "cloud_object":
-                raise MonitorError(f"GCS inventory row {index} is not an object")
-            url = require_nonempty(
-                row.get("url"), where=f"GCS inventory row {index} URL"
+        params = {
+            "prefix": prefix,
+            "maxResults": "1000",
+            "fields": "nextPageToken,items(name,generation,size,updated)",
+        }
+        page_tokens: set[str] = set()
+        while True:
+            endpoint = (
+                "https://storage.googleapis.com/storage/v1/b/"
+                f"{urllib.parse.quote(bucket, safe='')}/o?"
+                + urllib.parse.urlencode(params)
             )
-            metadata = row.get("metadata")
-            if not isinstance(metadata, Mapping):
-                raise MonitorError(f"GCS inventory row {index} has no metadata")
-            generation = str(metadata.get("generation", ""))
-            if not generation.isdecimal() or int(generation) < 1:
-                raise MonitorError(
-                    f"GCS inventory row {index} has an invalid generation"
+            page: Mapping[str, object] | None = None
+            for attempt in range(_JSON_READ_MAX_RETRIES + 1):
+                access_token = self._access_token()
+                try:
+                    request = urllib.request.Request(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+                    with self.urlopen(request, timeout=180) as response:
+                        status = getattr(response, "status", None)
+                        raw = response.read()
+                    if status != 200:
+                        raise MonitorError(
+                            f"GCS inventory returned HTTP {status}: {pattern}"
+                        )
+                    decoded = json.loads(raw)
+                    if not isinstance(decoded, Mapping):
+                        raise MonitorError("GCS inventory page is not an object")
+                    page = decoded
+                    break
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 401 and attempt < _JSON_READ_MAX_RETRIES:
+                        self._expire_access_token(access_token)
+                        continue
+                    if (
+                        not _is_transient_http_status(exc.code)
+                        or attempt >= _JSON_READ_MAX_RETRIES
+                    ):
+                        raise MonitorError(
+                            f"GCS inventory failed with HTTP {exc.code}: {pattern}"
+                        ) from exc
+                except urllib.error.URLError as exc:
+                    if attempt >= _JSON_READ_MAX_RETRIES:
+                        raise MonitorError(
+                            f"GCS inventory transport failed: {pattern}"
+                        ) from exc
+                except json.JSONDecodeError as exc:
+                    raise MonitorError("GCS inventory returned invalid JSON") from exc
+                self.sleeper(float(2**attempt))
+            if page is None:  # pragma: no cover - loop always returns or raises
+                raise AssertionError("unreachable")
+            items = page.get("items", [])
+            if not isinstance(items, list):
+                raise MonitorError("GCS inventory items are invalid")
+            for index, item in enumerate(items):
+                if not isinstance(item, Mapping):
+                    raise MonitorError(f"GCS inventory item {index} is invalid")
+                name = require_nonempty(
+                    item.get("name"), where=f"GCS inventory item {index} name"
                 )
-            suffix = f"#{generation}"
-            if not url.endswith(suffix):
-                raise MonitorError(f"GCS inventory row {index} generation drifted")
-            uri = validate_gcs_uri(
-                url[: -len(suffix)], where=f"GCS inventory row {index} URI"
-            )
-            try:
-                size_bytes = int(metadata.get("size"))
-            except (TypeError, ValueError) as exc:
-                raise MonitorError(
-                    f"GCS inventory row {index} has an invalid size"
-                ) from exc
-            if size_bytes < 1 or uri in seen:
-                raise MonitorError(f"GCS inventory row {index} is empty or duplicated")
-            seen.add(uri)
-            result.append(
-                {
-                    "uri": uri,
-                    "generation": generation,
-                    "size_bytes": size_bytes,
-                    "updated": str(metadata.get("updated", "")),
-                }
-            )
+                uri = validate_gcs_uri(
+                    f"gs://{bucket}/{name}", where=f"GCS inventory item {index} URI"
+                )
+                if not _gcs_pattern_matches(uri, pattern):
+                    continue
+                generation = str(item.get("generation", ""))
+                if not generation.isdecimal() or int(generation) < 1:
+                    raise MonitorError(
+                        f"GCS inventory item {index} has an invalid generation"
+                    )
+                try:
+                    size_bytes = int(item.get("size"))
+                except (TypeError, ValueError) as exc:
+                    raise MonitorError(
+                        f"GCS inventory item {index} has an invalid size"
+                    ) from exc
+                if size_bytes < 1 or uri in seen:
+                    raise MonitorError(
+                        f"GCS inventory item {index} is empty or duplicated"
+                    )
+                seen.add(uri)
+                result.append(
+                    {
+                        "uri": uri,
+                        "generation": generation,
+                        "size_bytes": size_bytes,
+                        "updated": str(item.get("updated", "")),
+                    }
+                )
+            next_page_token = page.get("nextPageToken")
+            if next_page_token is None:
+                break
+            token = require_nonempty(next_page_token, where="GCS inventory page token")
+            if token in page_tokens:
+                raise MonitorError("GCS inventory page token repeated")
+            page_tokens.add(token)
+            params["pageToken"] = token
         return sorted(result, key=lambda item: str(item["uri"]))
 
     def read_json(
@@ -216,6 +311,94 @@ class GcloudRunClient:
         if not isinstance(value, dict):
             raise MonitorError(f"GCS JSON object is not a mapping: {uri}")
         return raw, value
+
+    def read_json_many(
+        self, metadata_rows: Sequence[Mapping[str, object]]
+    ) -> list[tuple[bytes, dict[str, object]]]:
+        """Read a bounded batch through generation-pinned GCS media requests."""
+        rows = list(metadata_rows)
+        if not rows:
+            return []
+        requests: list[tuple[str, str, int, str]] = []
+        for index, metadata in enumerate(rows):
+            uri = validate_gcs_uri(
+                metadata.get("uri"), where=f"GCS JSON batch URI {index}"
+            )
+            generation = str(metadata.get("generation", ""))
+            if not generation.isdecimal() or int(generation) < 1:
+                raise MonitorError(f"GCS JSON batch generation is invalid: {uri}")
+            try:
+                size_bytes = int(metadata["size_bytes"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MonitorError(f"GCS JSON batch size is invalid: {uri}") from exc
+            if size_bytes < 1:
+                raise MonitorError(f"GCS JSON batch object is empty: {uri}")
+            bucket, object_name = uri[len("gs://") :].split("/", 1)
+            endpoint = (
+                "https://storage.googleapis.com/download/storage/v1/b/"
+                f"{urllib.parse.quote(bucket, safe='')}/o/"
+                f"{urllib.parse.quote(object_name, safe='')}?"
+                + urllib.parse.urlencode({"alt": "media", "generation": generation})
+            )
+            requests.append((uri, generation, size_bytes, endpoint))
+        def read_one(request: tuple[str, str, int, str]) -> bytes:
+            uri, generation, size_bytes, endpoint = request
+            for attempt in range(_JSON_READ_MAX_RETRIES + 1):
+                access_token = self._access_token()
+                try:
+                    http_request = urllib.request.Request(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+                    with self.urlopen(http_request, timeout=180) as response:
+                        status = getattr(response, "status", None)
+                        raw = response.read()
+                    if status != 200:
+                        raise MonitorError(
+                            f"GCS JSON generation read returned HTTP {status}: "
+                            f"{uri}#{generation}"
+                        )
+                    if len(raw) != size_bytes:
+                        raise MonitorError(
+                            f"GCS JSON generation size drifted: {uri}#{generation}"
+                        )
+                    return raw
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 401 and attempt < _JSON_READ_MAX_RETRIES:
+                        self._expire_access_token(access_token)
+                        continue
+                    if (
+                        not _is_transient_http_status(exc.code)
+                        or attempt >= _JSON_READ_MAX_RETRIES
+                    ):
+                        raise MonitorError(
+                            f"GCS JSON generation read failed with HTTP {exc.code}: "
+                            f"{uri}#{generation}"
+                        ) from exc
+                except urllib.error.URLError as exc:
+                    if attempt >= _JSON_READ_MAX_RETRIES:
+                        raise MonitorError(
+                            f"GCS JSON generation transport failed: {uri}#{generation}"
+                        ) from exc
+                self.sleeper(float(2**attempt))
+            raise AssertionError("unreachable")
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_JSON_READ_MAX_WORKERS, len(requests))
+        ) as executor:
+            raw_rows = list(executor.map(read_one, requests))
+        result: list[tuple[bytes, dict[str, object]]] = []
+        for index, raw in enumerate(raw_rows):
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise MonitorError(
+                    f"GCS JSON batch object {index} is not valid JSON"
+                ) from exc
+            if not isinstance(value, dict):
+                raise MonitorError(f"GCS JSON batch object {index} is not a mapping")
+            result.append((raw, value))
+        return result
 
     def list_instances(
         self, *, project_id: str, run_id: str
@@ -425,6 +608,59 @@ def _metadata_map(rows: Sequence[Mapping[str, object]]) -> dict[str, dict[str, o
     return result
 
 
+def _require_immutable_inventory(
+    *,
+    kind: str,
+    inventory: Mapping[str, Mapping[str, object]],
+    state: Mapping[str, object],
+) -> None:
+    cache = state["validated_receipts"]
+    assert isinstance(cache, Mapping)
+    missing = sorted(
+        uri
+        for uri, entry in cache.items()
+        if isinstance(uri, str)
+        and isinstance(entry, Mapping)
+        and entry.get("kind") == kind
+        and uri not in inventory
+    )
+    if missing:
+        raise MonitorError(
+            f"previously validated {kind} receipt disappeared: {missing[0]}"
+        )
+
+
+def _gcs_pattern_matches(uri: str, pattern: str) -> bool:
+    sentinel = "\x00"
+    expression = re.escape(pattern)
+    expression = expression.replace(r"\*\*", sentinel)
+    expression = expression.replace(r"\*", "[^/]*")
+    expression = expression.replace(sentinel, ".*")
+    return re.fullmatch(expression, uri) is not None
+
+
+def _read_json_rows(
+    client: RunClient, metadata_rows: Sequence[Mapping[str, object]]
+) -> list[tuple[bytes, dict[str, object]]]:
+    """Read uncached JSON receipts in bounded batches when the client supports it."""
+    rows = list(metadata_rows)
+    if not rows:
+        return []
+    batch_reader = getattr(client, "read_json_many", None)
+    if callable(batch_reader):
+        result: list[tuple[bytes, dict[str, object]]] = []
+        for offset in range(0, len(rows), _JSON_READ_BATCH_SIZE):
+            batch = rows[offset : offset + _JSON_READ_BATCH_SIZE]
+            values = batch_reader(batch)
+            if len(values) != len(batch):
+                raise MonitorError(
+                    "GCS JSON batch reader returned an unexpected object count"
+                )
+            result.extend(values)
+        return result
+    return [client.read_json(metadata) for metadata in rows]
+
+
 def _control_receipt(
     *,
     kind: str,
@@ -631,10 +867,15 @@ def _assignment_claim(
     return {
         "assignment_sha256": assignment_sha256,
         "attempt": attempt,
+        "claim_sha256": canonical_sha256(claim),
         "physical_worker_index": physical_index,
         "logical_worker": executor["worker"],
+        "executor": executor,
+        "scheduler_instance": scheduler_instance,
         "created_unix_s": created,
         "expires_unix_s": expires,
+        "lease_seconds": lease,
+        "heartbeat_seconds": heartbeat,
         "uri": uri,
         "generation": str(metadata["generation"]),
         "updated": metadata.get("updated", ""),
@@ -643,7 +884,12 @@ def _assignment_claim(
 
 
 def _cached_claim_summary(
-    cached: Mapping[str, object], metadata: Mapping[str, object]
+    cached: Mapping[str, object],
+    metadata: Mapping[str, object],
+    *,
+    config: Mapping[str, object],
+    manifest: Mapping[str, object],
+    jobs_by_sha256: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object] | None:
     summary = cached.get("summary")
     if not isinstance(summary, Mapping):
@@ -652,27 +898,327 @@ def _cached_claim_summary(
     expected = {
         "assignment_sha256",
         "attempt",
+        "claim_sha256",
         "physical_worker_index",
         "logical_worker",
+        "executor",
+        "scheduler_instance",
         "created_unix_s",
         "expires_unix_s",
+        "lease_seconds",
+        "heartbeat_seconds",
     }
     if set(value) != expected:
         return None
     try:
-        require_sha256(value["assignment_sha256"], where="cached claim assignment")
-        require_int(value["attempt"], where="cached claim attempt")
-        require_int(
+        assignment_sha256 = require_sha256(
+            value["assignment_sha256"], where="cached claim assignment"
+        )
+        attempt = require_int(value["attempt"], where="cached claim attempt")
+        job = jobs_by_sha256.get(assignment_sha256)
+        if job is None or attempt > 9_999:
+            return None
+        claim_sha256 = require_sha256(
+            value["claim_sha256"], where="cached canonical claim SHA-256"
+        )
+        physical_index = require_int(
             value["physical_worker_index"], where="cached claim physical worker"
         )
-        require_nonempty(value["logical_worker"], where="cached claim logical worker")
-        require_int(value["created_unix_s"], where="cached claim creation", minimum=1)
-        require_int(value["expires_unix_s"], where="cached claim expiry", minimum=1)
+        logical_worker = require_nonempty(
+            value["logical_worker"], where="cached claim logical worker"
+        )
+        if not isinstance(value["executor"], Mapping):
+            return None
+        executor = dict(value["executor"])
+        require_exact_fields(
+            executor,
+            {
+                "physical_worker_index",
+                "physical_worker_count",
+                "slots_per_worker",
+                "slot_index",
+                "worker",
+            },
+            where="cached claim executor",
+        )
+        scheduler_instance = require_nonempty(
+            value["scheduler_instance"], where="cached claim scheduler instance"
+        )
+        created = require_int(
+            value["created_unix_s"], where="cached claim creation", minimum=1
+        )
+        expires = require_int(
+            value["expires_unix_s"], where="cached claim expiry", minimum=1
+        )
+        lease_seconds = require_int(
+            value["lease_seconds"], where="cached claim lease", minimum=1
+        )
+        heartbeat_seconds = require_int(
+            value["heartbeat_seconds"], where="cached claim heartbeat", minimum=1
+        )
+        workers = config["physical_workers"]
+        assert isinstance(workers, list)
+        slots = int(config["slots_per_worker"])
+        slot_index = require_int(executor["slot_index"], where="cached claim slot")
+        expected_logical_worker = f"worker-{physical_index * slots + slot_index:04d}"
+        prefix = (
+            f"{config['run_root']}/source-assignment-claims/"
+            f"{manifest['manifest_sha256']}/"
+        )
+        uri = validate_gcs_uri(metadata.get("uri"), where="cached claim URI")
+        relative = uri[len(prefix) :] if uri.startswith(prefix) else ""
+        parts = relative.split("/")
+        filename_match = (
+            _CLAIM_FILENAME_RE.fullmatch(parts[1]) if len(parts) == 2 else None
+        )
+        if (
+            physical_index >= len(workers)
+            or slot_index >= slots
+            or executor["physical_worker_index"] != physical_index
+            or executor["physical_worker_count"] != len(workers)
+            or executor["slots_per_worker"] != slots
+            or executor["worker"] != logical_worker
+            or logical_worker != expected_logical_worker
+            or len(scheduler_instance) > 256
+            or not scheduler_instance.isascii()
+            or heartbeat_seconds >= lease_seconds
+            or expires != created + lease_seconds
+            or len(parts) != 2
+            or parts[0] != assignment_sha256
+            or filename_match is None
+            or int(filename_match.group(1)) != attempt
+        ):
+            return None
+        expected_claim = {
+            "schema": ASSIGNMENT_CLAIM_SCHEMA,
+            "status": "claimed",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": config["manifest_file_sha256"],
+            "assignment": {
+                key: job[key]
+                for key in (
+                    "ordinal",
+                    "repo",
+                    "project_id",
+                    "worker",
+                    "assignment_sha256",
+                )
+            },
+            "attempt": attempt,
+            "executor": executor,
+            "scheduler_instance": scheduler_instance,
+            "created_unix_s": created,
+            "expires_unix_s": expires,
+            "lease_seconds": lease_seconds,
+            "heartbeat_seconds": heartbeat_seconds,
+            "training_ready": False,
+        }
+        if claim_sha256 != canonical_sha256(expected_claim):
+            return None
     except ContractError:
         return None
     return {
         **value,
+        "executor": executor,
         "uri": metadata["uri"],
+        "generation": str(metadata["generation"]),
+        "updated": metadata.get("updated", ""),
+        "sha256": cached["sha256"],
+    }
+
+
+def _heartbeat_binding(
+    *,
+    assignment_sha256: str,
+    attempt: int,
+    claim_sha256: str,
+    heartbeat_index: int,
+    metadata: Mapping[str, object],
+    config: Mapping[str, object],
+    manifest: Mapping[str, object],
+    claims_by_identity: Mapping[tuple[str, int, str], Mapping[str, object]],
+) -> tuple[Mapping[str, object], int, int, str]:
+    claim = claims_by_identity.get((assignment_sha256, attempt, claim_sha256))
+    if claim is None:
+        raise MonitorError("GCP source assignment heartbeat has no exact claim")
+    scheduled = int(claim["created_unix_s"]) + heartbeat_index * int(
+        claim["heartbeat_seconds"]
+    )
+    lease_through = scheduled + int(claim["lease_seconds"])
+    prefix = (
+        f"{config['run_root']}/source-assignment-heartbeats/"
+        f"{manifest['manifest_sha256']}/"
+    )
+    uri = validate_gcs_uri(metadata.get("uri"), where="assignment heartbeat URI")
+    relative = uri[len(prefix) :] if uri.startswith(prefix) else ""
+    parts = relative.split("/")
+    claim_dir_match = (
+        _HEARTBEAT_CLAIM_DIR_RE.fullmatch(parts[1]) if len(parts) == 3 else None
+    )
+    filename_match = (
+        _HEARTBEAT_FILENAME_RE.fullmatch(parts[2]) if len(parts) == 3 else None
+    )
+    if (
+        len(parts) != 3
+        or parts[0] != assignment_sha256
+        or claim_dir_match is None
+        or int(claim_dir_match.group(1)) != attempt
+        or claim_dir_match.group(2) != claim_sha256
+        or filename_match is None
+        or int(filename_match.group(1)) != heartbeat_index
+    ):
+        raise MonitorError("GCP source assignment heartbeat URI binding drifted")
+    return claim, scheduled, lease_through, uri
+
+
+def _assignment_heartbeat(
+    *,
+    raw: bytes,
+    value: Mapping[str, object],
+    metadata: Mapping[str, object],
+    config: Mapping[str, object],
+    manifest: Mapping[str, object],
+    claims_by_identity: Mapping[tuple[str, int, str], Mapping[str, object]],
+) -> dict[str, object]:
+    heartbeat = dict(value)
+    require_exact_fields(
+        heartbeat,
+        {
+            "schema",
+            "status",
+            "manifest_sha256",
+            "assignment_sha256",
+            "attempt",
+            "claim_sha256",
+            "executor",
+            "scheduler_instance",
+            "heartbeat_index",
+            "scheduled_unix_s",
+            "lease_through_unix_s",
+            "training_ready",
+        },
+        where="GCP source assignment heartbeat",
+    )
+    assignment_sha256 = require_sha256(
+        heartbeat["assignment_sha256"],
+        where="GCP source assignment heartbeat assignment SHA-256",
+    )
+    claim_sha256 = require_sha256(
+        heartbeat["claim_sha256"],
+        where="GCP source assignment heartbeat claim SHA-256",
+    )
+    attempt = require_int(heartbeat["attempt"], where="heartbeat attempt")
+    heartbeat_index = require_int(
+        heartbeat["heartbeat_index"], where="heartbeat index", minimum=1
+    )
+    claim, scheduled, lease_through, uri = _heartbeat_binding(
+        assignment_sha256=assignment_sha256,
+        attempt=attempt,
+        claim_sha256=claim_sha256,
+        heartbeat_index=heartbeat_index,
+        metadata=metadata,
+        config=config,
+        manifest=manifest,
+        claims_by_identity=claims_by_identity,
+    )
+    if (
+        heartbeat["schema"] != ASSIGNMENT_HEARTBEAT_SCHEMA
+        or heartbeat["status"] != "active"
+        or heartbeat["manifest_sha256"] != manifest["manifest_sha256"]
+        or heartbeat["executor"] != claim["executor"]
+        or heartbeat["scheduler_instance"] != claim["scheduler_instance"]
+        or heartbeat["scheduled_unix_s"] != scheduled
+        or heartbeat["lease_through_unix_s"] != lease_through
+        or heartbeat["training_ready"] is not False
+    ):
+        raise MonitorError("GCP source assignment heartbeat binding drifted")
+    return {
+        "assignment_sha256": assignment_sha256,
+        "attempt": attempt,
+        "claim_sha256": claim_sha256,
+        "physical_worker_index": claim["physical_worker_index"],
+        "logical_worker": claim["logical_worker"],
+        "heartbeat_index": heartbeat_index,
+        "scheduled_unix_s": scheduled,
+        "lease_through_unix_s": lease_through,
+        "uri": uri,
+        "generation": str(metadata["generation"]),
+        "updated": metadata.get("updated", ""),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _cached_heartbeat_summary(
+    cached: Mapping[str, object],
+    metadata: Mapping[str, object],
+    *,
+    config: Mapping[str, object],
+    manifest: Mapping[str, object],
+    claims_by_identity: Mapping[tuple[str, int, str], Mapping[str, object]],
+) -> dict[str, object] | None:
+    summary = cached.get("summary")
+    if not isinstance(summary, Mapping):
+        return None
+    value = dict(summary)
+    expected = {
+        "assignment_sha256",
+        "attempt",
+        "claim_sha256",
+        "physical_worker_index",
+        "logical_worker",
+        "heartbeat_index",
+        "scheduled_unix_s",
+        "lease_through_unix_s",
+    }
+    if set(value) != expected:
+        return None
+    try:
+        assignment_sha256 = require_sha256(
+            value["assignment_sha256"], where="cached heartbeat assignment"
+        )
+        attempt = require_int(value["attempt"], where="cached heartbeat attempt")
+        claim_sha256 = require_sha256(
+            value["claim_sha256"], where="cached heartbeat claim"
+        )
+        physical_worker_index = require_int(
+            value["physical_worker_index"], where="cached heartbeat physical worker"
+        )
+        logical_worker = require_nonempty(
+            value["logical_worker"], where="cached heartbeat logical worker"
+        )
+        heartbeat_index = require_int(
+            value["heartbeat_index"], where="cached heartbeat index", minimum=1
+        )
+        scheduled_unix_s = require_int(
+            value["scheduled_unix_s"], where="cached heartbeat schedule", minimum=1
+        )
+        lease_through_unix_s = require_int(
+            value["lease_through_unix_s"],
+            where="cached heartbeat lease-through",
+            minimum=1,
+        )
+        claim, scheduled, lease_through, uri = _heartbeat_binding(
+            assignment_sha256=assignment_sha256,
+            attempt=attempt,
+            claim_sha256=claim_sha256,
+            heartbeat_index=heartbeat_index,
+            metadata=metadata,
+            config=config,
+            manifest=manifest,
+            claims_by_identity=claims_by_identity,
+        )
+        if (
+            physical_worker_index != claim["physical_worker_index"]
+            or logical_worker != claim["logical_worker"]
+            or scheduled_unix_s != scheduled
+            or lease_through_unix_s != lease_through
+        ):
+            return None
+    except ContractError:
+        return None
+    return {
+        **value,
+        "uri": uri,
         "generation": str(metadata["generation"]),
         "updated": metadata.get("updated", ""),
         "sha256": cached["sha256"],
@@ -704,12 +1250,19 @@ def _cached_receipt(
     raw = cache.get(str(metadata["uri"]))
     if not isinstance(raw, Mapping):
         return None
-    if raw.get("kind") != kind or str(raw.get("generation")) != str(
-        metadata["generation"]
-    ):
+    if raw.get("kind") != kind:
         return None
-    sha256 = raw.get("sha256")
-    if not isinstance(sha256, str) or len(sha256) != 64:
+    if str(raw.get("generation")) != str(metadata["generation"]):
+        raise MonitorError(
+            f"immutable {kind} receipt generation drifted: {metadata['uri']}"
+        )
+    if raw.get("size_bytes") != metadata.get("size_bytes"):
+        raise MonitorError(
+            f"immutable {kind} receipt size drifted: {metadata['uri']}"
+        )
+    try:
+        require_sha256(raw.get("sha256"), where=f"cached {kind} SHA-256")
+    except ContractError:
         return None
     return dict(raw)
 
@@ -791,9 +1344,6 @@ def _preserve_diagnostics(
     ).hexdigest()
     diagnostics = state["diagnostics"]
     assert isinstance(diagnostics, dict)
-    cached = diagnostics.get(fingerprint)
-    if isinstance(cached, Mapping) and cached.get("status") == "published":
-        return dict(cached)
     worker = str(failure["worker_name"])
     local_root = (
         _path(config["diagnostics_dir"], where="diagnostics_dir") / worker / fingerprint
@@ -1036,35 +1586,59 @@ def run_monitor(
                 f"{manifest['manifest_sha256']}/*/*.claim.json"
             )
         )
+        _require_immutable_inventory(
+            kind="claim", inventory=claim_inventory, state=state
+        )
         claim_records: list[dict[str, object]] = []
         claim_sha256: list[str] = []
+        uncached_claim_metadata: list[Mapping[str, object]] = []
         claim_summary_fields = (
             "assignment_sha256",
             "attempt",
+            "claim_sha256",
             "physical_worker_index",
             "logical_worker",
+            "executor",
+            "scheduler_instance",
             "created_unix_s",
             "expires_unix_s",
+            "lease_seconds",
+            "heartbeat_seconds",
         )
         for metadata in claim_inventory.values():
             cached = _cached_receipt(kind="claim", metadata=metadata, state=state)
             record = (
-                _cached_claim_summary(cached, metadata) if cached is not None else None
-            )
-            if record is None:
-                raw, value = run_client.read_json(metadata)
-                record = _assignment_claim(
-                    raw=raw,
-                    value=value,
-                    metadata=metadata,
+                _cached_claim_summary(
+                    cached,
+                    metadata,
                     config=checked,
                     manifest=manifest,
                     jobs_by_sha256=jobs_by_sha256,
                 )
-                cached = _remember_receipt(
-                    kind="claim", metadata=metadata, raw=raw, state=state
-                )
-                cached["summary"] = {key: record[key] for key in claim_summary_fields}
+                if cached is not None
+                else None
+            )
+            if record is None:
+                uncached_claim_metadata.append(metadata)
+                continue
+            claim_records.append(record)
+            claim_sha256.append(str(record["sha256"]))
+        for metadata, (raw, value) in zip(
+            uncached_claim_metadata,
+            _read_json_rows(run_client, uncached_claim_metadata),
+        ):
+            record = _assignment_claim(
+                raw=raw,
+                value=value,
+                metadata=metadata,
+                config=checked,
+                manifest=manifest,
+                jobs_by_sha256=jobs_by_sha256,
+            )
+            cached = _remember_receipt(
+                kind="claim", metadata=metadata, raw=raw, state=state
+            )
+            cached["summary"] = {key: record[key] for key in claim_summary_fields}
             claim_records.append(record)
             claim_sha256.append(str(record["sha256"]))
         latest_claims: dict[str, dict[str, object]] = {}
@@ -1081,12 +1655,81 @@ def run_monitor(
                 int(previous["generation"]),
             ):
                 latest_claims[assignment_sha256] = record
+        claims_by_identity = {
+            (
+                str(record["assignment_sha256"]),
+                int(record["attempt"]),
+                str(record["claim_sha256"]),
+            ): record
+            for record in claim_records
+        }
+        heartbeat_inventory = _metadata_map(
+            run_client.list_objects(
+                f"{checked['run_root']}/source-assignment-heartbeats/"
+                f"{manifest['manifest_sha256']}/*/*/*.heartbeat.json"
+            )
+        )
+        _require_immutable_inventory(
+            kind="heartbeat", inventory=heartbeat_inventory, state=state
+        )
+        heartbeat_records: list[dict[str, object]] = []
+        heartbeat_sha256: list[str] = []
+        uncached_heartbeat_metadata: list[Mapping[str, object]] = []
+        heartbeat_summary_fields = (
+            "assignment_sha256",
+            "attempt",
+            "claim_sha256",
+            "physical_worker_index",
+            "logical_worker",
+            "heartbeat_index",
+            "scheduled_unix_s",
+            "lease_through_unix_s",
+        )
+        for metadata in heartbeat_inventory.values():
+            cached = _cached_receipt(kind="heartbeat", metadata=metadata, state=state)
+            record = (
+                _cached_heartbeat_summary(
+                    cached,
+                    metadata,
+                    config=checked,
+                    manifest=manifest,
+                    claims_by_identity=claims_by_identity,
+                )
+                if cached is not None
+                else None
+            )
+            if record is None:
+                uncached_heartbeat_metadata.append(metadata)
+                continue
+            heartbeat_records.append(record)
+            heartbeat_sha256.append(str(record["sha256"]))
+        for metadata, (raw, value) in zip(
+            uncached_heartbeat_metadata,
+            _read_json_rows(run_client, uncached_heartbeat_metadata),
+        ):
+            record = _assignment_heartbeat(
+                raw=raw,
+                value=value,
+                metadata=metadata,
+                config=checked,
+                manifest=manifest,
+                claims_by_identity=claims_by_identity,
+            )
+            cached = _remember_receipt(
+                kind="heartbeat", metadata=metadata, raw=raw, state=state
+            )
+            cached["summary"] = {key: record[key] for key in heartbeat_summary_fields}
+            heartbeat_records.append(record)
+            heartbeat_sha256.append(str(record["sha256"]))
         jobs_by_uri = {assignment_completion_uri(manifest, job): job for job in jobs}
         assignment_inventory = _metadata_map(
             run_client.list_objects(
                 f"{checked['run_root']}/source-assignment-completions/"
                 f"{manifest['manifest_sha256']}/*.complete.json"
             )
+        )
+        _require_immutable_inventory(
+            kind="assignment", inventory=assignment_inventory, state=state
         )
         unexpected_assignments = sorted(set(assignment_inventory) - set(jobs_by_uri))
         if unexpected_assignments:
@@ -1095,23 +1738,73 @@ def run_monitor(
             )
         valid_assignment_uris: set[str] = set()
         assignment_sha256: list[str] = []
+        uncached_assignment_items: list[tuple[str, Mapping[str, object]]] = []
         for uri, metadata in assignment_inventory.items():
             cached = _cached_receipt(kind="assignment", metadata=metadata, state=state)
             if cached is None:
-                raw, value = run_client.read_json(metadata)
-                validate_assignment_completion_receipt(
-                    value,
-                    manifest=manifest,
-                    manifest_file_sha256=str(checked["manifest_file_sha256"]),
-                    job=jobs_by_uri[uri],
-                )
-                cached = _remember_receipt(
-                    kind="assignment", metadata=metadata, raw=raw, state=state
-                )
+                uncached_assignment_items.append((uri, metadata))
+                continue
+            valid_assignment_uris.add(uri)
+            assignment_sha256.append(str(cached["sha256"]))
+        for (uri, metadata), (raw, value) in zip(
+            uncached_assignment_items,
+            _read_json_rows(
+                run_client,
+                [metadata for _uri, metadata in uncached_assignment_items],
+            ),
+        ):
+            validate_assignment_completion_receipt(
+                value,
+                manifest=manifest,
+                manifest_file_sha256=str(checked["manifest_file_sha256"]),
+                job=jobs_by_uri[uri],
+            )
+            cached = _remember_receipt(
+                kind="assignment", metadata=metadata, raw=raw, state=state
+            )
             valid_assignment_uris.add(uri)
             assignment_sha256.append(str(cached["sha256"]))
         completed_assignment_sha256 = {
             str(jobs_by_uri[uri]["assignment_sha256"]) for uri in valid_assignment_uris
+        }
+        current_claims = {
+            assignment_sha256_value: record
+            for assignment_sha256_value, record in latest_claims.items()
+            if assignment_sha256_value not in completed_assignment_sha256
+        }
+        current_heartbeat_records = [
+            record
+            for record in heartbeat_records
+            if (latest_claim := current_claims.get(str(record["assignment_sha256"])))
+            is not None
+            and int(record["attempt"]) == int(latest_claim["attempt"])
+            and str(record["claim_sha256"])
+            == str(latest_claim["claim_sha256"])
+            and int(record["scheduled_unix_s"]) <= checked_at
+        ]
+        latest_current_heartbeats: dict[str, dict[str, object]] = {}
+        for record in current_heartbeat_records:
+            assignment_sha256_value = str(record["assignment_sha256"])
+            previous = latest_current_heartbeats.get(assignment_sha256_value)
+            if previous is None or (
+                int(record["heartbeat_index"]),
+                str(record["updated"]),
+                int(record["generation"]),
+            ) > (
+                int(previous["heartbeat_index"]),
+                str(previous["updated"]),
+                int(previous["generation"]),
+            ):
+                latest_current_heartbeats[assignment_sha256_value] = record
+        fresh_current_heartbeats = {
+            assignment_sha256_value: record
+            for assignment_sha256_value, record in latest_current_heartbeats.items()
+            if checked_at
+            < max(
+                int(record["lease_through_unix_s"]),
+                int(record["scheduled_unix_s"])
+                + int(checked["stale_after_seconds"]),
+            )
         }
 
         specs_by_uri = {
@@ -1129,6 +1822,7 @@ def run_monitor(
                 f"{manifest['manifest_sha256']}/*.complete.json"
             )
         )
+        _require_immutable_inventory(kind="slot", inventory=slot_inventory, state=state)
         unexpected_slots = sorted(set(slot_inventory) - set(specs_by_uri))
         if unexpected_slots:
             raise MonitorError(
@@ -1211,6 +1905,26 @@ def run_monitor(
                 for record in latest_claims.values()
                 if record["physical_worker_index"] == physical_index
             ]
+            worker_current_claims = [
+                record
+                for record in current_claims.values()
+                if record["physical_worker_index"] == physical_index
+            ]
+            worker_heartbeats = [
+                record
+                for record in heartbeat_records
+                if record["physical_worker_index"] == physical_index
+            ]
+            worker_current_heartbeats = [
+                record
+                for record in latest_current_heartbeats.values()
+                if record["physical_worker_index"] == physical_index
+            ]
+            worker_fresh_heartbeats = [
+                record
+                for record in fresh_current_heartbeats.values()
+                if record["physical_worker_index"] == physical_index
+            ]
             completed_claimed_assignments = sum(
                 str(record["assignment_sha256"]) in completed_assignment_sha256
                 for record in worker_latest_claims
@@ -1227,6 +1941,7 @@ def run_monitor(
                     if specs_by_uri[uri].worker in owned_workers
                 ]
                 + worker_claims
+                + worker_current_heartbeats
             )
             latest_progress_event = _latest(progress_events)
             signature = (
@@ -1246,6 +1961,14 @@ def run_monitor(
                     prior.get("progress_at_unix"),
                     where="worker progress time",
                     minimum=0,
+                )
+            if worker_current_heartbeats:
+                progress_at = max(
+                    progress_at,
+                    max(
+                        int(record["scheduled_unix_s"])
+                        for record in worker_current_heartbeats
+                    ),
                 )
             latest_ready = _latest(ready_by_worker[worker])
             latest_failed = _latest(failed_by_worker[worker])
@@ -1291,7 +2014,31 @@ def run_monitor(
                 "assignment_accounting": "manifest_home_shard",
                 "claim_receipts": len(worker_claims),
                 "claimed_assignments": len(worker_latest_claims),
+                "current_claimed_assignments": len(worker_current_claims),
                 "completed_claimed_assignments": completed_claimed_assignments,
+                "heartbeat_receipts": len(worker_heartbeats),
+                "current_claim_heartbeat_receipts": sum(
+                    record["physical_worker_index"] == physical_index
+                    for record in current_heartbeat_records
+                ),
+                "fresh_heartbeat_assignments": len(worker_fresh_heartbeats),
+                "fresh_assignment_heartbeats": [
+                    {
+                        "repo": jobs_by_sha256[str(record["assignment_sha256"])][
+                            "repo"
+                        ],
+                        "assignment_sha256": record["assignment_sha256"],
+                        "attempt": record["attempt"],
+                        "logical_worker": record["logical_worker"],
+                        "heartbeat_index": record["heartbeat_index"],
+                        "scheduled_unix_s": record["scheduled_unix_s"],
+                        "lease_through_unix_s": record["lease_through_unix_s"],
+                    }
+                    for record in sorted(
+                        worker_fresh_heartbeats,
+                        key=lambda item: str(item["assignment_sha256"]),
+                    )
+                ],
                 "slot_receipts": completed_slots,
                 "expected_slots": slots_per_worker,
                 "last_progress_at_unix": progress_at,
@@ -1364,6 +2111,13 @@ def run_monitor(
                 and completed_slots == slots_per_worker
             ):
                 report["state"] = "finalizing"
+            elif claim_records and not worker_current_claims:
+                report["state"] = "running"
+            elif any(
+                int(record["expires_unix_s"]) > checked_at
+                for record in worker_current_claims
+            ) or worker_fresh_heartbeats:
+                report["state"] = "running"
             elif checked_at - progress_at >= int(checked["stale_after_seconds"]):
                 report["state"] = "idle_suspected_manual_review"
             else:
@@ -1383,6 +2137,8 @@ def run_monitor(
             "expected_assignment_receipts": len(jobs),
             "assignment_claim_receipts": len(claim_records),
             "claimed_assignments": len(latest_claims),
+            "assignment_heartbeat_receipts": len(heartbeat_records),
+            "fresh_heartbeat_assignments": len(fresh_current_heartbeats),
             "slot_receipts": len(valid_slot_uris),
             "expected_slot_receipts": len(logical_specs),
         }
@@ -1399,6 +2155,9 @@ def run_monitor(
         ).hexdigest()
         claim_inventory_sha256 = hashlib.sha256(
             canonical_json_bytes(sorted(claim_sha256))
+        ).hexdigest()
+        heartbeat_inventory_sha256 = hashlib.sha256(
+            canonical_json_bytes(sorted(heartbeat_sha256))
         ).hexdigest()
         if counts["completed_workers"] == len(physical_workers):
             run_state = "complete"
@@ -1432,6 +2191,7 @@ def run_monitor(
             "unexpected_instances": unexpected_instances,
             "receipt_inventory_sha256": receipt_inventory_sha256,
             "claim_inventory_sha256": claim_inventory_sha256,
+            "heartbeat_inventory_sha256": heartbeat_inventory_sha256,
             "scheduler_mode": (
                 "dynamic_claim_queue" if claim_records else "manifest_home_shards"
             ),
