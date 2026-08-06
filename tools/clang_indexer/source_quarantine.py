@@ -63,6 +63,8 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "nul_ff_binary_blob"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
+    ("mislabeled_non_cpp", "truncated_utf32be_bom"),
+    ("mislabeled_non_cpp", "big5_shell_heredoc"),
 }
 
 
@@ -354,6 +356,15 @@ def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
 
 
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
+    if entry.detected_format == "truncated_utf32be_bom":
+        payload = path.read_bytes()
+        if payload != b"\x00\x00\xfe":
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared truncated_utf32be_bom but "
+                "the payload is not exactly the three-byte UTF-32BE BOM prefix"
+            )
+        return
+
     if entry.detected_format == "clang_embedded_nul_diagnostic":
         payload = path.read_bytes()
         try:
@@ -613,6 +624,124 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared posix_shell_appended_zip "
                 f"but ZIP CRC validation failed for {first_bad_member!r}"
+            )
+        return
+
+    if entry.detected_format == "big5_shell_heredoc":
+        payload = path.read_bytes()
+        if b"\x00" in payload:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "shell fixture contains a NUL byte"
+            )
+        prefix = (
+            b"#! /bin/sh\n\n"
+            b"# Test conversion from BIG5 to UTF-8.\n\n"
+            b'tmpfiles=""\n'
+            b"trap 'rm -fr $tmpfiles' 1 2 3 15\n\n"
+            b'tmpfiles="$tmpfiles mco-test1.po"\n'
+        )
+        if not payload.startswith(prefix):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "canonical shell preamble is absent"
+            )
+        po_marker = b"cat <<\\EOF > mco-test1.po\n"
+        ok_marker = b"cat <<\\EOF > mco-test1.ok\n"
+        if payload.count(po_marker) != 1 or payload.count(ok_marker) != 1:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "two expected heredoc declarations are not unique"
+            )
+        po_start = payload.index(po_marker) + len(po_marker)
+        po_end = payload.find(b"\nEOF\n", po_start)
+        ok_decl = payload.index(ok_marker)
+        ok_start = ok_decl + len(ok_marker)
+        ok_end = payload.find(b"\nEOF\n", ok_start)
+        if (
+            po_end < 0
+            or ok_end < 0
+            or po_end >= ok_start
+            or payload.count(b"\nEOF\n") != 2
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but heredoc "
+                "boundaries are invalid"
+            )
+        try:
+            po_text = payload[po_start:po_end].decode("big5")
+            ok_text = payload[ok_start:ok_end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but an "
+                f"heredoc payload has invalid encoding: {exc}"
+            ) from exc
+        common_prefix = (
+            '# Chinese translation for GNU gettext messages.\n'
+            '#\n'
+            'msgid ""\n'
+            'msgstr ""\n'
+            '"MIME-Version: 1.0\\n"\n'
+        )
+        common_suffix = (
+            '"Content-Transfer-Encoding: 8bit\\n"\n'
+            '\n'
+            '#: src/msgcmp.c:155 src/msgmerge.c:273\n'
+            'msgid "exactly 2 input files required"\n'
+        )
+        po_contract = (
+            common_prefix
+            + '"Content-Type: text/plain; charset=big5\\n"\n'
+            + common_suffix
+        )
+        ok_contract = (
+            common_prefix
+            + '"Content-Type: text/plain; charset=UTF-8\\n"\n'
+            + common_suffix
+        )
+        if not po_text.startswith(po_contract) or not ok_text.startswith(
+            ok_contract
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "gettext message contract is incomplete"
+            )
+        expected_translation = (
+            'msgstr "\u6b64\u529f\u80fd\u9700\u8981\u6070\u597d'
+            '\u6307\u5b9a\u5169\u500b\u8f38\u5165\u6a94"'
+        )
+        if (
+            not po_text.endswith(expected_translation)
+            or not ok_text.endswith(expected_translation)
+            or not any(byte >= 0x80 for byte in payload[po_start:po_end])
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "BIG5/UTF-8 message bodies do not match"
+            )
+        middle = (
+            b"\ntmpfiles=\"$tmpfiles mco-test1.out\"\n"
+            b": ${MSGCONV=msgconv}\n"
+            b"${MSGCONV} --to-code=UTF-8 -o mco-test1.out mco-test1.po\n"
+            b"test $? = 0 || { rm -fr $tmpfiles; exit 1; }\n\n"
+            b'tmpfiles="$tmpfiles mco-test1.ok"\n'
+        )
+        suffix = (
+            b"\n: ${DIFF=diff}\n"
+            b"# Redirect stdout, so as not to fill the user's screen with "
+            b"non-ASCII bytes.\n"
+            b"${DIFF} mco-test1.ok mco-test1.out >/dev/null\n"
+            b"result=$?\n\n"
+            b"rm -fr $tmpfiles\n\n"
+            b"exit $result\n"
+        )
+        if (
+            payload[po_end + len(b"\nEOF\n") : ok_decl] != middle
+            or not payload.endswith(suffix)
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "conversion and cleanup shell contract is incomplete"
             )
         return
 
