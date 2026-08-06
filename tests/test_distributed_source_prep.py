@@ -305,6 +305,11 @@ def test_git_fsck_exception_receipt_is_pinned_and_tamper_evident() -> None:
 
     validate_git_fsck_snapshot(source, snapshot)
 
+    snapshot["tree"] = "0" * 40
+    with pytest.raises(ContractError, match="checkout tree drifted"):
+        validate_git_fsck_snapshot(source, snapshot)
+
+    snapshot["tree"] = policy["checkout_tree"]
     snapshot["fsck"] = "ok"
     with pytest.raises(ContractError, match="omitted known fsck diagnostic"):
         validate_git_fsck_snapshot(source, snapshot)

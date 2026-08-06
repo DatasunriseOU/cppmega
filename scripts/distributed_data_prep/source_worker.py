@@ -812,18 +812,31 @@ def _git(git_dir: Path, *args: str) -> str:
     return run_checked(["git", f"--git-dir={git_dir}", *args]).stdout.strip()
 
 
-def _matching_git_fsck_exception(
+def _git_fsck_exception_for_source(
     source: Mapping[str, object],
-    checkout_tree: str,
     *,
     known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
 ) -> Mapping[str, object] | None:
     if (
         source.get("remote_url") == known_exception["remote_url"]
         and source.get("expected_commit") == known_exception["expected_commit"]
-        and checkout_tree == known_exception["checkout_tree"]
     ):
         return known_exception
+    return None
+
+
+def _matching_git_fsck_exception(
+    source: Mapping[str, object],
+    checkout_tree: str,
+    *,
+    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+) -> Mapping[str, object] | None:
+    policy = _git_fsck_exception_for_source(
+        source,
+        known_exception=known_exception,
+    )
+    if policy is not None and checkout_tree == policy["checkout_tree"]:
+        return policy
     return None
 
 
@@ -952,12 +965,14 @@ def validate_git_fsck_snapshot(
     """Validate normal fsck success or the one exact historical exception."""
 
     checkout_tree = str(source_snapshot.get("tree", ""))
-    policy = _matching_git_fsck_exception(source, checkout_tree)
+    policy = _git_fsck_exception_for_source(source)
     fsck = source_snapshot.get("fsck")
     if policy is None:
         if fsck != "ok":
             raise ContractError("Git source snapshot has unsupported fsck evidence")
         return
+    if checkout_tree != policy["checkout_tree"]:
+        raise ContractError("Git source snapshot known fsck checkout tree drifted")
     if not isinstance(fsck, Mapping):
         raise ContractError("Git source snapshot omitted known fsck diagnostic evidence")
     expected = _expected_git_fsck_exception_receipt(policy)
