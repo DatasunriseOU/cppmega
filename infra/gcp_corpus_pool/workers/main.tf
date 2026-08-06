@@ -38,7 +38,7 @@ data "google_storage_bucket" "corpus" {
 
 data "google_compute_image" "worker" {
   project = var.image_project
-  family  = var.image_family
+  name    = "debian-12-bookworm-v20260727"
 }
 
 resource "google_compute_resource_policy" "compact" {

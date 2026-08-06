@@ -175,12 +175,6 @@ variable "image_project" {
   default     = "debian-cloud"
 }
 
-variable "image_family" {
-  description = "Boot image family with gVNIC support."
-  type        = string
-  default     = "debian-12"
-}
-
 variable "use_spot" {
   description = "Use interruptible Spot VMs. Safe only when every shard checkpoints to GCS."
   type        = bool
