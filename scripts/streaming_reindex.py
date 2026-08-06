@@ -1728,6 +1728,26 @@ def process_one_repo(
         materialize_stats = read_materialize_stats(tok)
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
+        if int(materialize_stats["docs_out"]) == 0:
+            result = {
+                "source": "code",
+                "artifact_filename": code_output_filename(repo),
+                "repo": repo,
+                "project_id": project_id,
+                "skipped": True,
+                "skip_reason": "no_training_documents",
+                "detail": (
+                    "materializer produced zero training rows from "
+                    f"{materialize_stats['docs_in']} enriched document(s)"
+                ),
+                "lengths": {},
+                "stage_timings_s": timings,
+                "materialize_stats": materialize_stats,
+            }
+            if source_quarantine_receipt is not None:
+                result["source_quarantine_receipt"] = source_quarantine_receipt
+            return result
+
         started = time.monotonic()
         _bucket_for, route_by_fit = _route_by_fit_impl()
         route_dir = work / "routed"
