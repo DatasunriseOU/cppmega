@@ -18,6 +18,7 @@ import http.client
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Protocol, Sequence
 
@@ -36,6 +37,7 @@ if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
         sys.path.insert(0, str(_ROOT))
 
 from scripts.distributed_data_prep._common import (  # noqa: E402
+    MAX_METADATA_BYTES,
     ContractError,
     atomic_write_json,
     canonical_json_bytes,
@@ -72,6 +74,17 @@ STATE_SCHEMA = "cppmega.gcp_source_run_monitor_state_v1"
 REPORT_SCHEMA = "cppmega.gcp_source_run_monitor_report_v1"
 TERMINAL_SCHEMA = "cppmega.gcp_source_run_terminal_receipt_v1"
 DIAGNOSTICS_SCHEMA = "cppmega.gcp_source_failure_diagnostics_v1"
+HEARTBEAT_MEMBERSHIP_SCHEMA = "cppmega.gcp_source_heartbeat_membership_v1"
+HEARTBEAT_LEDGER_SCHEMA = "cppmega.gcp_source_heartbeat_ledger_v1"
+HEARTBEAT_LEDGER_SCHEMA_VERSION = 1
+_LEDGER_META_TABLE_SQL = (
+    "CREATE TABLE ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+)
+_HEARTBEAT_MEMBERS_TABLE_SQL = (
+    "CREATE TABLE heartbeat_members "
+    "(fingerprint TEXT PRIMARY KEY, uri TEXT UNIQUE, "
+    "generation TEXT, size_bytes INTEGER, sha256 TEXT, summary_json TEXT)"
+)
 TRANSIENT_EXIT_CODE = 75
 DETERMINISTIC_EXIT_CODE = 2
 _WORKER_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
@@ -82,6 +95,10 @@ _HEARTBEAT_FILENAME_RE = re.compile(r"([0-9]{8})\.heartbeat\.json")
 _JSON_READ_BATCH_SIZE = 1_024
 _JSON_READ_MAX_WORKERS = 64
 _JSON_READ_MAX_RETRIES = 3
+# One bounded read is allowed to compact a pre-sidecar state written by an
+# older monitor.  Normal state reads and every subsequent write stay at the
+# shared metadata bound.
+_LEGACY_STATE_MIGRATION_MAX_BYTES = 64 * 1024 * 1024
 _UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
     re.IGNORECASE,
@@ -96,6 +113,12 @@ _TRANSIENT_HTTP_TRANSPORT_ERRORS = (
     ConnectionResetError,
     http.client.IncompleteRead,
     http.client.BadStatusLine,
+)
+_TRANSIENT_AUTH_ERROR_RE = re.compile(
+    r"(?:\b(?:408|429|500|502|503|504)\b|too many requests|"
+    r"resource[_ -]?exhausted|temporarily unavailable|timed out|"
+    r"connection (?:reset|refused)|temporary failure)",
+    re.IGNORECASE,
 )
 
 
@@ -164,21 +187,32 @@ class GcloudRunClient:
         with self._access_token_lock:
             if self._cached_access_token is not None:
                 return self._cached_access_token
-            completed = self.runner([self.executable, "auth", "print-access-token"])
-            if completed.returncode != 0:
+            for attempt in range(_JSON_READ_MAX_RETRIES + 1):
+                completed = self.runner([self.executable, "auth", "print-access-token"])
+                if completed.returncode == 0:
+                    try:
+                        token = completed.stdout.decode(
+                            "ascii", errors="strict"
+                        ).strip()
+                    except UnicodeDecodeError as exc:
+                        raise MonitorError(
+                            "GCS monitor access token is invalid"
+                        ) from exc
+                    if not token or any(character.isspace() for character in token):
+                        raise MonitorError("GCS monitor access token is invalid")
+                    self._cached_access_token = token
+                    return token
                 detail = completed.stderr.decode("utf-8", errors="replace")[-4000:]
-                raise MonitorError(
-                    "GCS monitor access-token request failed with exit "
-                    f"{completed.returncode}: {detail}"
-                )
-            try:
-                token = completed.stdout.decode("ascii", errors="strict").strip()
-            except UnicodeDecodeError as exc:
-                raise MonitorError("GCS monitor access token is invalid") from exc
-            if not token or any(character.isspace() for character in token):
-                raise MonitorError("GCS monitor access token is invalid")
-            self._cached_access_token = token
-            return token
+                if (
+                    attempt >= _JSON_READ_MAX_RETRIES
+                    or not _TRANSIENT_AUTH_ERROR_RE.search(detail)
+                ):
+                    raise MonitorError(
+                        "GCS monitor access-token request failed with exit "
+                        f"{completed.returncode}: {detail}"
+                    )
+                self.sleeper(float(2**attempt))
+            raise AssertionError("unreachable")
 
     def _expire_access_token(self, token: str) -> None:
         with self._access_token_lock:
@@ -514,7 +548,7 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
     run_root = validate_gcs_uri(value["run_root"], where="run_root")
     if not run_root.endswith(f"/{run_id}"):
         raise MonitorError("run_root is not bound to run_id")
-    _path(value["manifest_path"], where="manifest_path")
+    manifest_path = _path(value["manifest_path"], where="manifest_path")
     require_sha256(value["manifest_file_sha256"], where="manifest_file_sha256")
     require_nonempty(value["project_id"], where="project_id")
     value["zone"] = _zone_name(value["zone"], where="zone")
@@ -548,13 +582,53 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
             or float(raw) <= 0
         ):
             raise MonitorError(f"{field} must be positive")
-    for field in (
-        "state_path",
-        "report_path",
-        "terminal_receipt_path",
-        "diagnostics_dir",
-    ):
-        _path(value[field], where=field)
+    state_path = _path(value["state_path"], where="state_path")
+    report_path = _path(value["report_path"], where="report_path")
+    terminal_path = _path(value["terminal_receipt_path"], where="terminal_receipt_path")
+    diagnostics_dir = _path(value["diagnostics_dir"], where="diagnostics_dir")
+    local_files = {
+        "manifest_path": manifest_path,
+        "state_path": state_path,
+        "report_path": report_path,
+        "terminal_receipt_path": terminal_path,
+        "heartbeat_ledger": state_path.with_name(
+            f"{state_path.name}.heartbeat.sqlite3"
+        ),
+        "monitor_lock": state_path.with_name(f".{state_path.name}.lock"),
+    }
+    resolved_files = {
+        name: path.resolve(strict=False) for name, path in local_files.items()
+    }
+    names = tuple(resolved_files)
+    for index, left_name in enumerate(names):
+        left = resolved_files[left_name]
+        for right_name in names[index + 1 :]:
+            right = resolved_files[right_name]
+            aliases = left == right
+            if not aliases and left.exists() and right.exists():
+                aliases = left.samefile(right)
+            if aliases:
+                raise MonitorError(
+                    f"GCP source monitor local paths alias: {left_name}, {right_name}"
+                )
+    resolved_diagnostics = diagnostics_dir.resolve(strict=False)
+    if diagnostics_dir.exists() and not diagnostics_dir.is_dir():
+        raise MonitorError("diagnostics_dir must be a directory")
+    for name, path in resolved_files.items():
+        if (
+            path == resolved_diagnostics
+            or resolved_diagnostics in path.parents
+            or path in resolved_diagnostics.parents
+        ):
+            raise MonitorError(
+                f"GCP source monitor local path overlaps diagnostics_dir: {name}"
+            )
+    gcloud_value = str(value["gcloud"])
+    if "/" in gcloud_value:
+        gcloud_path = Path(gcloud_value).resolve(strict=False)
+        for name, path in resolved_files.items():
+            if gcloud_path == path:
+                raise MonitorError(f"GCP source monitor gcloud path aliases {name}")
     diagnostics_prefix = validate_gcs_uri(
         value["diagnostics_upload_prefix"], where="diagnostics_upload_prefix"
     )
@@ -571,7 +645,17 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
 
 def load_config(path: Path) -> dict[str, object]:
     _raw, value = load_json_object(path, where="GCP source monitor config")
-    return validate_config(value)
+    checked = validate_config(value)
+    config_path = path.resolve(strict=False)
+    for field in (
+        "manifest_path",
+        "state_path",
+        "report_path",
+        "terminal_receipt_path",
+    ):
+        if config_path == Path(str(checked[field])).resolve(strict=False):
+            raise MonitorError(f"monitor config path aliases {field}")
+    return checked
 
 
 @contextmanager
@@ -598,7 +682,19 @@ def _empty_state(run_id: str) -> dict[str, object]:
 def _load_state(path: Path, *, run_id: str) -> dict[str, object]:
     if not path.exists():
         return _empty_state(run_id)
-    _raw, state = load_json_object(path, where="GCP source monitor state")
+    max_bytes = (
+        _LEGACY_STATE_MIGRATION_MAX_BYTES
+        if path.stat().st_size > MAX_METADATA_BYTES
+        else None
+    )
+    if max_bytes is None:
+        _raw, state = load_json_object(path, where="GCP source monitor state")
+    else:
+        _raw, state = load_json_object(
+            path,
+            where="GCP source monitor state",
+            max_bytes=max_bytes,
+        )
     if state.get("schema") != STATE_SCHEMA or state.get("run_id") != run_id:
         raise MonitorError("GCP source monitor state binding drifted")
     for field in ("validated_receipts", "workers", "diagnostics"):
@@ -606,6 +702,663 @@ def _load_state(path: Path, *, run_id: str) -> dict[str, object]:
             raise MonitorError(f"GCP source monitor state {field} is invalid")
         state[field] = dict(state[field])
     return state
+
+
+def _heartbeat_ledger_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.heartbeat.sqlite3")
+
+
+class _HeartbeatMembershipLedger:
+    """Persistent immutable heartbeat membership outside the bounded JSON state.
+
+    The JSON state keeps only the latest heartbeat details needed for liveness.
+    This ledger retains the complete immutable inventory in SQLite so a long
+    run can still detect disappearance without making the state file grow with
+    every heartbeat.  New rows are staged in memory and committed only after a
+    complete inventory pass succeeds.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        run_id: str,
+        manifest_sha256: str,
+    ) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.manifest_sha256 = manifest_sha256
+        self.connection: sqlite3.Connection | None = None
+        self.had_existing_file = False
+        self.pending: dict[str, dict[str, object]] = {}
+        self.pending_by_uri: dict[str, str] = {}
+        self.current_uris: set[str] = set()
+        self.current_fingerprints: set[str] = set()
+
+    @property
+    def _binding(self) -> str:
+        return canonical_json_bytes(
+            {
+                "schema": HEARTBEAT_LEDGER_SCHEMA,
+                "run_id": self.run_id,
+                "manifest_sha256": self.manifest_sha256,
+            }
+        ).decode("ascii")
+
+    def _conn(self) -> sqlite3.Connection:
+        if self.connection is None:
+            raise MonitorError("heartbeat membership ledger is not open")
+        return self.connection
+
+    @staticmethod
+    def _inventory_summary(
+        connection: sqlite3.Connection,
+    ) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        count = 0
+        for row in connection.execute(
+            "SELECT fingerprint, uri, generation, size_bytes, sha256, summary_json "
+            "FROM heartbeat_members ORDER BY fingerprint"
+        ):
+            if count:
+                digest.update(b",")
+            digest.update(canonical_json_bytes(list(row)))
+            count += 1
+        digest.update(b"]")
+        return count, digest.hexdigest()
+
+    @classmethod
+    def _write_inventory_meta(cls, connection: sqlite3.Connection) -> None:
+        count, digest = cls._inventory_summary(connection)
+        connection.executemany(
+            "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES(?, ?)",
+            (("member_count", str(count)), ("members_sha256", digest)),
+        )
+
+    @classmethod
+    def _verify_inventory_meta(cls, connection: sqlite3.Connection) -> None:
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if quick_check != ("ok",):
+            raise MonitorError("heartbeat membership ledger integrity check failed")
+        metadata = dict(
+            connection.execute(
+                "SELECT key, value FROM ledger_meta "
+                "WHERE key IN ('member_count', 'members_sha256')"
+            )
+        )
+        if set(metadata) != {"member_count", "members_sha256"}:
+            raise MonitorError(
+                "heartbeat membership ledger inventory metadata is missing"
+            )
+        raw_count = metadata["member_count"]
+        if not raw_count.isdecimal():
+            raise MonitorError("heartbeat membership ledger inventory metadata drifted")
+        count, digest = cls._inventory_summary(connection)
+        if int(raw_count) != count or metadata["members_sha256"] != digest:
+            raise MonitorError("heartbeat membership ledger inventory drifted")
+
+    @staticmethod
+    def _verify_schema(connection: sqlite3.Connection) -> None:
+        version = connection.execute("PRAGMA user_version").fetchone()
+        if version != (HEARTBEAT_LEDGER_SCHEMA_VERSION,):
+            raise MonitorError("heartbeat membership ledger schema version drifted")
+        objects = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY type, name"
+        ).fetchall()
+        if objects != [
+            (
+                "table",
+                "heartbeat_members",
+                "heartbeat_members",
+                _HEARTBEAT_MEMBERS_TABLE_SQL,
+            ),
+            ("table", "ledger_meta", "ledger_meta", _LEDGER_META_TABLE_SQL),
+        ]:
+            raise MonitorError("heartbeat membership ledger schema drifted")
+
+    def _bootstrap_new_file(self) -> None:
+        descriptor, raw_stage = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+        )
+        os.close(descriptor)
+        stage = Path(raw_stage)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(stage, timeout=30, isolation_level=None)
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_LEDGER_META_TABLE_SQL)
+            connection.execute(_HEARTBEAT_MEMBERS_TABLE_SQL)
+            connection.execute(f"PRAGMA user_version={HEARTBEAT_LEDGER_SCHEMA_VERSION}")
+            connection.execute(
+                "INSERT INTO ledger_meta(key, value) VALUES('binding', ?)",
+                (self._binding,),
+            )
+            self._write_inventory_meta(connection)
+            connection.execute("COMMIT")
+            connection.close()
+            connection = None
+            with stage.open("rb") as stream:
+                os.fsync(stream.fileno())
+            try:
+                os.link(stage, self.path)
+            except FileExistsError as exc:
+                raise MonitorError(
+                    "heartbeat membership ledger appeared during bootstrap"
+                ) from exc
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except (sqlite3.Error, OSError) as exc:
+            if connection is not None:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                connection.close()
+            raise MonitorError(
+                f"heartbeat membership ledger bootstrap failed: {exc}"
+            ) from exc
+        finally:
+            stage.unlink(missing_ok=True)
+
+    def open(self, state: dict[str, object]) -> None:
+        self.had_existing_file = self.path.exists()
+        state_has_binding = "heartbeat_ledger" in state
+        if self.path.is_symlink():
+            raise MonitorError("heartbeat membership ledger must not be a symlink")
+        if self.path.exists() and not self.path.is_file():
+            raise MonitorError("heartbeat membership ledger is not a regular file")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.had_existing_file:
+            if state_has_binding:
+                raise MonitorError("heartbeat membership ledger unexpectedly empty")
+            self._bootstrap_new_file()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                self.path,
+                timeout=30,
+                isolation_level=None,
+            )
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA synchronous=FULL")
+            self._verify_schema(connection)
+            row = connection.execute(
+                "SELECT value FROM ledger_meta WHERE key = 'binding'"
+            ).fetchone()
+            if row is None:
+                raise MonitorError("heartbeat membership ledger metadata is missing")
+            elif row[0] != self._binding:
+                raise MonitorError("heartbeat membership ledger binding drifted")
+            else:
+                self._verify_inventory_meta(connection)
+            self.connection = connection
+        except (sqlite3.Error, MonitorError) as exc:
+            if connection is not None:
+                connection.close()
+            if isinstance(exc, MonitorError):
+                raise
+            raise MonitorError(
+                f"heartbeat membership ledger is invalid: {exc}"
+            ) from exc
+
+        try:
+            self._migrate_legacy_state(state)
+            state["heartbeat_ledger"] = {
+                "schema": HEARTBEAT_LEDGER_SCHEMA,
+                "path": str(self.path),
+                "run_id": self.run_id,
+                "manifest_sha256": self.manifest_sha256,
+            }
+            # These fields were used by the pre-sidecar patch.  Removing them keeps
+            # the JSON state bounded while allowing a one-time migration.
+            state.pop("heartbeat_membership", None)
+        except BaseException:
+            self.close()
+            raise
+
+    def _migrate_legacy_state(self, state: Mapping[str, object]) -> None:
+        ledger_binding = state.get("heartbeat_ledger")
+        if ledger_binding is not None:
+            if not isinstance(ledger_binding, Mapping):
+                raise MonitorError("heartbeat ledger state binding is invalid")
+            require_exact_fields(
+                ledger_binding,
+                {"schema", "path", "run_id", "manifest_sha256"},
+                where="heartbeat ledger state binding",
+            )
+            if (
+                ledger_binding["schema"] != HEARTBEAT_LEDGER_SCHEMA
+                or ledger_binding["path"] != str(self.path)
+                or ledger_binding["run_id"] != self.run_id
+                or ledger_binding["manifest_sha256"] != self.manifest_sha256
+            ):
+                raise MonitorError("heartbeat ledger state binding drifted")
+            if not self.had_existing_file:
+                raise MonitorError("heartbeat membership ledger unexpectedly empty")
+
+        legacy_members: list[str] = []
+        raw_membership = state.get("heartbeat_membership")
+        if raw_membership is not None:
+            if not isinstance(raw_membership, Mapping):
+                raise MonitorError("legacy heartbeat membership is invalid")
+            value = dict(raw_membership)
+            require_exact_fields(
+                value,
+                {"schema", "members"},
+                where="legacy heartbeat membership",
+            )
+            members = value["members"]
+            if (
+                value["schema"] != HEARTBEAT_MEMBERSHIP_SCHEMA
+                or not isinstance(members, list)
+                or any(
+                    not isinstance(member, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", member) is None
+                    for member in members
+                )
+                or members != sorted(members)
+                or len(members) != len(set(members))
+            ):
+                raise MonitorError("legacy heartbeat membership drifted")
+            legacy_members.extend(members)
+
+        cache = state.get("validated_receipts")
+        if isinstance(cache, Mapping):
+            for uri, entry in cache.items():
+                if not isinstance(entry, Mapping) or entry.get("kind") != "heartbeat":
+                    continue
+                generation = str(entry.get("generation", ""))
+                size_bytes = entry.get("size_bytes")
+                if (
+                    not generation.isdecimal()
+                    or int(generation) < 1
+                    or isinstance(size_bytes, bool)
+                    or not isinstance(size_bytes, int)
+                    or size_bytes < 0
+                ):
+                    raise MonitorError("legacy heartbeat metadata is invalid")
+                sha256 = require_sha256(
+                    entry.get("sha256"), where="legacy heartbeat SHA-256"
+                )
+                fingerprint = _receipt_membership_fingerprint(
+                    {"uri": uri, "generation": generation, "sha256": sha256}
+                )
+                self._stage(
+                    fingerprint=fingerprint,
+                    uri=validate_gcs_uri(uri, where="legacy heartbeat URI"),
+                    generation=generation,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                    summary=entry.get("summary"),
+                    summary_source="legacy",
+                )
+
+        for fingerprint in legacy_members:
+            self._stage(
+                fingerprint=fingerprint,
+                uri=None,
+                generation=None,
+                size_bytes=None,
+                sha256=None,
+                summary=None,
+            )
+
+        if self.pending:
+            self._commit_pending()
+
+    @staticmethod
+    def _merge_rows(
+        existing: Mapping[str, object], candidate: Mapping[str, object]
+    ) -> dict[str, object]:
+        if existing["fingerprint"] != candidate["fingerprint"]:
+            raise MonitorError("heartbeat membership fingerprint drifted")
+        merged = dict(existing)
+        for field in ("uri", "generation", "size_bytes", "sha256", "summary_json"):
+            old = existing[field]
+            new = candidate[field]
+            if field == "summary_json":
+                if old is None and new is not None:
+                    merged[field] = new
+                elif old is not None and new is not None and old != new:
+                    new_source = str(candidate.get("_summary_source", "validated"))
+                    # A legacy JSON summary is only a cache hint.  A summary
+                    # freshly derived from a validated receipt may replace it.
+                    if candidate.get("_replace_summary") is True:
+                        merged[field] = new
+                    elif new_source != "legacy":
+                        raise MonitorError("heartbeat membership summary drifted")
+                continue
+            if old is not None and new is not None and old != new:
+                raise MonitorError("heartbeat membership ledger row drifted")
+            if old is None and new is not None:
+                merged[field] = new
+        merged["_summary_source"] = (
+            "validated"
+            if "validated"
+            in {
+                str(existing.get("_summary_source", "validated")),
+                str(candidate.get("_summary_source", "validated")),
+            }
+            else "legacy"
+        )
+        return merged
+
+    def _stage(
+        self,
+        *,
+        fingerprint: str,
+        uri: str | None,
+        generation: str | None,
+        size_bytes: int | None,
+        sha256: str | None,
+        summary: object,
+        summary_source: str = "validated",
+        replace_summary: bool = False,
+    ) -> None:
+        if (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+        ):
+            raise MonitorError("heartbeat membership fingerprint is invalid")
+        if uri is not None:
+            uri = validate_gcs_uri(uri, where="heartbeat membership URI")
+        if generation is not None and (
+            not generation.isdecimal() or int(generation) < 1
+        ):
+            raise MonitorError("heartbeat membership generation is invalid")
+        if size_bytes is not None and (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        ):
+            raise MonitorError("heartbeat membership size is invalid")
+        if summary_source not in {"legacy", "validated"}:
+            raise MonitorError("heartbeat membership summary source is invalid")
+        if sha256 is not None:
+            sha256 = require_sha256(sha256, where="heartbeat membership SHA-256")
+        summary_json: str | None = None
+        if summary is not None:
+            if not isinstance(summary, Mapping):
+                raise MonitorError("heartbeat membership summary is invalid")
+            summary_json = canonical_json_bytes(dict(summary)).decode("ascii")
+        candidate = {
+            "fingerprint": fingerprint,
+            "uri": uri,
+            "generation": generation,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+            "summary_json": summary_json,
+            "_summary_source": summary_source,
+            "_replace_summary": replace_summary,
+        }
+        if uri is not None:
+            pending_fingerprint = self.pending_by_uri.get(uri)
+            if pending_fingerprint is not None and pending_fingerprint != fingerprint:
+                raise MonitorError("heartbeat membership URI drifted")
+        previous = self.pending.get(fingerprint)
+        if previous is not None:
+            merged = self._merge_rows(previous, candidate)
+            self.pending[fingerprint] = merged
+            if merged["uri"] is not None:
+                self.pending_by_uri[str(merged["uri"])] = fingerprint
+            return
+        self.pending[fingerprint] = candidate
+        if uri is not None:
+            self.pending_by_uri[uri] = fingerprint
+
+    def _row_for_uri(self, uri: str) -> tuple[object, ...] | None:
+        return (
+            self._conn()
+            .execute(
+                "SELECT fingerprint, uri, generation, size_bytes, sha256, summary_json "
+                "FROM heartbeat_members WHERE uri = ?",
+                (uri,),
+            )
+            .fetchone()
+        )
+
+    def cached(self, metadata: Mapping[str, object]) -> dict[str, object] | None:
+        uri = validate_gcs_uri(metadata.get("uri"), where="heartbeat ledger URI")
+        generation = str(metadata.get("generation", ""))
+        size_bytes = metadata.get("size_bytes")
+        row = self._row_for_uri(uri)
+        if row is None:
+            return None
+        if row[2] is None or row[3] is None or row[4] is None or row[5] is None:
+            return None
+        if str(row[2]) != generation:
+            raise MonitorError(f"immutable heartbeat receipt generation drifted: {uri}")
+        if row[3] != size_bytes:
+            raise MonitorError(f"immutable heartbeat receipt size drifted: {uri}")
+        if row[4] is None or row[5] is None:
+            return None
+        try:
+            summary = json.loads(str(row[5]))
+        except json.JSONDecodeError as exc:
+            raise MonitorError("heartbeat membership summary is corrupt") from exc
+        if not isinstance(summary, Mapping):
+            raise MonitorError("heartbeat membership summary is corrupt")
+        return {
+            "kind": "heartbeat",
+            "generation": str(row[2]),
+            "size_bytes": int(row[3]),
+            "sha256": str(row[4]),
+            "summary": dict(summary),
+        }
+
+    def remember(
+        self,
+        *,
+        metadata: Mapping[str, object],
+        sha256: str,
+        summary: Mapping[str, object],
+    ) -> None:
+        uri = validate_gcs_uri(metadata.get("uri"), where="heartbeat ledger URI")
+        generation = str(metadata.get("generation", ""))
+        size_bytes = metadata.get("size_bytes")
+        if (
+            not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or size_bytes < 0
+        ):
+            raise MonitorError("heartbeat ledger size is invalid")
+        sha256 = require_sha256(sha256, where="heartbeat ledger SHA-256")
+        fingerprint = _receipt_membership_fingerprint(
+            {"uri": uri, "generation": generation, "sha256": sha256}
+        )
+        existing = self._row_for_uri(uri)
+        if existing is not None:
+            if str(existing[0]) != fingerprint or (
+                existing[4] is not None and str(existing[4]) != sha256
+            ):
+                raise MonitorError(f"immutable heartbeat receipt hash drifted: {uri}")
+        self._stage(
+            fingerprint=fingerprint,
+            uri=uri,
+            generation=generation,
+            size_bytes=size_bytes,
+            sha256=sha256,
+            summary=summary,
+            summary_source="validated",
+            replace_summary=True,
+        )
+        self.current_uris.add(uri)
+        self.current_fingerprints.add(fingerprint)
+
+    def finish(self, *, current_uris: Sequence[str]) -> None:
+        current = {
+            validate_gcs_uri(uri, where="current heartbeat ledger URI")
+            for uri in current_uris
+        }
+        self.current_uris.update(current)
+        existing_rows = (
+            self._conn()
+            .execute("SELECT fingerprint, uri FROM heartbeat_members")
+            .fetchall()
+        )
+        for fingerprint, uri in existing_rows:
+            if uri is not None and str(uri) not in current:
+                raise MonitorError(
+                    "previously validated heartbeat receipt disappeared: " f"{uri}"
+                )
+            if uri is None and str(fingerprint) not in self.current_fingerprints:
+                raise MonitorError(
+                    "previously validated heartbeat receipt disappeared: "
+                    f"{fingerprint}"
+                )
+        for fingerprint, row in self.pending.items():
+            if row["uri"] is not None and row["uri"] not in current:
+                raise MonitorError(
+                    "current heartbeat ledger URI was not observed: " f"{row['uri']}"
+                )
+            if row["uri"] is None and fingerprint not in self.current_fingerprints:
+                raise MonitorError("legacy heartbeat membership was not observed")
+        self._commit_pending()
+
+    def _commit_pending(self) -> None:
+        if not self.pending:
+            return
+        connection = self._conn()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for row in self.pending.values():
+                existing_by_fingerprint = connection.execute(
+                    "SELECT fingerprint, uri, generation, size_bytes, sha256, summary_json "
+                    "FROM heartbeat_members WHERE fingerprint = ?",
+                    (row["fingerprint"],),
+                ).fetchone()
+                existing_by_uri = None
+                if row["uri"] is not None:
+                    existing_by_uri = connection.execute(
+                        "SELECT fingerprint, uri, generation, size_bytes, sha256, summary_json "
+                        "FROM heartbeat_members WHERE uri = ?",
+                        (row["uri"],),
+                    ).fetchone()
+                if (
+                    existing_by_fingerprint is not None
+                    and existing_by_uri is not None
+                    and existing_by_fingerprint[0] != existing_by_uri[0]
+                ):
+                    raise MonitorError("heartbeat membership URI drifted")
+                existing_row = existing_by_fingerprint or existing_by_uri
+                candidate = dict(row)
+                if existing_row is not None:
+                    existing = dict(
+                        zip(
+                            (
+                                "fingerprint",
+                                "uri",
+                                "generation",
+                                "size_bytes",
+                                "sha256",
+                                "summary_json",
+                            ),
+                            existing_row,
+                        )
+                    )
+                    merged = self._merge_rows(existing, candidate)
+                    connection.execute(
+                        "UPDATE heartbeat_members SET uri = ?, generation = ?, size_bytes = ?, "
+                        "sha256 = ?, summary_json = ? WHERE fingerprint = ?",
+                        (
+                            merged["uri"],
+                            merged["generation"],
+                            merged["size_bytes"],
+                            merged["sha256"],
+                            merged["summary_json"],
+                            merged["fingerprint"],
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO heartbeat_members "
+                        "(fingerprint, uri, generation, size_bytes, sha256, summary_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        tuple(
+                            candidate[field]
+                            for field in (
+                                "fingerprint",
+                                "uri",
+                                "generation",
+                                "size_bytes",
+                                "sha256",
+                                "summary_json",
+                            )
+                        ),
+                    )
+            self._write_inventory_meta(connection)
+            connection.execute("COMMIT")
+            self.pending.clear()
+            self.pending_by_uri.clear()
+        except (sqlite3.Error, MonitorError) as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            if isinstance(exc, MonitorError):
+                raise
+            raise MonitorError(
+                f"heartbeat membership ledger write failed: {exc}"
+            ) from exc
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+
+def _receipt_membership_fingerprint(record: Mapping[str, object]) -> str:
+    uri = validate_gcs_uri(record.get("uri"), where="heartbeat membership URI")
+    generation = str(record.get("generation", ""))
+    if not generation.isdecimal() or int(generation) < 1:
+        raise MonitorError("heartbeat membership generation is invalid")
+    sha256 = require_sha256(record.get("sha256"), where="heartbeat membership SHA-256")
+    return hashlib.sha256(
+        canonical_json_bytes({"uri": uri, "generation": generation, "sha256": sha256})
+    ).hexdigest()
+
+
+def _retain_current_heartbeat_cache(
+    state: dict[str, object], *, records: Sequence[Mapping[str, object]]
+) -> None:
+    """Keep detailed heartbeat cache only for claims that still affect liveness."""
+
+    retained_uris = {
+        validate_gcs_uri(record.get("uri"), where="current heartbeat cache URI")
+        for record in records
+    }
+    cache = state["validated_receipts"]
+    assert isinstance(cache, dict)
+    for uri, entry in tuple(cache.items()):
+        if (
+            isinstance(entry, Mapping)
+            and entry.get("kind") == "heartbeat"
+            and uri not in retained_uris
+        ):
+            del cache[uri]
+
+
+def _require_bounded_state(state: Mapping[str, object]) -> None:
+    encoded_size = (
+        len(
+            json.dumps(state, indent=2, sort_keys=True, ensure_ascii=True).encode(
+                "ascii"
+            )
+        )
+        + 1
+    )
+    if encoded_size > MAX_METADATA_BYTES:
+        raise MonitorError(
+            "compacted GCP source monitor state exceeds the "
+            f"{MAX_METADATA_BYTES}-byte bound"
+        )
 
 
 def _raw_manifest(path: Path, expected_sha256: str) -> dict[str, object]:
@@ -1551,7 +2304,7 @@ def run_monitor(
     lock_path = state_path.with_name(f".{state_path.name}.lock")
     run_client = client or GcloudRunClient(str(checked["gcloud"]))
     store = object_store or GcloudObjectStore(str(checked["gcloud"]))
-    with _exclusive_lock(lock_path):
+    with _exclusive_lock(lock_path), ExitStack() as cleanup:
         state = _load_state(state_path, run_id=run_id)
         manifest = _raw_manifest(
             _path(checked["manifest_path"], where="manifest_path"),
@@ -1559,6 +2312,13 @@ def run_monitor(
         )
         if manifest["gcs_output_prefix"] != checked["run_root"]:
             raise MonitorError("manifest output prefix does not match run_root")
+        heartbeat_ledger = _HeartbeatMembershipLedger(
+            _heartbeat_ledger_path(state_path),
+            run_id=run_id,
+            manifest_sha256=str(manifest["manifest_sha256"]),
+        )
+        heartbeat_ledger.open(state)
+        cleanup.callback(heartbeat_ledger.close)
         physical_workers = checked["physical_workers"]
         assert isinstance(physical_workers, list)
         slots_per_worker = int(checked["slots_per_worker"])
@@ -1686,9 +2446,6 @@ def run_monitor(
                 f"{manifest['manifest_sha256']}/*/*/*.heartbeat.json"
             )
         )
-        _require_immutable_inventory(
-            kind="heartbeat", inventory=heartbeat_inventory, state=state
-        )
         heartbeat_records: list[dict[str, object]] = []
         heartbeat_sha256: list[str] = []
         uncached_heartbeat_metadata: list[Mapping[str, object]] = []
@@ -1703,7 +2460,11 @@ def run_monitor(
             "lease_through_unix_s",
         )
         for metadata in heartbeat_inventory.values():
-            cached = _cached_receipt(kind="heartbeat", metadata=metadata, state=state)
+            cached = heartbeat_ledger.cached(metadata)
+            if cached is None:
+                cached = _cached_receipt(
+                    kind="heartbeat", metadata=metadata, state=state
+                )
             record = (
                 _cached_heartbeat_summary(
                     cached,
@@ -1718,6 +2479,14 @@ def run_monitor(
             if record is None:
                 uncached_heartbeat_metadata.append(metadata)
                 continue
+            cache = state["validated_receipts"]
+            assert isinstance(cache, dict)
+            cache[str(metadata["uri"])] = cached
+            heartbeat_ledger.remember(
+                metadata=metadata,
+                sha256=str(cached["sha256"]),
+                summary=cached["summary"],
+            )
             heartbeat_records.append(record)
             heartbeat_sha256.append(str(record["sha256"]))
         for metadata, (raw, value) in zip(
@@ -1736,6 +2505,11 @@ def run_monitor(
                 kind="heartbeat", metadata=metadata, raw=raw, state=state
             )
             cached["summary"] = {key: record[key] for key in heartbeat_summary_fields}
+            heartbeat_ledger.remember(
+                metadata=metadata,
+                sha256=str(cached["sha256"]),
+                summary=cached["summary"],
+            )
             heartbeat_records.append(record)
             heartbeat_sha256.append(str(record["sha256"]))
         jobs_by_uri = {assignment_completion_uri(manifest, job): job for job in jobs}
@@ -1821,7 +2595,6 @@ def run_monitor(
                 int(record["scheduled_unix_s"]) + int(checked["stale_after_seconds"]),
             )
         }
-
         specs_by_uri = {
             gcs_join(
                 str(checked["run_root"]),
@@ -1969,12 +2742,20 @@ def run_monitor(
                 + worker_current_heartbeats
             )
             latest_progress_event = _latest(progress_events)
-            signature = (
-                f"{completed_assignments}/{expected_assignments}:"
-                f"{completed_slots}/{slots_per_worker}:"
-                f"{len(worker_claims)}/{len(worker_latest_claims)}/"
-                f"{completed_claimed_assignments}"
-            )
+            if claim_records:
+                # Claim and heartbeat counts are monotonic per physical
+                # executor. Latest-claim ownership and completion pointers can
+                # move to another executor, so they must not reset this
+                # worker's stale timer.
+                signature = (
+                    f"dynamic:{len(worker_claims)}/{len(worker_heartbeats)}:"
+                    f"{completed_slots}/{slots_per_worker}"
+                )
+            else:
+                signature = (
+                    f"static:{completed_assignments}/{expected_assignments}:"
+                    f"{completed_slots}/{slots_per_worker}"
+                )
             prior = worker_state.get(worker)
             if (
                 not isinstance(prior, Mapping)
@@ -2084,7 +2865,7 @@ def run_monitor(
                     completed_assignments != expected_assignments
                     or completed_slots != slots_per_worker
                 ):
-                    report["state"] = "completed_control_missing_receipts"
+                    report["state"] = "completed_control_missing_receipts_manual_review"
                 else:
                     report["state"] = "complete"
             elif active_failure is not None:
@@ -2133,7 +2914,11 @@ def run_monitor(
                 completed_assignments == expected_assignments
                 and completed_slots == slots_per_worker
             ):
-                report["state"] = "finalizing"
+                report["state"] = (
+                    "finalizing_control_missing_manual_review"
+                    if checked_at - progress_at >= int(checked["stale_after_seconds"])
+                    else "finalizing"
+                )
             elif (
                 worker_claims
                 and not worker_current_claims
@@ -2236,6 +3021,13 @@ def run_monitor(
             },
             "training_ready": False,
         }
+        _retain_current_heartbeat_cache(
+            state, records=tuple(latest_current_heartbeats.values())
+        )
+        state["updated_at_unix"] = checked_at
+        _require_bounded_state(state)
+        heartbeat_ledger.finish(current_uris=tuple(heartbeat_inventory))
+        atomic_write_json(state_path, state)
         if run_state == "complete":
             terminal_path = _path(
                 checked["terminal_receipt_path"], where="terminal_receipt_path"
@@ -2252,8 +3044,6 @@ def run_monitor(
                 "status": terminal["status"],
                 "sha256": sha256_file(terminal_path),
             }
-        state["updated_at_unix"] = checked_at
-        atomic_write_json(state_path, state)
         atomic_write_json(report_path, report_payload)
         return report_payload
 

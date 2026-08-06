@@ -4,6 +4,8 @@ import fnmatch
 import hashlib
 import http.client
 import json
+import os
+import sqlite3
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -12,6 +14,7 @@ from typing import Mapping
 import pytest
 
 from scripts.distributed_data_prep._common import (
+    MAX_METADATA_BYTES,
     atomic_write_json,
     canonical_sha256,
     sha256_file,
@@ -34,9 +37,16 @@ from scripts.distributed_data_prep.source_worker import (
     assignment_completion_uri,
 )
 from scripts.gcp_source_run_monitor import (
+    HEARTBEAT_MEMBERSHIP_SCHEMA,
     GcloudRunClient,
     MONITOR_SCHEMA,
     MonitorError,
+    _HeartbeatMembershipLedger,
+    _empty_state,
+    _heartbeat_ledger_path,
+    _load_state,
+    _receipt_membership_fingerprint,
+    _retain_current_heartbeat_cache,
     run_monitor,
 )
 
@@ -221,6 +231,43 @@ def test_gcloud_object_listing_retries_transient_http_statuses() -> None:
     )
     assert client.list_objects(f"{RUN_ROOT}/control/failed/*.json") == []
     assert calls == 2
+    assert sleeps == [1.0]
+
+
+def test_gcloud_access_token_retries_transient_auth_failure() -> None:
+    auth_calls = 0
+    sleeps: list[float] = []
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        nonlocal auth_calls
+        assert argv == ["gcloud", "auth", "print-access-token"]
+        auth_calls += 1
+        if auth_calls == 1:
+            return subprocess.CompletedProcess(
+                argv, 1, b"", b"HTTP 429 Too Many Requests\n"
+            )
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    client = GcloudRunClient(
+        "gcloud",
+        runner=runner,
+        urlopen=lambda *_args, **_kwargs: Response(),
+        sleeper=sleeps.append,
+    )
+    assert client.list_objects(f"{RUN_ROOT}/control/failed/*.json") == []
+    assert auth_calls == 2
     assert sleeps == [1.0]
 
 
@@ -413,6 +460,276 @@ def test_gcloud_batch_json_read_rejects_boundary_drift() -> None:
         GcloudRunClient("gcloud", runner=runner, urlopen=urlopen).read_json_many(rows)
 
 
+def test_heartbeat_detail_cache_is_compacted_below_metadata_bound(
+    tmp_path: Path,
+) -> None:
+    state = _empty_state(RUN_ID)
+    cache: dict[str, dict[str, object]] = {}
+    members: list[str] = []
+    for index in range(35_136):
+        uri = f"{RUN_ROOT}/heartbeat/{index:08d}.json"
+        cache[uri] = {
+            "kind": "heartbeat",
+            "generation": "1",
+            "size_bytes": 512,
+            "sha256": "b" * 64,
+            "summary": {
+                "assignment_sha256": "a" * 64,
+                "attempt": 0,
+                "claim_sha256": "c" * 64,
+                "physical_worker_index": 0,
+                "logical_worker": "worker-0000",
+                "heartbeat_index": index + 1,
+                "scheduled_unix_s": index + 1,
+                "lease_through_unix_s": index + 901,
+            },
+        }
+        members.append(
+            _receipt_membership_fingerprint(
+                {
+                    "uri": uri,
+                    "generation": "1",
+                    "sha256": "b" * 64,
+                }
+            )
+        )
+    state["validated_receipts"] = cache
+    state["heartbeat_membership"] = {
+        "schema": HEARTBEAT_MEMBERSHIP_SCHEMA,
+        "members": sorted(members),
+    }
+    legacy_size = len(json.dumps(state, indent=2, sort_keys=True).encode()) + 1
+    state_path = tmp_path / "state.json"
+    atomic_write_json(state_path, state)
+    loaded = _load_state(state_path, run_id=RUN_ID)
+    ledger_path = _heartbeat_ledger_path(state_path)
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    try:
+        ledger.open(loaded)
+        ledger.finish(current_uris=tuple(cache))
+    finally:
+        ledger.close()
+
+    keep_uri = next(iter(cache))
+    _retain_current_heartbeat_cache(loaded, records=({"uri": keep_uri},))
+    atomic_write_json(state_path, loaded)
+
+    assert legacy_size > MAX_METADATA_BYTES
+    assert len(loaded["validated_receipts"]) == 1
+    assert "heartbeat_membership" not in loaded
+    assert state_path.stat().st_size < MAX_METADATA_BYTES
+    with sqlite3.connect(ledger_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM heartbeat_members"
+        ).fetchone() == (35_136,)
+
+    second = _load_state(state_path, run_id=RUN_ID)
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    try:
+        ledger.open(second)
+        with pytest.raises(
+            MonitorError, match="previously validated heartbeat receipt disappeared"
+        ):
+            ledger.finish(current_uris=tuple(uri for uri in cache if uri != keep_uri))
+    finally:
+        ledger.close()
+
+    with sqlite3.connect(ledger_path) as connection:
+        deleted_row = connection.execute(
+            "SELECT fingerprint, uri, generation, size_bytes, sha256, summary_json "
+            "FROM heartbeat_members WHERE uri = ?",
+            (keep_uri,),
+        ).fetchone()
+        assert deleted_row is not None
+        connection.execute("DELETE FROM heartbeat_members WHERE uri = ?", (keep_uri,))
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    with pytest.raises(MonitorError, match="ledger inventory drifted"):
+        ledger.open(second)
+    ledger.close()
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute(
+            "INSERT INTO heartbeat_members "
+            "(fingerprint, uri, generation, size_bytes, sha256, summary_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            deleted_row,
+        )
+
+    with sqlite3.connect(ledger_path) as connection:
+        binding = connection.execute(
+            "SELECT value FROM ledger_meta WHERE key = 'binding'"
+        ).fetchone()
+        assert binding is not None
+        connection.execute(
+            "UPDATE ledger_meta SET value = 'tampered' WHERE key = 'binding'"
+        )
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    with pytest.raises(MonitorError, match="ledger binding drifted"):
+        ledger.open(second)
+    ledger.close()
+
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute(
+            "UPDATE ledger_meta SET value = ? WHERE key = 'binding'", binding
+        )
+    ledger_path.unlink()
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    with pytest.raises(MonitorError, match="ledger unexpectedly empty"):
+        ledger.open(second)
+    ledger.close()
+
+
+def test_fingerprint_only_legacy_member_is_upgraded_when_observed(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    ledger_path = _heartbeat_ledger_path(state_path)
+    uri = f"{RUN_ROOT}/heartbeat/00000001.json"
+    metadata = {"uri": uri, "generation": "7", "size_bytes": 512}
+    sha256 = "b" * 64
+    fingerprint = _receipt_membership_fingerprint(
+        {"uri": uri, "generation": "7", "sha256": sha256}
+    )
+    state = _empty_state(RUN_ID)
+    state["heartbeat_membership"] = {
+        "schema": HEARTBEAT_MEMBERSHIP_SCHEMA,
+        "members": [fingerprint],
+    }
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    ledger.open(state)
+    ledger.close()
+
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    try:
+        ledger.open(state)
+        ledger.remember(
+            metadata=metadata,
+            sha256=sha256,
+            summary={"heartbeat_index": 1},
+        )
+        ledger.finish(current_uris=(uri,))
+    finally:
+        ledger.close()
+
+    with sqlite3.connect(ledger_path) as connection:
+        assert connection.execute(
+            "SELECT uri, generation, size_bytes, sha256, summary_json "
+            "FROM heartbeat_members WHERE fingerprint = ?",
+            (fingerprint,),
+        ).fetchone() == (uri, "7", 512, sha256, '{"heartbeat_index":1}')
+
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    try:
+        ledger.open(state)
+        ledger._stage(
+            fingerprint=fingerprint,
+            uri=uri,
+            generation="7",
+            size_bytes=512,
+            sha256=sha256,
+            summary={"heartbeat_index": 2},
+        )
+        with pytest.raises(MonitorError, match="summary drifted"):
+            ledger.finish(current_uris=(uri,))
+    finally:
+        ledger.close()
+
+
+def test_heartbeat_ledger_bootstrap_failure_leaves_no_partial_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger_path = tmp_path / "state.json.heartbeat.sqlite3"
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+
+    def fail_link(_source: object, _target: object) -> None:
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(os, "link", fail_link)
+    with pytest.raises(MonitorError, match="ledger bootstrap failed"):
+        ledger.open(_empty_state(RUN_ID))
+
+    assert not ledger_path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_existing_partial_heartbeat_ledger_fails_closed(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "state.json.heartbeat.sqlite3"
+    ledger_path.write_bytes(b"")
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+
+    with pytest.raises(MonitorError, match="ledger schema version drifted"):
+        ledger.open(_empty_state(RUN_ID))
+
+
+def test_heartbeat_ledger_rejects_schema_without_immutable_keys(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "state.json.heartbeat.sqlite3"
+    ledger = _HeartbeatMembershipLedger(
+        ledger_path,
+        run_id=RUN_ID,
+        manifest_sha256="a" * 64,
+    )
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.execute("CREATE TABLE ledger_meta (key TEXT, value TEXT)")
+        connection.execute(
+            "CREATE TABLE heartbeat_members "
+            "(fingerprint TEXT, uri TEXT, generation TEXT, size_bytes INTEGER, "
+            "sha256 TEXT, summary_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO ledger_meta(key, value) VALUES(?, ?)",
+            (
+                ("binding", ledger._binding),
+                ("member_count", "0"),
+                ("members_sha256", hashlib.sha256(b"[]").hexdigest()),
+            ),
+        )
+
+    with pytest.raises(MonitorError, match="ledger schema drifted"):
+        ledger.open(_empty_state(RUN_ID))
+
+
 def test_ready_receipt_requires_the_configured_local_ssd_count(tmp_path: Path) -> None:
     manifest_path, _manifest_value = _manifest(tmp_path)
     config = _config(tmp_path, manifest_path)
@@ -485,6 +802,43 @@ def _config(tmp_path: Path, manifest_path: Path) -> dict[str, object]:
         "stale_after_seconds": 1800,
         "gcloud": "/opt/homebrew/bin/gcloud",
     }
+
+
+def test_config_rejects_report_aliasing_implicit_heartbeat_ledger(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    config["report_path"] = f"{config['state_path']}.heartbeat.sqlite3"
+
+    with pytest.raises(MonitorError, match="local paths alias"):
+        run_monitor(
+            config,
+            client=FakeRunClient(),
+            object_store=LocalObjectStore(tmp_path / "gcs"),
+        )
+
+    assert not Path(str(config["state_path"])).exists()
+
+
+def test_config_rejects_diagnostics_parent_of_monitor_outputs(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    config["diagnostics_dir"] = str(tmp_path)
+
+    with pytest.raises(MonitorError, match="overlaps diagnostics_dir"):
+        run_monitor(config, client=FakeRunClient())
+
+
+def test_config_rejects_gcloud_aliasing_monitor_state(tmp_path: Path) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    config["gcloud"] = str(config["state_path"])
+
+    with pytest.raises(MonitorError, match="gcloud path aliases state_path"):
+        run_monitor(config, client=FakeRunClient())
 
 
 def _boot_id(index: int) -> str:
@@ -881,6 +1235,42 @@ def test_dynamic_claims_are_counted_by_executor_not_manifest_home_worker(
     assert [completion_uri] in client.batch_calls
 
 
+def test_successor_claim_cannot_reset_stale_timer_for_previous_executor(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    job = jobs[0]
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+        attempt=0,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=2,
+        attempt=1,
+    )
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    assert result["scheduler_mode"] == "dynamic_claim_queue"
+    assert result["workers"][1]["current_claimed_assignments"] == 0
+    assert result["workers"][1]["state"] == "idle_suspected_manual_review"
+
+
 def test_fresh_exact_assignment_heartbeat_keeps_executor_worker_live(
     tmp_path: Path,
 ) -> None:
@@ -931,6 +1321,63 @@ def test_fresh_exact_assignment_heartbeat_keeps_executor_worker_live(
         }
     ]
     assert second["training_ready"] is False
+
+
+def test_legacy_heartbeat_cache_seeds_lossless_membership_migration(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    job = manifest["repositories"][0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    heartbeat_uri = _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    state_path = Path(str(config["state_path"]))
+    state = json.loads(state_path.read_text())
+    entry = state["validated_receipts"][heartbeat_uri]
+    fingerprint = _receipt_membership_fingerprint(
+        {
+            "uri": heartbeat_uri,
+            "generation": entry["generation"],
+            "sha256": entry["sha256"],
+        }
+    )
+    state.pop("heartbeat_ledger")
+    state["heartbeat_membership"] = {
+        "schema": HEARTBEAT_MEMBERSHIP_SCHEMA,
+        "members": [fingerprint],
+    }
+    _heartbeat_ledger_path(state_path).unlink()
+    atomic_write_json(state_path, state)
+
+    run_monitor(config, client=client, object_store=store, now=lambda: 2100)
+    migrated = json.loads(state_path.read_text())
+    assert "heartbeat_membership" not in migrated
+    assert migrated["heartbeat_ledger"]["run_id"] == RUN_ID
+
+    client.objects.pop(heartbeat_uri)
+
+    with pytest.raises(
+        MonitorError, match="previously validated heartbeat receipt disappeared"
+    ):
+        run_monitor(config, client=client, object_store=store, now=lambda: 3000)
 
 
 def test_current_claim_lease_prevents_a_false_idle_report(tmp_path: Path) -> None:
@@ -1567,3 +2014,61 @@ def test_complete_run_writes_local_verified_non_training_terminal_receipt(
     assert terminal["status"] == "verified"
     assert terminal["training_ready"] is False
     assert terminal["receipt_inventory_sha256"] == result["receipt_inventory_sha256"]
+
+
+def test_heartbeat_disappearance_prevents_terminal_receipt(tmp_path: Path) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    job = manifest["repositories"][0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    heartbeat_uri = _add_heartbeat(
+        client,
+        manifest=manifest,
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+        heartbeat_index=16,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+
+    client.objects.pop(heartbeat_uri)
+    _add_all_completions(client, manifest, str(config["manifest_file_sha256"]))
+    with pytest.raises(
+        MonitorError, match="previously validated heartbeat receipt disappeared"
+    ):
+        run_monitor(config, client=client, object_store=store, now=lambda: 200)
+
+    assert not Path(str(config["terminal_receipt_path"])).exists()
+
+
+def test_missing_completed_control_receipt_becomes_manual_after_stale_window(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    _add_all_completions(client, manifest, str(config["manifest_file_sha256"]))
+    for uri in list(client.objects):
+        if "/control/completed/" in uri:
+            client.objects.pop(uri)
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    first = run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    stale = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    assert first["state"] == "running"
+    assert {worker["state"] for worker in first["workers"]} == {"finalizing"}
+    assert stale["state"] == "manual_review"
+    assert {worker["state"] for worker in stale["workers"]} == {
+        "finalizing_control_missing_manual_review"
+    }
