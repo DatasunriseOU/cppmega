@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import http.client
 import json
 import subprocess
 import urllib.error
@@ -221,6 +222,107 @@ def test_gcloud_object_listing_retries_transient_http_statuses() -> None:
     assert client.list_objects(f"{RUN_ROOT}/control/failed/*.json") == []
     assert calls == 2
     assert sleeps == [1.0]
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("timed out"),
+        ConnectionResetError("connection reset"),
+        http.client.IncompleteRead(b"partial"),
+        http.client.BadStatusLine("bad status"),
+    ],
+    ids=["timeout", "connection-reset", "incomplete-read", "bad-status"],
+)
+def test_gcloud_object_listing_retries_body_transport_errors(
+    transport_error: BaseException,
+) -> None:
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
+
+    class Response:
+        status = 200
+
+        def __init__(self, error: BaseException | None = None) -> None:
+            self.error = error
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            if self.error is not None:
+                raise self.error
+            return b"{}"
+
+    calls = 0
+
+    def urlopen(_request: object, *, timeout: int) -> Response:
+        nonlocal calls
+        calls += 1
+        return Response(transport_error if calls == 1 else None)
+
+    client = GcloudRunClient("gcloud", runner=runner, urlopen=urlopen)
+    assert client.list_objects(f"{RUN_ROOT}/control/failed/*.json") == []
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("timed out"),
+        ConnectionResetError("connection reset"),
+        http.client.IncompleteRead(b"partial"),
+        http.client.BadStatusLine("bad status"),
+    ],
+    ids=["timeout", "connection-reset", "incomplete-read", "bad-status"],
+)
+def test_gcloud_batch_json_read_retries_body_transport_errors(
+    transport_error: BaseException,
+) -> None:
+    raw = b'{"training_ready":false}\n'
+    rows = [
+        {
+            "uri": f"{RUN_ROOT}/receipt.json",
+            "generation": "303",
+            "size_bytes": len(raw),
+        }
+    ]
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 0, b"test-access-token\n", b"")
+
+    class Response:
+        status = 200
+
+        def __init__(self, error: BaseException | None = None) -> None:
+            self.error = error
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            if self.error is not None:
+                raise self.error
+            return raw
+
+    calls = 0
+
+    def urlopen(_request: object, *, timeout: int) -> Response:
+        nonlocal calls
+        calls += 1
+        return Response(transport_error if calls == 1 else None)
+
+    result = GcloudRunClient("gcloud", runner=runner, urlopen=urlopen).read_json_many(
+        rows
+    )
+    assert result == [(raw, {"training_ready": False})]
+    assert calls == 2
 
 
 def test_gcloud_batch_json_read_preserves_generation_and_byte_boundaries() -> None:
@@ -688,6 +790,38 @@ def test_running_run_becomes_idle_only_after_unchanged_stale_window(
     assert second["training_ready"] is False
 
 
+def test_historical_claim_on_another_worker_does_not_hide_a_stale_worker(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=jobs[0],
+        physical_worker_index=1,
+    )
+    _add_completion(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=jobs[0],
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    run_monitor(config, client=client, object_store=store, now=lambda: 100)
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+
+    assert result["scheduler_mode"] == "dynamic_claim_queue"
+    assert result["workers"][0]["claim_receipts"] == 0
+    assert result["workers"][0]["state"] == "idle_suspected_manual_review"
+
+
 def test_dynamic_claims_are_counted_by_executor_not_manifest_home_worker(
     tmp_path: Path,
 ) -> None:
@@ -782,6 +916,7 @@ def test_fresh_exact_assignment_heartbeat_keeps_executor_worker_live(
     assert first["counts"]["fresh_heartbeat_assignments"] == 0
     worker = second["workers"][1]
     assert worker["state"] == "running"
+
     assert worker["last_progress_at_unix"] == 1930
     assert worker["fresh_heartbeat_assignments"] == 1
     assert worker["fresh_assignment_heartbeats"] == [
@@ -906,13 +1041,16 @@ def test_completed_assignment_does_not_make_executor_worker_look_idle(
     store = LocalObjectStore(tmp_path / "gcs")
 
     run_monitor(config, client=client, object_store=store, now=lambda: 100)
-    result = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+    result = run_monitor(config, client=client, object_store=store, now=lambda: 1000)
 
     worker = result["workers"][1]
     assert result["counts"]["fresh_heartbeat_assignments"] == 0
     assert worker["current_claim_heartbeat_receipts"] == 0
     assert worker["current_claimed_assignments"] == 0
     assert worker["state"] == "running"
+
+    stale = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
+    assert stale["workers"][1]["state"] == "idle_suspected_manual_review"
 
 
 def test_assignment_heartbeat_uri_is_bound_to_its_exact_index(tmp_path: Path) -> None:
@@ -1204,9 +1342,7 @@ def test_cached_diagnostics_are_reverified_before_retry_is_permitted(
     assert first["workers"][0]["replacement_permitted"] is True
     assert second["workers"][0]["state"] == "transient_failure_recovery_blocked"
     assert second["workers"][0]["replacement_permitted"] is False
-    assert "diagnostics upload unavailable" in second["workers"][0][
-        "diagnostics_error"
-    ]
+    assert "diagnostics upload unavailable" in second["workers"][0]["diagnostics_error"]
     assert client.serial_calls == [PHYSICAL_WORKERS[0]]
 
 
@@ -1316,6 +1452,48 @@ def test_later_assignment_progress_recovers_same_boot_after_exit_75(
     assert client.serial_calls == []
 
 
+def test_stolen_completion_cannot_recover_a_different_worker_after_exit_75(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    jobs = manifest["repositories"]
+    assert isinstance(jobs, list)
+    home_worker_job = jobs[0]
+    assert home_worker_job["worker"] == "worker-0000"
+    _add_failure(client, worker_index=0, exit_code=75)
+    _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=home_worker_job,
+        physical_worker_index=1,
+    )
+    _add_completion(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=home_worker_job,
+    )
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 100,
+    )
+
+    failed = result["workers"][0]
+    assert result["scheduler_mode"] == "dynamic_claim_queue"
+    assert failed["assignment_receipts"] == 1
+    assert failed["claim_receipts"] == 0
+    assert failed["state"] == "transient_failure_diagnostics_preserved"
+    assert failed["recovery_evidence"] == "exit_75"
+    assert failed["replacement_permitted"] is True
+
+
 def test_exit_2_never_becomes_retryable_even_when_serial_contains_429(
     tmp_path: Path,
 ) -> None:
@@ -1339,6 +1517,30 @@ def test_exit_2_never_becomes_retryable_even_when_serial_contains_429(
     assert failed["recovery_evidence"] == "exit_2"
     assert failed["diagnostics"]["confirmed_http_429"] is True
     assert failed["replacement_permitted"] is False
+
+
+def test_exit_one_with_historical_serial_429_stays_manual_review(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    client.serial = b"old HTTP 429 Too Many Requests\ncurrent contract failure\n"
+    _add_ready(client)
+    _add_failure(client, worker_index=1, exit_code=1)
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 100,
+    )
+
+    failed = result["workers"][1]
+    assert failed["diagnostics"]["confirmed_http_429"] is True
+    assert failed["state"] == "unclassified_failure_manual_review"
+    assert failed["replacement_permitted"] is False
+    assert result["state"] == "manual_review"
 
 
 def test_complete_run_writes_local_verified_non_training_terminal_receipt(
