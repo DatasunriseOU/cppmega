@@ -341,6 +341,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         == Path(args.run_root).expanduser().resolve()
     ):
         raise SystemExit("--run-root must be separate from the repair base run")
+    if args.repair_base_code_run_root and args.code_index_timeout_s <= 0:
+        raise SystemExit(
+            "targeted repair requires --code-index-timeout-s > 0"
+        )
+    if args.repair_base_code_run_root and args.code_index_stall_timeout_s <= 0:
+        raise SystemExit(
+            "targeted repair requires --code-index-stall-timeout-s > 0"
+        )
     return args
 
 

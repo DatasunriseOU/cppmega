@@ -240,6 +240,10 @@ def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
             str(base_root),
             "--only-repo",
             "project",
+            "--code-index-timeout-s",
+            "86400",
+            "--code-index-stall-timeout-s",
+            "1800",
         ]
     )
     repair_args = source_supervisor.parse_args(repair_argv)

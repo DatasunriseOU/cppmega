@@ -243,6 +243,10 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
             str(base_root),
             "--only-repo",
             "project",
+            "--code-index-timeout-s",
+            "86400",
+            "--code-index-stall-timeout-s",
+            "1800",
         ]
     )
     repair_args = supervisor.parse_args(repair_argv)
@@ -256,7 +260,9 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
             supervisor.load_repair_base_code_run(base_root)
     supervisor._atomic_json(base_launch_path, base_launch)
     wrong_selection_argv = list(repair_argv)
-    wrong_selection_argv[-1] = "owner/project"
+    wrong_selection_argv[
+        wrong_selection_argv.index("--only-repo") + 1
+    ] = "owner/project"
     with pytest.raises(RuntimeError, match="not failed by its base run"):
         supervisor.validate_repair_request(
             supervisor.parse_args(wrong_selection_argv),
@@ -334,6 +340,38 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
         output_root.mkdir()
 
 
+def test_targeted_repair_requires_finite_index_and_file_parse_bounds(
+    tmp_path: Path,
+) -> None:
+    _repo, argv = _input_fixture(tmp_path)
+    targeted = [
+        *argv,
+        "--repair-base-code-run-root",
+        str(tmp_path / "base"),
+        "--only-repo",
+        "project",
+    ]
+
+    with pytest.raises(SystemExit, match="--code-index-timeout-s > 0"):
+        supervisor.parse_args(targeted)
+    with pytest.raises(SystemExit, match="--code-index-stall-timeout-s > 0"):
+        supervisor.parse_args(
+            [*targeted, "--code-index-timeout-s", "86400"]
+        )
+
+    args = supervisor.parse_args(
+        [
+            *targeted,
+            "--code-index-timeout-s",
+            "86400",
+            "--code-index-stall-timeout-s",
+            "1800",
+        ]
+    )
+    assert args.code_index_timeout_s == 86400
+    assert args.code_index_stall_timeout_s == 1800
+
+
 def test_targeted_repairs_exclusively_lock_shared_base(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -348,6 +386,10 @@ def test_targeted_repairs_exclusively_lock_shared_base(
             str(base_root),
             "--only-repo",
             "project",
+            "--code-index-timeout-s",
+            "86400",
+            "--code-index-stall-timeout-s",
+            "1800",
         ]
     )
     args = supervisor.parse_args(repair_argv)
