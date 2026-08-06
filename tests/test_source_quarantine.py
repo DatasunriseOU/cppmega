@@ -3,11 +3,17 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from scripts.distributed_data_prep._common import ContractError
+from scripts.distributed_data_prep.source_worker import (
+    _validate_source_tree_entry_exclusions,
+    validate_quarantine_receipt_file,
+)
 from tools.clang_indexer import index_project as ip
 from tools.clang_indexer.source_quarantine import (
     LEGACY_MANIFEST_SCHEMA,
@@ -280,6 +286,137 @@ def test_cpp_discovery_preserves_large_and_nonproduction_source_trees(
         )
     }
     assert explicitly_filtered == set(fixtures) - {"third_party/vendor.hpp"}
+
+
+def _git_fixture(root: Path, *args: str, stdin: str | None = None) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def _create_dangling_gitlink_header_fixture(root: Path) -> Path:
+    _git_fixture(root, "init", "-q")
+    _git_fixture(root, "config", "user.name", "Fixture")
+    _git_fixture(root, "config", "user.email", "fixture@example.invalid")
+    empty_tree = _git_fixture(root, "mktree", stdin="")
+    gitlink_commit = _git_fixture(
+        root,
+        "commit-tree",
+        empty_tree,
+        stdin="submodule fixture\n",
+    )
+    header = root / "include/onednn/dnnl_debug.h"
+    header.parent.mkdir(parents=True)
+    (root / "third_party/onednn").mkdir(parents=True)
+    header.symlink_to("../../third_party/onednn/include/dnnl_debug.h")
+    _git_fixture(root, "add", "include/onednn/dnnl_debug.h")
+    _git_fixture(
+        root,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{gitlink_commit},third_party/onednn",
+    )
+    _git_fixture(root, "commit", "-qm", "fixture")
+    return header
+
+
+def test_cpp_discovery_receipts_exact_dangling_gitlink_header(
+    tmp_path: Path,
+) -> None:
+    header = _create_dangling_gitlink_header_fixture(tmp_path)
+    collector = ip.GitTreeSourceEntryExclusions(tmp_path)
+
+    assert ip.find_cpp_files(
+        str(tmp_path),
+        ineligible_entry_handler=collector.record,
+    ) == []
+
+    receipt = collector.receipt()
+    assert receipt["schema"] == "cppmega.source_tree_entry_exclusions_v1"
+    assert receipt["excluded_count"] == 1
+    assert receipt["git_tree"] == _git_fixture(tmp_path, "rev-parse", "HEAD^{tree}")
+    assert receipt["records"] == [
+        {
+            "relative_path": "include/onednn/dnnl_debug.h",
+            "reason": "dangling_symlink_target_below_unmaterialized_gitlink",
+            "git_tree": receipt["git_tree"],
+            "entry_mode": "120000",
+            "entry_object_id": _git_fixture(
+                tmp_path,
+                "rev-parse",
+                "HEAD:include/onednn/dnnl_debug.h",
+            ),
+            "entry_object_type": "blob",
+            "entry_object_size_bytes": len(header.readlink().as_posix().encode()),
+            "entry_object_sha256": hashlib.sha256(
+                header.readlink().as_posix().encode()
+            ).hexdigest(),
+            "symlink_target": "../../third_party/onednn/include/dnnl_debug.h",
+            "target_relative_path": "third_party/onednn/include/dnnl_debug.h",
+            "target_gitlink_path": "third_party/onednn",
+            "target_gitlink_mode": "160000",
+            "target_gitlink_commit": _git_fixture(
+                tmp_path,
+                "rev-parse",
+                "HEAD:third_party/onednn",
+            ),
+        }
+    ]
+    assert receipt["records_sha256"] == hashlib.sha256(
+        json.dumps(
+            receipt["records"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    validated = _validate_source_tree_entry_exclusions(
+        receipt,
+        source_snapshot={"kind": "git_mirror", "tree": receipt["git_tree"]},
+    )
+    assert validated == receipt
+
+    tampered = json.loads(json.dumps(receipt))
+    tampered["records"][0]["symlink_target"] = "../../third_party/onednn/include/changed.h"
+    tampered["records_sha256"] = hashlib.sha256(
+        json.dumps(
+            tampered["records"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    with pytest.raises(ContractError, match="target path drifted"):
+        _validate_source_tree_entry_exclusions(
+            tampered,
+            source_snapshot={"kind": "git_mirror", "tree": receipt["git_tree"]},
+        )
+    with pytest.raises(ContractError, match="not bound to the worker checkout tree"):
+        _validate_source_tree_entry_exclusions(
+            receipt,
+            source_snapshot={"kind": "git_mirror", "tree": "0" * 40},
+        )
+
+
+def test_cpp_discovery_rejects_mutated_dangling_symlink(
+    tmp_path: Path,
+) -> None:
+    header = _create_dangling_gitlink_header_fixture(tmp_path)
+    header.unlink()
+    header.symlink_to("../../third_party/onednn/include/changed.h")
+    collector = ip.GitTreeSourceEntryExclusions(tmp_path)
+
+    with pytest.raises(OSError, match="non-regular entry proof failed"):
+        ip.find_cpp_files(
+            str(tmp_path),
+            ineligible_entry_handler=collector.record,
+        )
 
 
 def test_exact_quarantine_filters_verified_non_cpp_and_builds_receipt(
@@ -960,12 +1097,13 @@ def test_process_project_writes_atomic_bound_receipt(
 
     assert documents == []
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt["schema"] == RECEIPT_SCHEMA
+    assert receipt["schema"] == "cppmega.source_quarantine_receipt_v2"
     assert receipt["project_id"] == PROJECT_ID
     assert (
         receipt["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     )
     assert receipt["quarantined_count"] == 1
+    assert receipt["source_tree_entry_exclusions"]["excluded_count"] == 0
     omission_receipt = receipt["external_reference_omissions"]
     assert omission_receipt["schema"] == "cppmega.external_reference_omissions_v1"
     assert omission_receipt["status"] == "complete"
@@ -974,6 +1112,47 @@ def test_process_project_writes_atomic_bound_receipt(
     assert omission_receipt["unique_reference_count"] == 0
     assert omission_receipt["location_count"] == 0
     assert omission_receipt["locations"] == []
+
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    validated_v2 = validate_quarantine_receipt_file(
+        receipt_path,
+        project_id=PROJECT_ID,
+        manifest_sha256=manifest_sha256,
+        source_snapshot={"kind": "git_mirror", "tree": "0" * 40},
+    )
+    assert validated_v2["schema"] == "cppmega.source_quarantine_receipt_v2"
+
+    legacy_receipt = dict(receipt)
+    legacy_receipt["schema"] = "cppmega.source_quarantine_receipt_v1"
+    legacy_receipt.pop("source_tree_entry_exclusions")
+    legacy_path = tmp_path / "receipts/source-v1.json"
+    legacy_path.write_text(
+        json.dumps(legacy_receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    validated_v1 = validate_quarantine_receipt_file(
+        legacy_path,
+        project_id=PROJECT_ID,
+        manifest_sha256=manifest_sha256,
+        source_snapshot={"kind": "git_mirror", "tree": "0" * 40},
+    )
+    assert validated_v1["schema"] == "cppmega.source_quarantine_receipt_v1"
+    assert "source_tree_entry_exclusions" not in validated_v1
+
+    malformed_v2 = dict(legacy_receipt)
+    malformed_v2["schema"] = "cppmega.source_quarantine_receipt_v2"
+    malformed_v2_path = tmp_path / "receipts/source-v2-missing-exclusions.json"
+    malformed_v2_path.write_text(
+        json.dumps(malformed_v2, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ContractError, match="fields drifted"):
+        validate_quarantine_receipt_file(
+            malformed_v2_path,
+            project_id=PROJECT_ID,
+            manifest_sha256=manifest_sha256,
+            source_snapshot={"kind": "git_mirror", "tree": "0" * 40},
+        )
 
 
 def test_process_project_quarantines_non_cpp_executable_archive(

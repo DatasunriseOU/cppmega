@@ -395,7 +395,7 @@ def test_worker_publishes_projected_quarantine_and_resumes_from_receipt(
         quarantine_receipt.write_text(
             json.dumps(
                 {
-                    "schema": "cppmega.source_quarantine_receipt_v1",
+                    "schema": "cppmega.source_quarantine_receipt_v2",
                     "project_id": project_id,
                     "manifest_path": str(quarantine_manifest),
                     "manifest_sha256": sha256_file(quarantine_manifest),
@@ -405,6 +405,18 @@ def test_worker_publishes_projected_quarantine_and_resumes_from_receipt(
                     "candidate_count_after_quarantine": 1,
                     "quarantined_count": 0,
                     "entries": [],
+                    "source_tree_entry_exclusions": {
+                        "schema": "cppmega.source_tree_entry_exclusions_v1",
+                        "status": "complete",
+                        "policy": (
+                            "skip_only_dangling_symlink_blobs_targeting_"
+                            "unmaterialized_gitlinks"
+                        ),
+                        "git_tree": None,
+                        "excluded_count": 0,
+                        "records_sha256": hashlib.sha256(b"[]").hexdigest(),
+                        "records": [],
+                    },
                     "external_reference_omissions": {
                         "schema": "cppmega.external_reference_omissions_v1",
                         "status": "complete",

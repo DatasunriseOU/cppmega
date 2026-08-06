@@ -599,6 +599,7 @@ def reduce_source_candidates(
                         quarantine_path,
                         project_id=str(job["project_id"]),
                         manifest_sha256=effective_quarantine_manifest_sha256,
+                        source_snapshot=receipt["source_snapshot"],
                     )
                     object_store.download(
                         str(artifact["uri"]),
