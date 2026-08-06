@@ -61,6 +61,9 @@ from scripts.distributed_data_prep.source_slot_scheduler import (  # noqa: E402
 from scripts.distributed_data_prep.source_work_queue import (  # noqa: E402
     ASSIGNMENT_CLAIM_SCHEMA,
     ASSIGNMENT_HEARTBEAT_SCHEMA,
+    ASSIGNMENT_OUTCOME_SCHEMA,
+    _validate_outcome,
+    assignment_outcome_uri,
 )
 from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     GcloudObjectStore,
@@ -1655,6 +1658,69 @@ def _assignment_claim(
     }
 
 
+def _assignment_outcome(
+    *,
+    raw: bytes,
+    value: Mapping[str, object],
+    metadata: Mapping[str, object],
+    config: Mapping[str, object],
+    manifest: Mapping[str, object],
+    jobs_by_sha256: Mapping[str, Mapping[str, object]],
+    claims_by_identity: Mapping[tuple[str, int, str], Mapping[str, object]],
+) -> dict[str, object]:
+    outcome = dict(value)
+    assignment = outcome.get("assignment")
+    if not isinstance(assignment, Mapping):
+        raise MonitorError("GCP source assignment outcome assignment is invalid")
+    assignment_sha256 = require_sha256(
+        assignment.get("assignment_sha256"),
+        where="GCP source assignment outcome assignment SHA-256",
+    )
+    attempt = require_int(outcome.get("attempt"), where="outcome attempt")
+    claim_sha256 = require_sha256(
+        outcome.get("claim_sha256"), where="outcome claim SHA-256"
+    )
+    job = jobs_by_sha256.get(assignment_sha256)
+    claim = claims_by_identity.get((assignment_sha256, attempt, claim_sha256))
+    if job is None or claim is None:
+        raise MonitorError("GCP source assignment outcome escaped its exact claim")
+    try:
+        validated = _validate_outcome(
+            outcome,
+            manifest=manifest,
+            job=job,
+            claim={
+                **claim,
+                "manifest_file_sha256": config["manifest_file_sha256"],
+            },
+            claim_sha256=claim_sha256,
+        )
+    except ContractError as exc:
+        raise MonitorError(
+            f"GCP source assignment outcome binding drifted: {exc}"
+        ) from exc
+    if validated["schema"] != ASSIGNMENT_OUTCOME_SCHEMA:
+        raise MonitorError("GCP source assignment outcome schema drifted")
+    uri = validate_gcs_uri(metadata.get("uri"), where="assignment outcome URI")
+    expected_uri = assignment_outcome_uri(manifest, job, attempt, claim_sha256)
+    if uri != expected_uri:
+        raise MonitorError("GCP source assignment outcome URI binding drifted")
+    return {
+        "assignment_sha256": assignment_sha256,
+        "attempt": attempt,
+        "claim_sha256": claim_sha256,
+        "status": validated["status"],
+        "worker_exit_code": validated["worker_exit_code"],
+        "physical_worker_index": claim["physical_worker_index"],
+        "logical_worker": claim["logical_worker"],
+        "published_unix_s": validated["published_unix_s"],
+        "uri": uri,
+        "generation": str(metadata["generation"]),
+        "updated": metadata.get("updated", ""),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def _cached_claim_summary(
     cached: Mapping[str, object],
     metadata: Mapping[str, object],
@@ -2440,6 +2506,45 @@ def run_monitor(
             ): record
             for record in claim_records
         }
+        outcome_inventory = _metadata_map(
+            run_client.list_objects(
+                f"{checked['run_root']}/source-assignment-attempt-outcomes/"
+                f"{manifest['manifest_sha256']}/*/*.outcome.json"
+            )
+        )
+        _require_immutable_inventory(
+            kind="outcome", inventory=outcome_inventory, state=state
+        )
+        outcome_records: list[dict[str, object]] = []
+        for metadata in outcome_inventory.values():
+            cached = _cached_receipt(kind="outcome", metadata=metadata, state=state)
+            raw, value = run_client.read_json(metadata)
+            record = _assignment_outcome(
+                raw=raw,
+                value=value,
+                metadata=metadata,
+                config=checked,
+                manifest=manifest,
+                jobs_by_sha256=jobs_by_sha256,
+                claims_by_identity=claims_by_identity,
+            )
+            if cached is None:
+                _remember_receipt(
+                    kind="outcome", metadata=metadata, raw=raw, state=state
+                )
+            elif cached["sha256"] != record["sha256"]:
+                raise MonitorError(
+                    f"immutable outcome receipt hash drifted: {metadata['uri']}"
+                )
+            outcome_records.append(record)
+        outcomes_by_identity = {
+            (
+                str(record["assignment_sha256"]),
+                int(record["attempt"]),
+                str(record["claim_sha256"]),
+            ): record
+            for record in outcome_records
+        }
         heartbeat_inventory = _metadata_map(
             run_client.list_objects(
                 f"{checked['run_root']}/source-assignment-heartbeats/"
@@ -2558,10 +2663,24 @@ def run_monitor(
         completed_assignment_sha256 = {
             str(jobs_by_uri[uri]["assignment_sha256"]) for uri in valid_assignment_uris
         }
+        terminal_assignment_outcomes = {
+            assignment_sha256_value: outcomes_by_identity[identity]
+            for assignment_sha256_value, record in latest_claims.items()
+            if assignment_sha256_value not in completed_assignment_sha256
+            and (
+                identity := (
+                    str(record["assignment_sha256"]),
+                    int(record["attempt"]),
+                    str(record["claim_sha256"]),
+                )
+            )
+            in outcomes_by_identity
+        }
         current_claims = {
             assignment_sha256_value: record
             for assignment_sha256_value, record in latest_claims.items()
             if assignment_sha256_value not in completed_assignment_sha256
+            and assignment_sha256_value not in terminal_assignment_outcomes
         }
         current_heartbeat_records = [
             record
@@ -2955,6 +3074,16 @@ def run_monitor(
             "expected_assignment_receipts": len(jobs),
             "assignment_claim_receipts": len(claim_records),
             "claimed_assignments": len(latest_claims),
+            "assignment_outcome_receipts": len(outcome_records),
+            "terminal_assignment_outcomes": len(terminal_assignment_outcomes),
+            "deterministic_assignment_outcomes": sum(
+                record["status"] == "deterministic"
+                for record in terminal_assignment_outcomes.values()
+            ),
+            "transient_assignment_outcomes": sum(
+                record["status"] == "transient"
+                for record in terminal_assignment_outcomes.values()
+            ),
             "assignment_heartbeat_receipts": len(heartbeat_records),
             "fresh_heartbeat_assignments": len(fresh_current_heartbeats),
             "slot_receipts": len(valid_slot_uris),
@@ -2974,11 +3103,18 @@ def run_monitor(
         claim_inventory_sha256 = hashlib.sha256(
             canonical_json_bytes(sorted(claim_sha256))
         ).hexdigest()
+        outcome_inventory_sha256 = hashlib.sha256(
+            canonical_json_bytes(
+                sorted(str(record["sha256"]) for record in outcome_records)
+            )
+        ).hexdigest()
         heartbeat_inventory_sha256 = hashlib.sha256(
             canonical_json_bytes(sorted(heartbeat_sha256))
         ).hexdigest()
         if counts["completed_workers"] == len(physical_workers):
             run_state = "complete"
+        elif counts["deterministic_assignment_outcomes"]:
+            run_state = "blocked_deterministic"
         elif any(
             report["state"] == "deterministic_failure_manual_review"
             for report in worker_reports
@@ -3009,6 +3145,7 @@ def run_monitor(
             "unexpected_instances": unexpected_instances,
             "receipt_inventory_sha256": receipt_inventory_sha256,
             "claim_inventory_sha256": claim_inventory_sha256,
+            "outcome_inventory_sha256": outcome_inventory_sha256,
             "heartbeat_inventory_sha256": heartbeat_inventory_sha256,
             "scheduler_mode": (
                 "dynamic_claim_queue" if claim_records else "manifest_home_shards"

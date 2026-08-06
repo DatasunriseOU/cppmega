@@ -29,7 +29,9 @@ from scripts.distributed_data_prep.source_slot_scheduler import (
 )
 from scripts.distributed_data_prep.source_work_queue import (
     ASSIGNMENT_HEARTBEAT_SCHEMA,
+    ASSIGNMENT_OUTCOME_SCHEMA,
     assignment_heartbeat_uri,
+    assignment_outcome_uri,
 )
 from scripts.distributed_data_prep.source_worker import (
     ASSIGNMENT_COMPLETION_RECEIPT_SCHEMA,
@@ -1028,6 +1030,51 @@ def _add_completion(
     )
 
 
+def _add_outcome(
+    client: FakeRunClient,
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    job: Mapping[str, object],
+    claim: Mapping[str, object],
+    claim_sha256: str,
+    worker_exit_code: int = 2,
+) -> str:
+    uri = assignment_outcome_uri(
+        manifest,
+        job,
+        int(claim["attempt"]),
+        claim_sha256,
+    )
+    client.add_json(
+        uri,
+        {
+            "schema": ASSIGNMENT_OUTCOME_SCHEMA,
+            "status": "transient" if worker_exit_code == 75 else "deterministic",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": manifest_file_sha256,
+            "assignment": {
+                key: job[key]
+                for key in (
+                    "ordinal",
+                    "repo",
+                    "project_id",
+                    "worker",
+                    "assignment_sha256",
+                )
+            },
+            "attempt": claim["attempt"],
+            "claim_sha256": claim_sha256,
+            "executor": claim["executor"],
+            "scheduler_instance": claim["scheduler_instance"],
+            "worker_exit_code": worker_exit_code,
+            "published_unix_s": 1000,
+            "training_ready": False,
+        },
+    )
+    return uri
+
+
 def _add_all_completions(
     client: FakeRunClient, manifest: dict[str, object], manifest_file_sha256: str
 ) -> None:
@@ -1498,6 +1545,77 @@ def test_completed_assignment_does_not_make_executor_worker_look_idle(
 
     stale = run_monitor(config, client=client, object_store=store, now=lambda: 2000)
     assert stale["workers"][1]["state"] == "idle_suspected_manual_review"
+
+
+def test_terminal_assignment_outcome_is_not_counted_as_current_claim(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    job = manifest["repositories"][0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    _add_outcome(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+    )
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 1000,
+    )
+
+    assert result["counts"]["assignment_outcome_receipts"] == 1
+    assert result["counts"]["claimed_assignments"] == 1
+    assert result["counts"]["terminal_assignment_outcomes"] == 1
+    assert result["counts"]["deterministic_assignment_outcomes"] == 1
+    assert result["counts"]["transient_assignment_outcomes"] == 0
+    assert result["workers"][1]["current_claimed_assignments"] == 0
+    assert result["counts"]["fresh_heartbeat_assignments"] == 0
+    assert result["state"] == "blocked_deterministic"
+
+
+def test_validated_assignment_outcome_cannot_disappear(tmp_path: Path) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    job = manifest["repositories"][0]
+    claim, claim_sha256 = _add_claim(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        physical_worker_index=1,
+    )
+    outcome_uri = _add_outcome(
+        client,
+        manifest=manifest,
+        manifest_file_sha256=str(config["manifest_file_sha256"]),
+        job=job,
+        claim=claim,
+        claim_sha256=claim_sha256,
+    )
+    store = LocalObjectStore(tmp_path / "gcs")
+
+    run_monitor(config, client=client, object_store=store, now=lambda: 1000)
+    client.objects.pop(outcome_uri)
+
+    with pytest.raises(MonitorError, match="outcome receipt disappeared"):
+        run_monitor(config, client=client, object_store=store, now=lambda: 1100)
 
 
 def test_assignment_heartbeat_uri_is_bound_to_its_exact_index(tmp_path: Path) -> None:
