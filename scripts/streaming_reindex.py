@@ -439,63 +439,45 @@ def _subprocess_env() -> dict:
     return env
 
 
-def _parse_ps_time_seconds(value: str) -> float | None:
-    """Parse ps TIME values like MM:SS.cc, HH:MM:SS.cc, or DD-HH:MM:SS.cc."""
-    raw = value.strip()
-    if not raw:
-        return None
-    days = 0
-    if "-" in raw:
-        day_raw, raw = raw.split("-", 1)
-        try:
-            days = int(day_raw)
-        except ValueError:
-            return None
-    parts = raw.split(":")
-    try:
-        if len(parts) == 2:
-            hours = 0
-            minutes = int(parts[0])
-            seconds = float(parts[1])
-        elif len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        else:
-            return None
-    except ValueError:
-        return None
-    return float(days * 86400 + hours * 3600 + minutes * 60) + seconds
+_HEARTBEAT_PROGRESS_RE = re.compile(
+    r"^\s*(?P<label>[^:\r\n]*\bheartbeat):\s*(?P<state>.*)\s*$",
+    re.IGNORECASE,
+)
 
 
-def _process_group_cpu_seconds(pgid: int) -> float | None:
-    """Return cumulative CPU seconds for a process group, when ps supports it."""
-    try:
-        output = subprocess.check_output(
-            ["ps", "-axo", "pgid=,time="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    total = 0.0
-    seen = False
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) < 2:
+def _consume_log_progress(
+    log_path: Path,
+    offset: int,
+    heartbeat_states: dict[str, str],
+) -> tuple[int, bool]:
+    """Read appended log bytes and ignore duplicate semantic heartbeats."""
+
+    size = log_path.stat().st_size
+    if size < offset:
+        offset = 0
+        heartbeat_states.clear()
+    if size == offset:
+        return offset, False
+
+    with log_path.open("rb") as log_reader:
+        log_reader.seek(offset)
+        appended = log_reader.read(size - offset)
+
+    progressed = False
+    for raw_line in appended.splitlines():
+        if not raw_line.strip():
             continue
-        try:
-            row_pgid = int(fields[0])
-        except ValueError:
+        line = raw_line.decode("utf-8", errors="replace")
+        heartbeat = _HEARTBEAT_PROGRESS_RE.fullmatch(line)
+        if heartbeat is None:
+            progressed = True
             continue
-        if row_pgid != pgid:
-            continue
-        seconds = _parse_ps_time_seconds(fields[1])
-        if seconds is None:
-            continue
-        total += seconds
-        seen = True
-    return total if seen else None
+        label = heartbeat.group("label").strip().casefold()
+        state = heartbeat.group("state").strip()
+        if heartbeat_states.get(label) != state:
+            heartbeat_states[label] = state
+            progressed = True
+    return size, progressed
 
 
 def run_checked(
@@ -550,8 +532,8 @@ def run_checked(
         if stall_timeout and log_path is not None:
             deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
             last_activity = time.monotonic()
-            last_signature: tuple[int, int] | None = None
-            last_cpu_seconds: float | None = None
+            log_offset = 0
+            heartbeat_states: dict[str, str] = {}
             while proc.poll() is None:
                 now = time.monotonic()
                 if deadline is not None and now > deadline:
@@ -562,23 +544,19 @@ def run_checked(
                         f"timed out after {timeout}s",
                     )
                 if log_path.exists():
-                    stat = log_path.stat()
-                    signature = (stat.st_size, stat.st_mtime_ns)
-                    if signature != last_signature:
-                        last_signature = signature
-                        last_activity = now
-                cpu_seconds = _process_group_cpu_seconds(proc.pid)
-                if cpu_seconds is not None and cpu_seconds != last_cpu_seconds:
-                    last_cpu_seconds = cpu_seconds
-                    last_activity = now
-                if now - last_activity > stall_timeout:
-                    terminate_process(
-                        f"no log/CPU progress for {stall_timeout}s"
+                    log_offset, progressed = _consume_log_progress(
+                        log_path,
+                        log_offset,
+                        heartbeat_states,
                     )
+                    if progressed:
+                        last_activity = now
+                if now - last_activity > stall_timeout:
+                    terminate_process(f"no log progress for {stall_timeout}s")
                     raise RepoFailure(
                         repo,
                         stage,
-                        f"stalled after {stall_timeout}s without log or CPU progress",
+                        f"stalled after {stall_timeout}s without log progress",
                     )
                 time.sleep(1.0)
             stdout_data, _ = proc.communicate(timeout=1)
