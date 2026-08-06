@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
@@ -32,9 +33,13 @@ from scripts.distributed_data_prep.source_quarantine_projection import (
 from scripts.distributed_data_prep.source_worker import (
     CANONICAL_DOCUMENT_ORDER,
     LocalObjectStore,
+    _accept_known_git_fsck_diagnostic,
+    _expected_git_fsck_exception_receipt,
+    _KEYDB_ZERO_PADDED_FILEMODE,
     acquire_git_mirror,
     canonicalize_enriched_jsonl,
     compress_zstd,
+    validate_git_fsck_snapshot,
 )
 
 _SHA = "a" * 64
@@ -171,6 +176,143 @@ def test_full_mirror_acquisition_pins_refs_tree_and_objects(tmp_path: Path) -> N
     assert receipt["objects"]["count"] >= 3
     assert len(receipt["objects"]["inventory_sha256"]) == 64
     assert receipt["fsck"] == "ok"
+
+
+def _write_loose_git_object(git_dir: Path, object_type: str, payload: bytes) -> str:
+    serialized = f"{object_type} {len(payload)}\0".encode("ascii") + payload
+    object_id = hashlib.sha1(serialized).hexdigest()
+    destination = git_dir / "objects" / object_id[:2] / object_id[2:]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(zlib.compress(serialized))
+    return object_id
+
+
+def test_git_fsck_exception_accepts_only_exact_pinned_object_diagnostic(
+    tmp_path: Path,
+) -> None:
+    mirror = tmp_path / "fixture.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    blob_id = _write_loose_git_object(mirror, "blob", b"fixture\n")
+    tree_payload = b"0100644 fixture.cpp\0" + bytes.fromhex(blob_id)
+    tree_id = _write_loose_git_object(mirror, "tree", tree_payload)
+    commit_payload = (
+        f"tree {tree_id}\n"
+        "author Fixture <fixture@example.test> 0 +0000\n"
+        "committer Fixture <fixture@example.test> 0 +0000\n"
+        "\nfixture\n"
+    ).encode("ascii")
+    commit_id = _write_loose_git_object(mirror, "commit", commit_payload)
+    subprocess.run(
+        ["git", f"--git-dir={mirror}", "update-ref", "refs/heads/main", commit_id],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    diagnostic = (
+        f"error in tree {tree_id}: zeroPaddedFilemode: "
+        "contains zero-padded file modes"
+    )
+    policy = {
+        "remote_url": "https://example.test/exact.git",
+        "expected_commit": commit_id,
+        "checkout_tree": tree_id,
+        "historical_commit": commit_id,
+        "object_id": tree_id,
+        "object_type": "tree",
+        "object_size_bytes": len(tree_payload),
+        "object_payload_sha256": hashlib.sha256(tree_payload).hexdigest(),
+        "message_id": "zeroPaddedFilemode",
+        "diagnostic": diagnostic,
+        "returncode": 0,
+    }
+    source = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": commit_id,
+        "expected_tree": tree_id,
+    }
+    fsck = subprocess.run(
+        ["git", f"--git-dir={mirror}", "fsck", "--full", "--strict"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fsck.returncode != 0
+    policy["returncode"] = fsck.returncode
+
+    receipt = _accept_known_git_fsck_diagnostic(
+        source,
+        tree_id,
+        mirror,
+        fsck,
+        known_exception=policy,
+    )
+
+    assert receipt == _expected_git_fsck_exception_receipt(policy)
+    assert receipt["status"] == "accepted_known_historical_diagnostic"
+    assert receipt["diagnostics"][0]["object_payload_sha256"] == hashlib.sha256(
+        tree_payload
+    ).hexdigest()
+
+    extra_diagnostic = subprocess.CompletedProcess(
+        fsck.args,
+        fsck.returncode,
+        fsck.stdout,
+        fsck.stderr + "error in commit deadbeef: another failure\n",
+    )
+    with pytest.raises(ContractError, match="did not match the exact"):
+        _accept_known_git_fsck_diagnostic(
+            source,
+            tree_id,
+            mirror,
+            extra_diagnostic,
+            known_exception=policy,
+        )
+
+    wrong_payload_policy = dict(policy)
+    wrong_payload_policy["object_payload_sha256"] = "0" * 64
+    with pytest.raises(ContractError, match="object payload drifted"):
+        _accept_known_git_fsck_diagnostic(
+            source,
+            tree_id,
+            mirror,
+            fsck,
+            known_exception=wrong_payload_policy,
+        )
+
+
+def test_git_fsck_exception_receipt_is_pinned_and_tamper_evident() -> None:
+    policy = _KEYDB_ZERO_PADDED_FILEMODE
+    source = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": policy["expected_commit"],
+        "expected_tree": None,
+    }
+    snapshot = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": policy["expected_commit"],
+        "resolved_commit": policy["expected_commit"],
+        "tree": policy["checkout_tree"],
+        "fsck": _expected_git_fsck_exception_receipt(policy),
+    }
+
+    validate_git_fsck_snapshot(source, snapshot)
+
+    snapshot["fsck"] = "ok"
+    with pytest.raises(ContractError, match="omitted known fsck diagnostic"):
+        validate_git_fsck_snapshot(source, snapshot)
+
+    snapshot["fsck"] = _expected_git_fsck_exception_receipt(policy)
+    snapshot["fsck"]["diagnostics"][0]["diagnostic"] += " tampered"
+    with pytest.raises(ContractError, match="evidence drifted"):
+        validate_git_fsck_snapshot(source, snapshot)
 
 
 def test_candidate_canonicalization_is_independent_of_emission_order(
