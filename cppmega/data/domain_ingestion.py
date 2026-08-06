@@ -251,6 +251,8 @@ _EXPLICIT_DOMAIN_SUFFIXES = frozenset(
         ".ddl",
         ".dml",
         ".psql",
+        ".s",
+        ".asm",
         ".py",
         ".m4",
         ".gn",
@@ -1299,6 +1301,8 @@ def _allows_domain_content_signatures(path: Path) -> bool:
 
 
 def _large_domain_is_chunkable(path: Path, adapter: DomainParserAdapter) -> bool:
+    if adapter.name == "assembly-raw":
+        return True
     if adapter.domain in _LARGE_DOMAIN_KINDS:
         return True
     return adapter.name == "raw-output" and _is_explicit_domain_path(
@@ -1603,6 +1607,19 @@ def _raw_typed_parser(
     return parse
 
 
+def _parse_assembly_raw(text: str) -> ParsedDomainDocument:
+    """Keep assembly source exact on the frozen broad code route."""
+
+    parsed = _raw_typed_parser(DomainKind.CPP, "assembly-raw")(text)
+    parsed.metadata.update(
+        {
+            "language": "assembly",
+            "shared_domain": "cpp",
+        }
+    )
+    return parsed
+
+
 def parse_powershell(text: str) -> ParsedDomainDocument:
     """Parse PowerShell with its own dialect parser on the shared shell domain."""
 
@@ -1690,6 +1707,11 @@ _ADAPTERS = {
         DomainKind.PYTHON,
         parse_python,
     ),
+    "assembly": DomainParserAdapter(
+        "assembly-raw",
+        DomainKind.CPP,
+        _parse_assembly_raw,
+    ),
     "raw": DomainParserAdapter("raw-output", DomainKind.TOOL_OUTPUT, _parse_raw_output),
 }
 
@@ -1776,6 +1798,8 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["gn"]
     if suffix in {".sql", ".ddl", ".dml", ".psql"}:
         return _ADAPTERS["sql"]
+    if suffix in {".s", ".asm"}:
+        return _ADAPTERS["assembly"]
     if suffix == ".py":
         return _ADAPTERS["python"]
 
@@ -2218,7 +2242,9 @@ def discover_project_domain_files(
             continue
 
         if adapter.name == "raw-output" or (
-            not include_cpp and adapter.domain == DomainKind.CPP
+            not include_cpp
+            and adapter.domain == DomainKind.CPP
+            and adapter.name != "assembly-raw"
         ):
             continue
         discovered.append(

@@ -16,6 +16,7 @@ import hashlib
 import heapq
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -136,6 +137,12 @@ _KEYDB_ZERO_PADDED_FILEMODE = {
     ),
     "returncode": 4,
 }
+SOURCE_QUARANTINE_RECEIPT_SCHEMA_V1 = "cppmega.source_quarantine_receipt_v1"
+SOURCE_QUARANTINE_RECEIPT_SCHEMA_V2 = "cppmega.source_quarantine_receipt_v2"
+SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA = "cppmega.source_tree_entry_exclusions_v1"
+_SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY = (
+    "skip_only_dangling_symlink_blobs_targeting_unmaterialized_gitlinks"
+)
 
 
 class TransientTransportError(RuntimeError):
@@ -1444,36 +1451,200 @@ def _run_indexer(
     }
 
 
+def _validate_source_tree_entry_exclusions(
+    value: object,
+    *,
+    source_snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ContractError("source tree entry exclusions receipt is missing")
+    receipt = dict(value)
+    require_exact_fields(
+        receipt,
+        {
+            "schema",
+            "status",
+            "policy",
+            "git_tree",
+            "excluded_count",
+            "records_sha256",
+            "records",
+        },
+        where="source tree entry exclusions receipt",
+    )
+    if (
+        receipt["schema"] != SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA
+        or receipt["status"] != "complete"
+        or receipt["policy"] != _SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY
+    ):
+        raise ContractError("source tree entry exclusions policy drifted")
+    excluded_count = require_int(
+        receipt["excluded_count"], where="source tree excluded count"
+    )
+    records = receipt["records"]
+    if not isinstance(records, list) or len(records) != excluded_count:
+        raise ContractError("source tree entry exclusion count does not close")
+    if canonical_sha256(records) != require_sha256(
+        receipt["records_sha256"],
+        where="source tree entry exclusion records sha256",
+    ):
+        raise ContractError("source tree entry exclusion records digest drifted")
+    git_tree = receipt["git_tree"]
+    if excluded_count:
+        git_tree = require_git_object(git_tree, where="source tree exclusion Git tree")
+    elif git_tree is not None:
+        raise ContractError("empty source tree exclusions must not claim a Git tree")
+    if excluded_count and (
+        source_snapshot.get("kind") != "git_mirror"
+        or source_snapshot.get("tree") != git_tree
+    ):
+        raise ContractError(
+            "source tree entry exclusions are not bound to the worker checkout tree"
+        )
+
+    expected_record_fields = {
+        "relative_path",
+        "reason",
+        "git_tree",
+        "entry_mode",
+        "entry_object_id",
+        "entry_object_type",
+        "entry_object_size_bytes",
+        "entry_object_sha256",
+        "symlink_target",
+        "target_relative_path",
+        "target_gitlink_path",
+        "target_gitlink_mode",
+        "target_gitlink_commit",
+    }
+    previous_path: str | None = None
+    for index, record_value in enumerate(records):
+        if not isinstance(record_value, Mapping):
+            raise ContractError(f"source tree exclusion record {index} is malformed")
+        record = dict(record_value)
+        require_exact_fields(
+            record,
+            expected_record_fields,
+            where=f"source tree exclusion record {index}",
+        )
+        relative_path = str(record["relative_path"])
+        target_relative_path = str(record["target_relative_path"])
+        gitlink_path = str(record["target_gitlink_path"])
+        for label, candidate in (
+            ("relative_path", relative_path),
+            ("target_relative_path", target_relative_path),
+            ("target_gitlink_path", gitlink_path),
+        ):
+            parsed = PurePosixPath(candidate)
+            if (
+                not candidate
+                or parsed.is_absolute()
+                or ".." in parsed.parts
+                or parsed.as_posix() != candidate
+            ):
+                raise ContractError(
+                    f"source tree exclusion {label} is not canonical: {candidate!r}"
+                )
+        if previous_path is not None and relative_path <= previous_path:
+            raise ContractError("source tree exclusion records are not canonical")
+        previous_path = relative_path
+        if not target_relative_path.startswith(gitlink_path + "/"):
+            raise ContractError("source tree exclusion target escaped its gitlink")
+        if (
+            record["reason"]
+            != "dangling_symlink_target_below_unmaterialized_gitlink"
+            or record["git_tree"] != git_tree
+            or record["entry_mode"] != "120000"
+            or record["entry_object_type"] != "blob"
+            or record["target_gitlink_mode"] != "160000"
+        ):
+            raise ContractError("source tree exclusion record semantics drifted")
+        require_git_object(
+            record["entry_object_id"], where="source tree symlink object id"
+        )
+        require_git_object(
+            record["target_gitlink_commit"], where="source tree gitlink commit"
+        )
+        symlink_target = record["symlink_target"]
+        if (
+            not isinstance(symlink_target, str)
+            or not symlink_target
+            or "\0" in symlink_target
+            or PurePosixPath(symlink_target).is_absolute()
+        ):
+            raise ContractError("source tree symlink target is invalid")
+        expected_target = posixpath.normpath(
+            posixpath.join(PurePosixPath(relative_path).parent.as_posix(), symlink_target)
+        )
+        if expected_target != target_relative_path:
+            raise ContractError("source tree symlink target path drifted")
+        symlink_payload = os.fsencode(symlink_target)
+        if (
+            require_int(
+                record["entry_object_size_bytes"],
+                where="source tree symlink object size",
+                minimum=1,
+            )
+            != len(symlink_payload)
+            or require_sha256(
+                record["entry_object_sha256"],
+                where="source tree symlink object sha256",
+            )
+            != hashlib.sha256(symlink_payload).hexdigest()
+        ):
+            raise ContractError("source tree symlink object payload drifted")
+    return receipt
+
+
 def validate_quarantine_receipt_file(
     path: Path,
     *,
     project_id: str,
     manifest_sha256: str,
+    source_snapshot: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate the physical source-quarantine sidecar used by release audits."""
 
     raw, receipt = load_json_object(path, where="source quarantine receipt")
-    require_exact_fields(
-        receipt,
-        {
-            "schema",
-            "project_id",
-            "manifest_path",
-            "manifest_sha256",
-            "manifest_entry_count",
-            "project_manifest_entry_count",
-            "candidate_count_before_quarantine",
-            "candidate_count_after_quarantine",
-            "quarantined_count",
-            "entries",
-            "external_reference_omissions",
-            "parse_recovery",
-        },
-        where="source quarantine receipt",
-    )
+    base_fields = {
+        "schema",
+        "project_id",
+        "manifest_path",
+        "manifest_sha256",
+        "manifest_entry_count",
+        "project_manifest_entry_count",
+        "candidate_count_before_quarantine",
+        "candidate_count_after_quarantine",
+        "quarantined_count",
+        "entries",
+        "external_reference_omissions",
+        "parse_recovery",
+    }
+    schema = receipt.get("schema")
+    if schema == SOURCE_QUARANTINE_RECEIPT_SCHEMA_V1:
+        require_exact_fields(
+            receipt,
+            base_fields,
+            where="source quarantine v1 receipt",
+        )
+    elif schema == SOURCE_QUARANTINE_RECEIPT_SCHEMA_V2:
+        require_exact_fields(
+            receipt,
+            base_fields | {"source_tree_entry_exclusions"},
+            where="source quarantine v2 receipt",
+        )
+        if not isinstance(source_snapshot, Mapping):
+            raise ContractError("source quarantine v2 receipt omitted source snapshot")
+        receipt["source_tree_entry_exclusions"] = (
+            _validate_source_tree_entry_exclusions(
+                receipt["source_tree_entry_exclusions"],
+                source_snapshot=source_snapshot,
+            )
+        )
+    else:
+        raise ContractError("source quarantine receipt schema drifted")
     if (
-        receipt["schema"] != "cppmega.source_quarantine_receipt_v1"
-        or receipt["project_id"] != project_id
+        receipt["project_id"] != project_id
         or receipt["manifest_sha256"] != manifest_sha256
     ):
         raise ContractError("source quarantine receipt binding drifted")
@@ -2071,6 +2242,7 @@ def run_source_worker(
                 quarantine_receipt,
                 project_id=str(job["project_id"]),
                 manifest_sha256=sha256_file(effective_quarantine_manifest),
+                source_snapshot=source_snapshot,
             )
             if (
                 validated_quarantine["receipt_sha256"]
