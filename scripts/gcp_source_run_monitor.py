@@ -14,6 +14,7 @@ import argparse
 import concurrent.futures
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -88,6 +89,13 @@ _UUID_RE = re.compile(
 _HTTP_429_RE = re.compile(
     r"(?:^|[^0-9])429(?:[^0-9]|$)|too many requests|resource_exhausted",
     re.IGNORECASE,
+)
+
+_TRANSIENT_HTTP_TRANSPORT_ERRORS = (
+    TimeoutError,
+    ConnectionResetError,
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
 )
 
 
@@ -238,6 +246,11 @@ class GcloudRunClient:
                         raise MonitorError(
                             f"GCS inventory transport failed: {pattern}"
                         ) from exc
+                except _TRANSIENT_HTTP_TRANSPORT_ERRORS as exc:
+                    if attempt >= _JSON_READ_MAX_RETRIES:
+                        raise MonitorError(
+                            f"GCS inventory transport failed: {pattern}"
+                        ) from exc
                 except json.JSONDecodeError as exc:
                     raise MonitorError("GCS inventory returned invalid JSON") from exc
                 self.sleeper(float(2**attempt))
@@ -341,6 +354,7 @@ class GcloudRunClient:
                 + urllib.parse.urlencode({"alt": "media", "generation": generation})
             )
             requests.append((uri, generation, size_bytes, endpoint))
+
         def read_one(request: tuple[str, str, int, str]) -> bytes:
             uri, generation, size_bytes, endpoint = request
             for attempt in range(_JSON_READ_MAX_RETRIES + 1):
@@ -376,6 +390,11 @@ class GcloudRunClient:
                             f"{uri}#{generation}"
                         ) from exc
                 except urllib.error.URLError as exc:
+                    if attempt >= _JSON_READ_MAX_RETRIES:
+                        raise MonitorError(
+                            f"GCS JSON generation transport failed: {uri}#{generation}"
+                        ) from exc
+                except _TRANSIENT_HTTP_TRANSPORT_ERRORS as exc:
                     if attempt >= _JSON_READ_MAX_RETRIES:
                         raise MonitorError(
                             f"GCS JSON generation transport failed: {uri}#{generation}"
@@ -1257,9 +1276,7 @@ def _cached_receipt(
             f"immutable {kind} receipt generation drifted: {metadata['uri']}"
         )
     if raw.get("size_bytes") != metadata.get("size_bytes"):
-        raise MonitorError(
-            f"immutable {kind} receipt size drifted: {metadata['uri']}"
-        )
+        raise MonitorError(f"immutable {kind} receipt size drifted: {metadata['uri']}")
     try:
         require_sha256(raw.get("sha256"), where=f"cached {kind} SHA-256")
     except ContractError:
@@ -1778,8 +1795,7 @@ def run_monitor(
             if (latest_claim := current_claims.get(str(record["assignment_sha256"])))
             is not None
             and int(record["attempt"]) == int(latest_claim["attempt"])
-            and str(record["claim_sha256"])
-            == str(latest_claim["claim_sha256"])
+            and str(record["claim_sha256"]) == str(latest_claim["claim_sha256"])
             and int(record["scheduled_unix_s"]) <= checked_at
         ]
         latest_current_heartbeats: dict[str, dict[str, object]] = {}
@@ -1802,8 +1818,7 @@ def run_monitor(
             if checked_at
             < max(
                 int(record["lease_through_unix_s"]),
-                int(record["scheduled_unix_s"])
-                + int(checked["stale_after_seconds"]),
+                int(record["scheduled_unix_s"]) + int(checked["stale_after_seconds"]),
             )
         }
 
@@ -1929,12 +1944,22 @@ def run_monitor(
                 str(record["assignment_sha256"]) in completed_assignment_sha256
                 for record in worker_latest_claims
             )
-            progress_events = (
-                [
+            # A dynamic completion pointer is bound to an assignment, not to
+            # the physical executor that produced it. Do not let a stolen
+            # completion on worker B supersede a same-boot failure on the
+            # manifest-home worker A. The static manifest-home mode has no
+            # claims, so its completion pointers remain worker-scoped.
+            assignment_progress_events = (
+                []
+                if claim_records
+                else [
                     metadata
                     for uri, metadata in assignment_inventory.items()
                     if jobs_by_uri[uri]["worker"] in owned_workers
                 ]
+            )
+            progress_events = (
+                assignment_progress_events
                 + [
                     metadata
                     for uri, metadata in slot_inventory.items()
@@ -2091,14 +2116,12 @@ def run_monitor(
                     )
                     report["recovery_evidence"] = "exit_75"
                     report["replacement_permitted"] = diagnostics is not None
-                elif (
-                    diagnostics is not None
-                    and diagnostics.get("confirmed_http_429") is True
-                ):
-                    report["state"] = "transient_failure_diagnostics_preserved"
-                    report["recovery_evidence"] = "confirmed_http_429"
-                    report["replacement_permitted"] = True
                 else:
+                    # Serial output is an append-only VM history, not a
+                    # failure-scoped transport receipt.  In particular, an
+                    # old HTTP 429 must never turn a later exit 1 into a
+                    # retryable event.  Source workers classify transport
+                    # failures themselves and publish the exact exit 75.
                     report["state"] = "unclassified_failure_manual_review"
             elif instance_status != "RUNNING":
                 report["state"] = "instance_not_running"
@@ -2111,12 +2134,22 @@ def run_monitor(
                 and completed_slots == slots_per_worker
             ):
                 report["state"] = "finalizing"
-            elif claim_records and not worker_current_claims:
+            elif (
+                worker_claims
+                and not worker_current_claims
+                and checked_at - progress_at < int(checked["stale_after_seconds"])
+            ):
+                # A worker that has published its own claim may still be
+                # draining or publishing its slot.  Do not infer that state
+                # from claims belonging to another physical worker.
                 report["state"] = "running"
-            elif any(
-                int(record["expires_unix_s"]) > checked_at
-                for record in worker_current_claims
-            ) or worker_fresh_heartbeats:
+            elif (
+                any(
+                    int(record["expires_unix_s"]) > checked_at
+                    for record in worker_current_claims
+                )
+                or worker_fresh_heartbeats
+            ):
                 report["state"] = "running"
             elif checked_at - progress_at >= int(checked["stale_after_seconds"]):
                 report["state"] = "idle_suspected_manual_review"
