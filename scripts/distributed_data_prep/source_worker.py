@@ -115,6 +115,27 @@ QUARANTINE_PROJECTION_MODE_OFF = "off"
 _QUARANTINE_PROJECTION_MODES = frozenset(
     {QUARANTINE_PROJECTION_MODE_OFF, PINNED_TREE_PROJECTION_MODE}
 )
+GIT_FSCK_RECEIPT_SCHEMA = "cppmega.git_fsck_receipt_v1"
+_GIT_FSCK_COMMAND = ("git", "fsck", "--full", "--strict")
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_KEYDB_ZERO_PADDED_FILEMODE = {
+    "remote_url": "https://github.com/Snapchat/KeyDB.git",
+    "expected_commit": "603ebb27fb82a27fb98b0feb6749b0f7661a1c4b",
+    "checkout_tree": "f5269110f16e1833586e15dd59dde6255c8cc787",
+    "historical_commit": "b435f64510a032528c42fc1cfc4eca15a4474a1b",
+    "object_id": "1f9ef1b6556b375d56767fd78bf06c7d90e9abea",
+    "object_type": "tree",
+    "object_size_bytes": 532,
+    "object_payload_sha256": (
+        "3032eb4682653aa4b6b0b3a603de8181342139cce177f0842681f2f0f3537ffc"
+    ),
+    "message_id": "zeroPaddedFilemode",
+    "diagnostic": (
+        "error in tree 1f9ef1b6556b375d56767fd78bf06c7d90e9abea: "
+        "zeroPaddedFilemode: contains zero-padded file modes"
+    ),
+    "returncode": 4,
+}
 
 
 class TransientTransportError(RuntimeError):
@@ -784,6 +805,159 @@ def _git(git_dir: Path, *args: str) -> str:
     return run_checked(["git", f"--git-dir={git_dir}", *args]).stdout.strip()
 
 
+def _matching_git_fsck_exception(
+    source: Mapping[str, object],
+    checkout_tree: str,
+    *,
+    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+) -> Mapping[str, object] | None:
+    if (
+        source.get("remote_url") == known_exception["remote_url"]
+        and source.get("expected_commit") == known_exception["expected_commit"]
+        and checkout_tree == known_exception["checkout_tree"]
+    ):
+        return known_exception
+    return None
+
+
+def _expected_git_fsck_exception_receipt(
+    known_exception: Mapping[str, object],
+) -> dict[str, object]:
+    diagnostic = str(known_exception["diagnostic"])
+    return {
+        "schema": GIT_FSCK_RECEIPT_SCHEMA,
+        "status": "accepted_known_historical_diagnostic",
+        "command": list(_GIT_FSCK_COMMAND),
+        "returncode": int(known_exception["returncode"]),
+        "stdout_sha256": _EMPTY_SHA256,
+        "stderr_sha256": hashlib.sha256(
+            (diagnostic + "\n").encode("utf-8")
+        ).hexdigest(),
+        "source_binding": {
+            "remote_url": str(known_exception["remote_url"]),
+            "expected_commit": str(known_exception["expected_commit"]),
+            "checkout_tree": str(known_exception["checkout_tree"]),
+        },
+        "diagnostics": [
+            {
+                "message_id": str(known_exception["message_id"]),
+                "diagnostic": diagnostic,
+                "object_id": str(known_exception["object_id"]),
+                "object_type": str(known_exception["object_type"]),
+                "object_size_bytes": int(known_exception["object_size_bytes"]),
+                "object_payload_sha256": str(
+                    known_exception["object_payload_sha256"]
+                ),
+                "historical_commit": str(known_exception["historical_commit"]),
+            }
+        ],
+    }
+
+
+def _accept_known_git_fsck_diagnostic(
+    source: Mapping[str, object],
+    checkout_tree: str,
+    mirror: Path,
+    fsck: subprocess.CompletedProcess[str],
+    *,
+    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+) -> dict[str, object]:
+    """Accept one byte-verified historical diagnostic for one pinned source.
+
+    The unmodified strict fsck command must emit exactly the known line and no
+    other output.  We deliberately do not use ``fsck.skipList``: that setting
+    would suppress every diagnostic attached to the listed object rather than
+    proving that only the independently verified diagnostic was observed.
+    """
+
+    policy = _matching_git_fsck_exception(
+        source,
+        checkout_tree,
+        known_exception=known_exception,
+    )
+    if policy is None:
+        raise ContractError(f"full mirror failed git fsck: {fsck.stderr[-8000:]}")
+    expected_receipt = _expected_git_fsck_exception_receipt(policy)
+    expected_stderr = str(policy["diagnostic"]) + "\n"
+    if (
+        fsck.returncode != policy["returncode"]
+        or fsck.stdout != ""
+        or fsck.stderr != expected_stderr
+    ):
+        raise ContractError(
+            "full mirror git fsck did not match the exact known historical "
+            f"diagnostic: stdout={fsck.stdout[-4000:]!r} "
+            f"stderr={fsck.stderr[-8000:]!r}"
+        )
+
+    object_id = str(policy["object_id"])
+    object_type = str(policy["object_type"])
+    if _git(mirror, "cat-file", "-t", object_id) != object_type:
+        raise ContractError("known git fsck object type drifted")
+    object_payload = subprocess.run(
+        ["git", f"--git-dir={mirror}", "cat-file", object_type, object_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if object_payload.returncode != 0 or object_payload.stderr:
+        raise ContractError(
+            "cannot read the exact known git fsck object: "
+            + object_payload.stderr[-4000:].decode(errors="replace")
+        )
+    if (
+        len(object_payload.stdout) != policy["object_size_bytes"]
+        or hashlib.sha256(object_payload.stdout).hexdigest()
+        != policy["object_payload_sha256"]
+    ):
+        raise ContractError("known git fsck object payload drifted")
+
+    historical_commit = str(policy["historical_commit"])
+    if (
+        _git(mirror, "rev-parse", f"{historical_commit}^{{commit}}")
+        != historical_commit
+        or _git(mirror, "rev-parse", f"{historical_commit}^{{tree}}") != object_id
+    ):
+        raise ContractError("known git fsck historical commit binding drifted")
+    ancestry = subprocess.run(
+        [
+            "git",
+            f"--git-dir={mirror}",
+            "merge-base",
+            "--is-ancestor",
+            historical_commit,
+            str(policy["expected_commit"]),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ancestry.returncode != 0 or ancestry.stdout or ancestry.stderr:
+        raise ContractError(
+            "known git fsck object is not bound to the pinned commit ancestry"
+        )
+    return expected_receipt
+
+
+def validate_git_fsck_snapshot(
+    source: Mapping[str, object], source_snapshot: Mapping[str, object]
+) -> None:
+    """Validate normal fsck success or the one exact historical exception."""
+
+    checkout_tree = str(source_snapshot.get("tree", ""))
+    policy = _matching_git_fsck_exception(source, checkout_tree)
+    fsck = source_snapshot.get("fsck")
+    if policy is None:
+        if fsck != "ok":
+            raise ContractError("Git source snapshot has unsupported fsck evidence")
+        return
+    if not isinstance(fsck, Mapping):
+        raise ContractError("Git source snapshot omitted known fsck diagnostic evidence")
+    expected = _expected_git_fsck_exception_receipt(policy)
+    if canonical_json_bytes(fsck) != canonical_json_bytes(expected):
+        raise ContractError("Git source snapshot known fsck evidence drifted")
+
+
 def _sorted_file_digest(source: Path, destination: Path) -> tuple[str, int, int, dict[str, int]]:
     env = dict(os.environ)
     env["LC_ALL"] = "C"
@@ -863,8 +1037,15 @@ def acquire_git_mirror(
         text=True,
         check=False,
     )
-    if fsck.returncode != 0:
-        raise ContractError(f"full mirror failed git fsck: {fsck.stderr[-8000:]}")
+    if fsck.returncode == 0:
+        fsck_receipt: str | dict[str, object] = "ok"
+    else:
+        fsck_receipt = _accept_known_git_fsck_diagnostic(
+            source,
+            tree,
+            mirror,
+            fsck,
+        )
 
     refs_lines = sorted(
         line
@@ -954,7 +1135,7 @@ def acquire_git_mirror(
             "inventory_sha256": inventory_sha,
         },
         "gitlink_count": gitlink_count,
-        "fsck": "ok",
+        "fsck": fsck_receipt,
     }
 
 
@@ -1370,6 +1551,12 @@ def validate_worker_receipt(
         for key in ("ordinal", "repo", "project_id", "worker", "assignment_sha256")
     }:
         raise ContractError("source worker assignment binding drifted")
+    source = job.get("source")
+    source_snapshot = value["source_snapshot"]
+    if not isinstance(source, Mapping) or not isinstance(source_snapshot, Mapping):
+        raise ContractError("source worker source snapshot is malformed")
+    if source.get("kind") == "git_mirror":
+        validate_git_fsck_snapshot(source, source_snapshot)
     candidate = value["candidate"]
     if not isinstance(candidate, Mapping):
         raise ContractError("source worker candidate receipt is missing")
