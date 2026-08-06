@@ -444,6 +444,47 @@ def _subprocess_env() -> dict:
     return env
 
 
+_HEARTBEAT_PROGRESS_RE = re.compile(
+    r"^\s*(?P<label>[^:\r\n]*\bheartbeat):\s*(?P<state>.*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _consume_log_progress(
+    log_path: Path,
+    offset: int,
+    heartbeat_states: dict[str, str],
+) -> tuple[int, bool]:
+    """Read appended log bytes and ignore duplicate semantic heartbeats."""
+
+    size = log_path.stat().st_size
+    if size < offset:
+        offset = 0
+        heartbeat_states.clear()
+    if size == offset:
+        return offset, False
+
+    with log_path.open("rb") as log_reader:
+        log_reader.seek(offset)
+        appended = log_reader.read(size - offset)
+
+    progressed = False
+    for raw_line in appended.splitlines():
+        if not raw_line.strip():
+            continue
+        line = raw_line.decode("utf-8", errors="replace")
+        heartbeat = _HEARTBEAT_PROGRESS_RE.fullmatch(line)
+        if heartbeat is None:
+            progressed = True
+            continue
+        label = heartbeat.group("label").strip().casefold()
+        state = heartbeat.group("state").strip()
+        if heartbeat_states.get(label) != state:
+            heartbeat_states[label] = state
+            progressed = True
+    return size, progressed
+
+
 def run_checked(
     repo: str,
     stage: str,
@@ -496,7 +537,8 @@ def run_checked(
         if stall_timeout and log_path is not None:
             deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
             last_activity = time.monotonic()
-            last_signature: tuple[int, int] | None = None
+            log_offset = 0
+            heartbeat_states: dict[str, str] = {}
             while proc.poll() is None:
                 now = time.monotonic()
                 if deadline is not None and now > deadline:
@@ -507,10 +549,12 @@ def run_checked(
                         f"timed out after {timeout}s",
                     )
                 if log_path.exists():
-                    stat = log_path.stat()
-                    signature = (stat.st_size, stat.st_mtime_ns)
-                    if signature != last_signature:
-                        last_signature = signature
+                    log_offset, progressed = _consume_log_progress(
+                        log_path,
+                        log_offset,
+                        heartbeat_states,
+                    )
+                    if progressed:
                         last_activity = now
                 if now - last_activity > stall_timeout:
                     terminate_process(f"no log progress for {stall_timeout}s")
