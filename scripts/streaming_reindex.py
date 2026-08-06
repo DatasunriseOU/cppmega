@@ -444,65 +444,6 @@ def _subprocess_env() -> dict:
     return env
 
 
-def _parse_ps_time_seconds(value: str) -> float | None:
-    """Parse ps TIME values like MM:SS.cc, HH:MM:SS.cc, or DD-HH:MM:SS.cc."""
-    raw = value.strip()
-    if not raw:
-        return None
-    days = 0
-    if "-" in raw:
-        day_raw, raw = raw.split("-", 1)
-        try:
-            days = int(day_raw)
-        except ValueError:
-            return None
-    parts = raw.split(":")
-    try:
-        if len(parts) == 2:
-            hours = 0
-            minutes = int(parts[0])
-            seconds = float(parts[1])
-        elif len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        else:
-            return None
-    except ValueError:
-        return None
-    return float(days * 86400 + hours * 3600 + minutes * 60) + seconds
-
-
-def _process_group_cpu_seconds(pgid: int) -> float | None:
-    """Return cumulative CPU seconds for a process group, when ps supports it."""
-    try:
-        output = subprocess.check_output(
-            ["ps", "-axo", "pgid=,time="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    total = 0.0
-    seen = False
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) < 2:
-            continue
-        try:
-            row_pgid = int(fields[0])
-        except ValueError:
-            continue
-        if row_pgid != pgid:
-            continue
-        seconds = _parse_ps_time_seconds(fields[1])
-        if seconds is None:
-            continue
-        total += seconds
-        seen = True
-    return total if seen else None
-
-
 def run_checked(
     repo: str,
     stage: str,
@@ -556,7 +497,6 @@ def run_checked(
             deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
             last_activity = time.monotonic()
             last_signature: tuple[int, int] | None = None
-            last_cpu_seconds: float | None = None
             while proc.poll() is None:
                 now = time.monotonic()
                 if deadline is not None and now > deadline:
@@ -572,18 +512,12 @@ def run_checked(
                     if signature != last_signature:
                         last_signature = signature
                         last_activity = now
-                cpu_seconds = _process_group_cpu_seconds(proc.pid)
-                if cpu_seconds is not None and cpu_seconds != last_cpu_seconds:
-                    last_cpu_seconds = cpu_seconds
-                    last_activity = now
                 if now - last_activity > stall_timeout:
-                    terminate_process(
-                        f"no log/CPU progress for {stall_timeout}s"
-                    )
+                    terminate_process(f"no log progress for {stall_timeout}s")
                     raise RepoFailure(
                         repo,
                         stage,
-                        f"stalled after {stall_timeout}s without log or CPU progress",
+                        f"stalled after {stall_timeout}s without log progress",
                     )
                 time.sleep(1.0)
             stdout_data, _ = proc.communicate(timeout=1)
