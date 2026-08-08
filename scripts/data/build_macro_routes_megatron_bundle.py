@@ -583,12 +583,16 @@ def _load_content_store_ci_export_allowlist(
         raise RuntimeError(f"{manifest_path}: CI export validation is not green")
 
     case5 = manifest.get("case5_contract")
+    case5_buckets = case5.get("buckets") if isinstance(case5, dict) else None
     if (
         not isinstance(case5, dict)
-        or case5.get("buckets") != list(buckets)
+        or not isinstance(case5_buckets, list)
+        or not case5_buckets
+        or len(set(case5_buckets)) != len(case5_buckets)
+        or any(bucket not in SUPPORTED_CI_BUCKETS for bucket in case5_buckets)
         or not buckets
         or len(set(buckets)) != len(buckets)
-        or any(bucket not in SUPPORTED_CI_BUCKETS for bucket in buckets)
+        or any(bucket not in case5_buckets for bucket in buckets)
         or case5.get("overflow_rows") != 0
         or case5.get("parquet_shard_max_rows") != 512
         or case5.get("parquet_layout")
