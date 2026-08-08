@@ -4907,6 +4907,24 @@ def _has_translation_unit_load_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_indexer_ast_visitor_recursion_error(exc: BaseException) -> bool:
+    """Return true only for recursion raised from this indexer's AST visitor."""
+
+    if not isinstance(exc, RecursionError):
+        return False
+    indexer_path = os.path.realpath(__file__)
+    traceback = exc.__traceback__
+    while traceback is not None:
+        code = traceback.tb_frame.f_code
+        if (
+            code.co_name == "_visit"
+            and os.path.realpath(code.co_filename) == indexer_path
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
 def _cpp_lexical_fallback_reason(exc: BaseException) -> str | None:
     """Classify only native TU-load and bounded AST-recursion failures."""
 
@@ -4916,7 +4934,7 @@ def _cpp_lexical_fallback_reason(exc: BaseException) -> str | None:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, RecursionError):
+        if _is_indexer_ast_visitor_recursion_error(current):
             return "ast_recursion_error"
         current = current.__cause__ or current.__context__
     return None
@@ -10585,7 +10603,7 @@ def _record_cpp_lexical_fallback(
             }
         )
     else:
-        existing.update(fallback_fields)
+        existing.update({"trigger": fallback_reason, **fallback_fields})
     print(
         "  Parse lexical fallback: "
         f"{relative_path} bytes={len(source_bytes)} "
