@@ -251,6 +251,8 @@ _EXPLICIT_DOMAIN_SUFFIXES = frozenset(
         ".ddl",
         ".dml",
         ".psql",
+        ".s",
+        ".asm",
         ".py",
         ".m4",
         ".gn",
@@ -356,7 +358,24 @@ def _trailing_nul_bytes(
     return width if stream.read(width) == b"\0" * width else 0
 
 
-def _path_declared_codec(path: Path) -> tuple[str, str] | None:
+_MULE_INTERNAL_SIGNATURE = b"-- MULE \x92"
+
+
+def _path_declared_codec(
+    path: Path,
+    *,
+    source_prefix: bytes = b"",
+) -> tuple[str, str] | None:
+    if tuple(part.casefold() for part in path.parts[-5:]) == (
+        "src",
+        "test",
+        "mb",
+        "sql",
+        "mule_internal.sql",
+    ):
+        if source_prefix.startswith(_MULE_INTERNAL_SIGNATURE):
+            return "latin-1", "mule-internal"
+        return None
     declared = _FILENAME_DECLARED_CODECS.get(path.name.casefold())
     if declared is not None:
         return declared
@@ -379,12 +398,12 @@ def _decode_euc_tw(payload: bytes, *, path: Path) -> str:
             )
         except OSError as exc:
             raise ValueError(
-                f"cannot run iconv for filename-declared EUC-TW input {path}: {exc}"
+                f"cannot run iconv for path-declared EUC-TW input {path}: {exc}"
             ) from exc
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", errors="replace").strip()[:512]
             raise ValueError(
-                f"invalid filename-declared EUC-TW domain input {path}: {detail}"
+                f"invalid path-declared EUC-TW domain input {path}: {detail}"
             )
         return result.stdout
 
@@ -392,7 +411,7 @@ def _decode_euc_tw(payload: bytes, *, path: Path) -> str:
     text = utf8.decode("utf-8", errors="strict")
     if convert("UTF-8", "EUC-TW", utf8) != payload:
         raise ValueError(
-            f"filename-declared EUC-TW input does not round-trip exactly: {path}"
+            f"path-declared EUC-TW input does not round-trip exactly: {path}"
         )
     return text
 
@@ -406,7 +425,7 @@ def _validate_euc_tw_stream(
 ) -> _ValidatedDomainText:
     if expected_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
         raise ValueError(
-            "filename-declared EUC-TW input exceeds the bounded native iconv "
+            "path-declared EUC-TW input exceeds the bounded native iconv "
             f"decoder limit of {DOMAIN_INPUT_SIZE_LIMIT_BYTES} bytes: {path}"
         )
     stream.seek(0)
@@ -779,7 +798,12 @@ def _validate_domain_stream(
             trailing_nul_bytes=trailing_nul_bytes,
         )
     except UnicodeDecodeError as utf8_exc:
-        declared_codec = _path_declared_codec(path)
+        stream.seek(0)
+        declared_codec = _path_declared_codec(
+            path,
+            source_prefix=stream.read(len(_MULE_INTERNAL_SIGNATURE)),
+        )
+        stream.seek(0)
         if declared_codec is not None:
             codec, source_encoding = declared_codec
             if codec == _ICONV_EUC_TW_CODEC:
@@ -801,7 +825,7 @@ def _validate_domain_stream(
                 )
             except UnicodeDecodeError as declared_exc:
                 raise ValueError(
-                    f"invalid UTF-8 or filename-declared {source_encoding} "
+                    f"invalid UTF-8 or path-declared {source_encoding} "
                     f"domain input {path}: utf-8={utf8_exc}; "
                     f"{source_encoding}={declared_exc}"
                 ) from declared_exc
@@ -913,8 +937,8 @@ def _is_domain_text_integrity_error(exc: ValueError) -> bool:
         or message.startswith("invalid UTF-16")
         or message.startswith("invalid UTF-32")
         or message.startswith("invalid windows-1252")
-        or message.startswith("invalid filename-declared")
-        or message.startswith("filename-declared")
+        or message.startswith("invalid path-declared")
+        or message.startswith("path-declared")
     )
 
 
@@ -1189,7 +1213,10 @@ def decode_domain_prefix(
                 final=False,
             )
         except UnicodeDecodeError as utf8_exc:
-            declared_codec = _path_declared_codec(path_obj)
+            declared_codec = _path_declared_codec(
+                path_obj,
+                source_prefix=payload_bytes,
+            )
             if declared_codec is not None:
                 codec, source_encoding = declared_codec
                 if codec == _ICONV_EUC_TW_CODEC:
@@ -1201,7 +1228,7 @@ def decode_domain_prefix(
                     )
                 except UnicodeDecodeError as declared_exc:
                     raise ValueError(
-                        f"invalid UTF-8 or filename-declared {source_encoding} "
+                        f"invalid UTF-8 or path-declared {source_encoding} "
                         f"domain input {path_obj}: utf-8={utf8_exc}; "
                         f"{source_encoding}={declared_exc}"
                     ) from declared_exc
@@ -1299,6 +1326,8 @@ def _allows_domain_content_signatures(path: Path) -> bool:
 
 
 def _large_domain_is_chunkable(path: Path, adapter: DomainParserAdapter) -> bool:
+    if adapter.name == "assembly-raw":
+        return True
     if adapter.domain in _LARGE_DOMAIN_KINDS:
         return True
     return adapter.name == "raw-output" and _is_explicit_domain_path(
@@ -1316,7 +1345,7 @@ def iter_domain_file_chunks(
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
-    UTF-8, BOM-marked UTF-16/32, filename-declared legacy SQL encodings, and
+    UTF-8, BOM-marked UTF-16/32, path-declared legacy SQL encodings, and
     strict Windows-1252 are decoded without replacement. Syntax-confined
     RowBinary SQL literals and explicit POSIX invalid-byte test sections use a
     one-byte ISO-8859-1 round trip; structural NULs and unmarked invalid shell
@@ -1603,6 +1632,19 @@ def _raw_typed_parser(
     return parse
 
 
+def _parse_assembly_raw(text: str) -> ParsedDomainDocument:
+    """Keep assembly source exact on the frozen broad code route."""
+
+    parsed = _raw_typed_parser(DomainKind.CPP, "assembly-raw")(text)
+    parsed.metadata.update(
+        {
+            "language": "assembly",
+            "shared_domain": "cpp",
+        }
+    )
+    return parsed
+
+
 def parse_powershell(text: str) -> ParsedDomainDocument:
     """Parse PowerShell with its own dialect parser on the shared shell domain."""
 
@@ -1690,6 +1732,11 @@ _ADAPTERS = {
         DomainKind.PYTHON,
         parse_python,
     ),
+    "assembly": DomainParserAdapter(
+        "assembly-raw",
+        DomainKind.CPP,
+        _parse_assembly_raw,
+    ),
     "raw": DomainParserAdapter("raw-output", DomainKind.TOOL_OUTPUT, _parse_raw_output),
 }
 
@@ -1776,6 +1823,8 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["gn"]
     if suffix in {".sql", ".ddl", ".dml", ".psql"}:
         return _ADAPTERS["sql"]
+    if suffix in {".s", ".asm"}:
+        return _ADAPTERS["assembly"]
     if suffix == ".py":
         return _ADAPTERS["python"]
 
@@ -2218,7 +2267,9 @@ def discover_project_domain_files(
             continue
 
         if adapter.name == "raw-output" or (
-            not include_cpp and adapter.domain == DomainKind.CPP
+            not include_cpp
+            and adapter.domain == DomainKind.CPP
+            and adapter.name != "assembly-raw"
         ):
             continue
         discovered.append(

@@ -66,11 +66,13 @@ from scripts.export_ci_content_store_case5 import (
     ExportError,
     FrozenStore,
     OccurrenceRecord,
+    _bounded_utf8_sha256,
     _decode_provenance,
     _fragment_ranges,
     _merge_bound_store_artifacts,
     _project_content,
     _publish_directory_no_replace,
+    _sanitize_head_commit,
     _sequence_digest,
     _smallest_bucket,
     _source_binding_projection_writer,
@@ -1799,6 +1801,35 @@ def test_metadata_ledgers_accept_bounded_records_over_one_mib(
     )[0]
     assert len(_canonical_bytes(occurrence)) > 1024 * 1024
     assert len(_canonical_bytes(representative)) > 1024 * 1024
+
+
+def test_head_commit_message_fingerprint_accepts_more_than_16k_chars() -> None:
+    message = "large commit message\n" + "\u03bb" * 16_384
+
+    sanitized = _sanitize_head_commit(
+        {
+            "id": "a" * 40,
+            "message": message,
+            "author": {"name": "Builder"},
+            "committer": {"name": "Builder"},
+        }
+    )
+
+    assert sanitized is not None
+    assert sanitized["message_char_count"] == len(message)
+    assert sanitized["message_sha256"] == hashlib.sha256(
+        message.encode("utf-8")
+    ).hexdigest()
+    assert "message" not in sanitized
+
+
+def test_bounded_utf8_fingerprint_enforces_encoded_byte_limit() -> None:
+    with pytest.raises(ExportError, match="state JSON evidence limit"):
+        _bounded_utf8_sha256(
+            "\u03bb" * 16_384,
+            where="workflow.head_commit.message",
+            max_bytes=16_384,
+        )
 
 
 def test_legacy_source_bindings_require_authorization_and_export_as_overlay(

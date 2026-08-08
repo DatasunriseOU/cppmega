@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import codecs
 import ctypes.util
 import glob
 import gzip
@@ -37,6 +38,8 @@ import posixpath
 import re
 import shutil
 import sqlite3
+import stat
+import subprocess
 import sys
 import time
 import warnings
@@ -65,9 +68,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from cppmega.data.build_context import (
+    BuildContextEvidenceError,
     detect_build_context,
     find_compile_commands_file,
     load_compile_commands_file,
+    normalize_macos_sdk_path_argument,
+    validate_macos_sdk_path,
 )
 from cppmega.data.language_info import detect_language_info
 from cppmega.data.source_identity import source_identity, source_identity_for_path
@@ -738,6 +744,9 @@ BUILD_NAME_KINDS: dict[str, str] = {
     "Dockerfile": "dockerfile",
 }
 BUILD_EXT_KINDS: dict[str, str] = {
+    # Assembly is source code emitted losslessly on the frozen broad code route.
+    ".s": "assembly",
+    ".asm": "assembly",
     ".cmake": "cmake",
     ".mk": "make",
     ".m4": "autoconf",
@@ -2590,20 +2599,45 @@ def _sanitize_compile_args_for_clang(args: list[str] | None) -> list[str]:
     return sanitized
 
 
+_WIDE_SOURCE_BOM_CODECS = (
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+_WIDE_SOURCE_CODECS = frozenset(
+    encoding for _bom, encoding in _WIDE_SOURCE_BOM_CODECS
+)
+
+
+def _wide_source_codec(raw: bytes) -> str | None:
+    for bom, encoding in _WIDE_SOURCE_BOM_CODECS:
+        if raw.startswith(bom):
+            return encoding
+    return None
+
+
 def _decode_source_bytes(raw: bytes, filename: str) -> tuple[str, str]:
     """Decode source with a byte-exact fallback for mixed legacy text."""
 
-    try:
-        text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
-    except UnicodeDecodeError:
+    encoding = _wide_source_codec(raw)
+    if encoding is not None:
+        # Use the explicit endian codec so the decoded U+FEFF round-trips to
+        # the original BOM. Malformed BOM-declared input must fail closed
+        # instead of falling through to a single-byte codec.
+        text = raw.decode(encoding, errors="strict")
+    else:
         try:
-            text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
+            text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
         except UnicodeDecodeError:
-            # Historical source trees can mix Shift-JIS comments with raw
-            # single-byte font tables in one translation unit. No semantic
-            # codec covers that mixture; ISO-8859-1 preserves every byte and
-            # keeps libclang byte offsets exact.
-            text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
+            try:
+                text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
+            except UnicodeDecodeError:
+                # Historical source trees can mix Shift-JIS comments with raw
+                # single-byte font tables in one translation unit. No semantic
+                # codec covers that mixture; ISO-8859-1 preserves every byte and
+                # keeps libclang byte offsets exact.
+                text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
     if "\0" in text and "\0" in _mask_non_code(text):
         raise ValueError(f"source contains NUL byte: {filename}")
     return text, encoding
@@ -2615,6 +2649,12 @@ def _read_source_file(filename: str) -> tuple[str, bytes, str]:
     source, source_encoding = _decode_source_bytes(source_bytes, filename)
     if source.encode(source_encoding, errors="strict") != source_bytes:
         raise ValueError(f"source decoding did not round-trip exactly: {filename}")
+    if source_encoding in _WIDE_SOURCE_CODECS:
+        # libclang rejects UTF-16/32 source files even when they carry a BOM.
+        # Parse an equivalent UTF-8 unsaved buffer and make every offset mapper
+        # and text extractor use those same parser bytes.
+        source_bytes = source.encode("utf-8", errors="strict")
+        source_encoding = "utf-8"
     return source, source_bytes, source_encoding
 
 
@@ -3447,10 +3487,226 @@ _DEFAULT_SKIP_DIRS = frozenset({'.git'})
 
 C_EXTENSIONS = {'.c'}
 
+SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA = "cppmega.source_tree_entry_exclusions_v1"
+_SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY = (
+    "skip_only_dangling_symlink_blobs_targeting_unmaterialized_gitlinks"
+)
+
+
+def _canonical_receipt_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class GitTreeSourceEntryExclusions:
+    """Prove the only safe-to-skip non-regular Git checkout entries."""
+
+    def __init__(self, project_dir: str | os.PathLike[str]) -> None:
+        self.project_dir = os.path.abspath(os.fspath(project_dir))
+        self._git_tree: str | None = None
+        self._index_entries: dict[str, tuple[str, str, str]] | None = None
+        self._records: dict[str, dict[str, object]] = {}
+
+    def _git(self, *args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "-C", self.project_dir, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr[-4000:].decode(errors="replace")
+            raise OSError(
+                "cannot prove non-regular source entry against pinned Git "
+                f"checkout: git {' '.join(args)}: {detail}"
+            )
+        return completed.stdout
+
+    def _load_git_index(self) -> None:
+        if self._index_entries is not None:
+            return
+        raw_tree = self._git("rev-parse", "HEAD^{tree}").strip()
+        if re.fullmatch(rb"[0-9a-f]{40}(?:[0-9a-f]{24})?", raw_tree) is None:
+            raise OSError("pinned Git checkout returned an invalid tree id")
+        self._git_tree = raw_tree.decode("ascii")
+        entries: dict[str, tuple[str, str, str]] = {}
+        for encoded in self._git("ls-files", "--stage", "-z").split(b"\0"):
+            if not encoded:
+                continue
+            metadata, separator, raw_path = encoded.partition(b"\t")
+            fields = metadata.split(b" ")
+            if not separator or len(fields) != 3:
+                raise OSError("pinned Git index returned a malformed stage entry")
+            mode, object_id, stage = fields
+            try:
+                relative_path = os.fsdecode(raw_path)
+                mode_text = mode.decode("ascii")
+                object_text = object_id.decode("ascii")
+                stage_text = stage.decode("ascii")
+            except UnicodeError as exc:
+                raise OSError("pinned Git index entry metadata is invalid") from exc
+            if relative_path in entries:
+                raise OSError(
+                    f"pinned Git index contains duplicate stages for {relative_path}"
+                )
+            entries[relative_path] = (mode_text, object_text, stage_text)
+        self._index_entries = entries
+
+    def _clean_status(self, relative_path: str, gitlink_path: str) -> None:
+        status = self._git(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            "--",
+            relative_path,
+            gitlink_path,
+        )
+        if status:
+            raise OSError(
+                "source entry or target gitlink changed during immutable inspection"
+            )
+
+    def record(self, filepath: str, _stat_error: OSError) -> None:
+        absolute_path = os.path.abspath(filepath)
+        try:
+            if os.path.commonpath((self.project_dir, absolute_path)) != self.project_dir:
+                raise OSError("source candidate escapes project root")
+        except ValueError as exc:
+            raise OSError("source candidate has an invalid project-relative path") from exc
+        relative_path = Path(
+            os.path.relpath(absolute_path, self.project_dir)
+        ).as_posix()
+
+        try:
+            before = os.lstat(absolute_path)
+        except OSError as exc:
+            raise OSError(
+                "source candidate vanished instead of remaining a provable "
+                f"non-regular tree entry: {relative_path}"
+            ) from exc
+        if not stat.S_ISLNK(before.st_mode) or os.path.exists(absolute_path):
+            raise OSError(
+                "unreadable source candidate is not a dangling symlink tree entry: "
+                f"{relative_path}"
+            )
+        symlink_target = os.readlink(absolute_path)
+        symlink_target_bytes = os.fsencode(symlink_target)
+        if b"\0" in symlink_target_bytes:
+            raise OSError("Git symlink target unexpectedly contains NUL")
+
+        self._load_git_index()
+        assert self._index_entries is not None
+        assert self._git_tree is not None
+        index_entry = self._index_entries.get(relative_path)
+        if index_entry is None:
+            raise OSError(
+                f"dangling source symlink is not tracked by Git: {relative_path}"
+            )
+        entry_mode, entry_object_id, entry_stage = index_entry
+        if entry_mode != "120000" or entry_stage != "0":
+            raise OSError(
+                "unreadable source candidate is not an exact stage-0 mode-120000 "
+                f"Git entry: {relative_path}"
+            )
+        object_type = self._git("cat-file", "-t", entry_object_id).strip()
+        if object_type != b"blob":
+            raise OSError(f"Git symlink object is not a blob: {relative_path}")
+        object_payload = self._git("cat-file", "blob", entry_object_id)
+        if object_payload != symlink_target_bytes:
+            raise OSError(
+                f"Git symlink blob and checkout target differ: {relative_path}"
+            )
+
+        if os.path.isabs(symlink_target):
+            raise OSError(f"absolute dangling source symlink is unsupported: {relative_path}")
+        target_relative_path = posixpath.normpath(
+            posixpath.join(posixpath.dirname(relative_path), symlink_target)
+        )
+        if target_relative_path == ".." or target_relative_path.startswith("../"):
+            raise OSError(f"dangling source symlink escapes checkout: {relative_path}")
+        if os.path.lexists(os.path.join(self.project_dir, target_relative_path)):
+            raise OSError(
+                f"dangling source target unexpectedly materialized: {relative_path}"
+            )
+
+        target_parts = target_relative_path.split("/")
+        gitlink_path = ""
+        gitlink_entry: tuple[str, str, str] | None = None
+        for length in range(len(target_parts) - 1, 0, -1):
+            candidate = "/".join(target_parts[:length])
+            candidate_entry = self._index_entries.get(candidate)
+            if candidate_entry is not None and candidate_entry[0] == "160000":
+                gitlink_path = candidate
+                gitlink_entry = candidate_entry
+                break
+        if gitlink_entry is None or gitlink_entry[2] != "0":
+            raise OSError(
+                "dangling source symlink is not beneath an exact stage-0 Git "
+                f"gitlink: {relative_path} -> {target_relative_path}"
+            )
+
+        self._clean_status(relative_path, gitlink_path)
+        try:
+            after = os.lstat(absolute_path)
+            after_target = os.readlink(absolute_path)
+        except OSError as exc:
+            raise OSError(
+                f"source symlink changed during immutable inspection: {relative_path}"
+            ) from exc
+        stable_fields = ("st_mode", "st_ino", "st_dev", "st_size", "st_mtime_ns")
+        if (
+            any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+            or after_target != symlink_target
+            or os.path.exists(absolute_path)
+        ):
+            raise OSError(
+                f"source symlink eligibility changed during inspection: {relative_path}"
+            )
+        self._clean_status(relative_path, gitlink_path)
+
+        record = {
+            "relative_path": relative_path,
+            "reason": "dangling_symlink_target_below_unmaterialized_gitlink",
+            "git_tree": self._git_tree,
+            "entry_mode": entry_mode,
+            "entry_object_id": entry_object_id,
+            "entry_object_type": "blob",
+            "entry_object_size_bytes": len(object_payload),
+            "entry_object_sha256": hashlib.sha256(object_payload).hexdigest(),
+            "symlink_target": symlink_target,
+            "target_relative_path": target_relative_path,
+            "target_gitlink_path": gitlink_path,
+            "target_gitlink_mode": gitlink_entry[0],
+            "target_gitlink_commit": gitlink_entry[1],
+        }
+        previous = self._records.setdefault(relative_path, record)
+        if previous != record:
+            raise OSError(f"source entry exclusion receipt drifted: {relative_path}")
+
+    def receipt(self) -> dict[str, object]:
+        records = [self._records[key] for key in sorted(self._records)]
+        return {
+            "schema": SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA,
+            "status": "complete",
+            "policy": _SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY,
+            "git_tree": self._git_tree if records else None,
+            "excluded_count": len(records),
+            "records_sha256": _canonical_receipt_sha256(records),
+            "records": records,
+        }
+
 
 def find_cpp_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
+    *,
+    ineligible_entry_handler: Callable[[str, OSError], None] | None = None,
 ) -> list[str]:
     """Find all C/C++ source files in a directory."""
     skip_dirs = _DEFAULT_SKIP_DIRS | (extra_exclude_dirs or set())
@@ -3465,6 +3721,15 @@ def find_cpp_files(
                 try:
                     os.path.getsize(filepath)
                 except OSError as exc:
+                    if ineligible_entry_handler is not None:
+                        try:
+                            ineligible_entry_handler(filepath, exc)
+                        except OSError as proof_error:
+                            raise OSError(
+                                f"failed to stat C/C++ input {filepath}: {exc}; "
+                                f"non-regular entry proof failed: {proof_error}"
+                            ) from proof_error
+                        continue
                     raise OSError(
                         f"failed to stat C/C++ input {filepath}: {exc}"
                     ) from exc
@@ -4859,14 +5124,38 @@ def _translation_unit_load_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "TranslationUnitLoadError"
 
 
+def _has_translation_unit_load_error(exc: BaseException) -> bool:
+    """Return true only when a chained failure came from libclang TU loading."""
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _translation_unit_load_error(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _load_translation_unit(
     filepath: str,
     index: Index,
     compile_args: Sequence[str],
 ) -> TranslationUnit:
+    with open(filepath, "rb") as source_file:
+        prefix = source_file.read(4)
+    unsaved_files = None
+    if _wide_source_codec(prefix) is not None:
+        source, _parser_bytes, parser_encoding = _read_source_file(filepath)
+        if parser_encoding != "utf-8":
+            raise ValueError(
+                f"wide source was not normalized for libclang: {filepath}"
+            )
+        unsaved_files = [(filepath, source)]
     return index.parse(
         filepath,
         args=list(compile_args),
+        unsaved_files=unsaved_files,
         # Corpus indexing parses each translation unit once. PCH preamble
         # caches are a native-memory win only for repeated reparses; here they
         # make many parallel clang workers retain large buffers.
@@ -5460,9 +5749,16 @@ def _harmonize_build_info_with_compile_args(
     return harmonized
 
 
-def get_default_compile_args(project_dir: str) -> list[str]:
+def get_default_compile_args(
+    project_dir: str,
+    *,
+    macos_sdk_path: str | None = None,
+) -> list[str]:
     """Generate default compile args for projects without compile_commands.json."""
-    platform_info, args, _compile_index = detect_build_context(project_dir)
+    platform_info, args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     result, _build_info = _resolve_default_compile_context(
         project_dir,
         platform_info,
@@ -5471,10 +5767,18 @@ def get_default_compile_args(project_dir: str) -> list[str]:
     return result
 
 
+def _is_legacy_cpp_c_path(filepath: str) -> bool:
+    """Return whether an upstream path explicitly declares a .c file as C++."""
+
+    parts = tuple(part.casefold() for part in Path(filepath).parts)
+    return any(
+        parts[index : index + 2] == ("bld", "plusplus")
+        for index in range(len(parts) - 1)
+    )
+
+
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
-    """Adapt compile args based on file extension — .c files need C mode, not C++,
-    and headers need an explicit header language (otherwise libclang can infer
-    the wrong mode for a standalone .h/.hpp translation unit)."""
+    """Adapt compile args to the file's extension or explicit path dialect."""
     raw_ext = os.path.splitext(filepath)[1]
     ext = raw_ext.lower()
     if ext in HEADER_EXTENSIONS:
@@ -5533,7 +5837,9 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
+        force_cpp = _is_legacy_cpp_c_path(filepath)
         has_c_standard = False
+        has_cpp_standard = False
         for arg in args:
             if skip_next:
                 skip_next = False
@@ -5554,12 +5860,22 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 else None
             )
             if standard_context is not None:
-                if standard_context[1] == 'c':
+                if standard_context[1] == 'c' and not force_cpp:
                     adapted.append(arg)
                     has_c_standard = True
-                # A non-C standard cannot describe the C translation unit.
+                elif standard_context[1] == 'c++' and force_cpp:
+                    adapted.append(arg)
+                    has_cpp_standard = True
+                # A standard for the other language cannot describe this TU.
                 continue
             adapted.append(arg)
+        if force_cpp:
+            # Open Watcom keeps C++ regression inputs under bld/plusplus with
+            # .c suffixes. Parsing those as C can make libclang loop forever.
+            prefix = ['-x', 'c++']
+            if not has_cpp_standard:
+                prefix.append('-std=c++17')
+            return prefix + adapted
         # Ensure C mode is set, and use the established parser fallback only
         # when the build context did not supply a valid C dialect.
         prefix = ['-x', 'c']
@@ -7877,6 +8193,7 @@ def _build_domain_sidecars(
         "cmd": "script.cmd",
         "sql": "schema.sql",
         "python": "module.py",
+        "assembly": "source.s",
     }
     parser_path = parser_path_by_kind.get(kind)
     resolved_path = filepath or parser_path
@@ -8091,14 +8408,15 @@ def build_build_doc(
                 if triple not in seen_shell_edges:
                     shell_edges.append(edge)
                     seen_shell_edges.add(triple)
-    is_python_doc = domain == DomainKind.PYTHON
+    is_code_doc = domain in {DomainKind.CPP, DomainKind.PYTHON}
+    is_assembly_doc = build_kind == "assembly"
     is_sql_doc = domain == DomainKind.SQL
     is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
     doc_type = (
         "shell"
         if is_shell_doc
         else "code"
-        if is_python_doc
+        if is_code_doc
         else "diagnostic"
         if is_diagnostic_doc
         else "sql"
@@ -8132,7 +8450,7 @@ def build_build_doc(
         "primary_language": build_kind,
         "primary_standard": (
             None
-            if is_shell_doc or is_sql_doc
+            if is_shell_doc or is_sql_doc or is_assembly_doc
             else (build_info or {}).get("standard")
         ),
         "primary_dialect": (
@@ -8143,7 +8461,7 @@ def build_build_doc(
             f"shell_file:{build_kind}"
             if is_shell_doc
             else f"code_file:{build_kind}"
-            if is_python_doc
+            if is_code_doc
             else f"sql_file:{build_kind}"
             if is_sql_doc
             else f"build_file:{build_kind}"
@@ -8156,7 +8474,7 @@ def build_build_doc(
             "shell_file"
             if is_shell_doc
             else "code_file"
-            if is_python_doc
+            if is_code_doc
             else "sql_file"
             if is_sql_doc
             else "build_file"
@@ -9904,6 +10222,7 @@ def emit_build_documents(
                     "batch",
                     "cmd",
                     "python",
+                    "assembly",
                     "sql",
                     "compiler_diagnostic",
                     "linker_diagnostic",
@@ -10396,6 +10715,346 @@ def _resolve_file_args(filepath, compile_db, default_args):
     return _adapt_args_for_file(args, filepath)
 
 
+CPP_LEXICAL_FALLBACK_CHUNK_BYTES = 500_000
+
+
+def _cpp_lexical_fallback_compile_args_sha256(
+    compile_args: Sequence[str],
+) -> str:
+    encoded_args = json.dumps(
+        list(map(str, compile_args)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded_args).hexdigest()
+
+
+def _project_local_cpp_lexical_fallback_path(
+    project_dir: str,
+    relative_path: str,
+) -> str:
+    """Resolve one fallback source and reject root/symlink escapes."""
+
+    canonical_path = _canonical_project_path(relative_path)
+    project_root = os.path.realpath(project_dir)
+    absolute_path = os.path.realpath(os.path.join(project_root, canonical_path))
+    try:
+        is_project_local = (
+            not os.path.isabs(canonical_path)
+            and "://" not in canonical_path
+            and os.path.commonpath((project_root, absolute_path)) == project_root
+        )
+    except ValueError:
+        is_project_local = False
+    if not is_project_local:
+        raise RuntimeError(
+            "C/C++ lexical fallback path escapes the project root: "
+            f"{relative_path}"
+        )
+    return absolute_path
+
+
+def _record_cpp_lexical_fallback(
+    filepath: str,
+    compile_args: Sequence[str],
+    project_dir: str,
+    parse_error: BaseException,
+    parse_recovery_records: list[dict[str, object]],
+) -> str | None:
+    """Authorize a lossless lexical fallback for one native libclang load error.
+
+    Deliberately narrow: a bad/ambiguous compiler context must still fail loud,
+    as must every exception other than TranslationUnitLoadError.  The returned
+    path is project-relative and the receipt binds the exact source bytes that
+    the later lexical emitter must reproduce.
+    """
+
+    normalized_args = list(map(str, compile_args))
+    if (
+        not _has_translation_unit_load_error(parse_error)
+        or not _is_sane_compile_args(normalized_args)
+    ):
+        return None
+
+    relative_path = _canonical_project_path(
+        Path(os.path.relpath(filepath, project_dir)).as_posix()
+    )
+    absolute_path = _project_local_cpp_lexical_fallback_path(
+        project_dir,
+        relative_path,
+    )
+    source, source_bytes, source_encoding = _read_source_file(absolute_path)
+    fallback_fields: dict[str, object] = {
+        "status": "lexical_fallback",
+        "fallback_mode": "lossless_cpp_lexical_v1",
+        "fallback_reason": "translation_unit_load_error",
+        "compile_args_status": "sane",
+        "compile_arg_count": len(normalized_args),
+        "compile_args_sha256": _cpp_lexical_fallback_compile_args_sha256(
+            normalized_args
+        ),
+        "source_size_bytes": len(source_bytes),
+        "source_char_count": len(source),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_encoding": source_encoding,
+    }
+    existing = next(
+        (
+            record
+            for record in reversed(parse_recovery_records)
+            if record.get("relative_path") == relative_path
+            and record.get("status") == "unresolved"
+        ),
+        None,
+    )
+    if existing is None:
+        parse_recovery_records.append(
+            {
+                "relative_path": relative_path,
+                "trigger": "translation_unit_load_error",
+                **fallback_fields,
+            }
+        )
+    else:
+        existing.update(fallback_fields)
+    print(
+        "  Parse lexical fallback: "
+        f"{relative_path} bytes={len(source_bytes)} "
+        f"sha256={fallback_fields['source_sha256']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return relative_path
+
+
+def _iter_cpp_lexical_fallback_chunks(
+    filepath: str,
+    *,
+    max_chunk_bytes: int = CPP_LEXICAL_FALLBACK_CHUNK_BYTES,
+) -> Iterator[tuple[str, dict[str, int | str]]]:
+    """Yield byte-exact decoded C/C++ chunks, preferring line boundaries."""
+
+    if max_chunk_bytes < 4:
+        raise ValueError(
+            f"max_chunk_bytes must be at least 4, got {max_chunk_bytes}"
+        )
+    _source, source_bytes, source_encoding = _read_source_file(filepath)
+    if not source_bytes:
+        return
+
+    byte_start = 0
+    char_start = 0
+    chunk_index = 0
+    while byte_start < len(source_bytes):
+        byte_end = min(byte_start + max_chunk_bytes, len(source_bytes))
+        split_reason = "eof" if byte_end == len(source_bytes) else "byte_limit"
+        if byte_end < len(source_bytes):
+            newline = source_bytes.rfind(b"\n", byte_start, byte_end)
+            if newline >= byte_start:
+                byte_end = newline + 1
+                split_reason = "line_boundary"
+
+        while byte_end > byte_start:
+            try:
+                text = source_bytes[byte_start:byte_end].decode(
+                    source_encoding,
+                    errors="strict",
+                )
+            except UnicodeDecodeError:
+                byte_end -= 1
+                split_reason = "character_boundary"
+                continue
+            break
+        else:
+            raise ValueError(
+                "cannot find a decodable C/C++ lexical fallback boundary: "
+                f"{filepath} byte_start={byte_start} encoding={source_encoding}"
+            )
+
+        if text.encode(source_encoding, errors="strict") != source_bytes[
+            byte_start:byte_end
+        ]:
+            raise ValueError(
+                f"C/C++ lexical fallback chunk did not round-trip: {filepath}"
+            )
+        char_end = char_start + len(text)
+        span: dict[str, int | str] = {
+            "chunk_index": chunk_index,
+            "byte_start": byte_start,
+            "byte_end": byte_end,
+            "char_start": char_start,
+            "char_end": char_end,
+            "source_size_bytes": len(source_bytes),
+            "chunk_limit_bytes": max_chunk_bytes,
+            "split_reason": split_reason,
+            "source_encoding": source_encoding,
+        }
+        yield text, span
+        byte_start = byte_end
+        char_start = char_end
+        chunk_index += 1
+
+
+def emit_cpp_lexical_fallback_documents(
+    relative_paths: Iterable[str],
+    *,
+    index: ProjectIndex,
+    project_dir: str,
+    project_id: str,
+    compile_db: dict | None,
+    default_args: list[str] | None,
+    default_build_info: dict | None,
+    parse_recovery_records: Sequence[dict[str, object]],
+    enriched: bool,
+    emit_doc: Callable[[str | dict[str, object]], None] | None = None,
+) -> list[str | dict[str, object]]:
+    """Emit every byte of each authorized lexical fallback source exactly once."""
+
+    documents: list[str | dict[str, object]] = []
+    stable_project_id = require_project_identity(
+        project_id,
+        source="emit_cpp_lexical_fallback_documents",
+    )
+    from cppmega.data.domain_schema import ParseConfidence
+
+    for relative_path in sorted(set(map(str, relative_paths))):
+        canonical_path = _canonical_project_path(relative_path)
+        absolute_path = _project_local_cpp_lexical_fallback_path(
+            project_dir,
+            canonical_path,
+        )
+        source, source_bytes, source_encoding = _read_source_file(absolute_path)
+        record = next(
+            (
+                candidate
+                for candidate in parse_recovery_records
+                if candidate.get("relative_path") == canonical_path
+                and candidate.get("status") == "lexical_fallback"
+            ),
+            None,
+        )
+        if record is None:
+            raise RuntimeError(
+                "C/C++ lexical fallback emission lacks an authorization record: "
+                f"{canonical_path}"
+            )
+        expected_binding = (
+            int(record.get("source_size_bytes") or -1),
+            int(record.get("source_char_count") or -1),
+            str(record.get("source_sha256") or ""),
+            str(record.get("source_encoding") or ""),
+        )
+        actual_binding = (
+            len(source_bytes),
+            len(source),
+            hashlib.sha256(source_bytes).hexdigest(),
+            source_encoding,
+        )
+        if actual_binding != expected_binding:
+            raise RuntimeError(
+                "C/C++ lexical fallback source changed after parse failure: "
+                f"{canonical_path} expected={expected_binding} actual={actual_binding}"
+            )
+
+        compile_args, build_info = _compile_context_for_rel_file(
+            canonical_path,
+            project_dir=project_dir,
+            compile_db=compile_db,
+            default_args=default_args,
+            default_build_info=default_build_info,
+        )
+        expected_compile_args_binding = str(
+            record.get("compile_args_sha256") or ""
+        )
+        actual_compile_args_binding = (
+            _cpp_lexical_fallback_compile_args_sha256(compile_args)
+        )
+        if (
+            record.get("compile_args_status") != "sane"
+            or actual_compile_args_binding != expected_compile_args_binding
+        ):
+            raise RuntimeError(
+                "C/C++ lexical fallback compile args changed after parse failure: "
+                f"{canonical_path} expected={expected_compile_args_binding} "
+                f"actual={actual_compile_args_binding}"
+            )
+        emitted_bytes = bytearray()
+        chunk_count = 0
+        for text, source_span in _iter_cpp_lexical_fallback_chunks(absolute_path):
+            emitted_bytes.extend(text.encode(source_encoding, errors="strict"))
+            if enriched:
+                chunk_name = os.path.basename(canonical_path)
+                if source_span["chunk_index"]:
+                    chunk_name += f"#{source_span['chunk_index']}"
+                part: PartInfo = (
+                    text,
+                    0,
+                    0,
+                    chunk_name,
+                    None,
+                    None,
+                    None,
+                    None,
+                    canonical_path,
+                )
+                document = build_enriched_doc(
+                    [part],
+                    index,
+                    filepath=canonical_path,
+                    compile_args=compile_args,
+                    build_info=build_info,
+                    project_id=stable_project_id,
+                )
+                document["source_span"] = dict(source_span)
+                document["cpp_parse_fallback"] = {
+                    "schema": "cppmega.cpp_parse_fallback_v1",
+                    "mode": "lossless_cpp_lexical_v1",
+                    "reason": "translation_unit_load_error",
+                    "compile_args_status": "sane",
+                    "source_sha256": actual_binding[2],
+                    "source_encoding": source_encoding,
+                    "source_span": dict(source_span),
+                }
+                document["domain_confidence_ids"] = [
+                    int(ParseConfidence.HEURISTIC)
+                ] * len(text)
+                parse_info = cast(
+                    dict[str, object],
+                    document["domain_parse_info"],
+                )
+                parse_info.update(
+                    {
+                        "parser": "cpp-lexical",
+                        "fallback_reason": "translation_unit_load_error",
+                        "source_span": dict(source_span),
+                    }
+                )
+                output: str | dict[str, object] = document
+            else:
+                output = text
+            if emit_doc is None:
+                documents.append(output)
+            else:
+                emit_doc(output)
+            chunk_count += 1
+
+        if bytes(emitted_bytes) != source_bytes:
+            raise RuntimeError(
+                f"C/C++ lexical fallback emission was not lossless: {canonical_path}"
+            )
+        if source and not chunk_count:
+            raise RuntimeError(
+                f"C/C++ lexical fallback emitted no chunks: {canonical_path}"
+            )
+        print(
+            "  Emitted lossless C/C++ lexical fallback: "
+            f"{canonical_path} chunks={chunk_count} bytes={len(source_bytes)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return documents
+
+
 def _parse_file_batch(args_tuple):
     """Worker function for parallel parsing. Each worker creates its own Index."""
     filepaths, compile_db, default_args, project_dir, project_id = args_tuple
@@ -10406,6 +11065,7 @@ def _parse_file_batch(args_tuple):
     type_results: list[dict] = []
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
+    lexical_fallback_files: list[str] = []
     last_heartbeat = time.monotonic()
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
@@ -10427,12 +11087,21 @@ def _parse_file_batch(args_tuple):
         except SymbolIdentityError:
             raise
         except Exception as exc:
-            cause = exc.__cause__ or exc
-            context = f"; {exc}" if cause is not exc else ""
-            raise RuntimeError(
-                f"C/C++ parse failed for {filepath}: "
-                f"{type(cause).__name__}: {cause}{context}"
-            ) from exc
+            fallback_path = _record_cpp_lexical_fallback(
+                filepath,
+                args,
+                project_dir,
+                exc,
+                parse_recovery_records,
+            )
+            if fallback_path is None:
+                cause = exc.__cause__ or exc
+                context = f"; {exc}" if cause is not exc else ""
+                raise RuntimeError(
+                    f"C/C++ parse failed for {filepath}: "
+                    f"{type(cause).__name__}: {cause}{context}"
+                ) from exc
+            lexical_fallback_files.append(fallback_path)
         now = time.monotonic()
         if (
             idx == len(filepaths)
@@ -10450,6 +11119,7 @@ def _parse_file_batch(args_tuple):
         "typedefs": type_results,
         "external_reference_omissions": external_reference_omissions,
         "parse_recovery_records": parse_recovery_records,
+        "lexical_fallback_files": lexical_fallback_files,
     }, len(filepaths)
 
 
@@ -10619,9 +11289,13 @@ def _parse_recovery_summary(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    recovered_count = sum(
+    semantic_recovered_count = sum(
         record.get("status") == "recovered" for record in normalized
     )
+    lexical_fallback_count = sum(
+        record.get("status") == "lexical_fallback" for record in normalized
+    )
+    recovered_count = semantic_recovered_count + lexical_fallback_count
     unresolved_count = sum(
         record.get("status") == "unresolved" for record in normalized
     )
@@ -10634,10 +11308,18 @@ def _parse_recovery_summary(
         ),
         "policy": (
             "retry_missing_includes_with_header_matched_project_local_dirs_"
-            "only_without_compile_command"
+            "only_without_compile_command_then_lossless_cpp_lexical_fallback_"
+            "only_for_translation_unit_load_error_with_sane_compile_args"
         ),
         "attempted_file_count": len(normalized),
         "recovered_file_count": recovered_count,
+        "semantic_recovered_file_count": semantic_recovered_count,
+        "lexical_fallback_file_count": lexical_fallback_count,
+        "lexical_fallback_source_bytes": sum(
+            int(record.get("source_size_bytes") or 0)
+            for record in normalized
+            if record.get("status") == "lexical_fallback"
+        ),
         "unresolved_file_count": unresolved_count,
         "records_sha256": hashlib.sha256(encoded).hexdigest(),
         "records": normalized,
@@ -10664,6 +11346,7 @@ def process_project(
     skip_invalid_domain_inputs: bool = False,
     source_quarantine_manifest: str | None = None,
     source_quarantine_receipt: str | None = None,
+    macos_sdk_path: str | None = None,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -10706,6 +11389,8 @@ def process_project(
     quarantined_paths: set[str] = set()
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
+    lexical_fallback_files: set[str] = set()
+    source_tree_entry_exclusions = GitTreeSourceEntryExclusions(project_dir)
 
     invalid_domain_paths: set[str] = set()
 
@@ -10716,7 +11401,15 @@ def process_project(
     invalid_handler = _handle_invalid_domain_input if skip_invalid_domain_inputs else None
 
     # Find source files
-    cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    cpp_files = find_cpp_files(
+        project_dir,
+        extra_exclude_dirs=extra_exclude_dirs,
+        ineligible_entry_handler=(
+            source_tree_entry_exclusions.record
+            if source_quarantine is not None
+            else None
+        ),
+    )
     if source_quarantine is not None:
         quarantine_candidates = list(cpp_files)
         candidate_identities = {
@@ -10731,6 +11424,10 @@ def process_project(
             project_dir,
             quarantine_candidates,
         )
+        quarantine_receipt["source_tree_entry_exclusions"] = (
+            source_tree_entry_exclusions.receipt()
+        )
+        quarantine_receipt["schema"] = "cppmega.source_quarantine_receipt_v2"
         kept_candidate_identities = {
             os.path.abspath(candidate) for candidate in kept_candidates
         }
@@ -10812,7 +11509,10 @@ def process_project(
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
     compile_db = load_compile_commands(project_dir)
-    _platform_info, _raw_args, _compile_index = detect_build_context(project_dir)
+    _platform_info, _raw_args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     default_args, default_build_info = _resolve_default_compile_context(
         project_dir,
         _platform_info,
@@ -10869,6 +11569,7 @@ def process_project(
                         external_reference_omissions.get(key, 0) + int(count)
                     )
                 parse_recovery_records.extend(payload["parse_recovery_records"])
+                lexical_fallback_files.update(payload["lexical_fallback_files"])
                 total_parsed += parsed_count
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
@@ -10906,16 +11607,25 @@ def process_project(
                     index_obj.add_function(func)
                 for td in typedefs:
                     index_obj.add_typedef(td)
-                parsed += 1
             except SymbolIdentityError:
                 raise
             except Exception as exc:
-                cause = exc.__cause__ or exc
-                context = f"; {exc}" if cause is not exc else ""
-                raise RuntimeError(
-                    f"C/C++ parse failed for {filepath}: "
-                    f"{type(cause).__name__}: {cause}{context}"
-                ) from exc
+                fallback_path = _record_cpp_lexical_fallback(
+                    filepath,
+                    args,
+                    project_dir,
+                    exc,
+                    parse_recovery_records,
+                )
+                if fallback_path is None:
+                    cause = exc.__cause__ or exc
+                    context = f"; {exc}" if cause is not exc else ""
+                    raise RuntimeError(
+                        f"C/C++ parse failed for {filepath}: "
+                        f"{type(cause).__name__}: {cause}{context}"
+                    ) from exc
+                lexical_fallback_files.add(fallback_path)
+            parsed += 1
             processed = parsed
             now = time.monotonic()
             if (
@@ -11014,6 +11724,20 @@ def process_project(
             emit_doc=_emit_counted if emit_doc is not None else None,
             memory_limit_gb=memory_limit_gb,
         )
+        fallback_documents = emit_cpp_lexical_fallback_documents(
+            lexical_fallback_files,
+            index=index_obj,
+            project_dir=project_dir,
+            project_id=stable_project_id,
+            compile_db=compile_db,
+            default_args=default_args,
+            default_build_info=default_build_info,
+            parse_recovery_records=parse_recovery_records,
+            enriched=enriched,
+            emit_doc=_emit_counted if emit_doc is not None else None,
+        )
+        if emit_doc is None:
+            documents.extend(fallback_documents)
     check_memory_limit(memory_limit_gb, label="index_project")
     code_doc_count = emitted_docs if emit_doc is not None else len(documents)
     print(f"  Generated {code_doc_count} code training documents", file=sys.stderr)
@@ -11081,6 +11805,14 @@ def main() -> int:
                         help='Number of parallel parse workers within each project (default: 8)')
     parser.add_argument('--libclang-path', type=str, default=None,
                         help='Path to libclang.so (auto-detected if not set)')
+    parser.add_argument(
+        '--macos-sdk',
+        type=normalize_macos_sdk_path_argument,
+        default=None,
+        help='Explicit macOS SDK root used only for projects whose bounded '
+             '.xcconfig evidence requires a macOS build context. No ambient '
+             'SDK lookup is performed.',
+    )
     parser.add_argument('--append', action='store_true',
                         help='Append to output file instead of overwriting')
     parser.add_argument('--enriched', action='store_true',
@@ -11145,6 +11877,11 @@ def main() -> int:
                              'unchanged when absent.')
 
     args = parser.parse_args()
+    if args.macos_sdk is not None:
+        try:
+            validate_macos_sdk_path(args.macos_sdk)
+        except BuildContextEvidenceError as exc:
+            parser.error(str(exc))
     start_memory_guard(args.memory_limit_gb, label="index_project")
 
     try:
@@ -11348,6 +12085,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         ): (pd, project_id)
                         for pd, project_id in project_specs
                     }
@@ -11377,6 +12115,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         )
                         for doc in docs:
                             _write_doc(doc)

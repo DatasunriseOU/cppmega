@@ -56,6 +56,11 @@ from cppmega.data.symbol_identity import (  # noqa: E402
     SymbolIdentityError,
     require_project_identity,
 )
+from cppmega.data.build_context import (  # noqa: E402
+    BuildContextEvidenceError,
+    normalize_macos_sdk_path_argument,
+    validate_macos_sdk_path,
+)
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).
@@ -439,63 +444,45 @@ def _subprocess_env() -> dict:
     return env
 
 
-def _parse_ps_time_seconds(value: str) -> float | None:
-    """Parse ps TIME values like MM:SS.cc, HH:MM:SS.cc, or DD-HH:MM:SS.cc."""
-    raw = value.strip()
-    if not raw:
-        return None
-    days = 0
-    if "-" in raw:
-        day_raw, raw = raw.split("-", 1)
-        try:
-            days = int(day_raw)
-        except ValueError:
-            return None
-    parts = raw.split(":")
-    try:
-        if len(parts) == 2:
-            hours = 0
-            minutes = int(parts[0])
-            seconds = float(parts[1])
-        elif len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        else:
-            return None
-    except ValueError:
-        return None
-    return float(days * 86400 + hours * 3600 + minutes * 60) + seconds
+_HEARTBEAT_PROGRESS_RE = re.compile(
+    r"^\s*(?P<label>[^:\r\n]*\bheartbeat):\s*(?P<state>.*)\s*$",
+    re.IGNORECASE,
+)
 
 
-def _process_group_cpu_seconds(pgid: int) -> float | None:
-    """Return cumulative CPU seconds for a process group, when ps supports it."""
-    try:
-        output = subprocess.check_output(
-            ["ps", "-axo", "pgid=,time="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    total = 0.0
-    seen = False
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) < 2:
+def _consume_log_progress(
+    log_path: Path,
+    offset: int,
+    heartbeat_states: dict[str, str],
+) -> tuple[int, bool]:
+    """Read appended log bytes and ignore duplicate semantic heartbeats."""
+
+    size = log_path.stat().st_size
+    if size < offset:
+        offset = 0
+        heartbeat_states.clear()
+    if size == offset:
+        return offset, False
+
+    with log_path.open("rb") as log_reader:
+        log_reader.seek(offset)
+        appended = log_reader.read(size - offset)
+
+    progressed = False
+    for raw_line in appended.splitlines():
+        if not raw_line.strip():
             continue
-        try:
-            row_pgid = int(fields[0])
-        except ValueError:
+        line = raw_line.decode("utf-8", errors="replace")
+        heartbeat = _HEARTBEAT_PROGRESS_RE.fullmatch(line)
+        if heartbeat is None:
+            progressed = True
             continue
-        if row_pgid != pgid:
-            continue
-        seconds = _parse_ps_time_seconds(fields[1])
-        if seconds is None:
-            continue
-        total += seconds
-        seen = True
-    return total if seen else None
+        label = heartbeat.group("label").strip().casefold()
+        state = heartbeat.group("state").strip()
+        if heartbeat_states.get(label) != state:
+            heartbeat_states[label] = state
+            progressed = True
+    return size, progressed
 
 
 def run_checked(
@@ -550,8 +537,8 @@ def run_checked(
         if stall_timeout and log_path is not None:
             deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
             last_activity = time.monotonic()
-            last_signature: tuple[int, int] | None = None
-            last_cpu_seconds: float | None = None
+            log_offset = 0
+            heartbeat_states: dict[str, str] = {}
             while proc.poll() is None:
                 now = time.monotonic()
                 if deadline is not None and now > deadline:
@@ -562,23 +549,19 @@ def run_checked(
                         f"timed out after {timeout}s",
                     )
                 if log_path.exists():
-                    stat = log_path.stat()
-                    signature = (stat.st_size, stat.st_mtime_ns)
-                    if signature != last_signature:
-                        last_signature = signature
-                        last_activity = now
-                cpu_seconds = _process_group_cpu_seconds(proc.pid)
-                if cpu_seconds is not None and cpu_seconds != last_cpu_seconds:
-                    last_cpu_seconds = cpu_seconds
-                    last_activity = now
-                if now - last_activity > stall_timeout:
-                    terminate_process(
-                        f"no log/CPU progress for {stall_timeout}s"
+                    log_offset, progressed = _consume_log_progress(
+                        log_path,
+                        log_offset,
+                        heartbeat_states,
                     )
+                    if progressed:
+                        last_activity = now
+                if now - last_activity > stall_timeout:
+                    terminate_process(f"no log progress for {stall_timeout}s")
                     raise RepoFailure(
                         repo,
                         stage,
-                        f"stalled after {stall_timeout}s without log or CPU progress",
+                        f"stalled after {stall_timeout}s without log progress",
                     )
                 time.sleep(1.0)
             stdout_data, _ = proc.communicate(timeout=1)
@@ -1078,6 +1061,7 @@ def stage_index_source(
     index_timeout_s: int | None = None,
     index_stall_timeout_s: int | None = None,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.gz.
 
@@ -1123,6 +1107,8 @@ def stage_index_source(
             "--source-quarantine-receipt",
             str(quarantine_receipt),
         ]
+    if macos_sdk is not None:
+        cmd += ["--macos-sdk", str(macos_sdk)]
     log_path = work / f"{repo}.index.log"
     run_checked(
         repo,
@@ -1175,7 +1161,11 @@ def read_source_quarantine_receipt(work: Path, repo: str) -> dict[str, object]:
         ) from exc
     if (
         not isinstance(receipt, dict)
-        or receipt.get("schema") != "cppmega.source_quarantine_receipt_v1"
+        or receipt.get("schema")
+        not in {
+            "cppmega.source_quarantine_receipt_v1",
+            "cppmega.source_quarantine_receipt_v2",
+        }
     ):
         raise RepoFailure(
             repo,
@@ -1727,6 +1717,7 @@ def process_one_repo(
     project_id: str,
     promote_dedup_on_success: bool = True,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
@@ -1757,7 +1748,7 @@ def process_one_repo(
                 repo, project_id, repo_dir, work, dedup_db, dedup_near,
                 stage_id, stage_db, global_symbol_index, memory_limit_gb,
                 parse_workers, index_timeout_s, index_stall_timeout_s,
-                source_quarantine_manifest,
+                source_quarantine_manifest, macos_sdk,
             )
         except RepoNoTrainingDocs as exc:
             timings["index_project_s"] = round(time.monotonic() - started, 6)
@@ -1784,6 +1775,26 @@ def process_one_repo(
         )
         materialize_stats = read_materialize_stats(tok)
         timings["materialize_s"] = round(time.monotonic() - started, 6)
+
+        if int(materialize_stats["docs_out"]) == 0:
+            result = {
+                "source": "code",
+                "artifact_filename": code_output_filename(repo),
+                "repo": repo,
+                "project_id": project_id,
+                "skipped": True,
+                "skip_reason": "no_training_documents",
+                "detail": (
+                    "materializer produced zero training rows from "
+                    f"{materialize_stats['docs_in']} enriched document(s)"
+                ),
+                "lengths": {},
+                "stage_timings_s": timings,
+                "materialize_stats": materialize_stats,
+            }
+            if source_quarantine_receipt is not None:
+                result["source_quarantine_receipt"] = source_quarantine_receipt
+            return result
 
         started = time.monotonic()
         _bucket_for, route_by_fit = _route_by_fit_impl()
@@ -1955,6 +1966,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "under C/C++ suffixes. Passed to every code indexing subprocess; "
              f"default {DEFAULT_SOURCE_QUARANTINE_MANIFEST}.",
     )
+    p.add_argument(
+        "--macos-sdk",
+        type=normalize_macos_sdk_path_argument,
+        default=None,
+        help="Explicit macOS SDK root passed to every code indexer. It is used "
+             "only when bounded project xcconfig evidence requires macOS.",
+    )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
@@ -2015,6 +2033,16 @@ def main(argv: list[str]) -> int:
         if args.source_quarantine_manifest
         else None
     )
+    macos_sdk = (
+        Path(args.macos_sdk)
+        if args.macos_sdk
+        else None
+    )
+    if macos_sdk is not None:
+        try:
+            validate_macos_sdk_path(macos_sdk)
+        except BuildContextEvidenceError as exc:
+            raise SystemExit(str(exc)) from exc
     if (
         source_quarantine_manifest is not None
         and not source_quarantine_manifest.is_file()
@@ -2190,7 +2218,8 @@ def main(argv: list[str]) -> int:
                                             project_id=project_id,
                                             source_quarantine_manifest=(
                                                 source_quarantine_manifest
-                                            ))
+                                            ),
+                                            macos_sdk=macos_sdk)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

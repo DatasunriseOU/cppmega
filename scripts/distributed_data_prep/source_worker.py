@@ -16,6 +16,7 @@ import hashlib
 import heapq
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -114,6 +115,33 @@ _NONRETRYABLE_GIT_MARKERS = (
 QUARANTINE_PROJECTION_MODE_OFF = "off"
 _QUARANTINE_PROJECTION_MODES = frozenset(
     {QUARANTINE_PROJECTION_MODE_OFF, PINNED_TREE_PROJECTION_MODE}
+)
+GIT_FSCK_RECEIPT_SCHEMA = "cppmega.git_fsck_receipt_v1"
+_GIT_FSCK_COMMAND = ("git", "fsck", "--full", "--strict")
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_KEYDB_ZERO_PADDED_FILEMODE = {
+    "remote_url": "https://github.com/Snapchat/KeyDB.git",
+    "expected_commit": "603ebb27fb82a27fb98b0feb6749b0f7661a1c4b",
+    "checkout_tree": "f5269110f16e1833586e15dd59dde6255c8cc787",
+    "historical_commit": "b435f64510a032528c42fc1cfc4eca15a4474a1b",
+    "object_id": "1f9ef1b6556b375d56767fd78bf06c7d90e9abea",
+    "object_type": "tree",
+    "object_size_bytes": 532,
+    "object_payload_sha256": (
+        "3032eb4682653aa4b6b0b3a603de8181342139cce177f0842681f2f0f3537ffc"
+    ),
+    "message_id": "zeroPaddedFilemode",
+    "diagnostic": (
+        "error in tree 1f9ef1b6556b375d56767fd78bf06c7d90e9abea: "
+        "zeroPaddedFilemode: contains zero-padded file modes"
+    ),
+    "returncode": 4,
+}
+SOURCE_QUARANTINE_RECEIPT_SCHEMA_V1 = "cppmega.source_quarantine_receipt_v1"
+SOURCE_QUARANTINE_RECEIPT_SCHEMA_V2 = "cppmega.source_quarantine_receipt_v2"
+SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA = "cppmega.source_tree_entry_exclusions_v1"
+_SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY = (
+    "skip_only_dangling_symlink_blobs_targeting_unmaterialized_gitlinks"
 )
 
 
@@ -784,6 +812,174 @@ def _git(git_dir: Path, *args: str) -> str:
     return run_checked(["git", f"--git-dir={git_dir}", *args]).stdout.strip()
 
 
+def _git_fsck_exception_for_source(
+    source: Mapping[str, object],
+    *,
+    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+) -> Mapping[str, object] | None:
+    if (
+        source.get("remote_url") == known_exception["remote_url"]
+        and source.get("expected_commit") == known_exception["expected_commit"]
+    ):
+        return known_exception
+    return None
+
+
+def _matching_git_fsck_exception(
+    source: Mapping[str, object],
+    checkout_tree: str,
+    *,
+    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+) -> Mapping[str, object] | None:
+    policy = _git_fsck_exception_for_source(
+        source,
+        known_exception=known_exception,
+    )
+    if policy is not None and checkout_tree == policy["checkout_tree"]:
+        return policy
+    return None
+
+
+def _expected_git_fsck_exception_receipt(
+    known_exception: Mapping[str, object],
+) -> dict[str, object]:
+    diagnostic = str(known_exception["diagnostic"])
+    return {
+        "schema": GIT_FSCK_RECEIPT_SCHEMA,
+        "status": "accepted_known_historical_diagnostic",
+        "command": list(_GIT_FSCK_COMMAND),
+        "returncode": int(known_exception["returncode"]),
+        "stdout_sha256": _EMPTY_SHA256,
+        "stderr_sha256": hashlib.sha256(
+            (diagnostic + "\n").encode("utf-8")
+        ).hexdigest(),
+        "source_binding": {
+            "remote_url": str(known_exception["remote_url"]),
+            "expected_commit": str(known_exception["expected_commit"]),
+            "checkout_tree": str(known_exception["checkout_tree"]),
+        },
+        "diagnostics": [
+            {
+                "message_id": str(known_exception["message_id"]),
+                "diagnostic": diagnostic,
+                "object_id": str(known_exception["object_id"]),
+                "object_type": str(known_exception["object_type"]),
+                "object_size_bytes": int(known_exception["object_size_bytes"]),
+                "object_payload_sha256": str(
+                    known_exception["object_payload_sha256"]
+                ),
+                "historical_commit": str(known_exception["historical_commit"]),
+            }
+        ],
+    }
+
+
+def _accept_known_git_fsck_diagnostic(
+    source: Mapping[str, object],
+    checkout_tree: str,
+    mirror: Path,
+    fsck: subprocess.CompletedProcess[str],
+    *,
+    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+) -> dict[str, object]:
+    """Accept one byte-verified historical diagnostic for one pinned source.
+
+    The unmodified strict fsck command must emit exactly the known line and no
+    other output.  We deliberately do not use ``fsck.skipList``: that setting
+    would suppress every diagnostic attached to the listed object rather than
+    proving that only the independently verified diagnostic was observed.
+    """
+
+    policy = _matching_git_fsck_exception(
+        source,
+        checkout_tree,
+        known_exception=known_exception,
+    )
+    if policy is None:
+        raise ContractError(f"full mirror failed git fsck: {fsck.stderr[-8000:]}")
+    expected_receipt = _expected_git_fsck_exception_receipt(policy)
+    expected_stderr = str(policy["diagnostic"]) + "\n"
+    if (
+        fsck.returncode != policy["returncode"]
+        or fsck.stdout != ""
+        or fsck.stderr != expected_stderr
+    ):
+        raise ContractError(
+            "full mirror git fsck did not match the exact known historical "
+            f"diagnostic: stdout={fsck.stdout[-4000:]!r} "
+            f"stderr={fsck.stderr[-8000:]!r}"
+        )
+
+    object_id = str(policy["object_id"])
+    object_type = str(policy["object_type"])
+    if _git(mirror, "cat-file", "-t", object_id) != object_type:
+        raise ContractError("known git fsck object type drifted")
+    object_payload = subprocess.run(
+        ["git", f"--git-dir={mirror}", "cat-file", object_type, object_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if object_payload.returncode != 0 or object_payload.stderr:
+        raise ContractError(
+            "cannot read the exact known git fsck object: "
+            + object_payload.stderr[-4000:].decode(errors="replace")
+        )
+    if (
+        len(object_payload.stdout) != policy["object_size_bytes"]
+        or hashlib.sha256(object_payload.stdout).hexdigest()
+        != policy["object_payload_sha256"]
+    ):
+        raise ContractError("known git fsck object payload drifted")
+
+    historical_commit = str(policy["historical_commit"])
+    if (
+        _git(mirror, "rev-parse", f"{historical_commit}^{{commit}}")
+        != historical_commit
+        or _git(mirror, "rev-parse", f"{historical_commit}^{{tree}}") != object_id
+    ):
+        raise ContractError("known git fsck historical commit binding drifted")
+    ancestry = subprocess.run(
+        [
+            "git",
+            f"--git-dir={mirror}",
+            "merge-base",
+            "--is-ancestor",
+            historical_commit,
+            str(policy["expected_commit"]),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ancestry.returncode != 0 or ancestry.stdout or ancestry.stderr:
+        raise ContractError(
+            "known git fsck object is not bound to the pinned commit ancestry"
+        )
+    return expected_receipt
+
+
+def validate_git_fsck_snapshot(
+    source: Mapping[str, object], source_snapshot: Mapping[str, object]
+) -> None:
+    """Validate normal fsck success or the one exact historical exception."""
+
+    checkout_tree = str(source_snapshot.get("tree", ""))
+    policy = _git_fsck_exception_for_source(source)
+    fsck = source_snapshot.get("fsck")
+    if policy is None:
+        if fsck != "ok":
+            raise ContractError("Git source snapshot has unsupported fsck evidence")
+        return
+    if checkout_tree != policy["checkout_tree"]:
+        raise ContractError("Git source snapshot known fsck checkout tree drifted")
+    if not isinstance(fsck, Mapping):
+        raise ContractError("Git source snapshot omitted known fsck diagnostic evidence")
+    expected = _expected_git_fsck_exception_receipt(policy)
+    if canonical_json_bytes(fsck) != canonical_json_bytes(expected):
+        raise ContractError("Git source snapshot known fsck evidence drifted")
+
+
 def _sorted_file_digest(source: Path, destination: Path) -> tuple[str, int, int, dict[str, int]]:
     env = dict(os.environ)
     env["LC_ALL"] = "C"
@@ -863,8 +1059,15 @@ def acquire_git_mirror(
         text=True,
         check=False,
     )
-    if fsck.returncode != 0:
-        raise ContractError(f"full mirror failed git fsck: {fsck.stderr[-8000:]}")
+    if fsck.returncode == 0:
+        fsck_receipt: str | dict[str, object] = "ok"
+    else:
+        fsck_receipt = _accept_known_git_fsck_diagnostic(
+            source,
+            tree,
+            mirror,
+            fsck,
+        )
 
     refs_lines = sorted(
         line
@@ -954,7 +1157,7 @@ def acquire_git_mirror(
             "inventory_sha256": inventory_sha,
         },
         "gitlink_count": gitlink_count,
-        "fsck": "ok",
+        "fsck": fsck_receipt,
     }
 
 
@@ -1263,36 +1466,200 @@ def _run_indexer(
     }
 
 
+def _validate_source_tree_entry_exclusions(
+    value: object,
+    *,
+    source_snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ContractError("source tree entry exclusions receipt is missing")
+    receipt = dict(value)
+    require_exact_fields(
+        receipt,
+        {
+            "schema",
+            "status",
+            "policy",
+            "git_tree",
+            "excluded_count",
+            "records_sha256",
+            "records",
+        },
+        where="source tree entry exclusions receipt",
+    )
+    if (
+        receipt["schema"] != SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA
+        or receipt["status"] != "complete"
+        or receipt["policy"] != _SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY
+    ):
+        raise ContractError("source tree entry exclusions policy drifted")
+    excluded_count = require_int(
+        receipt["excluded_count"], where="source tree excluded count"
+    )
+    records = receipt["records"]
+    if not isinstance(records, list) or len(records) != excluded_count:
+        raise ContractError("source tree entry exclusion count does not close")
+    if canonical_sha256(records) != require_sha256(
+        receipt["records_sha256"],
+        where="source tree entry exclusion records sha256",
+    ):
+        raise ContractError("source tree entry exclusion records digest drifted")
+    git_tree = receipt["git_tree"]
+    if excluded_count:
+        git_tree = require_git_object(git_tree, where="source tree exclusion Git tree")
+    elif git_tree is not None:
+        raise ContractError("empty source tree exclusions must not claim a Git tree")
+    if excluded_count and (
+        source_snapshot.get("kind") != "git_mirror"
+        or source_snapshot.get("tree") != git_tree
+    ):
+        raise ContractError(
+            "source tree entry exclusions are not bound to the worker checkout tree"
+        )
+
+    expected_record_fields = {
+        "relative_path",
+        "reason",
+        "git_tree",
+        "entry_mode",
+        "entry_object_id",
+        "entry_object_type",
+        "entry_object_size_bytes",
+        "entry_object_sha256",
+        "symlink_target",
+        "target_relative_path",
+        "target_gitlink_path",
+        "target_gitlink_mode",
+        "target_gitlink_commit",
+    }
+    previous_path: str | None = None
+    for index, record_value in enumerate(records):
+        if not isinstance(record_value, Mapping):
+            raise ContractError(f"source tree exclusion record {index} is malformed")
+        record = dict(record_value)
+        require_exact_fields(
+            record,
+            expected_record_fields,
+            where=f"source tree exclusion record {index}",
+        )
+        relative_path = str(record["relative_path"])
+        target_relative_path = str(record["target_relative_path"])
+        gitlink_path = str(record["target_gitlink_path"])
+        for label, candidate in (
+            ("relative_path", relative_path),
+            ("target_relative_path", target_relative_path),
+            ("target_gitlink_path", gitlink_path),
+        ):
+            parsed = PurePosixPath(candidate)
+            if (
+                not candidate
+                or parsed.is_absolute()
+                or ".." in parsed.parts
+                or parsed.as_posix() != candidate
+            ):
+                raise ContractError(
+                    f"source tree exclusion {label} is not canonical: {candidate!r}"
+                )
+        if previous_path is not None and relative_path <= previous_path:
+            raise ContractError("source tree exclusion records are not canonical")
+        previous_path = relative_path
+        if not target_relative_path.startswith(gitlink_path + "/"):
+            raise ContractError("source tree exclusion target escaped its gitlink")
+        if (
+            record["reason"]
+            != "dangling_symlink_target_below_unmaterialized_gitlink"
+            or record["git_tree"] != git_tree
+            or record["entry_mode"] != "120000"
+            or record["entry_object_type"] != "blob"
+            or record["target_gitlink_mode"] != "160000"
+        ):
+            raise ContractError("source tree exclusion record semantics drifted")
+        require_git_object(
+            record["entry_object_id"], where="source tree symlink object id"
+        )
+        require_git_object(
+            record["target_gitlink_commit"], where="source tree gitlink commit"
+        )
+        symlink_target = record["symlink_target"]
+        if (
+            not isinstance(symlink_target, str)
+            or not symlink_target
+            or "\0" in symlink_target
+            or PurePosixPath(symlink_target).is_absolute()
+        ):
+            raise ContractError("source tree symlink target is invalid")
+        expected_target = posixpath.normpath(
+            posixpath.join(PurePosixPath(relative_path).parent.as_posix(), symlink_target)
+        )
+        if expected_target != target_relative_path:
+            raise ContractError("source tree symlink target path drifted")
+        symlink_payload = os.fsencode(symlink_target)
+        if (
+            require_int(
+                record["entry_object_size_bytes"],
+                where="source tree symlink object size",
+                minimum=1,
+            )
+            != len(symlink_payload)
+            or require_sha256(
+                record["entry_object_sha256"],
+                where="source tree symlink object sha256",
+            )
+            != hashlib.sha256(symlink_payload).hexdigest()
+        ):
+            raise ContractError("source tree symlink object payload drifted")
+    return receipt
+
+
 def validate_quarantine_receipt_file(
     path: Path,
     *,
     project_id: str,
     manifest_sha256: str,
+    source_snapshot: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate the physical source-quarantine sidecar used by release audits."""
 
     raw, receipt = load_json_object(path, where="source quarantine receipt")
-    require_exact_fields(
-        receipt,
-        {
-            "schema",
-            "project_id",
-            "manifest_path",
-            "manifest_sha256",
-            "manifest_entry_count",
-            "project_manifest_entry_count",
-            "candidate_count_before_quarantine",
-            "candidate_count_after_quarantine",
-            "quarantined_count",
-            "entries",
-            "external_reference_omissions",
-            "parse_recovery",
-        },
-        where="source quarantine receipt",
-    )
+    base_fields = {
+        "schema",
+        "project_id",
+        "manifest_path",
+        "manifest_sha256",
+        "manifest_entry_count",
+        "project_manifest_entry_count",
+        "candidate_count_before_quarantine",
+        "candidate_count_after_quarantine",
+        "quarantined_count",
+        "entries",
+        "external_reference_omissions",
+        "parse_recovery",
+    }
+    schema = receipt.get("schema")
+    if schema == SOURCE_QUARANTINE_RECEIPT_SCHEMA_V1:
+        require_exact_fields(
+            receipt,
+            base_fields,
+            where="source quarantine v1 receipt",
+        )
+    elif schema == SOURCE_QUARANTINE_RECEIPT_SCHEMA_V2:
+        require_exact_fields(
+            receipt,
+            base_fields | {"source_tree_entry_exclusions"},
+            where="source quarantine v2 receipt",
+        )
+        if not isinstance(source_snapshot, Mapping):
+            raise ContractError("source quarantine v2 receipt omitted source snapshot")
+        receipt["source_tree_entry_exclusions"] = (
+            _validate_source_tree_entry_exclusions(
+                receipt["source_tree_entry_exclusions"],
+                source_snapshot=source_snapshot,
+            )
+        )
+    else:
+        raise ContractError("source quarantine receipt schema drifted")
     if (
-        receipt["schema"] != "cppmega.source_quarantine_receipt_v1"
-        or receipt["project_id"] != project_id
+        receipt["project_id"] != project_id
         or receipt["manifest_sha256"] != manifest_sha256
     ):
         raise ContractError("source quarantine receipt binding drifted")
@@ -1370,6 +1737,12 @@ def validate_worker_receipt(
         for key in ("ordinal", "repo", "project_id", "worker", "assignment_sha256")
     }:
         raise ContractError("source worker assignment binding drifted")
+    source = job.get("source")
+    source_snapshot = value["source_snapshot"]
+    if not isinstance(source, Mapping) or not isinstance(source_snapshot, Mapping):
+        raise ContractError("source worker source snapshot is malformed")
+    if source.get("kind") == "git_mirror":
+        validate_git_fsck_snapshot(source, source_snapshot)
     candidate = value["candidate"]
     if not isinstance(candidate, Mapping):
         raise ContractError("source worker candidate receipt is missing")
@@ -1884,6 +2257,7 @@ def run_source_worker(
                 quarantine_receipt,
                 project_id=str(job["project_id"]),
                 manifest_sha256=sha256_file(effective_quarantine_manifest),
+                source_snapshot=source_snapshot,
             )
             if (
                 validated_quarantine["receipt_sha256"]
