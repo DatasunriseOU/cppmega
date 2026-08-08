@@ -22,7 +22,11 @@ class TokenCounter(Protocol):
 
 
 def resolve_tokenizer_path(tokenizer_path: str | None = None) -> str:
-    """Resolve a usable tokenizer.json path for offline data scripts."""
+    """Resolve a usable tokenizer.json path for offline data scripts.
+
+    Prefer explicit and repo-bound paths. Never require a live process cwd:
+    conveyor workers may materialize after their original workdir is gone.
+    """
     candidates: list[str] = []
     if tokenizer_path:
         candidates.append(tokenizer_path)
@@ -43,8 +47,13 @@ def resolve_tokenizer_path(tokenizer_path: str | None = None) -> str:
     if requested_base_dir:
         candidates.append(str(Path(requested_base_dir) / "tokenizer" / "tokenizer.json"))
 
-    candidates.append(str(Path.cwd() / "tokenizer.json"))
-    candidates.append(str(Path.cwd() / "tokenizer" / "tokenizer.json"))
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = None
+    if cwd is not None:
+        candidates.append(str(cwd / "tokenizer.json"))
+        candidates.append(str(cwd / "tokenizer" / "tokenizer.json"))
 
     for candidate in candidates:
         if candidate and os.path.exists(candidate):
