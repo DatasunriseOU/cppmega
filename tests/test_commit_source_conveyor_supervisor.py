@@ -230,6 +230,17 @@ def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
         completion_path=base_root / "conveyor" / "completion_receipt.json",
     )
 
+    commit_source = commit_supervisor.load_commit_source_run(base_root)
+    assert commit_source["repair_required"] is True
+    assert commit_source["repositories"] == ("project",)
+    assert commit_source["identities"] == [commit_source["identity"]]
+    with pytest.raises(RuntimeError, match="run root does not exist"):
+        commit_supervisor.wait_for_terminal_code_run(
+            base_root,
+            (tmp_path / "missing-repair",),
+            poll_seconds=0.01,
+        )
+
     repair_root = tmp_path / "repair"
     repair_root.mkdir()
     repair_argv = list(argv)
