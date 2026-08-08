@@ -42,6 +42,26 @@ _VALGRIND_AUTOCONF_ARGS = [
 ]
 
 
+_GCC_LIMITS_CASELABELS_SOURCE = (
+    b"#define LIM1(x) x##0: x##1: x##2: x##3: x##4: x##5: x##6: x##7: "
+    b"x##8: x##9: \n"
+    b"#define LIM2(x) LIM1(x##0) LIM1(x##1) LIM1(x##2) LIM1(x##3) LIM1(x##4) "
+    b"\\\n\t\tLIM1(x##5) LIM1(x##6) LIM1(x##7) LIM1(x##8) LIM1(x##9)\n"
+    b"#define LIM3(x) LIM2(x##0) LIM2(x##1) LIM2(x##2) LIM2(x##3) LIM2(x##4) "
+    b"\\\n\t\tLIM2(x##5) LIM2(x##6) LIM2(x##7) LIM2(x##8) LIM2(x##9)\n"
+    b"#define LIM4(x) LIM3(x##0) LIM3(x##1) LIM3(x##2) LIM3(x##3) LIM3(x##4) "
+    b"\\\n\t\tLIM3(x##5) LIM3(x##6) LIM3(x##7) LIM3(x##8) LIM3(x##9)\n"
+    b"#define LIM5(x) LIM4(x##0) LIM4(x##1) LIM4(x##2) LIM4(x##3) LIM4(x##4) "
+    b"\\\n\t\tLIM4(x##5) LIM4(x##6) LIM4(x##7) LIM4(x##8) LIM4(x##9)\n"
+    b"#define LIM6(x) LIM5(x##0) LIM5(x##1) LIM5(x##2) LIM5(x##3) LIM5(x##4) "
+    b"\\\n\t\tLIM5(x##5) LIM5(x##6) LIM5(x##7) LIM5(x##8) LIM5(x##9)\n"
+    b"#define LIM7(x) LIM6(x##0) LIM6(x##1) LIM6(x##2) LIM6(x##3) LIM6(x##4) "
+    b"\\\n\t\tLIM6(x##5) LIM6(x##6) LIM6(x##7) LIM6(x##8) LIM6(x##9)\n"
+    b"\nvoid q19_func (long i)\n{\n  switch (i) {\n    LIM5 (case 1)\n"
+    b"      break;\n  }\n}\n"
+)
+
+
 def _write_valgrind_style_configure(project_dir: Path) -> None:
     detected_flags = _VALGRIND_AUTOCONF_ARGS[3:-2]
     (project_dir / "configure.ac").write_text(
@@ -206,6 +226,92 @@ def test_sane_translation_unit_load_error_uses_bound_lossless_lexical_fallback(
     assert summary["lexical_fallback_file_count"] == 1
     assert summary["lexical_fallback_source_bytes"] == len(raw_source)
     assert summary["unresolved_file_count"] == 0
+
+
+def test_gcc_case_label_ast_recursion_uses_bound_lossless_lexical_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    assert len(_GCC_LIMITS_CASELABELS_SOURCE) == 935
+    assert hashlib.sha256(_GCC_LIMITS_CASELABELS_SOURCE).hexdigest() == (
+        "cd4aaab81ac06ab6265f81567297015b364c8c6e026e757fac87cc38faae868e"
+    )
+    source = tmp_path / "limits-caselabels.c"
+    source.write_bytes(_GCC_LIMITS_CASELABELS_SOURCE)
+
+    class FakeIndex:
+        @staticmethod
+        def create() -> object:
+            return object()
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
+    monkeypatch.setattr(index_project, "Index", FakeIndex)
+    monkeypatch.setattr(
+        index_project,
+        "parse_translation_unit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RecursionError("maximum recursion depth exceeded in _visit")
+        ),
+    )
+    compile_args = ["-std=c11", "-fsyntax-only", "-Wno-everything"]
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            compile_args,
+            str(tmp_path),
+            "gcc-mirror/gcc",
+        )
+    )
+
+    assert parsed_count == 1
+    assert payload["functions"] == []
+    assert payload["typedefs"] == []
+    assert payload["lexical_fallback_files"] == ["limits-caselabels.c"]
+    assert payload["parse_recovery_records"] == [
+        {
+            "relative_path": "limits-caselabels.c",
+            "trigger": "ast_recursion_error",
+            "status": "lexical_fallback",
+            "fallback_mode": "lossless_cpp_lexical_v1",
+            "fallback_reason": "ast_recursion_error",
+            "compile_args_status": "sane",
+            "compile_arg_count": 5,
+            "compile_args_sha256": payload["parse_recovery_records"][0][
+                "compile_args_sha256"
+            ],
+            "source_size_bytes": len(_GCC_LIMITS_CASELABELS_SOURCE),
+            "source_char_count": len(_GCC_LIMITS_CASELABELS_SOURCE),
+            "source_sha256": hashlib.sha256(
+                _GCC_LIMITS_CASELABELS_SOURCE
+            ).hexdigest(),
+            "source_encoding": "utf-8",
+        }
+    ]
+
+    documents = index_project.emit_cpp_lexical_fallback_documents(
+        payload["lexical_fallback_files"],
+        index=index_project.ProjectIndex(),
+        project_dir=str(tmp_path),
+        project_id="gcc-mirror/gcc",
+        compile_db={},
+        default_args=compile_args,
+        default_build_info=None,
+        parse_recovery_records=payload["parse_recovery_records"],
+        enriched=True,
+    )
+
+    assert len(documents) == 1
+    assert documents[0]["text"].encode("utf-8") == _GCC_LIMITS_CASELABELS_SOURCE
+    assert documents[0]["cpp_parse_fallback"]["reason"] == (
+        "ast_recursion_error"
+    )
+    assert documents[0]["domain_parse_info"]["fallback_reason"] == (
+        "ast_recursion_error"
+    )
 
 
 def test_non_translation_unit_error_still_fails_loud(
