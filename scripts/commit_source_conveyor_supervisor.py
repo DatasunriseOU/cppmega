@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the commit conveyor from a terminal canonical code-run chain."""
+"""Launch commits from a clean code run or a terminal failed code base."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from scripts.data.verify_global_dedup_store import (  # noqa: E402
 )
 
 DEFAULT_MINIMUM_FREE_BYTES = 50 * 1024**3
+DEFAULT_REPAIR_POLL_SECONDS = 30.0
 
 
 def _object(value: object, *, label: str) -> dict[str, Any]:
@@ -80,6 +82,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MINIMUM_FREE_BYTES,
     )
     parser.add_argument("--dedup-busy-timeout-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--repair-poll-seconds",
+        type=float,
+        default=DEFAULT_REPAIR_POLL_SECONDS,
+        help="Seconds between terminal repair receipt checks after commit extraction.",
+    )
     return parser
 
 
@@ -96,6 +104,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         raise SystemExit("--minimum-free-bytes must be >= 0")
     if args.dedup_busy_timeout_seconds <= 0:
         raise SystemExit("--dedup-busy-timeout-seconds must be > 0")
+    if args.repair_poll_seconds <= 0:
+        raise SystemExit("--repair-poll-seconds must be > 0")
     if (
         Path(args.code_run_root).expanduser().resolve()
         == Path(args.run_root).expanduser().resolve()
@@ -245,6 +255,148 @@ def load_terminal_code_run(
             "run_binding_sha256": run_binding_sha256,
         },
     }
+
+
+def _load_failed_base_commit_metadata(code_run_root: Path) -> dict[str, Any]:
+    """Load the immutable source metadata needed before code repair is terminal."""
+
+    base = source_supervisor.load_repair_base_code_run(code_run_root)
+    producer_root = Path(
+        _text(base["launch"].get("repository_root"), label="base repository root")
+    )
+    if producer_root.is_symlink():
+        raise RuntimeError(f"base repository root must not be a symlink: {producer_root}")
+    producer_root = producer_root.resolve(strict=True)
+    source_supervisor.revalidate_recorded_inputs(
+        base["launch"],
+        run_root=base["root"],
+        repo_root=producer_root,
+    )
+    identity = dict(base["identity"])
+    return {
+        "root": base["root"],
+        "launch_path": base["launch_path"],
+        "exit_path": base["exit_path"],
+        "manifest_path": base["manifest_path"],
+        "launch": base["launch"],
+        "inputs": base["inputs"],
+        "producer_root": producer_root,
+        "code_output_root": base["code_output_root"],
+        "commit_output_root": base["commit_output_root"],
+        "dedup_db": base["dedup_db"],
+        "target_lengths": base["target_lengths"],
+        "repositories": base["repositories"],
+        "identity": identity,
+        "identities": [identity],
+        "repair_runs": [],
+        "repair_required": True,
+    }
+
+
+def load_commit_source_run(code_run_root: Path) -> dict[str, Any]:
+    """Load commit inputs from a clean code run or its terminal failed base."""
+
+    root = code_run_root.expanduser().resolve()
+    _read_launch, _launch_sha256 = source_supervisor._read_json_snapshot(
+        root / "launch_receipt.json",
+        label="code launch receipt",
+    )
+    exit_receipt = source_supervisor._read_json(
+        root / "exit_receipt.json",
+        label="code exit receipt",
+    )
+    exit_code = exit_receipt.get("exit_code")
+    if exit_code == 0:
+        result = load_terminal_code_run(root)
+        result["repair_required"] = False
+        return result
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise RuntimeError("code exit receipt has an invalid exit code")
+    return _load_failed_base_commit_metadata(root)
+
+
+def _repair_exit_code(root: Path) -> int | None:
+    """Return a repair exit code once its immutable exit receipt is present."""
+
+    root = root.expanduser()
+    if root.is_symlink():
+        raise RuntimeError(f"code repair run root must not be a symlink: {root}")
+    exit_path = root / "exit_receipt.json"
+    if not exit_path.is_file() or exit_path.is_symlink():
+        return None
+    try:
+        receipt = source_supervisor._read_json(
+            exit_path,
+            label="code repair exit receipt",
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    value = receipt.get("exit_code")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _validate_repair_run_roots(
+    repair_run_roots: Sequence[Path],
+) -> tuple[Path, ...]:
+    """Validate repair root configuration before any long-running child starts."""
+
+    validated: list[Path] = []
+    for index, raw_root in enumerate(repair_run_roots, start=1):
+        root = raw_root.expanduser()
+        if root.is_symlink():
+            raise RuntimeError(
+                f"code repair {index} run root must not be a symlink: {root}"
+            )
+        try:
+            root = root.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"code repair {index} run root does not exist: {root}"
+            ) from exc
+        if not root.is_dir():
+            raise RuntimeError(
+                f"code repair {index} run root is not a directory: {root}"
+            )
+        validated.append(root)
+    return tuple(validated)
+
+
+def wait_for_terminal_code_run(
+    code_run_root: Path,
+    repair_run_roots: Sequence[Path],
+    *,
+    poll_seconds: float = DEFAULT_REPAIR_POLL_SECONDS,
+    sleeper: Any = time.sleep,
+) -> dict[str, Any]:
+    """Wait until the failed base has a fully validated terminal repair chain."""
+
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive")
+    if not repair_run_roots:
+        raise RuntimeError("failed base code run has no repair run roots")
+    repair_run_roots = _validate_repair_run_roots(repair_run_roots)
+    while True:
+        try:
+            return load_terminal_code_run(
+                code_run_root,
+                repair_run_roots=repair_run_roots,
+            )
+        except Exception:  # noqa: BLE001 - receipts may be mid-write
+            exit_codes = [
+                _repair_exit_code(Path(root)) for root in repair_run_roots
+            ]
+            terminal_failures = [
+                root
+                for root, exit_code in zip(repair_run_roots, exit_codes, strict=True)
+                if exit_code is not None and exit_code != 0
+            ]
+            if terminal_failures:
+                raise
+            if all(exit_code == 0 for exit_code in exit_codes):
+                raise
+            sleeper(poll_seconds)
 
 
 def load_terminal_code_run_chain(
@@ -628,6 +780,23 @@ def _write_composition_plan(
     )
 
 
+def _bind_terminal_code_runs(
+    launch: dict[str, Any],
+    *,
+    code_run: Mapping[str, Any],
+) -> None:
+    """Bind the commit receipt to every code generation used by composition."""
+
+    identities = list(code_run.get("identities", [code_run["identity"]]))
+    if not identities:
+        raise RuntimeError("terminal code run has no identities")
+    # Keep the launch run_binding immutable so a supervisor can resume after
+    # the repair chain becomes terminal; the receipt fields below carry the
+    # complete composed provenance.
+    launch["source_code_run"] = identities[0]
+    launch["source_code_runs"] = identities
+
+
 def _run(args: argparse.Namespace) -> int:
     run_root = Path(args.run_root).expanduser().resolve()
     run_root.mkdir(parents=True, exist_ok=True)
@@ -639,10 +808,13 @@ def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("commit conveyor supervisor is already running") from exc
 
         repair_run_roots = tuple(Path(value) for value in args.code_repair_run_root)
-        code_run = load_terminal_code_run(
-            Path(args.code_run_root),
-            repair_run_roots=repair_run_roots,
-        )
+        code_run = load_commit_source_run(Path(args.code_run_root))
+        if not code_run.get("repair_required") and repair_run_roots:
+            raise RuntimeError(
+                "code repair run roots are only valid for a failed base code run"
+            )
+        if code_run.get("repair_required"):
+            repair_run_roots = _validate_repair_run_roots(repair_run_roots)
         free_bytes = shutil.disk_usage(run_root).free
         if free_bytes < args.minimum_free_bytes:
             raise RuntimeError(
@@ -740,14 +912,23 @@ def _run(args: argparse.Namespace) -> int:
             return return_code
 
         try:
-            current_code_run = load_terminal_code_run(
-                Path(args.code_run_root),
-                repair_run_roots=repair_run_roots,
+            if code_run.get("repair_required"):
+                current_code_run = wait_for_terminal_code_run(
+                    Path(args.code_run_root),
+                    repair_run_roots,
+                    poll_seconds=args.repair_poll_seconds,
+                )
+            else:
+                current_code_run = load_terminal_code_run(Path(args.code_run_root))
+            initial_identity = code_run["identity"]
+            current_identities = current_code_run.get(
+                "identities",
+                [current_code_run["identity"]],
             )
-            if current_code_run.get("identities", [current_code_run["identity"]]) != (
-                code_run.get("identities", [code_run["identity"]])
-            ):
-                raise RuntimeError("terminal code run changed during commit extraction")
+            if not current_identities or current_identities[0] != initial_identity:
+                raise RuntimeError("base code run changed during commit extraction")
+            _bind_terminal_code_runs(launch, code_run=current_code_run)
+            source_supervisor._atomic_json(launch_path, launch)
             pr_store, pr_repo_list, pr_completion = pr_paths
             conveyor.revalidate_pr_completion_binding(
                 pr_inputs["completion_binding"],
