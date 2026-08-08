@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import io
 import json
 import subprocess
@@ -275,6 +274,25 @@ def test_gcp_overlay_and_runner_ship_pinned_projection_support(
         repo_root / "infra/gcp_corpus_pool/pilot/source-worker-runner.sh.tmpl"
     ).read_text(encoding="utf-8")
     assert "--quarantine-projection-mode pinned_source_tree_v1" in runner
+
+
+def test_gcp_source_runner_failure_receipts_are_attempt_unique() -> None:
+    runner = (
+        Path(__file__).parents[1]
+        / "infra/gcp_corpus_pool/pilot/source-worker-runner.sh.tmpl"
+    ).read_text(encoding="utf-8")
+
+    assert 'ATTEMPT_ID="$(cat /proc/sys/kernel/random/uuid)"' in runner
+    assert (
+        'failure_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.$ATTEMPT_ID.failed.json"'
+        in runner
+    )
+    assert '--arg attempt_id "$ATTEMPT_ID"' in runner
+    assert (
+        '"$RUN_ROOT/control/failed/$worker_name.$BOOT_ID.$ATTEMPT_ID.json"'
+        in runner
+    )
+    assert 'scheduler-instance "$worker_name.$BOOT_ID"' in runner
 
 
 def test_slot_topology_is_contiguous_and_manifest_bound() -> None:

@@ -11,6 +11,8 @@ readonly RUN_ROOT="${CPPMEGA_RUN_ROOT:?CPPMEGA_RUN_ROOT is required}"
 readonly WORKER_CONFIG="${CPPMEGA_WORKER_CONFIG:?CPPMEGA_WORKER_CONFIG is required}"
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
 readonly BOOT_ID
+ATTEMPT_ID="$(cat /proc/sys/kernel/random/uuid)"
+readonly ATTEMPT_ID
 
 worker_name="$(jq -er '.worker_name' "$WORKER_CONFIG")"
 worker_index="$(jq -er '.worker_index' "$WORKER_CONFIG")"
@@ -28,7 +30,7 @@ bundle="$input_root/cppmega.bundle"
 overlay="$input_root/distributed-data-prep.tar.zst"
 manifest="$input_root/source-manifest.json"
 
-failure_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.failed.json"
+failure_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.$ATTEMPT_ID.failed.json"
 readonly MAX_TRANSPORT_RETRIES=4
 readonly RETRY_BASE_SECONDS=5
 readonly RETRY_MAX_SECONDS=300
@@ -213,16 +215,18 @@ publish_failure() {
   trap - ERR
   jq -n \
     --arg boot_id "$BOOT_ID" \
+    --arg attempt_id "$ATTEMPT_ID" \
     --arg created_at "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
     --arg worker "$worker_id" \
     --arg worker_name "$worker_name" \
     --argjson exit_code "$status" \
     '{schema_version: 1, state: "failed", worker: $worker,
       worker_name: $worker_name, boot_id: $boot_id,
+      attempt_id: $attempt_id,
       created_at: $created_at, exit_code: $exit_code}' \
     >"$failure_receipt"
   gcs_create_if_absent "$failure_receipt" \
-    "$RUN_ROOT/control/failed/$worker_name.$BOOT_ID.json" || true
+    "$RUN_ROOT/control/failed/$worker_name.$BOOT_ID.$ATTEMPT_ID.json" || true
   exit "$status"
 }
 trap publish_failure ERR
