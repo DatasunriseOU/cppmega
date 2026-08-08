@@ -5137,6 +5137,21 @@ def _has_translation_unit_load_error(exc: BaseException) -> bool:
     return False
 
 
+def _cpp_lexical_fallback_reason(exc: BaseException) -> str | None:
+    """Classify only native TU-load and bounded AST-recursion failures."""
+
+    if _has_translation_unit_load_error(exc):
+        return "translation_unit_load_error"
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RecursionError):
+            return "ast_recursion_error"
+        current = current.__cause__ or current.__context__
+    return None
+
+
 def _load_translation_unit(
     filepath: str,
     index: Index,
@@ -10761,17 +10776,19 @@ def _record_cpp_lexical_fallback(
     parse_error: BaseException,
     parse_recovery_records: list[dict[str, object]],
 ) -> str | None:
-    """Authorize a lossless lexical fallback for one native libclang load error.
+    """Authorize a lossless lexical fallback for one bounded parser failure.
 
     Deliberately narrow: a bad/ambiguous compiler context must still fail loud,
-    as must every exception other than TranslationUnitLoadError.  The returned
-    path is project-relative and the receipt binds the exact source bytes that
-    the later lexical emitter must reproduce.
+    as must every exception other than TranslationUnitLoadError or
+    RecursionError from AST extraction.  The returned path is project-relative
+    and the receipt binds the exact source bytes that the later lexical emitter
+    must reproduce.
     """
 
     normalized_args = list(map(str, compile_args))
+    fallback_reason = _cpp_lexical_fallback_reason(parse_error)
     if (
-        not _has_translation_unit_load_error(parse_error)
+        fallback_reason is None
         or not _is_sane_compile_args(normalized_args)
     ):
         return None
@@ -10787,7 +10804,7 @@ def _record_cpp_lexical_fallback(
     fallback_fields: dict[str, object] = {
         "status": "lexical_fallback",
         "fallback_mode": "lossless_cpp_lexical_v1",
-        "fallback_reason": "translation_unit_load_error",
+        "fallback_reason": fallback_reason,
         "compile_args_status": "sane",
         "compile_arg_count": len(normalized_args),
         "compile_args_sha256": _cpp_lexical_fallback_compile_args_sha256(
@@ -10811,7 +10828,7 @@ def _record_cpp_lexical_fallback(
         parse_recovery_records.append(
             {
                 "relative_path": relative_path,
-                "trigger": "translation_unit_load_error",
+                "trigger": fallback_reason,
                 **fallback_fields,
             }
         )
@@ -10938,6 +10955,15 @@ def emit_cpp_lexical_fallback_documents(
                 "C/C++ lexical fallback emission lacks an authorization record: "
                 f"{canonical_path}"
             )
+        fallback_reason = str(record.get("fallback_reason") or "")
+        if fallback_reason not in {
+            "translation_unit_load_error",
+            "ast_recursion_error",
+        }:
+            raise RuntimeError(
+                "C/C++ lexical fallback emission has an unsupported reason: "
+                f"{canonical_path} reason={fallback_reason!r}"
+            )
         expected_binding = (
             int(record.get("source_size_bytes") or -1),
             int(record.get("source_char_count") or -1),
@@ -10978,10 +11004,13 @@ def emit_cpp_lexical_fallback_documents(
                 f"{canonical_path} expected={expected_compile_args_binding} "
                 f"actual={actual_compile_args_binding}"
             )
-        emitted_bytes = bytearray()
+        emitted_sha256 = hashlib.sha256()
+        emitted_size_bytes = 0
         chunk_count = 0
         for text, source_span in _iter_cpp_lexical_fallback_chunks(absolute_path):
-            emitted_bytes.extend(text.encode(source_encoding, errors="strict"))
+            encoded_text = text.encode(source_encoding, errors="strict")
+            emitted_sha256.update(encoded_text)
+            emitted_size_bytes += len(encoded_text)
             if enriched:
                 chunk_name = os.path.basename(canonical_path)
                 if source_span["chunk_index"]:
@@ -11009,7 +11038,7 @@ def emit_cpp_lexical_fallback_documents(
                 document["cpp_parse_fallback"] = {
                     "schema": "cppmega.cpp_parse_fallback_v1",
                     "mode": "lossless_cpp_lexical_v1",
-                    "reason": "translation_unit_load_error",
+                    "reason": fallback_reason,
                     "compile_args_status": "sane",
                     "source_sha256": actual_binding[2],
                     "source_encoding": source_encoding,
@@ -11025,7 +11054,7 @@ def emit_cpp_lexical_fallback_documents(
                 parse_info.update(
                     {
                         "parser": "cpp-lexical",
-                        "fallback_reason": "translation_unit_load_error",
+                        "fallback_reason": fallback_reason,
                         "source_span": dict(source_span),
                     }
                 )
@@ -11038,7 +11067,10 @@ def emit_cpp_lexical_fallback_documents(
                 emit_doc(output)
             chunk_count += 1
 
-        if bytes(emitted_bytes) != source_bytes:
+        if (
+            emitted_size_bytes != len(source_bytes)
+            or emitted_sha256.hexdigest() != actual_binding[2]
+        ):
             raise RuntimeError(
                 f"C/C++ lexical fallback emission was not lossless: {canonical_path}"
             )
@@ -11309,7 +11341,8 @@ def _parse_recovery_summary(
         "policy": (
             "retry_missing_includes_with_header_matched_project_local_dirs_"
             "only_without_compile_command_then_lossless_cpp_lexical_fallback_"
-            "only_for_translation_unit_load_error_with_sane_compile_args"
+            "only_for_translation_unit_load_or_ast_recursion_error_"
+            "with_sane_compile_args"
         ),
         "attempted_file_count": len(normalized),
         "recovered_file_count": recovered_count,

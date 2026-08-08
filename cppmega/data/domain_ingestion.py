@@ -379,7 +379,7 @@ def _path_declared_codec(
     declared = _FILENAME_DECLARED_CODECS.get(path.name.casefold())
     if declared is not None:
         return declared
-    if path.suffix.casefold() == ".bat" and any(
+    if path.suffix.casefold() in {".bat", ".cmd"} and any(
         part.casefold() == "jpn" for part in path.parts
     ):
         return "shift_jis", "shift-jis"
@@ -627,6 +627,108 @@ def _posix_shell_gb18030_heredoc_is_byte_preserving(payload: bytes) -> bool:
     return found_gb18030_fixture and not in_heredoc
 
 
+def _is_dialog_8bit_fixture_path(path: Path) -> bool:
+    return tuple(part.casefold() for part in path.parts[-4:]) == (
+        "contrib",
+        "dialog",
+        "samples",
+        "testdata-8bit",
+    )
+
+
+def _dialog_8bit_shell_fixture_is_byte_preserving(
+    payload: bytes,
+    *,
+    path: Path,
+) -> bool:
+    """Recognize dialog's extensionless C0/C1/Latin-1 shell test fixture."""
+
+    if (
+        not _is_dialog_8bit_fixture_path(path)
+        or not payload.startswith(b"#!/bin/sh\n")
+        or b"\0" in payload
+        or b"# C1 controls" not in payload
+        or b"# Latin-1" not in payload
+    ):
+        return False
+
+    found_raw_fixture_byte = False
+    for raw_line in payload.split(b"\n"):
+        unsafe_offsets = [
+            index
+            for index, byte in enumerate(raw_line)
+            if byte >= 0x80 or (byte < 0x20 and byte != 0x09)
+        ]
+        if not unsafe_offsets:
+            try:
+                raw_line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return False
+            continue
+
+        match = re.fullmatch(rb'\t?SAMPLE="([^"\x00]*)"', raw_line)
+        if match is None:
+            return False
+        value_start, value_end = match.span(1)
+        if any(not value_start <= offset < value_end for offset in unsafe_offsets):
+            return False
+        found_raw_fixture_byte = True
+
+    return found_raw_fixture_byte
+
+
+def _shift_jis_expected_output_heredoc_is_byte_preserving(
+    payload: bytes,
+    *,
+    path: Path,
+) -> bool:
+    """Recognize glibc's mixed UTF-8/Shift-JIS expected-output heredoc."""
+
+    path_tail = tuple(part.casefold() for part in path.parts[-2:])
+    if (
+        path_tail != ("catgets", "test-gencat.sh")
+        or not payload.startswith((b"#!/bin/sh\n", b"#! /bin/sh\n"))
+        or b"\0" in payload
+        or b"LC_ALL=ja_JP.SJIS" not in payload
+    ):
+        return False
+
+    in_expected_output = False
+    found_shift_jis_line = False
+    heredoc_count = 0
+    for line in payload.splitlines(keepends=True):
+        content = line.rstrip(b"\r\n")
+        if not in_expected_output:
+            try:
+                line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return False
+            if re.search(rb"\bcmp\b.*<<(?:\\?\"?EOF\"?)$", content):
+                heredoc_count += 1
+                if heredoc_count > 8:
+                    return False
+                in_expected_output = True
+            continue
+
+        if content == b"EOF":
+            in_expected_output = False
+            continue
+        try:
+            line.decode("utf-8", errors="strict")
+            continue
+        except UnicodeDecodeError:
+            pass
+        try:
+            decoded = line.decode("shift_jis", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        if decoded.encode("shift_jis", errors="strict") != line:
+            return False
+        found_shift_jis_line = True
+
+    return found_shift_jis_line and not in_expected_output
+
+
 def _validate_byte_preserving_domain_stream(
     stream: BinaryIO,
     *,
@@ -664,6 +766,17 @@ def _validate_byte_preserving_domain_stream(
         ):
             accepted = True
             source_encoding = "mixed-utf-8-gb18030-byte-preserving"
+        if not accepted and _dialog_8bit_shell_fixture_is_byte_preserving(
+            payload,
+            path=path,
+        ):
+            accepted = True
+        if not accepted and _shift_jis_expected_output_heredoc_is_byte_preserving(
+            payload,
+            path=path,
+        ):
+            accepted = True
+            source_encoding = "mixed-utf-8-shift-jis-byte-preserving"
     if not accepted:
         return None
     text = payload.decode("latin-1", errors="strict")

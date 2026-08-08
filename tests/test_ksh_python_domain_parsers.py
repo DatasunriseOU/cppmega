@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,6 +16,58 @@ from cppmega.data.domain_schema import (
     validate_case5_contract_metadata,
 )
 from cppmega.data.tokenizer_contract import TOKENIZER_CONTRACT_SHA256_METADATA_KEY
+
+
+_FREEBSD_DIALOG_TESTDATA_8BIT_B64 = (
+    "IyEvYmluL3NoCiMgJElkOiB0ZXN0ZGF0YS04Yml0LHYgMS4yIDIwMTEvMTAvMTYgMjM6MjY6MzIg"
+    "dG9tIEV4cCAkCgojIFNlbGVjdCBvbmUgb2YgdGhlICJTQU1QTEU9IiBsaW5lcywgdG8gdGVzdCBo"
+    "YW5kbGluZyBvZiBjaGFyYWN0ZXJzIHdoaWNoCiMgYXJlIG5vbnByaW50aW5nIGluIGEgUE9TSVgg"
+    "bG9jYWxlOgoKY2FzZSAuJDEgaW4KCSMgQzEgY29udHJvbHMKLjgpCglTQU1QTEU9IoCBgoOEhYaH"
+    "iImKi4yNjo8iCgk7OwouOSkKCVNBTVBMRT0ikJGSk5SVlpeYmZqbnJ2enyIKCTs7CgojIExhdGlu"
+    "LTEKLlthQV0pCglTQU1QTEU9IqChoqOkpaanqKmqq6ytrq8iCgk7OwouW2JCXSkKCVNBTVBMRT0i"
+    "sLGys7S1tre4ubq7vL2+vyIKCTs7Ci5bY0NdKQoJU0FNUExFPSLAwcLDxMXGx8jJysvMzc7PIgoJ"
+    "OzsKLltkRF0pCglTQU1QTEU9ItDR0tPU1dbX2Nna29zd3t8iCgk7OwouW2VFXSkKCVNBTVBMRT0i"
+    "4OHi4+Tl5ufo6err7O3u7yIKCTs7Ci5bZkZdKQoJU0FNUExFPSLw8fLz9PX29/j5+vv8/f7/IgoJ"
+    "OzsKKikKCSMgQzAgY29udHJvbHMgKGV4Y2VwdCBhIGZldyB3aGljaCBhcmUgYWx3YXlzIHRyZWF0"
+    "ZWQgc3BlY2lhbGx5IGJ5IGN1cnNlcyk6CglTQU1QTEU9IgECAwQFBgcLDA4PEBESExQVFhcYGRoi"
+    "Cgk7Owplc2FjCgojIFRoaXMgc2NyaXB0IGlzIHNvdXJjZSdkIGZyb20gb3RoZXIgc2NyaXB0cywg"
+    "YW5kIHVzZXMgdGhlIHBhcmFtZXRlciBsaXN0IGZyb20KIyB0aG9zZSBleHBsaWNpdGx5LiAgQnV0"
+    "IHRoZXkgbWF5IHVzZSB0aGUgcGFyYW1ldGVyIGxpc3QgbGF0ZXIsIHRvIHNldCBvcHRpb25zCiMg"
+    "c3BlY2lhbGx5IGZvciBkaWFsb2cuICBXb3JrIGFyb3VuZCB0aGUgY29uZmxpY3RpbmcgdXNlcyBi"
+    "eSByZW1vdmluZyB0aGUKIyBwYXJhbWV0ZXIgd2hpY2ggd2UganVzdCB1c2VkIHRvIHNlbGVjdCBh"
+    "IHNldCBvZiBkYXRhLgppZiB0ZXN0ICQjICE9IDAKdGhlbgoJc2hpZnQgMQpmaQo="
+)
+
+_GLIBC_TEST_GENCAT_SHIFT_JIS_B64 = (
+    "IyEvYmluL3NoCiMgVGVzdCBlc2NhcGUgY2hhcmFjdGVyIGhhbmRsaW5nIGluIGdlbmNhdC4KIyBD"
+    "b3B5cmlnaHQgKEMpIDIwMDAtMjAyNiBGcmVlIFNvZnR3YXJlIEZvdW5kYXRpb24sIEluYy4KIyBU"
+    "aGlzIGZpbGUgaXMgcGFydCBvZiB0aGUgR05VIEMgTGlicmFyeS4KCiMgVGhlIEdOVSBDIExpYnJh"
+    "cnkgaXMgZnJlZSBzb2Z0d2FyZTsgeW91IGNhbiByZWRpc3RyaWJ1dGUgaXQgYW5kL29yCiMgbW9k"
+    "aWZ5IGl0IHVuZGVyIHRoZSB0ZXJtcyBvZiB0aGUgR05VIExlc3NlciBHZW5lcmFsIFB1YmxpYwoj"
+    "IExpY2Vuc2UgYXMgcHVibGlzaGVkIGJ5IHRoZSBGcmVlIFNvZnR3YXJlIEZvdW5kYXRpb247IGVp"
+    "dGhlcgojIHZlcnNpb24gMi4xIG9mIHRoZSBMaWNlbnNlLCBvciAoYXQgeW91ciBvcHRpb24pIGFu"
+    "eSBsYXRlciB2ZXJzaW9uLgoKIyBUaGUgR05VIEMgTGlicmFyeSBpcyBkaXN0cmlidXRlZCBpbiB0"
+    "aGUgaG9wZSB0aGF0IGl0IHdpbGwgYmUgdXNlZnVsLAojIGJ1dCBXSVRIT1VUIEFOWSBXQVJSQU5U"
+    "WTsgd2l0aG91dCBldmVuIHRoZSBpbXBsaWVkIHdhcnJhbnR5IG9mCiMgTUVSQ0hBTlRBQklMSVRZ"
+    "IG9yIEZJVE5FU1MgRk9SIEEgUEFSVElDVUxBUiBQVVJQT1NFLiAgU2VlIHRoZSBHTlUKIyBMZXNz"
+    "ZXIgR2VuZXJhbCBQdWJsaWMgTGljZW5zZSBmb3IgbW9yZSBkZXRhaWxzLgoKIyBZb3Ugc2hvdWxk"
+    "IGhhdmUgcmVjZWl2ZWQgYSBjb3B5IG9mIHRoZSBHTlUgTGVzc2VyIEdlbmVyYWwgUHVibGljCiMg"
+    "TGljZW5zZSBhbG9uZyB3aXRoIHRoZSBHTlUgQyBMaWJyYXJ5OyBpZiBub3QsIHNlZQojIDxodHRw"
+    "czovL3d3dy5nbnUub3JnL2xpY2Vuc2VzLz4uCgpzZXQgLWUKCmNvbW1vbl9vYmpwZng9JDEKdGVz"
+    "dF9wcm9ncmFtX2NtZF9iZWZvcmVfZW52PSQyCnJ1bl9wcm9ncmFtX2Vudj0kMwp0ZXN0X3Byb2dy"
+    "YW1fY21kX2FmdGVyX2Vudj0kNAoKIyBSdW4gdGhlIHRlc3QgcHJvZ3JhbS4KJHt0ZXN0X3Byb2dy"
+    "YW1fY21kX2JlZm9yZV9lbnZ9IFwKICAke3J1bl9wcm9ncmFtX2Vudn0gXAogIE5MU1BBVEg9JHtj"
+    "b21tb25fb2JqcGZ4fWNhdGdldHMvJU4uJWMuY2F0IExDX0FMTD1qYV9KUC5TSklTIFwKICAke3Rl"
+    "c3RfcHJvZ3JhbV9jbWRfYWZ0ZXJfZW52fSBcCiAgICA+ICR7Y29tbW9uX29ianBmeH1jYXRnZXRz"
+    "L3Rlc3QtZ2VuY2F0Lm91dAoKIyBDb21wYXJlIHdpdGggdGhlIGV4cGVjdGVkIHJlc3VsdC4KY21w"
+    "IC0gJHtjb21tb25fb2JqcGZ4fWNhdGdldHMvdGVzdC1nZW5jYXQub3V0IDw8IkVPRiIKTENfTUVT"
+    "U0FHRVMgPSBqYV9KUC5TSklTCnNhbXBsZTE6QUJDREVGOgpzYW1wbGUyOpP6lnuM6joKc2FtcGxl"
+    "MzqXXJLolVw6CnNhbXBsZTQ6VEVTVAlUQUI6CnNhbXBsZTU6i0CUXAmPXI7tl946CmRvdWJsZSBz"
+    "bGFzaFwKYW5vdGhlciBsaW5lCkVPRgpyZXM9JD8KCmNhdCA8PEVPRiB8CiNkZWZpbmUgQW5vdGhl"
+    "clNldCAweDIJLyogKnN0YW5kYXJkIGlucHV0KjoxMyAqLwojZGVmaW5lIEFub3RoZXJGT08gMHgx"
+    "CS8qICpzdGFuZGFyZCBpbnB1dCo6MTQgKi8KRU9GCmNtcCAke2NvbW1vbl9vYmpwZnh9Y2F0Z2V0"
+    "cy90ZXN0LWdlbmNhdC5oIC0gfHwgcmVzPTEKCmV4aXQgJHJlcwo="
+)
 
 
 def _role_tokens(parsed, role: DomainRoleKind) -> set[str]:
@@ -383,6 +437,78 @@ def test_posix_invalid_byte_fixture_preserves_every_source_byte(
     assert all(chunk.byte_end - chunk.byte_start <= 40 for chunk in chunks)
 
 
+def test_freebsd_dialog_8bit_fixture_preserves_exact_upstream_bytes(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import (
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    encoded = base64.b64decode(_FREEBSD_DIALOG_TESTDATA_8BIT_B64)
+    assert len(encoded) == 959
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "8da95be352cc07a792179bb103aa6f7a7a073b59ba007a28b94fd8b30afb37dc"
+    )
+    path = tmp_path / "contrib/dialog/samples/testdata-8bit"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    discovered = discover_project_domain_files(tmp_path)
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=96))
+
+    assert [item.path for item in discovered] == [path]
+    assert {chunk.source_encoding for chunk in chunks} == {"iso-8859-1"}
+    assert b"".join(chunk.text.encode("latin-1") for chunk in chunks) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 96 for chunk in chunks)
+
+
+def test_glibc_shift_jis_expected_output_preserves_exact_upstream_bytes(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import (
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    encoded = base64.b64decode(_GLIBC_TEST_GENCAT_SHIFT_JIS_B64)
+    assert len(encoded) == 1577
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "88a7a81dc5c99fe901b1fe8966bdee605aea949b2dc20cee26156db55d4cdc4d"
+    )
+    path = tmp_path / "catgets/test-gencat.sh"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    discovered = discover_project_domain_files(tmp_path)
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=128))
+
+    assert [item.path for item in discovered] == [path]
+    assert {chunk.source_encoding for chunk in chunks} == {
+        "mixed-utf-8-shift-jis-byte-preserving"
+    }
+    assert b"".join(chunk.text.encode("latin-1") for chunk in chunks) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 128 for chunk in chunks)
+
+
+def test_glibc_shift_jis_marker_does_not_authorize_bytes_outside_heredoc(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    encoded = base64.b64decode(_GLIBC_TEST_GENCAT_SHIFT_JIS_B64).replace(
+        b"set -e\n",
+        b"set -e\x81\n",
+        1,
+    )
+    path = tmp_path / "catgets/test-gencat.sh"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
+        list(iter_domain_file_chunks(path))
+
+
 def test_invalid_shell_bytes_without_fixture_contract_still_fail(
     tmp_path: Path,
 ) -> None:
@@ -591,6 +717,27 @@ def test_japanese_localized_batch_file_round_trips_shift_jis(
     path.write_bytes(encoded)
 
     chunks = list(iter_domain_file_chunks(path))
+
+    assert "".join(chunk.text for chunk in chunks) == text
+    assert {chunk.source_encoding for chunk in chunks} == {"shift-jis"}
+    assert b"".join(chunk.text.encode("shift_jis") for chunk in chunks) == encoded
+
+
+def test_nt5_japanese_localized_cmd_round_trips_shift_jis(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    text = "@echo off\r\nrem 日本語セットアップ\r\n"
+    encoded = text.encode("shift_jis")
+    path = (
+        tmp_path
+        / "nt5src/Source/XPSP1/NT/termsrv/admtools/appcmpt/jpn/msie4usr.cmd"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=24))
 
     assert "".join(chunk.text for chunk in chunks) == text
     assert {chunk.source_encoding for chunk in chunks} == {"shift-jis"}
