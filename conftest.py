@@ -18,7 +18,6 @@ from types import ModuleType
 
 import pytest
 
-
 _REPO_ROOT = Path(__file__).resolve().parent
 _SOURCE_ROOT_ENV = ("MEGATRON_LM_REPO", "MEGATRON_ROOT")
 _DEFAULT_SOURCE_ROOTS = (
@@ -64,16 +63,16 @@ _PORTABLE_TEST_ALLOWLIST = frozenset(
         "tests/test_gcp_isolated_worker_rollout.py",
         "tests/test_source_slot_scheduler.py",
         "tests/test_source_work_queue.py",
+        "tests/test_distributed_source_prep.py",
+        "tests/test_source_quarantine_projection.py",
         "tests/test_streaming_overlong_lossless.py",
         "tests/test_workflow_runner_policy.py",
         "tests/ci/test_repository_ci_runner.py",
     }
 )
 
-
 def _is_megatron_source_root(path: Path) -> bool:
     return (path / "megatron" / "core" / "__init__.py").is_file()
-
 
 def _same_location(left: Path, right: Path) -> bool:
     left = left.expanduser()
@@ -82,7 +81,6 @@ def _same_location(left: Path, right: Path) -> bool:
         return os.path.samefile(left, right)
     except OSError:
         return left.resolve(strict=False) == right.resolve(strict=False)
-
 
 def _environment_manifest() -> tuple[Path, dict[str, object]] | None:
     manifest_path = Path(sys.prefix) / _ENVIRONMENT_MANIFEST
@@ -120,7 +118,6 @@ def _environment_manifest() -> tuple[Path, dict[str, object]] | None:
     # temporary checkout, so it must not be compared with this module's path.
     return manifest_path, manifest
 
-
 def _reject_unowned_repo_venv(
     manifest: tuple[Path, dict[str, object]] | None,
 ) -> None:
@@ -135,7 +132,6 @@ def _reject_unowned_repo_venv(
             f"a shared venv ({Path(sys.prefix).resolve(strict=False)}) without a "
             "matching cppmega environment manifest"
         )
-
 
 def _validate_manifest_source(
     manifest_path: Path,
@@ -191,7 +187,6 @@ def _validate_manifest_source(
         raise RuntimeError(
             f"Megatron source changed after receipt creation: {source_root}"
         )
-
 
 def _resolve_megatron_source_root() -> Path | None:
     manifest_entry = _environment_manifest()
@@ -281,12 +276,10 @@ def _resolve_megatron_source_root() -> Path | None:
 
     return None
 
-
 def _prepend_source_root(source_root: Path) -> None:
     value = str(source_root)
     sys.path[:] = [entry for entry in sys.path if entry != value]
     sys.path.insert(0, value)
-
 
 def _module_file(module: ModuleType) -> Path | None:
     value = getattr(module, "__file__", None)
@@ -294,14 +287,12 @@ def _module_file(module: ModuleType) -> Path | None:
         return None
     return Path(value).resolve()
 
-
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
     except ValueError:
         return False
     return True
-
 
 def _validate_real_megatron(
     megatron: ModuleType,
@@ -365,7 +356,6 @@ def _validate_real_megatron(
         )
     return source_root
 
-
 def _bootstrap_real_megatron() -> Path:
     source_root = _resolve_megatron_source_root()
     if source_root is None:
@@ -389,7 +379,6 @@ def _bootstrap_real_megatron() -> Path:
 
     return _validate_real_megatron(megatron, core, source_root=source_root)
 
-
 def _portable_profile_requested(
     _argv: tuple[str, ...] | None = None,
 ) -> bool:
@@ -400,7 +389,6 @@ def _portable_profile_requested(
     The argument is retained for compatibility with environment-contract tests.
     """
     return os.environ.get("CPPMEGA_TEST_PROFILE") == _PORTABLE_TEST_PROFILE
-
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Enforce the portable allowlist and its explicit dependency boundary."""
@@ -436,7 +424,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.get_closest_marker(_NATIVE_TOOLCHAIN_MARKER) is not None:
             item.add_marker(native_toolchain_skip)
-
 
 MEGATRON_SOURCE_ROOT = (
     None if _portable_profile_requested() else _bootstrap_real_megatron()

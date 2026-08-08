@@ -8,6 +8,12 @@ locals {
   worker_names = {
     for index in range(var.worker_count) : format("%s-%02d", var.name_prefix, index) => index
   }
+  worker_zones = {
+    for name in keys(local.worker_names) : name => lookup(var.worker_zones, name, var.zone)
+  }
+  worker_machine_types = {
+    for name in keys(local.worker_names) : name => lookup(var.worker_machine_types, name, var.machine_type)
+  }
 }
 
 data "google_compute_network" "corpus" {
@@ -32,7 +38,7 @@ data "google_storage_bucket" "corpus" {
 
 data "google_compute_image" "worker" {
   project = var.image_project
-  name    = "debian-12-bookworm-v20260727"
+  family  = var.image_family
 }
 
 resource "google_compute_resource_policy" "compact" {
@@ -44,6 +50,12 @@ resource "google_compute_resource_policy" "compact" {
 
   group_placement_policy {
     collocation = "COLLOCATED"
+  }
+
+  # GCP does not support renaming a placement policy. Keep the pool-level
+  # policy identity stable while run-scoped workers are replaced.
+  lifecycle {
+    ignore_changes = [name]
   }
 }
 
@@ -62,14 +74,18 @@ resource "google_compute_instance" "worker" {
 
   project                   = var.project_id
   name                      = "${each.key}-${var.run_id}"
-  zone                      = var.zone
-  machine_type              = var.machine_type
+  zone                      = local.worker_zones[each.key]
+  machine_type              = local.worker_machine_types[each.key]
   allow_stopping_for_update = true
   can_ip_forward            = false
   deletion_protection       = false
   enable_display            = false
-  resource_policies         = var.compact_placement ? [google_compute_resource_policy.compact[0].self_link] : []
-  tags                      = [local.worker_tag]
+  resource_policies = (
+    var.compact_placement && var.attach_compact_placement_policy
+    ? [google_compute_resource_policy.compact[0].self_link]
+    : []
+  )
+  tags = [local.worker_tag]
 
   labels = merge(
     {
@@ -189,13 +205,26 @@ resource "google_compute_instance" "worker" {
     }
 
     precondition {
-      condition     = startswith(var.zone, "${var.region}-")
-      error_message = "zone must belong to region so workers and the canonical bucket remain colocated."
+      condition = (
+        length(setsubtract(toset(keys(var.worker_zones)), toset(keys(local.worker_names)))) == 0 &&
+        alltrue([for zone in values(local.worker_zones) : startswith(zone, "${var.region}-")])
+      )
+      error_message = "worker_zones may name only configured workers and every selected zone must belong to the configured region."
+    }
+
+    precondition {
+      condition     = length(setsubtract(toset(keys(var.worker_machine_types)), toset(keys(local.worker_names)))) == 0
+      error_message = "worker_machine_types may name only configured workers."
     }
 
     precondition {
       condition     = !var.compact_placement || var.worker_count <= 22
       error_message = "Google compact placement policies support at most 22 instances; disable compact_placement for a larger pool."
+    }
+
+    precondition {
+      condition     = !var.attach_compact_placement_policy || var.compact_placement
+      error_message = "attach_compact_placement_policy requires compact_placement to retain the managed policy."
     }
 
     precondition {

@@ -86,6 +86,7 @@ run "content_addressed_v4_bootstrap" {
     condition     = strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcs_read_exact \"$BOOTSTRAP_URI\"") && !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcloud storage cp \"$BOOTSTRAP_URI\"")
     error_message = "Startup must use the v4-proven exact-object download path."
   }
+
   assert {
     condition = (
       strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "RUNNER_ROLE=\"source\"") &&
@@ -137,6 +138,107 @@ run "bounded_two_slot_profile" {
   assert {
     condition     = alltrue([for worker in google_compute_instance.worker : worker.metadata["cppmega-slots-per-worker"] == "2"])
     error_message = "Worker metadata must expose the physical-to-logical slot topology."
+  }
+}
+
+run "retained_compact_policy_can_be_detached" {
+  command = plan
+
+  variables {
+    project_id                      = "natural-bison-491019-t9"
+    run_id                          = "source-capacity-relief-test"
+    worker_count                    = 2
+    compact_placement               = true
+    attach_compact_placement_policy = false
+    bootstrap_script_gcs_uri        = ""
+    bootstrap_script_sha256         = ""
+    bootstrap_bundle_sha256         = ""
+    bootstrap_overlay_sha256        = ""
+    bootstrap_manifest_sha256       = ""
+  }
+
+  assert {
+    condition     = length(google_compute_resource_policy.compact) == 1
+    error_message = "Capacity relief must retain the managed compact policy for later cleanup."
+  }
+
+  assert {
+    condition     = alltrue([for worker in google_compute_instance.worker : length(worker.resource_policies) == 0])
+    error_message = "Capacity relief workers must not request compact placement."
+  }
+}
+
+run "workers_can_span_two_regional_zones" {
+  command = plan
+
+  variables {
+    project_id                      = "natural-bison-491019-t9"
+    run_id                          = "source-two-zone-test"
+    zone                            = "us-central1-c"
+    worker_count                    = 4
+    compact_placement               = true
+    attach_compact_placement_policy = false
+    worker_zones = {
+      cppmega-corpus-00 = "us-central1-c"
+      cppmega-corpus-01 = "us-central1-c"
+      cppmega-corpus-02 = "us-central1-f"
+      cppmega-corpus-03 = "us-central1-f"
+    }
+    bootstrap_script_gcs_uri  = ""
+    bootstrap_script_sha256   = ""
+    bootstrap_bundle_sha256   = ""
+    bootstrap_overlay_sha256  = ""
+    bootstrap_manifest_sha256 = ""
+  }
+
+  assert {
+    condition = (
+      google_compute_instance.worker["cppmega-corpus-00"].zone == "us-central1-c" &&
+      google_compute_instance.worker["cppmega-corpus-01"].zone == "us-central1-c" &&
+      google_compute_instance.worker["cppmega-corpus-02"].zone == "us-central1-f" &&
+      google_compute_instance.worker["cppmega-corpus-03"].zone == "us-central1-f"
+    )
+    error_message = "Each worker must retain its explicit regional zone assignment."
+  }
+
+  assert {
+    condition = (
+      strcontains(output.iap_ssh_commands["cppmega-corpus-00"], "--zone=us-central1-c") &&
+      strcontains(output.iap_ssh_commands["cppmega-corpus-01"], "--zone=us-central1-c") &&
+      strcontains(output.iap_ssh_commands["cppmega-corpus-02"], "--zone=us-central1-f") &&
+      strcontains(output.iap_ssh_commands["cppmega-corpus-03"], "--zone=us-central1-f")
+    )
+    error_message = "Every generated IAP SSH command must use its worker's actual zone."
+  }
+}
+
+run "workers_can_use_mixed_machine_types" {
+  command = plan
+
+  variables {
+    project_id   = "natural-bison-491019-t9"
+    run_id       = "source-mixed-machine-test"
+    worker_count = 4
+    machine_type = "n2-standard-16"
+    worker_machine_types = {
+      cppmega-corpus-02 = "n2d-standard-16"
+      cppmega-corpus-03 = "n2d-standard-16"
+    }
+    bootstrap_script_gcs_uri  = ""
+    bootstrap_script_sha256   = ""
+    bootstrap_bundle_sha256   = ""
+    bootstrap_overlay_sha256  = ""
+    bootstrap_manifest_sha256 = ""
+  }
+
+  assert {
+    condition = (
+      google_compute_instance.worker["cppmega-corpus-00"].machine_type == "n2-standard-16" &&
+      google_compute_instance.worker["cppmega-corpus-01"].machine_type == "n2-standard-16" &&
+      google_compute_instance.worker["cppmega-corpus-02"].machine_type == "n2d-standard-16" &&
+      google_compute_instance.worker["cppmega-corpus-03"].machine_type == "n2d-standard-16"
+    )
+    error_message = "Per-worker machine types must override only the selected workers."
   }
 }
 

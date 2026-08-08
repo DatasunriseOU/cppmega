@@ -96,8 +96,15 @@ On first boot, the startup script:
 5. writes `/etc/cppmega/worker.json` with the exact run and shard identity;
 6. uploads a ready receipt to
    `gs://<bucket>/<prefix>/<run_id>/control/ready/<worker>.<boot-id>.json`;
-7. optionally downloads a SHA-256-pinned runner from GCS and executes it as
-   the unprivileged `cppmega` user.
+7. optionally downloads a SHA-256-pinned runner from GCS and starts it as the
+   unprivileged `cppmega` user under `cppmega-source-worker.service`.
+
+The systemd unit restarts only transiently failed runner attempts, with a
+30-minute delay and no start-rate cutoff. Exit `75` means the bounded transport
+retry budget was exhausted; exit `2` is a contract or artifact failure and is
+explicitly not restarted. Each attempt reuses the same immutable manifest and
+GCS assignment pointers, so already verified repository assignments are
+skipped. A successful runner exit remains stopped.
 
 When a runner is configured, Terraform requires the complete five-part
 binding: runner URI, runner SHA-256, bundle SHA-256, overlay SHA-256, and raw
@@ -111,6 +118,76 @@ values. A runner must download only its assigned inputs, checkpoint reusable
 state to GCS, upload output to a temporary object name, validate hashes and
 row/token receipts, and only then publish its completion receipt. Never rely
 on Local SSD surviving stop, deletion, host failure, or Spot preemption.
+
+### Bounded slots per VM
+
+`worker_count` remains the physical VM count. `slots_per_worker` derives the
+logical manifest worker count (`worker_count * slots_per_worker`), and VM `v`
+owns contiguous logical IDs `v * slots_per_worker .. v * slots_per_worker +
+slots_per_worker - 1`. The default is one slot, preserving the original smoke
+payload. Terraform caps the supported profile at two slots per VM and checks
+aggregate parser and memory limits before apply.
+
+Each slot gets a separate Git checkout, scratch tree, log, and receipt root.
+The scheduler refuses a manifest whose logical worker list does not exactly
+match the VM topology, and refuses aggregate resource overcommit. It publishes
+an immutable slot receipt only after every source receipt has been read back;
+the source worker also publishes an immutable assignment pointer, so a crash
+can skip assignments already confirmed in GCS. No worker-local dedup database
+is shared or enabled.
+
+Newly rendered source runners use
+`immutable_assignment_work_stealing_v1`. The manifest's logical worker remains
+part of each immutable assignment identity, but it is an ownership label, not
+an execution constraint: an idle physical slot first consumes its home shard,
+then claims unfinished assignments from other shards. Claim, heartbeat, and
+attempt-outcome objects are create-only. A live long-running assignment renews
+its lease with immutable heartbeats; an expired claim can be taken over without
+changing the assignment digest. The assignment completion pointer remains the
+only completion fact and is still published with create-if-absent semantics.
+
+Worker `exit 75` publishes a transient attempt outcome and is the only path
+that opens another claim attempt. Any other nonzero worker exit publishes a
+terminal deterministic outcome for that assignment while its lease is still
+valid; a stale owner is fenced and treated as transient instead. The failed
+assignment is excluded from further claims while every unrelated assignment
+continues to drain. After the runnable complement closes, each physical
+scheduler publishes an exact immutable incomplete receipt and exits nonzero. A
+single parser defect therefore cannot strand the rest of a VM's queue or
+masquerade as a complete run.
+
+For `n2-standard-16` (16 vCPU, 64 GB), the recommended first production
+profile is four VMs with `slots_per_worker = 2`,
+`parse_workers_per_slot = 6`, `memory_limit_gb_per_slot = 24`,
+`cpu_budget_vcpus = 16`, and `memory_budget_gb = 56`. Build the source payload
+with the same physical count and `--slots-per-worker 2`; this creates eight
+logical manifest workers. Keep the default one-slot profile for the existing
+smoke run and use a new run ID and new content-addressed payload for a two-slot
+run.
+
+Do not switch an active static run to this scheduler. Finish or explicitly
+adjudicate that run, then build a new content-addressed payload and run ID; this
+prevents dynamic claims from racing static workers that do not publish claims.
+
+### Capacity relief without state deletion
+
+`compact_placement = true` keeps the run-scoped placement policy managed in
+Terraform. When a region cannot allocate a compact group, set
+`attach_compact_placement_policy = false` for a new, reviewed plan. New VMs no
+longer request collocation, while the policy remains in the same state for
+normal teardown. Do not change `compact_placement` to `false` on a partially
+provisioned run: that plans deletion of the retained policy.
+
+`worker_zones` can spread new workers across zones in the same region while
+preserving worker names, static regional IPs, and the immutable logical-worker
+manifest. Keep a selected worker's zone stable once it exists: changing it
+requires replacement and the guarded rollout rejects replacement plans.
+
+`worker_machine_types` can select a capacity-compatible shape only for workers
+that do not exist yet. Keep existing workers on their recorded type; changing
+one requires replacement and is rejected by the guarded rollout. A mixed N2
+and N2D pool is safe only when both profiles satisfy the same slot CPU, memory,
+Local SSD, and architecture contracts.
 
 Recommended object layout:
 

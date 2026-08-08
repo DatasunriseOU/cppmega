@@ -55,6 +55,14 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "clang_debug_parser_crash_pragma",
     ),
     (
+        "compiler_regression_fixture",
+        "gcc_c_flexible_array_union_initializer_regression",
+    ),
+    (
+        "binary_protocol_test_fixture",
+        "clickhouse_dollar_quoted_binary_sql",
+    ),
+    (
         "deliberate_compiler_diagnostic_fixture",
         "clang_embedded_nul_diagnostic",
     ),
@@ -533,6 +541,126 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared "
                 "clang_debug_parser_crash_pragma but the Clang parser-crash "
                 "test contract is incomplete or ambiguous"
+            )
+        return
+
+    if (
+        entry.detected_format
+        == "gcc_c_flexible_array_union_initializer_regression"
+    ):
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "gcc_c_flexible_array_union_initializer_regression but the "
+                f"fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        required_lines = {
+            "/* PR c/119001 */",
+            "/* { dg-do run } */",
+            '/* { dg-options "" } */',
+            "union U { char a[]; int i; };",
+            "union U u = { \"12345\" };",
+            "union U v = { .a = \"6789\" };",
+            "union U w = { { 1, 2, 3, 4, 5, 6 } };",
+            "union U x = { .a = { 7, 8, 9 } };",
+            "union V { int i; char a[]; };",
+            "union V y = { .a = \"abcdefghijk\" };",
+            "union V z = { .a = { 10, 11, 12, 13, 14, 15, 16, 17 } };",
+        }
+        if (
+            path.suffix.casefold() != ".c"
+            or not required_lines.issubset(lines)
+            or decoded.count("__builtin_abort ();") != 6
+            or decoded.count("char a[];") != 2
+            or decoded.count("int\nmain ()\n{") != 1
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "gcc_c_flexible_array_union_initializer_regression but the "
+                "GCC PR119001 DejaGNU run-test contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "clickhouse_dollar_quoted_binary_sql":
+        payload = path.read_bytes()
+        if path.suffix.casefold() != ".sql" or payload.count(b"$$") != 2:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                "but the SQL dollar-quoted payload boundary is absent or ambiguous"
+            )
+        payload_start = payload.index(b"$$")
+        payload_end = payload.index(b"$$", payload_start + 2)
+        sql_prefix = payload[:payload_start]
+        binary_payload = payload[payload_start + 2 : payload_end]
+        sql_suffix = payload[payload_end + 2 :]
+        try:
+            decoded_prefix = sql_prefix.decode("utf-8")
+            decoded_suffix = sql_suffix.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                f"but its SQL envelope is not UTF-8/ASCII: {exc}"
+            ) from exc
+        format_match = re.match(
+            r"\A(?:[ \t]*(?:--[^\r\n]*)?\r?\n)*[ \t]*"
+            r"SELECT\s+\*\s+FROM\s+format\s*\(\s*"
+            r"((?:'(?:Native|BSONEachRow)')|(?:Native|BSONEachRow))\s*,",
+            decoded_prefix,
+            flags=re.IGNORECASE,
+        )
+        error_match = re.fullmatch(
+            r"\s*\)\s*;\s*--\s*\{\s*serverError\s+"
+            r"(?P<errors>"
+            r"(?:TOO_LARGE_STRING_SIZE|TOO_LARGE_ARRAY_SIZE|INCORRECT_DATA|"
+            r"UNKNOWN_TYPE|CANNOT_READ_ALL_DATA)"
+            r"(?:\s*,\s*(?:TOO_LARGE_STRING_SIZE|TOO_LARGE_ARRAY_SIZE|"
+            r"INCORRECT_DATA|UNKNOWN_TYPE|CANNOT_READ_ALL_DATA))*"
+            r")"
+            r"\s*\}\s*",
+            decoded_suffix,
+        )
+        if (
+            format_match is None
+            or not sql_prefix.rstrip().endswith(b",")
+            or not binary_payload
+            or b"\0" not in binary_payload
+            or error_match is None
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                "but the binary format regression-test contract is incomplete"
+            )
+        input_format = format_match.group(1).strip("'").casefold()
+        allowed_errors = {
+            "native": {"TOO_LARGE_STRING_SIZE", "TOO_LARGE_ARRAY_SIZE"},
+            "bsoneachrow": {
+                "INCORRECT_DATA",
+                "UNKNOWN_TYPE",
+                "CANNOT_READ_ALL_DATA",
+            },
+        }
+        observed_errors = [
+            value.strip() for value in error_match.group("errors").split(",")
+        ]
+        valid_native_errors = (
+            input_format == "native"
+            and len(observed_errors) == 1
+            and observed_errors[0] in allowed_errors[input_format]
+        )
+        valid_bson_errors = (
+            input_format == "bsoneachrow"
+            and observed_errors[0] == "INCORRECT_DATA"
+            and len(observed_errors) == len(set(observed_errors))
+            and set(observed_errors) <= allowed_errors[input_format]
+        )
+        if not (valid_native_errors or valid_bson_errors):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clickhouse_dollar_quoted_binary_sql "
+                "but its format and expected server error disagree"
             )
         return
 

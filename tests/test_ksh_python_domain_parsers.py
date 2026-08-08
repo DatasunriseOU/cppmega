@@ -521,6 +521,63 @@ def test_invalid_shell_bytes_without_fixture_contract_still_fail(
         list(iter_domain_file_chunks(path))
 
 
+def test_gb18030_shell_heredoc_fixture_preserves_every_source_byte(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import (
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    encoded = (
+        b"#! /bin/sh\n"
+        b". ./init.sh\n"
+        b"cat <<\\EOF > utf8.po\n"
+        b'"Content-Type: text/plain; charset=UTF-8\\n"\n'
+        b"#: \xe2\x81\xa8source file.c\xe2\x81\xa9:1\n"
+        b"EOF\n"
+        b"msgcat --to-code=GB18030 utf8.po\n"
+        b"cat <<\\EOF > gb18030.po\n"
+        b'"Content-Type: text/plain; charset=GB18030\\n"\n'
+        b"#: \x81\x36\xac\x34source file.c\x81\x36\xac\x35:1\n"
+        b"EOF\n"
+    )
+    path = tmp_path / "msgcat-22"
+    path.write_bytes(encoded)
+
+    discovered = discover_project_domain_files(tmp_path)
+    assert [item.path for item in discovered] == [path]
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=48))
+
+    assert {chunk.source_encoding for chunk in chunks} == {
+        "mixed-utf-8-gb18030-byte-preserving"
+    }
+    assert b"".join(
+        chunk.text.encode("latin-1", errors="strict") for chunk in chunks
+    ) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 48 for chunk in chunks)
+
+
+def test_gb18030_marker_does_not_authorize_bytes_outside_its_heredoc(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import (
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    path = tmp_path / "msgcat-22"
+    path.write_bytes(
+        b"#! /bin/sh\n"
+        b"msgcat --to-code=GB18030 input.po\n"
+        b'printf "unrelated \x81 byte"\n'
+    )
+
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
+        list(iter_domain_file_chunks(path))
+    assert discover_project_domain_files(tmp_path) == []
+
+
 def test_shell_byte_fixture_marker_does_not_authorize_arbitrary_invalid_bytes(
     tmp_path: Path,
 ) -> None:

@@ -1161,7 +1161,11 @@ def read_source_quarantine_receipt(work: Path, repo: str) -> dict[str, object]:
         ) from exc
     if (
         not isinstance(receipt, dict)
-        or receipt.get("schema") != "cppmega.source_quarantine_receipt_v1"
+        or receipt.get("schema")
+        not in {
+            "cppmega.source_quarantine_receipt_v1",
+            "cppmega.source_quarantine_receipt_v2",
+        }
     ):
         raise RepoFailure(
             repo,

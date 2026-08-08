@@ -38,6 +38,8 @@ import posixpath
 import re
 import shutil
 import sqlite3
+import stat
+import subprocess
 import sys
 import time
 import warnings
@@ -742,6 +744,9 @@ BUILD_NAME_KINDS: dict[str, str] = {
     "Dockerfile": "dockerfile",
 }
 BUILD_EXT_KINDS: dict[str, str] = {
+    # Assembly is source code emitted losslessly on the frozen broad code route.
+    ".s": "assembly",
+    ".asm": "assembly",
     ".cmake": "cmake",
     ".mk": "make",
     ".m4": "autoconf",
@@ -3482,10 +3487,226 @@ _DEFAULT_SKIP_DIRS = frozenset({'.git'})
 
 C_EXTENSIONS = {'.c'}
 
+SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA = "cppmega.source_tree_entry_exclusions_v1"
+_SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY = (
+    "skip_only_dangling_symlink_blobs_targeting_unmaterialized_gitlinks"
+)
+
+
+def _canonical_receipt_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class GitTreeSourceEntryExclusions:
+    """Prove the only safe-to-skip non-regular Git checkout entries."""
+
+    def __init__(self, project_dir: str | os.PathLike[str]) -> None:
+        self.project_dir = os.path.abspath(os.fspath(project_dir))
+        self._git_tree: str | None = None
+        self._index_entries: dict[str, tuple[str, str, str]] | None = None
+        self._records: dict[str, dict[str, object]] = {}
+
+    def _git(self, *args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "-C", self.project_dir, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr[-4000:].decode(errors="replace")
+            raise OSError(
+                "cannot prove non-regular source entry against pinned Git "
+                f"checkout: git {' '.join(args)}: {detail}"
+            )
+        return completed.stdout
+
+    def _load_git_index(self) -> None:
+        if self._index_entries is not None:
+            return
+        raw_tree = self._git("rev-parse", "HEAD^{tree}").strip()
+        if re.fullmatch(rb"[0-9a-f]{40}(?:[0-9a-f]{24})?", raw_tree) is None:
+            raise OSError("pinned Git checkout returned an invalid tree id")
+        self._git_tree = raw_tree.decode("ascii")
+        entries: dict[str, tuple[str, str, str]] = {}
+        for encoded in self._git("ls-files", "--stage", "-z").split(b"\0"):
+            if not encoded:
+                continue
+            metadata, separator, raw_path = encoded.partition(b"\t")
+            fields = metadata.split(b" ")
+            if not separator or len(fields) != 3:
+                raise OSError("pinned Git index returned a malformed stage entry")
+            mode, object_id, stage = fields
+            try:
+                relative_path = os.fsdecode(raw_path)
+                mode_text = mode.decode("ascii")
+                object_text = object_id.decode("ascii")
+                stage_text = stage.decode("ascii")
+            except UnicodeError as exc:
+                raise OSError("pinned Git index entry metadata is invalid") from exc
+            if relative_path in entries:
+                raise OSError(
+                    f"pinned Git index contains duplicate stages for {relative_path}"
+                )
+            entries[relative_path] = (mode_text, object_text, stage_text)
+        self._index_entries = entries
+
+    def _clean_status(self, relative_path: str, gitlink_path: str) -> None:
+        status = self._git(
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            "--",
+            relative_path,
+            gitlink_path,
+        )
+        if status:
+            raise OSError(
+                "source entry or target gitlink changed during immutable inspection"
+            )
+
+    def record(self, filepath: str, _stat_error: OSError) -> None:
+        absolute_path = os.path.abspath(filepath)
+        try:
+            if os.path.commonpath((self.project_dir, absolute_path)) != self.project_dir:
+                raise OSError("source candidate escapes project root")
+        except ValueError as exc:
+            raise OSError("source candidate has an invalid project-relative path") from exc
+        relative_path = Path(
+            os.path.relpath(absolute_path, self.project_dir)
+        ).as_posix()
+
+        try:
+            before = os.lstat(absolute_path)
+        except OSError as exc:
+            raise OSError(
+                "source candidate vanished instead of remaining a provable "
+                f"non-regular tree entry: {relative_path}"
+            ) from exc
+        if not stat.S_ISLNK(before.st_mode) or os.path.exists(absolute_path):
+            raise OSError(
+                "unreadable source candidate is not a dangling symlink tree entry: "
+                f"{relative_path}"
+            )
+        symlink_target = os.readlink(absolute_path)
+        symlink_target_bytes = os.fsencode(symlink_target)
+        if b"\0" in symlink_target_bytes:
+            raise OSError("Git symlink target unexpectedly contains NUL")
+
+        self._load_git_index()
+        assert self._index_entries is not None
+        assert self._git_tree is not None
+        index_entry = self._index_entries.get(relative_path)
+        if index_entry is None:
+            raise OSError(
+                f"dangling source symlink is not tracked by Git: {relative_path}"
+            )
+        entry_mode, entry_object_id, entry_stage = index_entry
+        if entry_mode != "120000" or entry_stage != "0":
+            raise OSError(
+                "unreadable source candidate is not an exact stage-0 mode-120000 "
+                f"Git entry: {relative_path}"
+            )
+        object_type = self._git("cat-file", "-t", entry_object_id).strip()
+        if object_type != b"blob":
+            raise OSError(f"Git symlink object is not a blob: {relative_path}")
+        object_payload = self._git("cat-file", "blob", entry_object_id)
+        if object_payload != symlink_target_bytes:
+            raise OSError(
+                f"Git symlink blob and checkout target differ: {relative_path}"
+            )
+
+        if os.path.isabs(symlink_target):
+            raise OSError(f"absolute dangling source symlink is unsupported: {relative_path}")
+        target_relative_path = posixpath.normpath(
+            posixpath.join(posixpath.dirname(relative_path), symlink_target)
+        )
+        if target_relative_path == ".." or target_relative_path.startswith("../"):
+            raise OSError(f"dangling source symlink escapes checkout: {relative_path}")
+        if os.path.lexists(os.path.join(self.project_dir, target_relative_path)):
+            raise OSError(
+                f"dangling source target unexpectedly materialized: {relative_path}"
+            )
+
+        target_parts = target_relative_path.split("/")
+        gitlink_path = ""
+        gitlink_entry: tuple[str, str, str] | None = None
+        for length in range(len(target_parts) - 1, 0, -1):
+            candidate = "/".join(target_parts[:length])
+            candidate_entry = self._index_entries.get(candidate)
+            if candidate_entry is not None and candidate_entry[0] == "160000":
+                gitlink_path = candidate
+                gitlink_entry = candidate_entry
+                break
+        if gitlink_entry is None or gitlink_entry[2] != "0":
+            raise OSError(
+                "dangling source symlink is not beneath an exact stage-0 Git "
+                f"gitlink: {relative_path} -> {target_relative_path}"
+            )
+
+        self._clean_status(relative_path, gitlink_path)
+        try:
+            after = os.lstat(absolute_path)
+            after_target = os.readlink(absolute_path)
+        except OSError as exc:
+            raise OSError(
+                f"source symlink changed during immutable inspection: {relative_path}"
+            ) from exc
+        stable_fields = ("st_mode", "st_ino", "st_dev", "st_size", "st_mtime_ns")
+        if (
+            any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+            or after_target != symlink_target
+            or os.path.exists(absolute_path)
+        ):
+            raise OSError(
+                f"source symlink eligibility changed during inspection: {relative_path}"
+            )
+        self._clean_status(relative_path, gitlink_path)
+
+        record = {
+            "relative_path": relative_path,
+            "reason": "dangling_symlink_target_below_unmaterialized_gitlink",
+            "git_tree": self._git_tree,
+            "entry_mode": entry_mode,
+            "entry_object_id": entry_object_id,
+            "entry_object_type": "blob",
+            "entry_object_size_bytes": len(object_payload),
+            "entry_object_sha256": hashlib.sha256(object_payload).hexdigest(),
+            "symlink_target": symlink_target,
+            "target_relative_path": target_relative_path,
+            "target_gitlink_path": gitlink_path,
+            "target_gitlink_mode": gitlink_entry[0],
+            "target_gitlink_commit": gitlink_entry[1],
+        }
+        previous = self._records.setdefault(relative_path, record)
+        if previous != record:
+            raise OSError(f"source entry exclusion receipt drifted: {relative_path}")
+
+    def receipt(self) -> dict[str, object]:
+        records = [self._records[key] for key in sorted(self._records)]
+        return {
+            "schema": SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA,
+            "status": "complete",
+            "policy": _SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY,
+            "git_tree": self._git_tree if records else None,
+            "excluded_count": len(records),
+            "records_sha256": _canonical_receipt_sha256(records),
+            "records": records,
+        }
+
 
 def find_cpp_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
+    *,
+    ineligible_entry_handler: Callable[[str, OSError], None] | None = None,
 ) -> list[str]:
     """Find all C/C++ source files in a directory."""
     skip_dirs = _DEFAULT_SKIP_DIRS | (extra_exclude_dirs or set())
@@ -3500,6 +3721,15 @@ def find_cpp_files(
                 try:
                     os.path.getsize(filepath)
                 except OSError as exc:
+                    if ineligible_entry_handler is not None:
+                        try:
+                            ineligible_entry_handler(filepath, exc)
+                        except OSError as proof_error:
+                            raise OSError(
+                                f"failed to stat C/C++ input {filepath}: {exc}; "
+                                f"non-regular entry proof failed: {proof_error}"
+                            ) from proof_error
+                        continue
                     raise OSError(
                         f"failed to stat C/C++ input {filepath}: {exc}"
                     ) from exc
@@ -5344,6 +5574,11 @@ def _is_sane_compile_args(args: list[str]) -> bool:
         return False
 
     machine_width_flags: set[str] = set()
+    target_values: dict[str, set[str]] = {
+        "target": set(),
+        "march": set(),
+        "mcpu": set(),
+    }
     language_values: set[str] = set()
     standard_values: set[str] = set()
     standard_families: set[str] = set()
@@ -5376,6 +5611,7 @@ def _is_sane_compile_args(args: list[str]) -> bool:
             elif value_kind == "target":
                 if _TARGET_VALUE_RE.fullmatch(operand) is None:
                     return False
+                target_values["target"].add(operand)
             index += 2
             continue
 
@@ -5413,6 +5649,13 @@ def _is_sane_compile_args(args: list[str]) -> bool:
                     _TARGET_VALUE_RE.fullmatch(value) is None
                 ):
                     return False
+                target_key = {
+                    "--target=": "target",
+                    "-march=": "march",
+                    "-mcpu=": "mcpu",
+                }.get(prefix)
+                if target_key is not None:
+                    target_values[target_key].add(value)
 
         for prefix in _JOINED_PATH_ARG_PREFIXES:
             if arg.startswith(prefix) and arg != prefix:
@@ -5430,6 +5673,8 @@ def _is_sane_compile_args(args: list[str]) -> bool:
         index += 1
 
     if {"-m32", "-m64"}.issubset(machine_width_flags):
+        return False
+    if any(len(values) > 1 for values in target_values.values()):
         return False
     if len(language_values) > 1 or len(standard_values) > 1:
         return False
@@ -7981,6 +8226,7 @@ def _build_domain_sidecars(
         "cmd": "script.cmd",
         "sql": "schema.sql",
         "python": "module.py",
+        "assembly": "source.s",
     }
     parser_path = parser_path_by_kind.get(kind)
     resolved_path = filepath or parser_path
@@ -8195,14 +8441,15 @@ def build_build_doc(
                 if triple not in seen_shell_edges:
                     shell_edges.append(edge)
                     seen_shell_edges.add(triple)
-    is_python_doc = domain == DomainKind.PYTHON
+    is_code_doc = domain in {DomainKind.CPP, DomainKind.PYTHON}
+    is_assembly_doc = build_kind == "assembly"
     is_sql_doc = domain == DomainKind.SQL
     is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
     doc_type = (
         "shell"
         if is_shell_doc
         else "code"
-        if is_python_doc
+        if is_code_doc
         else "diagnostic"
         if is_diagnostic_doc
         else "sql"
@@ -8236,7 +8483,7 @@ def build_build_doc(
         "primary_language": build_kind,
         "primary_standard": (
             None
-            if is_shell_doc or is_sql_doc
+            if is_shell_doc or is_sql_doc or is_assembly_doc
             else (build_info or {}).get("standard")
         ),
         "primary_dialect": (
@@ -8247,7 +8494,7 @@ def build_build_doc(
             f"shell_file:{build_kind}"
             if is_shell_doc
             else f"code_file:{build_kind}"
-            if is_python_doc
+            if is_code_doc
             else f"sql_file:{build_kind}"
             if is_sql_doc
             else f"build_file:{build_kind}"
@@ -8260,7 +8507,7 @@ def build_build_doc(
             "shell_file"
             if is_shell_doc
             else "code_file"
-            if is_python_doc
+            if is_code_doc
             else "sql_file"
             if is_sql_doc
             else "build_file"
@@ -10008,6 +10255,7 @@ def emit_build_documents(
                     "batch",
                     "cmd",
                     "python",
+                    "assembly",
                     "sql",
                     "compiler_diagnostic",
                     "linker_diagnostic",
@@ -11193,6 +11441,7 @@ def process_project(
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
     lexical_fallback_files: set[str] = set()
+    source_tree_entry_exclusions = GitTreeSourceEntryExclusions(project_dir)
 
     invalid_domain_paths: set[str] = set()
 
@@ -11203,7 +11452,15 @@ def process_project(
     invalid_handler = _handle_invalid_domain_input if skip_invalid_domain_inputs else None
 
     # Find source files
-    cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    cpp_files = find_cpp_files(
+        project_dir,
+        extra_exclude_dirs=extra_exclude_dirs,
+        ineligible_entry_handler=(
+            source_tree_entry_exclusions.record
+            if source_quarantine is not None
+            else None
+        ),
+    )
     if source_quarantine is not None:
         quarantine_candidates = list(cpp_files)
         candidate_identities = {
@@ -11218,6 +11475,10 @@ def process_project(
             project_dir,
             quarantine_candidates,
         )
+        quarantine_receipt["source_tree_entry_exclusions"] = (
+            source_tree_entry_exclusions.receipt()
+        )
+        quarantine_receipt["schema"] = "cppmega.source_quarantine_receipt_v2"
         kept_candidate_identities = {
             os.path.abspath(candidate) for candidate in kept_candidates
         }

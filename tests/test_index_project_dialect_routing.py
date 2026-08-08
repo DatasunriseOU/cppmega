@@ -200,6 +200,43 @@ def test_process_project_preserves_domain_and_powershell_dialect(
         assert doc["filepath"] == filepath
 
 
+@pytest.mark.parametrize("suffix", [".s", ".asm"])
+def test_assembly_source_is_lossless_on_frozen_broad_code_route(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    source = "start:\r\n  mov $1, %eax\r\n  ret\r\n"
+    source_path = tmp_path / f"boot/start{suffix}"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source, encoding="utf-8")
+
+    assert ip.find_build_files(str(tmp_path)) == [(str(source_path), "assembly")]
+    discovered = discover_project_domain_files(tmp_path, include_cpp=False)
+    assert [(item.path, item.domain, item.adapter) for item in discovered] == [
+        (source_path, DomainKind.CPP, "assembly-raw")
+    ]
+
+    documents = ip.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="fixture/assembly-source",
+    )
+    assert len(documents) == 1
+    document = documents[0]
+    assert document["text"] == source
+    assert document["filepath"] == f"boot/start{suffix}"
+    assert document["doc_type"] == "code"
+    assert document["build_kind"] == "assembly"
+    assert document["domain_kind"] == int(DomainKind.CPP)
+    assert document["domain_parse_info"]["parser_adapter"] == "assembly-raw"
+    assert document["domain_parse_info"]["shared_domain"] == "cpp"
+    assert document["language_info"]["primary_language"] == "assembly"
+    assert document["language_info"]["primary_standard"] is None
+    assert document["source_span"]["byte_start"] == 0
+    assert document["source_span"]["byte_end"] == len(source.encode())
+    assert set(document["domain_confidence_ids"]) == {int(ParseConfidence.RAW)}
+
+
 def test_meson_tree_sitter_edges_use_character_offsets_after_utf8_prefix() -> None:
     from cppmega.data.build_parsers.base import ParsedDomainDocument
     from cppmega.data.build_parsers.meson import _attach_edges_to_doc
