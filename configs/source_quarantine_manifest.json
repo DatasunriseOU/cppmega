@@ -47,6 +47,15 @@
       "reason": "Clang code-completion crash-recovery fixture deliberately invokes #pragma clang __debug crash"
     },
     {
+      "project_id": "gcc-mirror/gcc",
+      "relative_path": "gcc/testsuite/gcc.dg/pr119001-1.c",
+      "size_bytes": 867,
+      "sha256": "a01d63621d40ce04f9d95341d6a3931d38da7168eace62765970d8f4f382c178",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "gcc_c_flexible_array_union_initializer_regression",
+      "reason": "GCC PR119001 regression fixture deterministically crashes the pinned libclang parser"
+    },
+    {
       "project_id": "microsoft/DirectXShaderCompiler",
       "relative_path": "tools/clang/test/Parser/crash-report.c",
       "size_bytes": 271,
@@ -117,6 +126,51 @@
       "classification": "generated_executable_archive",
       "detected_format": "posix_shell_appended_zip",
       "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02683_native_too_large_size.sql",
+      "size_bytes": 5742,
+      "sha256": "0dd70078b534e164c86d82c27c926573745c186970189914d886aab6aa0259ea",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse Native-format exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02684_bson.sql",
+      "size_bytes": 9071,
+      "sha256": "52a2ea38b7ee657f6ad8b7c4ce4ca9f652ec032dc5af0415852c6d515b858137",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse BSONEachRow exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02685_bson2.sql",
+      "size_bytes": 21329,
+      "sha256": "e6be67fb4b042a5b0845243d3790db2230483cfeb2fd072491415aa34a106507",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse BSONEachRow exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02686_bson3.sql",
+      "size_bytes": 21327,
+      "sha256": "7b1b4bd8e2f641baf789ddd854f89c5c1583c5240999f494360f27fc9473e90d",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse BSONEachRow exception regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "ClickHouse/ClickHouse",
+      "relative_path": "tests/queries/0_stateless/02687_native_fuzz.sql",
+      "size_bytes": 630,
+      "sha256": "e96d08c5033a3409725549d8c0909dc40b4f94a687fdd3b1e390b810db691e2c",
+      "classification": "binary_protocol_test_fixture",
+      "detected_format": "clickhouse_dollar_quoted_binary_sql",
+      "reason": "ClickHouse Native-format fuzz regression fixture with a dollar-quoted binary protocol payload"
     }
   ],
   "collections": [

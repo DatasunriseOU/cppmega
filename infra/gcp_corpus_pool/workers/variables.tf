@@ -15,9 +15,15 @@ variable "region" {
 }
 
 variable "zone" {
-  description = "Single worker zone. Keep it in region and near the regional bucket."
+  description = "Default worker zone. worker_zones can override selected workers within the same region."
   type        = string
   default     = "us-central1-a"
+}
+
+variable "worker_zones" {
+  description = "Optional per-worker zone overrides. Keys must be generated worker names and zones must remain in region."
+  type        = map(string)
+  default     = {}
 }
 
 variable "name_prefix" {
@@ -70,7 +76,7 @@ variable "worker_count" {
 }
 
 variable "slots_per_worker" {
-  description = "Independent logical worker slots launched by each VM."
+  description = "Independent logical source-worker slots launched by each VM. One preserves the original smoke behavior; two is the bounded production profile."
   type        = number
   default     = 1
 
@@ -81,7 +87,7 @@ variable "slots_per_worker" {
 }
 
 variable "parse_workers_per_slot" {
-  description = "Bounded parser workers per logical slot."
+  description = "Bounded clang indexer parser workers per logical slot."
   type        = number
   default     = 8
 
@@ -92,7 +98,7 @@ variable "parse_workers_per_slot" {
 }
 
 variable "memory_limit_gb_per_slot" {
-  description = "Memory limit for each logical slot in GiB."
+  description = "Indexer memory limit for each logical slot in GiB."
   type        = number
   default     = 48
 
@@ -103,7 +109,7 @@ variable "memory_limit_gb_per_slot" {
 }
 
 variable "cpu_budget_vcpus" {
-  description = "Aggregate logical-slot CPU budget per VM."
+  description = "Aggregate parser-worker CPU budget per VM; the runner refuses to exceed visible host capacity."
   type        = number
   default     = 16
 
@@ -114,7 +120,7 @@ variable "cpu_budget_vcpus" {
 }
 
 variable "memory_budget_gb" {
-  description = "Aggregate logical-slot memory budget per VM in GiB."
+  description = "Aggregate slot memory budget per VM in GiB, leaving room for the OS and GCS transport."
   type        = number
   default     = 56
 
@@ -125,9 +131,20 @@ variable "memory_budget_gb" {
 }
 
 variable "machine_type" {
-  description = "Worker machine type. n2-standard-16 is 16 vCPU, 64 GB, and up to 32 Gbps default egress."
+  description = "Default worker machine type. n2-standard-16 is 16 vCPU, 64 GB, and up to 32 Gbps default egress."
   type        = string
   default     = "n2-standard-16"
+}
+
+variable "worker_machine_types" {
+  description = "Optional per-worker machine type overrides. Keys must be generated worker names."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for machine_type in values(var.worker_machine_types) : can(regex("^[a-z0-9]+(?:-[a-z0-9]+)+$", machine_type))])
+    error_message = "worker_machine_types values must be non-empty canonical machine type names."
+  }
 }
 
 variable "local_ssd_count" {
@@ -158,6 +175,12 @@ variable "image_project" {
   default     = "debian-cloud"
 }
 
+variable "image_family" {
+  description = "Boot image family with gVNIC support."
+  type        = string
+  default     = "debian-12"
+}
+
 variable "use_spot" {
   description = "Use interruptible Spot VMs. Safe only when every shard checkpoints to GCS."
   type        = bool
@@ -165,7 +188,13 @@ variable "use_spot" {
 }
 
 variable "compact_placement" {
-  description = "Request compact placement for lower worker-to-worker latency. Disable if capacity is scarce."
+  description = "Manage a compact placement policy for this run. Keep true to retain an existing policy in state."
+  type        = bool
+  default     = true
+}
+
+variable "attach_compact_placement_policy" {
+  description = "Attach the managed compact placement policy to new workers. Set false to relieve capacity pressure while retaining the policy in state."
   type        = bool
   default     = true
 }

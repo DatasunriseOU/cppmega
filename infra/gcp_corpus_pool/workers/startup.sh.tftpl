@@ -25,22 +25,61 @@ STAGE_ROOT=/mnt/cppmega-stage
 RUN_ROOT="gs://$BUCKET/$GCS_PREFIX/$RUN_ID"
 BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)
 MAX_TRANSPORT_RETRIES=4
+RETRY_BASE_SECONDS=5
+RETRY_MAX_SECONDS=300
 
 retry_sleep() {
   local attempt=$1
-  local delay=$((5 << attempt))
-  (( delay > 300 )) && delay=300
+  local delay=$((RETRY_BASE_SECONDS << attempt))
+  if (( delay > RETRY_MAX_SECONDS )); then
+    delay=$RETRY_MAX_SECONDS
+  fi
+  echo "transient GCS failure; retrying in $${delay}s (attempt $${attempt}/$${MAX_TRANSPORT_RETRIES})" >&2
   sleep "$delay"
 }
 
-is_http_429() {
-  grep -Eq '(^|[^0-9])429([^0-9]|$)' "$1"
+gcs_retryable_status() {
+  local status=$1
+  local curl_exit=$2
+  [[ "$status" =~ ^(408|429|5[0-9]{2})$ ]] && return 0
+  case "$curl_exit" in
+    5|6|7|18|28|35|47|52|55|56|92) return 0 ;;
+  esac
+  return 1
+}
+
+gcs_access_token() {
+  local attempt=0 token error
+  while (( attempt <= MAX_TRANSPORT_RETRIES )); do
+    error=$(mktemp)
+    if token=$(gcloud auth print-access-token 2>"$error"); then
+      rm -f "$error"
+      if [[ -z "$token" || "$token" =~ [[:space:]] ]]; then
+        echo "gcloud returned an invalid access token" >&2
+        return 2
+      fi
+      printf '%s' "$token"
+      return 0
+    fi
+    if ! grep -Eiq '(^|[^0-9])(408|429|5[0-9]{2})([^0-9]|$)|UNAVAILABLE|RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|timed out|connection reset|temporary failure' "$error"; then
+      cat "$error" >&2
+      rm -f "$error"
+      return 2
+    fi
+    rm -f "$error"
+    if (( attempt == MAX_TRANSPORT_RETRIES )); then
+      return 75
+    fi
+    retry_sleep "$attempt"
+    attempt=$((attempt + 1))
+  done
+  return 75
 }
 
 gcs_create_if_absent() {
   local source=$1
   local uri=$2
-  local relative bucket object encoded token response status error curl_exit attempt
+  local relative bucket object encoded token response status curl_exit error existing existing_status
   relative=$${uri#gs://}
   bucket=$${relative%%/*}
   object=$${relative#*/}
@@ -52,7 +91,7 @@ gcs_create_if_absent() {
     'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
     "$object")
   for ((attempt=0; attempt<=MAX_TRANSPORT_RETRIES; attempt++)); do
-    token=$(gcloud auth print-access-token)
+    token=$(gcs_access_token) || return $?
     response=$(mktemp)
     error=$(mktemp)
     if status=$(curl --silent --show-error --output "$response" \
@@ -71,14 +110,39 @@ gcs_create_if_absent() {
       rm -f "$response" "$error"
       return 0
     fi
-    if ! is_http_429 "$response" && ! is_http_429 "$error"; then
+    # A failed immutable POST may have committed before the connection broke.
+    # Read back and hash the existing object before retrying or accepting it.
+    if [[ "$status" == 412 ]] || gcs_retryable_status "$status" "$curl_exit"; then
+      existing="$response.existing"
+      if gcs_read_exact "$uri" "$existing"; then
+        if [[ "$(sha256sum "$existing" | awk '{print $1}')" == "$(sha256sum "$source" | awk '{print $1}')" ]]; then
+          rm -f "$response" "$error" "$existing"
+          return 0
+        fi
+        echo "immutable GCS object collision: $uri" >&2
+        rm -f "$response" "$error" "$existing"
+        return 2
+      else
+        existing_status=$?
+        rm -f "$existing"
+        if [[ "$existing_status" -ne 1 && "$existing_status" -ne 75 ]]; then
+          cat "$response" >&2 || true
+          cat "$error" >&2 || true
+          rm -f "$response" "$error"
+          return "$existing_status"
+        fi
+      fi
+    fi
+    if ! gcs_retryable_status "$status" "$curl_exit"; then
       cat "$response" >&2 || true
       cat "$error" >&2 || true
       rm -f "$response" "$error"
       return 2
     fi
     rm -f "$response" "$error"
-    (( attempt == MAX_TRANSPORT_RETRIES )) && return 75
+    if (( attempt == MAX_TRANSPORT_RETRIES )); then
+      return 75
+    fi
     retry_sleep "$attempt"
   done
   return 75
@@ -87,7 +151,7 @@ gcs_create_if_absent() {
 gcs_read_exact() {
   local uri=$1
   local destination=$2
-  local relative bucket object encoded token stage status error curl_exit attempt
+  local relative bucket object encoded token stage status curl_exit error
   relative=$${uri#gs://}
   bucket=$${relative%%/*}
   object=$${relative#*/}
@@ -100,7 +164,7 @@ gcs_read_exact() {
     "$object")
   stage="$destination.$BOOT_ID.tmp"
   for ((attempt=0; attempt<=MAX_TRANSPORT_RETRIES; attempt++)); do
-    token=$(gcloud auth print-access-token)
+    token=$(gcs_access_token) || return $?
     error=$(mktemp)
     if status=$(curl --silent --show-error --location \
       --header "Authorization: Bearer $token" \
@@ -117,13 +181,25 @@ gcs_read_exact() {
       return 0
     fi
     rm -f "$stage"
-    if ! is_http_429 "$error"; then
+    if [[ "$status" == 404 ]]; then
+      cat "$error" >&2 || true
+      rm -f "$error"
+      return 1
+    fi
+    if [[ "$status" == 401 || "$status" == 403 || "$status" == 409 ]]; then
+      cat "$error" >&2 || true
+      rm -f "$error"
+      return 2
+    fi
+    if ! gcs_retryable_status "$status" "$curl_exit"; then
       cat "$error" >&2 || true
       rm -f "$error"
       return 2
     fi
     rm -f "$error"
-    (( attempt == MAX_TRANSPORT_RETRIES )) && return 75
+    if (( attempt == MAX_TRANSPORT_RETRIES )); then
+      return 75
+    fi
     retry_sleep "$attempt"
   done
   return 75
@@ -133,7 +209,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl git gnupg jq libclang-dev mdadm pigz \
-  python3 python3-clang python3-venv rsync zstd
+  python3 python3-clang rsync zstd
 
 if ! command -v gcloud >/dev/null 2>&1; then
   install -d -m 0755 /usr/share/keyrings
@@ -174,6 +250,7 @@ install -d -m 0755 "$STAGE_ROOT"
 if ! mountpoint -q "$STAGE_ROOT"; then
   mount -o noatime,nodiratime,discard "$RAID_DEVICE" "$STAGE_ROOT"
 fi
+# The scheduler takes its cross-slot lock in the stage root and runs as cppmega.
 chown cppmega:cppmega "$STAGE_ROOT"
 chmod 0770 "$STAGE_ROOT"
 

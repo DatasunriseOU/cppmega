@@ -251,6 +251,8 @@ _EXPLICIT_DOMAIN_SUFFIXES = frozenset(
         ".ddl",
         ".dml",
         ".psql",
+        ".s",
+        ".asm",
         ".py",
         ".m4",
         ".gn",
@@ -575,6 +577,56 @@ def _posix_shell_invalid_byte_test_is_byte_preserving(payload: bytes) -> bool:
     return found_invalid_fixture
 
 
+def _posix_shell_gb18030_heredoc_is_byte_preserving(payload: bytes) -> bool:
+    """Recognize shell tests with a filename fixture encoded as GB18030."""
+
+    if (
+        not payload.startswith((b"#!/bin/sh\n", b"#! /bin/sh\n"))
+        or b"\0" in payload
+        or b"--to-code=GB18030" not in payload
+    ):
+        return False
+    lines = payload.splitlines(keepends=True)
+    in_heredoc = False
+    heredoc_lines: list[bytes] = []
+    found_gb18030_fixture = False
+    for line in lines:
+        content = line.rstrip(b"\r\n")
+        if not in_heredoc:
+            try:
+                line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return False
+            if re.fullmatch(rb"cat[ \t]+<<\\EOF(?:[ \t]+.*)?", content):
+                in_heredoc = True
+                heredoc_lines = []
+            continue
+        if content == b"EOF":
+            heredoc = b"".join(heredoc_lines)
+            invalid_utf8_lines: list[bytes] = []
+            for heredoc_line in heredoc_lines:
+                try:
+                    heredoc_line.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    invalid_utf8_lines.append(heredoc_line)
+            if invalid_utf8_lines:
+                if b"charset=GB18030" not in heredoc:
+                    return False
+                for invalid_line in invalid_utf8_lines:
+                    try:
+                        decoded = invalid_line.decode("gb18030", errors="strict")
+                    except UnicodeDecodeError:
+                        return False
+                    if decoded.encode("gb18030", errors="strict") != invalid_line:
+                        return False
+                found_gb18030_fixture = True
+            in_heredoc = False
+            heredoc_lines = []
+            continue
+        heredoc_lines.append(line)
+    return found_gb18030_fixture and not in_heredoc
+
+
 def _is_dialog_8bit_fixture_path(path: Path) -> bool:
     return tuple(part.casefold() for part in path.parts[-4:]) == (
         "contrib",
@@ -709,6 +761,11 @@ def _validate_byte_preserving_domain_stream(
             suffix == ".sh"
             and _posix_shell_invalid_byte_test_is_byte_preserving(payload)
         )
+        if not accepted and _posix_shell_gb18030_heredoc_is_byte_preserving(
+            payload
+        ):
+            accepted = True
+            source_encoding = "mixed-utf-8-gb18030-byte-preserving"
         if not accepted and _dialog_8bit_shell_fixture_is_byte_preserving(
             payload,
             path=path,
@@ -1382,6 +1439,8 @@ def _allows_domain_content_signatures(path: Path) -> bool:
 
 
 def _large_domain_is_chunkable(path: Path, adapter: DomainParserAdapter) -> bool:
+    if adapter.name == "assembly-raw":
+        return True
     if adapter.domain in _LARGE_DOMAIN_KINDS:
         return True
     return adapter.name == "raw-output" and _is_explicit_domain_path(
@@ -1686,6 +1745,19 @@ def _raw_typed_parser(
     return parse
 
 
+def _parse_assembly_raw(text: str) -> ParsedDomainDocument:
+    """Keep assembly source exact on the frozen broad code route."""
+
+    parsed = _raw_typed_parser(DomainKind.CPP, "assembly-raw")(text)
+    parsed.metadata.update(
+        {
+            "language": "assembly",
+            "shared_domain": "cpp",
+        }
+    )
+    return parsed
+
+
 def parse_powershell(text: str) -> ParsedDomainDocument:
     """Parse PowerShell with its own dialect parser on the shared shell domain."""
 
@@ -1773,6 +1845,11 @@ _ADAPTERS = {
         DomainKind.PYTHON,
         parse_python,
     ),
+    "assembly": DomainParserAdapter(
+        "assembly-raw",
+        DomainKind.CPP,
+        _parse_assembly_raw,
+    ),
     "raw": DomainParserAdapter("raw-output", DomainKind.TOOL_OUTPUT, _parse_raw_output),
 }
 
@@ -1859,6 +1936,8 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["gn"]
     if suffix in {".sql", ".ddl", ".dml", ".psql"}:
         return _ADAPTERS["sql"]
+    if suffix in {".s", ".asm"}:
+        return _ADAPTERS["assembly"]
     if suffix == ".py":
         return _ADAPTERS["python"]
 
@@ -2236,13 +2315,16 @@ def discover_project_domain_files(
                 try:
                     prefix_text = decode_domain_prefix(prefix, path=path)
                 except ValueError:
-                    if (
-                        _is_dialog_8bit_fixture_path(path)
-                        and prefix.startswith(b"#!/bin/sh\n")
-                    ):
-                        prefix_text = "#!/bin/sh\n"
-                    else:
+                    if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
                         continue
+                    try:
+                        validated = _validate_domain_path(
+                            path,
+                            expected_size=source_size,
+                        )
+                    except ValueError:
+                        continue
+                    prefix_text = validated.signature_text
                 prefix_adapter = resolve_domain_parser(path, prefix_text)
                 implicit_typed = prefix_adapter.name != "raw-output"
                 if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES and not implicit_typed:
@@ -2298,7 +2380,9 @@ def discover_project_domain_files(
             continue
 
         if adapter.name == "raw-output" or (
-            not include_cpp and adapter.domain == DomainKind.CPP
+            not include_cpp
+            and adapter.domain == DomainKind.CPP
+            and adapter.name != "assembly-raw"
         ):
             continue
         discovered.append(

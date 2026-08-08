@@ -81,8 +81,6 @@ def test_run_checked_stall_watchdog_stops_cpu_spin_without_log_progress(
 
     assert "stalled after 1s without log progress" in caught.value.detail
     assert "started" in log_path.read_text(encoding="utf-8")
-
-
 def test_run_checked_stall_watchdog_ignores_duplicate_heartbeats(tmp_path) -> None:
     from scripts import streaming_reindex
 

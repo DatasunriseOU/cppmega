@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
@@ -26,12 +27,19 @@ from scripts.distributed_data_prep.source_reducer import (
     load_worker_receipts,
     reduce_source_candidates,
 )
+from scripts.distributed_data_prep.source_quarantine_projection import (
+    build_pinned_tree_quarantine_projection,
+)
 from scripts.distributed_data_prep.source_worker import (
     CANONICAL_DOCUMENT_ORDER,
     LocalObjectStore,
+    _accept_known_git_fsck_diagnostic,
+    _expected_git_fsck_exception_receipt,
+    _KEYDB_ZERO_PADDED_FILEMODE,
     acquire_git_mirror,
     canonicalize_enriched_jsonl,
     compress_zstd,
+    validate_git_fsck_snapshot,
 )
 
 _SHA = "a" * 64
@@ -170,6 +178,148 @@ def test_full_mirror_acquisition_pins_refs_tree_and_objects(tmp_path: Path) -> N
     assert receipt["fsck"] == "ok"
 
 
+def _write_loose_git_object(git_dir: Path, object_type: str, payload: bytes) -> str:
+    serialized = f"{object_type} {len(payload)}\0".encode("ascii") + payload
+    object_id = hashlib.sha1(serialized).hexdigest()
+    destination = git_dir / "objects" / object_id[:2] / object_id[2:]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(zlib.compress(serialized))
+    return object_id
+
+
+def test_git_fsck_exception_accepts_only_exact_pinned_object_diagnostic(
+    tmp_path: Path,
+) -> None:
+    mirror = tmp_path / "fixture.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    blob_id = _write_loose_git_object(mirror, "blob", b"fixture\n")
+    tree_payload = b"0100644 fixture.cpp\0" + bytes.fromhex(blob_id)
+    tree_id = _write_loose_git_object(mirror, "tree", tree_payload)
+    commit_payload = (
+        f"tree {tree_id}\n"
+        "author Fixture <fixture@example.test> 0 +0000\n"
+        "committer Fixture <fixture@example.test> 0 +0000\n"
+        "\nfixture\n"
+    ).encode("ascii")
+    commit_id = _write_loose_git_object(mirror, "commit", commit_payload)
+    subprocess.run(
+        ["git", f"--git-dir={mirror}", "update-ref", "refs/heads/main", commit_id],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    diagnostic = (
+        f"error in tree {tree_id}: zeroPaddedFilemode: "
+        "contains zero-padded file modes"
+    )
+    policy = {
+        "remote_url": "https://example.test/exact.git",
+        "expected_commit": commit_id,
+        "checkout_tree": tree_id,
+        "historical_commit": commit_id,
+        "object_id": tree_id,
+        "object_type": "tree",
+        "object_size_bytes": len(tree_payload),
+        "object_payload_sha256": hashlib.sha256(tree_payload).hexdigest(),
+        "message_id": "zeroPaddedFilemode",
+        "diagnostic": diagnostic,
+        "returncode": 0,
+    }
+    source = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": commit_id,
+        "expected_tree": tree_id,
+    }
+    fsck = subprocess.run(
+        ["git", f"--git-dir={mirror}", "fsck", "--full", "--strict"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fsck.returncode != 0
+    policy["returncode"] = fsck.returncode
+
+    receipt = _accept_known_git_fsck_diagnostic(
+        source,
+        tree_id,
+        mirror,
+        fsck,
+        known_exception=policy,
+    )
+
+    assert receipt == _expected_git_fsck_exception_receipt(policy)
+    assert receipt["status"] == "accepted_known_historical_diagnostic"
+    assert receipt["diagnostics"][0]["object_payload_sha256"] == hashlib.sha256(
+        tree_payload
+    ).hexdigest()
+
+    extra_diagnostic = subprocess.CompletedProcess(
+        fsck.args,
+        fsck.returncode,
+        fsck.stdout,
+        fsck.stderr + "error in commit deadbeef: another failure\n",
+    )
+    with pytest.raises(ContractError, match="did not match the exact"):
+        _accept_known_git_fsck_diagnostic(
+            source,
+            tree_id,
+            mirror,
+            extra_diagnostic,
+            known_exception=policy,
+        )
+
+    wrong_payload_policy = dict(policy)
+    wrong_payload_policy["object_payload_sha256"] = "0" * 64
+    with pytest.raises(ContractError, match="object payload drifted"):
+        _accept_known_git_fsck_diagnostic(
+            source,
+            tree_id,
+            mirror,
+            fsck,
+            known_exception=wrong_payload_policy,
+        )
+
+
+def test_git_fsck_exception_receipt_is_pinned_and_tamper_evident() -> None:
+    policy = _KEYDB_ZERO_PADDED_FILEMODE
+    source = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": policy["expected_commit"],
+        "expected_tree": None,
+    }
+    snapshot = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": policy["expected_commit"],
+        "resolved_commit": policy["expected_commit"],
+        "tree": policy["checkout_tree"],
+        "fsck": _expected_git_fsck_exception_receipt(policy),
+    }
+
+    validate_git_fsck_snapshot(source, snapshot)
+
+    snapshot["tree"] = "0" * 40
+    with pytest.raises(ContractError, match="checkout tree drifted"):
+        validate_git_fsck_snapshot(source, snapshot)
+
+    snapshot["tree"] = policy["checkout_tree"]
+    snapshot["fsck"] = "ok"
+    with pytest.raises(ContractError, match="omitted known fsck diagnostic"):
+        validate_git_fsck_snapshot(source, snapshot)
+
+    snapshot["fsck"] = _expected_git_fsck_exception_receipt(policy)
+    snapshot["fsck"]["diagnostics"][0]["diagnostic"] += " tampered"
+    with pytest.raises(ContractError, match="evidence drifted"):
+        validate_git_fsck_snapshot(source, snapshot)
+
+
 def test_candidate_canonicalization_is_independent_of_emission_order(
     tmp_path: Path,
 ) -> None:
@@ -247,22 +397,59 @@ class _SqliteExactDedup:
         self.connection.close()
 
 
-def _reducer_fixture(tmp_path: Path):
+def _reducer_fixture(tmp_path: Path, *, with_projection: bool = False):
     source_sha = "3" * 64
-    repositories = [
-        {
-            "repo": "project",
-            "project_id": "owner/project",
-            "source": {
-                "kind": "immutable_gcs_tar",
-                "uri": "gs://snapshots/project.tar.zst",
-                "generation": "7",
-                "sha256": source_sha,
-                "archive_format": "tar.zst",
-                "strip_components": 1,
+    base_quarantine_sha256 = "6" * 64
+    source_root: Path | None = None
+    base_quarantine: Path | None = None
+    if with_projection:
+        payload = (
+            '<?xml version="1.0" encoding="utf-16"?>\r\n'
+            "<license><name>fixture</name></license>\r\n"
+        ).encode("utf-16")
+        source_root = tmp_path / "projection-checkout"
+        present = source_root / "sdk/present.cc"
+        present.parent.mkdir(parents=True)
+        present.write_bytes(payload)
+        base_quarantine = tmp_path / "base-quarantine.json"
+        entries = []
+        for relative_path in ("sdk/present.cc", "sdk/removed.cc"):
+            entries.append(
+                {
+                    "project_id": "owner/project",
+                    "relative_path": relative_path,
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "classification": "mislabeled_non_cpp",
+                    "detected_format": "xml_utf16le",
+                    "reason": "exact projection fixture",
+                }
+            )
+        atomic_write_json(
+            base_quarantine,
+            {
+                "schema": "cppmega.source_quarantine_manifest_v2",
+                "entries": entries,
+                "collections": [],
             },
+        )
+        base_quarantine_sha256 = sha256_file(base_quarantine)
+        source = {
+            "kind": "git_mirror",
+            "remote_url": "https://github.com/owner/project.git",
+            "expected_commit": "a" * 40,
+            "expected_tree": "b" * 40,
         }
-    ]
+    else:
+        source = {
+            "kind": "immutable_gcs_tar",
+            "uri": "gs://snapshots/project.tar.zst",
+            "generation": "7",
+            "sha256": source_sha,
+            "archive_format": "tar.zst",
+            "strip_components": 1,
+        }
+    repositories = [{"repo": "project", "project_id": "owner/project", "source": source}]
     tokenizer = tmp_path / "tokenizer.json"
     tokenizer.write_text("{}\n", encoding="utf-8")
     manifest = build_source_manifest(
@@ -272,7 +459,7 @@ def _reducer_fixture(tmp_path: Path):
         code_revision="4" * 40,
         indexer_sha256="5" * 64,
         tokenizer_sha256=sha256_file(tokenizer),
-        quarantine_manifest_sha256="6" * 64,
+        quarantine_manifest_sha256=base_quarantine_sha256,
     )
     manifest_file_sha = "7" * 64
     raw = tmp_path / "candidate.jsonl"
@@ -298,11 +485,60 @@ def _reducer_fixture(tmp_path: Path):
         f"{compression['sha256']}.jsonl.zst",
     )
     published = dict(store.publish_if_absent(compressed, artifact_uri))
+    if with_projection:
+        assert source_root is not None
+        assert base_quarantine is not None
+        source_snapshot = {
+            "kind": "git_mirror",
+            "remote_url": source["remote_url"],
+            "expected_commit": source["expected_commit"],
+            "resolved_commit": source["expected_commit"],
+            "tree": source["expected_tree"],
+            "head_ref": "refs/heads/main",
+            "head_commit": source["expected_commit"],
+            "refs": {"count": 1, "sha256": "8" * 64},
+            "objects": {
+                "count": 3,
+                "logical_bytes": 1,
+                "types": {"blob": 1, "commit": 1, "tree": 1},
+                "inventory_sha256": "9" * 64,
+            },
+            "gitlink_count": 0,
+            "fsck": "ok",
+        }
+        projected_manifest = tmp_path / "projected-quarantine.json"
+        projection_path = tmp_path / "source-quarantine-projection.json"
+        projection = build_pinned_tree_quarantine_projection(
+            base_manifest_path=base_quarantine,
+            source_root=source_root,
+            project_id="owner/project",
+            source_snapshot=source_snapshot,
+            projected_manifest_path=projected_manifest,
+            receipt_path=projection_path,
+        )
+        effective_quarantine_sha256 = str(projection["projected_manifest"]["sha256"])
+    else:
+        source_snapshot = {
+            "kind": "immutable_gcs_tar",
+            "object": {
+                "uri": repositories[0]["source"]["uri"],
+                "generation": repositories[0]["source"]["generation"],
+                "sha256": source_sha,
+                "size_bytes": 1,
+            },
+            "archive_format": "tar.zst",
+            "strip_components": 1,
+            "file_count": 1,
+            "extracted_bytes": 1,
+        }
+        projection_path = None
+        projection = None
+        effective_quarantine_sha256 = base_quarantine_sha256
     quarantine = {
         "schema": "cppmega.source_quarantine_receipt_v1",
         "project_id": "owner/project",
         "manifest_path": "/fixture/source_quarantine_manifest.json",
-        "manifest_sha256": "6" * 64,
+        "manifest_sha256": effective_quarantine_sha256,
         "manifest_entry_count": 0,
         "project_manifest_entry_count": 0,
         "candidate_count_before_quarantine": 3,
@@ -346,19 +582,7 @@ def _reducer_fixture(tmp_path: Path):
                 "assignment_sha256",
             )
         },
-        "source_snapshot": {
-            "kind": "immutable_gcs_tar",
-            "object": {
-                "uri": repositories[0]["source"]["uri"],
-                "generation": repositories[0]["source"]["generation"],
-                "sha256": source_sha,
-                "size_bytes": 1,
-            },
-            "archive_format": "tar.zst",
-            "strip_components": 1,
-            "file_count": 1,
-            "extracted_bytes": 1,
-        },
+        "source_snapshot": source_snapshot,
         "candidate": candidate,
         "artifact": {
             **published,
@@ -384,6 +608,24 @@ def _reducer_fixture(tmp_path: Path):
         },
         "training_ready": False,
     }
+    if with_projection:
+        assert projection_path is not None
+        assert projection is not None
+        projection_sha256 = sha256_file(projection_path)
+        projection_uri = gcs_join(
+            str(manifest["gcs_output_prefix"]),
+            "source-quarantine-projections",
+            str(manifest["manifest_sha256"]),
+            "00000-project",
+            f"{projection_sha256}.projection.json",
+        )
+        published_projection = dict(
+            store.publish_if_absent(projection_path, projection_uri)
+        )
+        receipt["quarantine_projection_artifact"] = {
+            **published_projection,
+            "sha256": projection_sha256,
+        }
     receipt_path = tmp_path / "worker-receipt.json"
     atomic_write_json(receipt_path, receipt)
     return manifest, manifest_file_sha, tokenizer, store, receipt_path
@@ -433,6 +675,33 @@ def test_reducer_requires_exact_receipt_coverage_and_dedups_before_pack(
     assert not (tmp_path / "reduced" / "global_dedup.sqlite-shm").exists()
     accepted = next((tmp_path / "reduced" / "accepted").glob("*.jsonl.gz"))
     assert accepted.is_file()
+
+
+def test_reducer_readbacks_and_binds_pinned_tree_quarantine_projection(
+    tmp_path: Path,
+) -> None:
+    manifest, manifest_file_sha, tokenizer, store, receipt_path = _reducer_fixture(
+        tmp_path,
+        with_projection=True,
+    )
+
+    receipt = reduce_source_candidates(
+        manifest,
+        [receipt_path],
+        manifest_file_sha256=manifest_file_sha,
+        output_root=tmp_path / "reduced",
+        scratch_root=tmp_path / "scratch",
+        tokenizer_path=tokenizer,
+        object_store=store,
+        dedup_factory=_SqliteExactDedup,
+        tokenizer_factory=lambda _path: _Tokenizer(),
+        pack=False,
+    )
+
+    binding = receipt["worker_receipts"][0]
+    assert binding["quarantine_projection_sha256"]
+    assert binding["quarantine_projection_generation"] == "1"
+    assert len(binding["quarantine_projection_summary_sha256"]) == 64
 
 
 def test_worker_receipt_tampering_is_rejected(tmp_path: Path) -> None:

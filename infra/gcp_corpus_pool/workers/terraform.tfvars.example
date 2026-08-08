@@ -6,6 +6,15 @@ run_id       = "source-pilot-20260803-002"
 worker_count = 4
 machine_type = "n2-standard-16"
 
+# One slot preserves the original smoke contract. For the bounded n2-standard-16
+# production profile use slots_per_worker = 2 with 6 parser workers and 24 GiB
+# per slot (the pilot payload must then be built with --slots-per-worker 2).
+slots_per_worker         = 1
+parse_workers_per_slot   = 8
+memory_limit_gb_per_slot = 48
+cpu_budget_vcpus         = 16
+memory_budget_gb          = 56
+
 # Two 375 GiB NVMe devices become one disposable 750 GiB RAID0 staging volume.
 local_ssd_count = 2
 
