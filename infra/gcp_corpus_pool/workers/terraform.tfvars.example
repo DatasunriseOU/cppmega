@@ -1,0 +1,22 @@
+project_id = "natural-bison-491019-t9"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+run_id       = "source-pilot-20260803-002"
+worker_count = 4
+machine_type = "n2-standard-16"
+
+# Two 375 GiB NVMe devices become one disposable 750 GiB RAID0 staging volume.
+local_ssd_count = 2
+
+# Verified v4 pilot chain. All four payloads are content-addressed; the startup
+# script also checks that the pinned runner embeds these exact three inputs.
+bootstrap_script_gcs_uri    = "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002/bootstrap/cf62ebff18126915061ad2505f3f4773bb4e1d5702d78e50e51291fea3f79cf4.source-worker-runner"
+bootstrap_script_sha256     = "cf62ebff18126915061ad2505f3f4773bb4e1d5702d78e50e51291fea3f79cf4"
+bootstrap_bundle_sha256     = "cf312c1216ce521eedd5412b619d6de238f9baced1e9933b549faf366cd2445d"
+bootstrap_overlay_sha256    = "c075c268145782c6956d4ac8d13b26a73e6ae7aedc815debfb4056b1e464d323"
+bootstrap_manifest_sha256   = "8b928428520138ab90700640af3f2811bc988e3de883442eed938f28eb054ae2"
+
+# Start on demand for the first validated run. Spot is appropriate only after
+# checkpoint/resume has been proven against forced termination.
+use_spot = false

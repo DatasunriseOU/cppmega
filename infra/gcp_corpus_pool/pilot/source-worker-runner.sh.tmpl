@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 027
+
+readonly BUNDLE_SHA256="__CPPMEGA_BUNDLE_SHA256__"
+readonly OVERLAY_SHA256="__CPPMEGA_OVERLAY_SHA256__"
+readonly MANIFEST_SHA256="__CPPMEGA_MANIFEST_SHA256__"
+readonly STAGE_ROOT="${CPPMEGA_STAGE_ROOT:?CPPMEGA_STAGE_ROOT is required}"
+readonly RUN_ROOT="${CPPMEGA_RUN_ROOT:?CPPMEGA_RUN_ROOT is required}"
+readonly WORKER_CONFIG="${CPPMEGA_WORKER_CONFIG:?CPPMEGA_WORKER_CONFIG is required}"
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+readonly BOOT_ID
+
+worker_name="$(jq -er '.worker_name' "$WORKER_CONFIG")"
+worker_index="$(jq -er '.worker_index' "$WORKER_CONFIG")"
+worker_id="$(printf 'worker-%04d' "$worker_index")"
+input_root="$STAGE_ROOT/input"
+work_root="$STAGE_ROOT/work"
+receipt_root="$STAGE_ROOT/receipts/source"
+repo_root="$work_root/cppmega"
+bundle="$input_root/cppmega.bundle"
+overlay="$input_root/distributed-data-prep.tar.zst"
+manifest="$input_root/source-manifest.json"
+
+failure_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.failed.json"
+
+gcs_create_if_absent() {
+  local source=$1
+  local uri=$2
+  local relative bucket object encoded token response status
+  relative=${uri#gs://}
+  bucket=${relative%%/*}
+  object=${relative#*/}
+  if [[ -z "$bucket" || -z "$object" || "$object" == "$relative" ]]; then
+    echo "invalid GCS object URI: $uri" >&2
+    return 2
+  fi
+  encoded="$(python3 -c \
+    'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+    "$object")"
+  token="$(gcloud auth print-access-token)"
+  response="$(mktemp)"
+  status="$(curl --silent --show-error --output "$response" \
+    --write-out '%{http_code}' --request POST \
+    --header "Authorization: Bearer $token" \
+    --header 'Content-Type: application/octet-stream' \
+    --upload-file "$source" \
+    "https://storage.googleapis.com/upload/storage/v1/b/$bucket/o?uploadType=media&name=$encoded&ifGenerationMatch=0")"
+  if [[ "$status" != 200 ]]; then
+    cat "$response" >&2
+    rm -f "$response"
+    return 1
+  fi
+  jq -e --arg expected "$object" '.name == $expected and (.generation | length > 0)' \
+    "$response" >/dev/null
+  rm -f "$response"
+}
+
+gcs_read_exact() {
+  local uri=$1
+  local destination=$2
+  local relative bucket object encoded token stage
+  relative=${uri#gs://}
+  bucket=${relative%%/*}
+  object=${relative#*/}
+  if [[ -z "$bucket" || -z "$object" || "$object" == "$relative" ]]; then
+    echo "invalid GCS object URI: $uri" >&2
+    return 2
+  fi
+  encoded="$(python3 -c \
+    'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+    "$object")"
+  token="$(gcloud auth print-access-token)"
+  stage="$destination.$BOOT_ID.tmp"
+  curl --fail-with-body --silent --show-error --location \
+    --header "Authorization: Bearer $token" \
+    --output "$stage" \
+    "https://storage.googleapis.com/download/storage/v1/b/$bucket/o/$encoded?alt=media"
+  mv -f "$stage" "$destination"
+}
+
+publish_failure() {
+  status=$?
+  trap - ERR
+  jq -n \
+    --arg boot_id "$BOOT_ID" \
+    --arg created_at "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg worker "$worker_id" \
+    --arg worker_name "$worker_name" \
+    --argjson exit_code "$status" \
+    '{schema_version: 1, state: "failed", worker: $worker,
+      worker_name: $worker_name, boot_id: $boot_id,
+      created_at: $created_at, exit_code: $exit_code}' \
+    >"$failure_receipt"
+  gcs_create_if_absent "$failure_receipt" \
+    "$RUN_ROOT/control/failed/$worker_name.$BOOT_ID.json" || true
+  exit "$status"
+}
+trap publish_failure ERR
+
+for command in curl git gcloud jq python3 sha256sum tar zstd; do
+  command -v "$command" >/dev/null
+done
+
+mkdir -p "$input_root" "$work_root" "$receipt_root"
+gcs_read_exact "$RUN_ROOT/bootstrap/$BUNDLE_SHA256.cppmega.bundle" "$bundle"
+gcs_read_exact "$RUN_ROOT/bootstrap/$OVERLAY_SHA256.distributed-data-prep.tar.zst" "$overlay"
+gcs_read_exact "$RUN_ROOT/manifests/$MANIFEST_SHA256.source-manifest.json" "$manifest"
+
+printf '%s  %s\n' "$BUNDLE_SHA256" "$bundle" | sha256sum --check --strict
+printf '%s  %s\n' "$OVERLAY_SHA256" "$overlay" | sha256sum --check --strict
+printf '%s  %s\n' "$MANIFEST_SHA256" "$manifest" | sha256sum --check --strict
+
+code_revision="$(jq -er '.code_revision' "$manifest")"
+git clone --no-checkout "$bundle" "$repo_root"
+git -C "$repo_root" bundle verify "$bundle"
+git -C "$repo_root" checkout --detach "$code_revision"
+zstd -dc -- "$overlay" | tar -xf - -C "$repo_root" --no-same-owner
+
+python3 "$repo_root/scripts/distributed_data_prep/source_worker.py" \
+  --manifest "$manifest" \
+  --worker "$worker_id" \
+  --scratch-root "$work_root/source" \
+  --receipt-root "$receipt_root" \
+  --repo-root "$repo_root" \
+  --python /usr/bin/python3 \
+  --parse-workers 8 \
+  --memory-limit-gb 48
+
+receipt_count="$(find "$receipt_root" -maxdepth 1 -type f -name '*.json' | wc -l)"
+if [[ "$receipt_count" -lt 1 ]]; then
+  echo "worker emitted no source receipt" >&2
+  exit 1
+fi
+
+completion_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.complete.json"
+jq -n \
+  --arg boot_id "$BOOT_ID" \
+  --arg created_at "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg manifest_sha256 "$MANIFEST_SHA256" \
+  --arg worker "$worker_id" \
+  --arg worker_name "$worker_name" \
+  --argjson receipt_count "$receipt_count" \
+  '{schema_version: 1, state: "complete", worker: $worker,
+    worker_name: $worker_name, boot_id: $boot_id, created_at: $created_at,
+    manifest_file_sha256: $manifest_sha256, receipt_count: $receipt_count}' \
+  >"$completion_receipt"
+gcs_create_if_absent "$completion_receipt" \
+  "$RUN_ROOT/control/completed/$worker_name.$BOOT_ID.json"
+
+trap - ERR

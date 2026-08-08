@@ -1,0 +1,68 @@
+{
+  "archive": {
+    "compression": "zstd",
+    "crc32c": null,
+    "generation": "1785782990336466",
+    "level": 19,
+    "md5_hash": null,
+    "sha256": "c51b34b142aa245b4c49cf267d1969129bb4e3c84d57664e234d74f5c1d3042c",
+    "size_bytes": 33884234,
+    "threads": 1,
+    "uri": "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002/reducer-artifacts/c88ace50fbde8a9aba775ae8b6b31e7526c7312a37f79aad6386b18b063f2209/c51b34b142aa245b4c49cf267d1969129bb4e3c84d57664e234d74f5c1d3042c.tar.zst"
+  },
+  "artifact_set_sha256": "c88ace50fbde8a9aba775ae8b6b31e7526c7312a37f79aad6386b18b063f2209",
+  "blocking_gates": [
+    "semantic_function_and_chunk_dedup_parity",
+    "packed_sidecar_validation",
+    "megatron_sealing"
+  ],
+  "manifest_file_sha256": "8b928428520138ab90700640af3f2811bc988e3de883442eed938f28eb054ae2",
+  "manifest_sha256": "83541fc49aedab353d1580695494618f8b7d344a69ef9424fa561586eda29b13",
+  "members": [
+    {
+      "path": "accepted/00000-fmt.jsonl.gz",
+      "sha256": "2c0d90fbaa0fd23979419ef60ed76daef3d1973ed5894ecd4c40c40b919614df",
+      "size_bytes": 8340777
+    },
+    {
+      "path": "accepted/00001-spdlog.jsonl.gz",
+      "sha256": "73b4b359b06aa120968313738fa75b0ee1f4a039e9d54fffe59f3c1f3a44fdfc",
+      "size_bytes": 2045028
+    },
+    {
+      "path": "accepted/00002-googletest.jsonl.gz",
+      "sha256": "31985d7becfb0912cbd7165306d3dca1cd303cb44d4ab82a722c3d8980ffb786",
+      "size_bytes": 5595969
+    },
+    {
+      "path": "accepted/00003-json.jsonl.gz",
+      "sha256": "919c387f0f962d7acb4162d47e07bf195718bcb47ff11064e8dd5103e997b373",
+      "size_bytes": 4656617
+    },
+    {
+      "path": "global_dedup.sqlite",
+      "sha256": "267964411f4e2bf11886a00c4f2059c57d94c71e23110a92772be61376d7fdf2",
+      "size_bytes": 50081792
+    },
+    {
+      "path": "global_dedup.sqlite-shm",
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+      "size_bytes": 32768
+    },
+    {
+      "path": "global_dedup.sqlite-wal",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    {
+      "path": "reducer_receipt.json",
+      "sha256": "6beb5fb016d53fbd9168fa3541db822afc9d1f14c06ad260495e2afaa094affe",
+      "size_bytes": 5013
+    }
+  ],
+  "reducer_receipt_sha256": "6beb5fb016d53fbd9168fa3541db822afc9d1f14c06ad260495e2afaa094affe",
+  "schema": "cppmega.source_reducer_smoke_publication_v1",
+  "status": "verified",
+  "training_ready": false,
+  "worker_receipts_sha256": "4ecdae82d069e643e8482324706b56d7dba8360055f147ce63a23dcabf87241d"
+}

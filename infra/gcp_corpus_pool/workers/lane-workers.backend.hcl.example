@@ -1,0 +1,2 @@
+bucket = "natural-bison-491019-t9-cppmega-corpus"
+prefix = "terraform/lane-workers"
