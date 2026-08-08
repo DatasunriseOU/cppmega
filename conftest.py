@@ -65,6 +65,7 @@ _PORTABLE_TEST_ALLOWLIST = frozenset(
         "tests/test_source_work_queue.py",
         "tests/test_distributed_source_prep.py",
         "tests/test_source_quarantine_projection.py",
+        "tests/test_packed_source_tokenizer_sidecar_integrity.py",
         "tests/test_token_budget_tokenizer_path.py",
         "tests/test_streaming_overlong_lossless.py",
         "tests/test_workflow_runner_policy.py",
