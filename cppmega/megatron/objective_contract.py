@@ -110,6 +110,10 @@ OBJECTIVE_CI_EXPORT_SCHEMAS = {
     "cppmega_ci_content_store_case5_export_v4",
 }
 OBJECTIVE_SOURCE_BUCKETS = (1024, 2048, 4096, 8192, 16384)
+SUPPORTED_OBJECTIVE_SOURCE_BUCKETS = (*OBJECTIVE_SOURCE_BUCKETS, 32768, 65536)
+OBJECTIVE_SOURCE_BUCKET_PROFILES = frozenset(
+    {OBJECTIVE_SOURCE_BUCKETS, SUPPORTED_OBJECTIVE_SOURCE_BUCKETS}
+)
 _BOUNDED_SOURCE_SAMPLING_MODE = (
     "deterministic_shard_row_group_record_batch_shuffle_v2"
 )
@@ -1262,6 +1266,16 @@ def _verify_two_pool_source_bindings(
         )
 
     manifest, _manifest_raw = bound["source_pool_manifest"]
+    raw_sequence_lengths = manifest.get("sequence_lengths")
+    sequence_lengths = (
+        tuple(raw_sequence_lengths)
+        if isinstance(raw_sequence_lengths, list)
+        and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in raw_sequence_lengths
+        )
+        else ()
+    )
     if set(manifest) != {
         "schema",
         "algorithm",
@@ -1273,7 +1287,7 @@ def _verify_two_pool_source_bindings(
     } or (
         manifest.get("schema") != OBJECTIVE_SOURCE_POOL_MANIFEST_SCHEMA
         or manifest.get("algorithm") != OBJECTIVE_SOURCE_POOL_SCHEDULE
-        or manifest.get("sequence_lengths") != list(OBJECTIVE_SOURCE_BUCKETS)
+        or sequence_lengths not in OBJECTIVE_SOURCE_BUCKET_PROFILES
     ):
         raise ValueError("source pool manifest contract is invalid")
     producer = _mapping(
@@ -1311,7 +1325,7 @@ def _verify_two_pool_source_bindings(
     if (
         set(primary) != {"files_by_sequence_length"}
         or set(files_by_length)
-        != {str(bucket) for bucket in OBJECTIVE_SOURCE_BUCKETS}
+        != {str(bucket) for bucket in sequence_lengths}
     ):
         raise ValueError("source pool manifest primary inventory is invalid")
     manifest_primary = {
@@ -1322,7 +1336,7 @@ def _verify_two_pool_source_bindings(
                 f"{bucket}"
             ),
         )
-        for bucket in OBJECTIVE_SOURCE_BUCKETS
+        for bucket in sequence_lengths
     }
     seed = _mapping(
         manifest.get("objective_seed"),
@@ -1335,6 +1349,10 @@ def _verify_two_pool_source_bindings(
     )
     pools = _mapping(snapshot.get("pools"), where="source_snapshot.pools")
     sequence_length = int(snapshot["sequence_length"])
+    if sequence_length not in sequence_lengths:
+        raise ValueError(
+            "source_snapshot.sequence_length is not in the source pool profile"
+        )
     snapshot_primary = _source_file_records(
         _mapping(
             pools.get("primary_ci"), where="source_snapshot.pools.primary_ci"

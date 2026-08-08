@@ -57,6 +57,8 @@ _PORTABLE_TEST_ALLOWLIST = frozenset(
         "tests/test_graphql_pr_stream.py",
         "tests/test_pr_completion_receipt.py",
         "tests/test_pr_export_batches.py",
+        "tests/test_pr_primary_membership.py",
+        "tests/test_gitlab_primary_membership_bridge.py",
         "tests/test_restore_megatron_bundle_from_nebius_s3.py",
         "tests/test_route_packed_source_docs.py",
         "tests/test_streaming_overlong_lossless.py",

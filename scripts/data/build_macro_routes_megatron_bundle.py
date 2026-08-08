@@ -90,6 +90,9 @@ from scripts.nanochat_data.route_packed_source_docs import (  # noqa: E402
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
+# CI CASE5 accepts only this audited extension of the default ladder.  The
+# default remains intentionally unchanged for existing live bundle workflows.
+SUPPORTED_CI_BUCKETS = (*DEFAULT_BUCKETS, 32768, 65536)
 BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v3"
 SNAPSHOT_PLAN_SCHEMA = "cppmega_macro_routes_snapshot_plan_v2"
 SOURCE_ROUTE_SET_SCHEMA = "cppmega_packed_source_primary_routes_v1"
@@ -557,10 +560,10 @@ def _load_content_store_ci_export_allowlist(
     case5 = manifest.get("case5_contract")
     if (
         not isinstance(case5, dict)
-        or case5.get("buckets") != list(DEFAULT_BUCKETS)
+        or case5.get("buckets") != list(buckets)
         or not buckets
         or len(set(buckets)) != len(buckets)
-        or any(bucket not in DEFAULT_BUCKETS for bucket in buckets)
+        or any(bucket not in SUPPORTED_CI_BUCKETS for bucket in buckets)
         or case5.get("overflow_rows") != 0
         or case5.get("parquet_shard_max_rows") != 512
         or case5.get("parquet_layout")

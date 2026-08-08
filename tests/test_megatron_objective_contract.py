@@ -308,11 +308,15 @@ def _source_artifact_digest(records: list[dict[str, object]]) -> str:
     ).hexdigest()
 
 
-def _source_pool_snapshot(record: dict[str, object]) -> dict[str, object]:
+def _source_pool_snapshot(
+    record: dict[str, object],
+    *,
+    sequence_length: int = 1024,
+) -> dict[str, object]:
     records = [record]
     return {
         "schema": "cppmega_objective_source_snapshot_v1",
-        "sequence_length": 1024,
+        "sequence_length": sequence_length,
         "file_count": 1,
         "row_count": 3,
         "files": records,
@@ -358,9 +362,14 @@ def _source_pool_snapshot(record: dict[str, object]) -> dict[str, object]:
 def _attach_two_pool_source_snapshot(
     tmp_path: Path,
     contract: dict[str, object],
+    *,
+    buckets: tuple[int, ...] = objective_contract.OBJECTIVE_SOURCE_BUCKETS,
+    sequence_length: int = 1024,
 ) -> None:
-    primary = _source_record("1024/ci.parquet")
-    seed = _source_record("commits/1024/seed.parquet")
+    if sequence_length not in buckets:
+        raise ValueError("fixture sequence length must be in buckets")
+    primary = _source_record(f"{sequence_length}/ci.parquet")
+    seed = _source_record(f"commits/{sequence_length}/seed.parquet")
     receipt = {
         "schema": "cppmega_ci_content_store_case5_export_v2",
         "status": "complete",
@@ -373,12 +382,12 @@ def _attach_two_pool_source_snapshot(
             if bucket == 1024
             else _source_record(f"{bucket}/ci.parquet")
         ]
-        for bucket in (1024, 2048, 4096, 8192, 16384)
+        for bucket in buckets
     }
     manifest = {
         "schema": "cppmega_ci_objective_pool_manifest_v1",
         "algorithm": "alternate_primary_seed_v1",
-        "sequence_lengths": [1024, 2048, 4096, 8192, 16384],
+        "sequence_lengths": list(buckets),
         "ci_export": {
             "path": "export_receipt.json",
             "sha256": hashlib.sha256(receipt_raw).hexdigest(),
@@ -402,7 +411,7 @@ def _attach_two_pool_source_snapshot(
     (tmp_path / "objective_source_pool_manifest.json").write_bytes(manifest_raw)
     contract["source_snapshot"] = {
         "schema": "cppmega_objective_source_snapshot_v2",
-        "sequence_length": 1024,
+        "sequence_length": sequence_length,
         "algorithm": "alternate_primary_seed_v1",
         "pool_order": ["primary_ci", "objective_seed"],
         "source_pool_manifest": {
@@ -416,8 +425,14 @@ def _attach_two_pool_source_snapshot(
             "sha256": hashlib.sha256(receipt_raw).hexdigest(),
         },
         "pools": {
-            "primary_ci": _source_pool_snapshot(primary),
-            "objective_seed": _source_pool_snapshot(seed),
+            "primary_ci": _source_pool_snapshot(
+                primary,
+                sequence_length=sequence_length,
+            ),
+            "objective_seed": _source_pool_snapshot(
+                seed,
+                sequence_length=sequence_length,
+            ),
         },
     }
     resume = contract["source_selection"]["resume"]  # type: ignore[index]
@@ -614,6 +629,24 @@ def test_objective_artifact_opens_bound_two_pool_source_snapshot(
     assert artifact.contract.payload["source_snapshot"]["schema"] == (
         "cppmega_objective_source_snapshot_v2"
     )
+
+
+def test_objective_artifact_opens_bound_large_context_source_snapshot(
+    tmp_path: Path,
+) -> None:
+    contract = _valid_contract()
+    _attach_two_pool_source_snapshot(
+        tmp_path,
+        contract,
+        buckets=objective_contract.SUPPORTED_OBJECTIVE_SOURCE_BUCKETS,
+        sequence_length=65536,
+    )
+
+    artifact = load_objective_materialization_artifact(
+        _write_materialization_artifact(tmp_path, contract=contract)
+    )
+
+    assert artifact.contract.payload["source_snapshot"]["sequence_length"] == 65536
 
 
 def test_objective_artifact_rejects_two_pool_manifest_byte_drift(

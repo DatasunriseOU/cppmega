@@ -18,6 +18,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     DEFAULT_BUCKETS,
     PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA,
     REPO_ROOT,
+    SUPPORTED_CI_BUCKETS,
     _inventory_regular_files_fail_closed,
     _load_content_store_ci_export_allowlist,
     _sha256,
@@ -31,6 +32,17 @@ _REPAIRED_SNAPSHOT_SCHEMA = "cppmega_repaired_parquet_snapshot_v1"
 _CASE5_SHARD_NAME = re.compile(
     r"ci-case5-(train|validation|test)-([0-9]+)-([0-9]{6})\.parquet"
 )
+
+
+def _validate_buckets(buckets: tuple[int, ...]) -> tuple[int, ...]:
+    """Accept only the immutable live or large-context CI bucket profile."""
+
+    if buckets not in {DEFAULT_BUCKETS, SUPPORTED_CI_BUCKETS}:
+        raise ValueError(
+            "objective source manifest requires exactly one of "
+            f"{DEFAULT_BUCKETS} or {SUPPORTED_CI_BUCKETS}"
+        )
+    return buckets
 
 
 def _stable_seed_record(path: Path, *, root: Path) -> dict[str, object]:
@@ -242,8 +254,7 @@ def build_source_pool_manifest(
     buckets: tuple[int, ...],
     producer: Mapping[str, object],
 ) -> dict[str, object]:
-    if buckets != DEFAULT_BUCKETS:
-        raise ValueError(f"objective source manifest requires {DEFAULT_BUCKETS}")
+    buckets = _validate_buckets(buckets)
     ci_root = ci_root.absolute()
     ci_receipt_path = ci_receipt_path.absolute()
     objective_seed_root = objective_seed_root.absolute()
@@ -387,10 +398,11 @@ def _producer_binding() -> dict[str, object]:
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
-    buckets = tuple(int(value) for value in raw.split(",") if value)
-    if buckets != DEFAULT_BUCKETS:
-        raise ValueError(f"--buckets must be exactly {DEFAULT_BUCKETS}")
-    return buckets
+    try:
+        buckets = tuple(int(value) for value in raw.split(",") if value)
+    except ValueError as exc:
+        raise ValueError("--buckets must be comma-separated integers") from exc
+    return _validate_buckets(buckets)
 
 
 def main() -> int:

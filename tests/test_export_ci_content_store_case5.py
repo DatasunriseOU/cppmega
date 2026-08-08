@@ -58,6 +58,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
 )
 from scripts.export_ci_content_store_case5 import (
     BUCKETS,
+    SUPPORTED_BUCKETS,
     EXPORT_SCHEMA,
     OCCURRENCE_SCHEMA,
     REPRESENTATIVE_LEDGER_SCHEMA,
@@ -69,6 +70,8 @@ from scripts.export_ci_content_store_case5 import (
     _bounded_utf8_sha256,
     _decode_provenance,
     _fragment_ranges,
+    _normalize_target_lengths,
+    _parse_target_lengths,
     _merge_bound_store_artifacts,
     _project_content,
     _publish_directory_no_replace,
@@ -1008,6 +1011,7 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
         tokenizer_json=TOKENIZER_JSON,
         output=output,
         require_current_parser_only=True,
+        target_lengths=(1024,),
     )
 
     assert receipt["schema"] == EXPORT_SCHEMA
@@ -3226,3 +3230,61 @@ def test_over_16k_mixed_domain_fragments_are_balanced_and_conserved(
         for row in pq.read_table(output / artifact["path"]).to_pylist():
             valid = int(row["valid_token_count"])
             assert not delimiter_ids.intersection(row["input_ids"][valid:])
+
+
+def test_explicit_large_context_ladder_preserves_32k_payload_and_64k_boundary(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "alpha  \n\n" * 5000
+    payload_ids = exact_tokenizer.encode_batch([text])[0]
+    assert BUCKETS[-1] < len(payload_ids) < 32768
+
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, _provenance(text))],
+    )
+    output = tmp_path / "large-context-case5"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+        target_lengths=SUPPORTED_BUCKETS,
+    )
+
+    assert receipt["case5_contract"]["buckets"] == list(SUPPORTED_BUCKETS)
+    assert receipt["validation"]["payload_conserved"] is True
+    fragments = _read_parquet_ledger(
+        output / receipt["fragment_ledger"]["artifact"],
+    )
+    assert len(fragments) == 1
+    assert fragments[0]["payload_tokens"] == len(payload_ids)
+    assert fragments[0]["bucket"] == 32768
+    parquet_artifacts = [
+        artifact
+        for artifact in receipt["artifacts"]
+        if artifact["kind"] == "case5_parquet"
+    ]
+    assert len(parquet_artifacts) == 1
+    assert parquet_artifacts[0]["bucket"] == 32768
+    row = pq.read_table(output / parquet_artifacts[0]["path"]).to_pylist()[0]
+    _assert_balanced_case5_row(row, bucket=32768)
+    assert row["input_ids"][1 : int(row["valid_token_count"])] == payload_ids
+
+    sixty_four_k_payload = [int(DomainKind.UNKNOWN)] * 65536
+    ranges = _fragment_ranges(sixty_four_k_payload, buckets=SUPPORTED_BUCKETS)
+    assert ranges == [(0, 65535), (65535, 65536)]
+    assert sum(end - start for start, end in ranges) == len(sixty_four_k_payload)
+    assert _smallest_bucket(65536, buckets=SUPPORTED_BUCKETS) == 65536
+
+
+def test_case5_large_context_ladder_is_explicit_and_canonical() -> None:
+    assert _parse_target_lengths("1024,2048,4096,8192,16384,32768,65536") == SUPPORTED_BUCKETS
+    assert _normalize_target_lengths(BUCKETS) == BUCKETS
+    with pytest.raises(ExportError, match="strictly ascending"):
+        _normalize_target_lengths((1024, 32768, 16384))
+    with pytest.raises(ExportError, match="unsupported CASE5 target lengths"):
+        _normalize_target_lengths((1024, 12288))

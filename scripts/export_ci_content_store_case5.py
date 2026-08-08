@@ -195,7 +195,10 @@ TRAINING_SCOPE_EXCLUSION_LEDGER_DOMAIN = (
 OPAQUE_INVALID_RATIO_PPM_THRESHOLD = 100_000
 OCCURRENCE_SCHEMA = "cppmega_ci_chunk_occurrence_v3"
 TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v2"
+# Keep the live CASE5 default stable.  Larger buckets are an explicit immutable
+# export profile so an in-progress 1K..16K run can never gain new output paths.
 BUCKETS = (1024, 2048, 4096, 8192, 16384)
+SUPPORTED_BUCKETS = (*BUCKETS, 32768, 65536)
 PARQUET_SHARD_ROWS = 512
 PARQUET_SHARD_TOKEN_BUDGET = 16_384
 PARQUET_ZSTD_LEVEL = 9
@@ -276,6 +279,48 @@ _EDGE_COLUMN_BY_FAMILY = {
 
 class ExportError(RuntimeError):
     """The frozen input or generated CASE5 output violated its contract."""
+
+
+def _normalize_target_lengths(values: Sequence[int]) -> tuple[int, ...]:
+    """Accept only the audited CASE5 packing ladder in ascending order."""
+
+    normalized: list[int] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise ExportError("CASE5 target lengths must be positive integers")
+        try:
+            length = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ExportError("CASE5 target lengths must be positive integers") from exc
+        if length <= 0:
+            raise ExportError("CASE5 target lengths must be positive integers")
+        normalized.append(length)
+    if not normalized:
+        raise ExportError("at least one CASE5 target length is required")
+    if normalized != sorted(normalized) or len(normalized) != len(set(normalized)):
+        raise ExportError(
+            "CASE5 target lengths must be unique and strictly ascending"
+        )
+    unsupported = sorted(set(normalized) - set(SUPPORTED_BUCKETS))
+    if unsupported:
+        raise ExportError(
+            "unsupported CASE5 target lengths: "
+            f"{unsupported}; supported={list(SUPPORTED_BUCKETS)}"
+        )
+    return tuple(normalized)
+
+
+def _parse_target_lengths(value: str) -> tuple[int, ...]:
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--target-lengths must be comma-separated integers"
+        ) from exc
+    try:
+        return _normalize_target_lengths(values)
+    except ExportError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _constrain_evidence_connection(
@@ -3533,9 +3578,14 @@ def _framed_length(domains: Sequence[int]) -> int:
     return 1 + len(domains) + 2 * runs
 
 
-def _fragment_ranges(domains: Sequence[int]) -> list[tuple[int, int]]:
+def _fragment_ranges(
+    domains: Sequence[int],
+    *,
+    buckets: Sequence[int] = BUCKETS,
+) -> list[tuple[int, int]]:
     if not domains:
         return []
+    max_bucket = int(buckets[-1])
     ranges: list[tuple[int, int]] = []
     start = 0
     while start < len(domains):
@@ -3547,7 +3597,7 @@ def _fragment_ranges(domains: Sequence[int]) -> list[tuple[int, int]]:
             added = 1
             if domain != int(DomainKind.UNKNOWN) and domain != previous:
                 added += 2
-            if framed_length + added > BUCKETS[-1]:
+            if framed_length + added > max_bucket:
                 break
             framed_length += added
             previous = domain
@@ -3559,11 +3609,17 @@ def _fragment_ranges(domains: Sequence[int]) -> list[tuple[int, int]]:
     return ranges
 
 
-def _smallest_bucket(token_count: int) -> int:
-    for bucket in BUCKETS:
+def _smallest_bucket(
+    token_count: int,
+    *,
+    buckets: Sequence[int] = BUCKETS,
+) -> int:
+    for bucket in buckets:
         if token_count <= bucket:
             return bucket
-    raise ExportError(f"framed fragment has {token_count} tokens (> {BUCKETS[-1]})")
+    raise ExportError(
+        f"framed fragment has {token_count} tokens (> {int(buckets[-1])})"
+    )
 
 
 def _frame_fragment(
@@ -4977,6 +5033,7 @@ def export_store(
     inventory_receipt: str | os.PathLike[str] | None = None,
     fetch_receipt: str | os.PathLike[str] | None = None,
     merge_receipt: str | os.PathLike[str] | None = None,
+    target_lengths: Sequence[int] = BUCKETS,
 ) -> dict[str, Any]:
     """Export one receipt-frozen store and atomically publish a CASE5 directory."""
 
@@ -5008,6 +5065,7 @@ def export_store(
         "sha256": _sha256_file(resolved_tokenizer),
     }
     output_path = raw_output.resolve()
+    buckets = _normalize_target_lengths(target_lengths)
     if completion_mode not in {
         COMPLETION_MODE_THRESHOLD,
         COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
@@ -6086,7 +6144,10 @@ def export_store(
                     != representative_content.token_sequence_sha256
                 ):
                     raise ExportError("offset projection changed exact payload tokens")
-                ranges = _fragment_ranges(projected.token_domain_ids)
+                ranges = _fragment_ranges(
+                    projected.token_domain_ids,
+                    buckets=buckets,
+                )
                 if not ranges:
                     raise ExportError("empty token sequence cannot produce CASE5 data")
                 split = _split_for_sequence(
@@ -6191,7 +6252,7 @@ def export_store(
                         ),
                     )
                     framed_tokens = len(doc.token_ids)
-                    bucket = _smallest_bucket(framed_tokens)
+                    bucket = _smallest_bucket(framed_tokens, buckets=buckets)
                     packed, overflow = pack_documents(
                         [doc],
                         target_length=bucket,
@@ -6642,7 +6703,7 @@ def export_store(
                     ),
                     "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
                     "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
-                    "buckets": list(BUCKETS),
+                    "buckets": list(buckets),
                     "parquet_shard_max_rows": PARQUET_SHARD_ROWS,
                     "parquet_compression": {
                         "codec": "zstd",
@@ -7019,6 +7080,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-json", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--target-lengths",
+        type=_parse_target_lengths,
+        default=BUCKETS,
+        metavar="CSV",
+        help=(
+            "Immutable CASE5 bucket ladder. Defaults to the live 1K..16K "
+            "profile; 32K/64K require an explicit new output root."
+        ),
+    )
+    parser.add_argument(
         "--source-binding-projection-from-parser-sha256",
         help=(
             "explicitly authorize the exact legacy parser SHA-256 whose "
@@ -7066,6 +7137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inventory_receipt=args.inventory_receipt,
             fetch_receipt=args.fetch_receipt,
             merge_receipt=args.merge_receipt,
+            target_lengths=args.target_lengths,
         )
     except (
         ExportError,
