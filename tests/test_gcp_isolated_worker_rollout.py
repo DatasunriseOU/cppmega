@@ -181,6 +181,52 @@ def test_plan_accepts_exact_target_creates_only() -> None:
     assert len(receipt["expected_managed_resources"]) == 5
 
 
+def test_plan_managed_membership_ignores_data_sources() -> None:
+    spec = _spec()
+    plan = _plan(spec=spec)
+    data_resource = {
+        "address": "data.google_compute_image.worker",
+        "mode": "data",
+        "type": "google_compute_image",
+        "name": "worker",
+        "values": {"name": "debian-12-bookworm-v20260727"},
+    }
+    child_data_resource = {
+        "address": "module.foundation.data.google_compute_network.corpus",
+        "mode": "data",
+        "type": "google_compute_network",
+        "name": "corpus",
+        "values": {"name": "cppmega-corpus"},
+    }
+    plan["planned_values"]["root_module"]["resources"].append(data_resource)
+    plan["planned_values"]["root_module"]["child_modules"] = [
+        {"resources": [child_data_resource]}
+    ]
+    plan["prior_state"] = {
+        "values": {
+            "root_module": {
+                "resources": [copy.deepcopy(data_resource)],
+                "child_modules": [{"resources": [copy.deepcopy(child_data_resource)]}],
+            }
+        }
+    }
+    plan["resource_changes"].append(
+        {
+            "address": data_resource["address"],
+            "mode": "data",
+            "change": {"actions": ["read"]},
+        }
+    )
+
+    receipt = validate_isolated_plan(plan, spec=spec)
+
+    assert len(receipt["expected_managed_resources"]) == 5
+    assert len(receipt["resource_actions"]) == 5
+    assert all(
+        not address.startswith("data.") for address in receipt["resource_actions"]
+    )
+
+
 def test_plan_rejects_delete_from_another_run_state() -> None:
     spec = _spec()
     plan = _plan(spec=spec)

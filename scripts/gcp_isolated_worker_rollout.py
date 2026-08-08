@@ -183,6 +183,23 @@ def _flatten_module_resources(
         )
 
 
+def _managed_module_resources(
+    module: Mapping[str, object], *, where: str
+) -> list[Mapping[str, object]]:
+    """Return only Terraform-managed resources from a module tree.
+
+    Terraform state and plan JSON may contain ``mode: data`` entries alongside
+    resources that Terraform manages.  Data sources are inputs, not pool
+    resources, so they must not affect isolated-state membership or counts.
+    """
+
+    return [
+        resource
+        for resource in _flatten_module_resources(module, where=where)
+        if resource.get("mode") == "managed"
+    ]
+
+
 def _resource_address(resource: Mapping[str, object], *, where: str) -> str:
     address = resource.get("address")
     if not isinstance(address, str) or not address:
@@ -271,13 +288,9 @@ def validate_isolated_plan(
 
     expected = _expected_resources(spec)
     planned = _plan_module(plan, key="planned_values")
-    planned_resources = [
-        resource
-        for resource in _flatten_module_resources(
-            planned, where="planned_values.root_module"
-        )
-        if resource.get("mode") == "managed"
-    ]
+    planned_resources = _managed_module_resources(
+        planned, where="planned_values.root_module"
+    )
     planned_addresses = {
         _validate_target_resource(
             resource,
@@ -298,15 +311,14 @@ def validate_isolated_plan(
 
     prior = _plan_module(plan, key="prior_state")
     for index, resource in enumerate(
-        _flatten_module_resources(prior, where="prior_state.values.root_module")
+        _managed_module_resources(prior, where="prior_state.values.root_module")
     ):
-        if resource.get("mode") == "managed":
-            _validate_target_resource(
-                resource,
-                spec=spec,
-                expected=expected,
-                where=f"prior managed resource[{index}]",
-            )
+        _validate_target_resource(
+            resource,
+            spec=spec,
+            expected=expected,
+            where=f"prior managed resource[{index}]",
+        )
 
     changes = _optional_list(plan.get("resource_changes", []), where="resource_changes")
     actions_by_address: dict[str, list[str]] = {}
