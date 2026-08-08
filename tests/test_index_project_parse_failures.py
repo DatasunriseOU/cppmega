@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Timer
 
 import pytest
-
 
 _VALGRIND_AUTOCONF_ARGS = [
     "-x",
@@ -132,6 +132,303 @@ def test_sequential_project_parse_fails_loud_instead_of_publishing(
     assert str(source) in message
     assert "TranslationUnitLoadError" in message
     assert "libclang parse failed" in message
+
+
+def test_sane_translation_unit_load_error_uses_bound_lossless_lexical_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    class FakeIndex:
+        @staticmethod
+        def create() -> object:
+            return object()
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
+    monkeypatch.setattr(index_project, "Index", FakeIndex)
+    source = tmp_path / "native_crash.cpp"
+    raw_source = (
+        "// libclang native-crash regression: π\n"
+        "int preserved_answer() { return 42; }\n"
+    ).encode()
+    source.write_bytes(raw_source)
+
+    class TranslationUnitLoadError(Exception):
+        pass
+
+    def crash_translation_unit(*_args, **_kwargs):
+        raise TranslationUnitLoadError("native parser crashed")
+
+    monkeypatch.setattr(
+        index_project,
+        "_load_translation_unit",
+        crash_translation_unit,
+    )
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+            str(tmp_path),
+            "fixture/native-clang-crash",
+        )
+    )
+
+    assert parsed_count == 1
+    assert payload["functions"] == []
+    assert payload["typedefs"] == []
+    assert payload["lexical_fallback_files"] == ["native_crash.cpp"]
+    assert payload["parse_recovery_records"] == [
+        {
+            "relative_path": "native_crash.cpp",
+            "trigger": "translation_unit_load_error",
+            "status": "lexical_fallback",
+            "fallback_mode": "lossless_cpp_lexical_v1",
+            "fallback_reason": "translation_unit_load_error",
+            "compile_args_status": "sane",
+            "compile_arg_count": 3,
+            "compile_args_sha256": payload["parse_recovery_records"][0][
+                "compile_args_sha256"
+            ],
+            "source_size_bytes": len(raw_source),
+            "source_char_count": len(raw_source.decode("utf-8")),
+            "source_sha256": hashlib.sha256(raw_source).hexdigest(),
+            "source_encoding": "utf-8",
+        }
+    ]
+    summary = index_project._parse_recovery_summary(
+        payload["parse_recovery_records"]
+    )
+    assert summary["status"] == "complete"
+    assert summary["recovered_file_count"] == 1
+    assert summary["semantic_recovered_file_count"] == 0
+    assert summary["lexical_fallback_file_count"] == 1
+    assert summary["lexical_fallback_source_bytes"] == len(raw_source)
+    assert summary["unresolved_file_count"] == 0
+
+
+def test_non_translation_unit_error_still_fails_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    class FakeIndex:
+        @staticmethod
+        def create() -> object:
+            return object()
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
+    monkeypatch.setattr(index_project, "Index", FakeIndex)
+    source = tmp_path / "unexpected_failure.cpp"
+    source.write_text("int preserved = 1;\n")
+    monkeypatch.setattr(
+        index_project,
+        "_load_translation_unit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("not a libclang TU load error")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="ValueError"):
+        index_project._parse_file_batch(
+            (
+                [str(source)],
+                {},
+                ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+                str(tmp_path),
+                "fixture/non-tu-error",
+            )
+        )
+
+
+def test_sane_translation_unit_load_error_emits_heuristic_source_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega.data.domain_schema import ParseConfidence
+    from tools.clang_indexer import index_project
+
+    class FakeIndex:
+        @staticmethod
+        def create() -> object:
+            return object()
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
+    monkeypatch.setattr(index_project, "Index", FakeIndex)
+    source = tmp_path / "driver.cpp"
+    raw_source = (
+        b"// Useful driver implementation must not be quarantined.\n"
+        b"int driver_value(int input) { return input + 7; }\n"
+    )
+    source.write_bytes(raw_source)
+
+    class TranslationUnitLoadError(Exception):
+        pass
+
+    monkeypatch.setattr(
+        index_project,
+        "_load_translation_unit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TranslationUnitLoadError("native parser crashed")
+        ),
+    )
+    documents = index_project.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="fixture/lossless-lexical-fallback",
+    )
+
+    assert len(documents) == 1
+    document = documents[0]
+    assert document["doc_type"] == "code"
+    assert document["filepath"] == "driver.cpp"
+    assert document["text"].encode("utf-8") == raw_source
+    assert document["cpp_parse_fallback"] == {
+        "schema": "cppmega.cpp_parse_fallback_v1",
+        "mode": "lossless_cpp_lexical_v1",
+        "reason": "translation_unit_load_error",
+        "compile_args_status": "sane",
+        "source_sha256": hashlib.sha256(raw_source).hexdigest(),
+        "source_encoding": "utf-8",
+        "source_span": document["source_span"],
+    }
+    assert document["source_span"] == {
+        "chunk_index": 0,
+        "byte_start": 0,
+        "byte_end": len(raw_source),
+        "char_start": 0,
+        "char_end": len(raw_source.decode("utf-8")),
+        "source_size_bytes": len(raw_source),
+        "chunk_limit_bytes": index_project.CPP_LEXICAL_FALLBACK_CHUNK_BYTES,
+        "split_reason": "eof",
+        "source_encoding": "utf-8",
+    }
+    text_len = len(document["text"])
+    assert document["domain_confidence_ids"] == [
+        int(ParseConfidence.HEURISTIC)
+    ] * text_len
+    for field in (
+        "call_edges",
+        "type_edges",
+        "build_edges",
+        "shell_edges",
+        "diagnostic_edges",
+    ):
+        assert document[field] == []
+    for field in (
+        "structure_ids",
+        "ast_depth",
+        "sibling_index",
+        "ast_node_type",
+        "symbol_ids",
+        "call_targets",
+        "type_refs",
+        "def_use",
+        "domain_scope_ids",
+    ):
+        assert document[field] == [0] * text_len
+    for field in (
+        "domain_ids",
+        "domain_role_ids",
+        "domain_entity_ids",
+        "domain_source_doc_ids",
+        "domain_source_identity_ids",
+    ):
+        assert len(document[field]) == text_len
+
+
+def test_cpp_lexical_fallback_chunks_preserve_utf8_bytes_and_spans(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    source = tmp_path / "utf8.cpp"
+    raw_source = (
+        "// αβγδεζηθ\n"
+        "int first = 1;\n"
+        "int second = 2;\n"
+    ).encode()
+    source.write_bytes(raw_source)
+
+    chunks = list(
+        index_project._iter_cpp_lexical_fallback_chunks(
+            str(source),
+            max_chunk_bytes=17,
+        )
+    )
+
+    assert b"".join(text.encode("utf-8") for text, _span in chunks) == raw_source
+    assert [span["chunk_index"] for _text, span in chunks] == list(
+        range(len(chunks))
+    )
+    assert [span["byte_start"] for _text, span in chunks] == [
+        0,
+        *[span["byte_end"] for _text, span in chunks[:-1]],
+    ]
+    assert chunks[-1][1]["byte_end"] == len(raw_source)
+
+
+def test_cpp_lexical_fallback_rejects_project_root_escape(tmp_path: Path) -> None:
+    from tools.clang_indexer import index_project
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    outside_source = tmp_path / "outside.cpp"
+    outside_source.write_text("int outside = 1;\n")
+
+    class TranslationUnitLoadError(Exception):
+        pass
+
+    with pytest.raises(RuntimeError, match="escapes the project root"):
+        index_project._record_cpp_lexical_fallback(
+            str(outside_source),
+            ["-x", "c++", "-std=c++17"],
+            str(project_dir),
+            TranslationUnitLoadError("native parser crashed"),
+            [],
+        )
+
+
+def test_cpp_lexical_fallback_rechecks_compile_args_digest(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    source = tmp_path / "changed_context.cpp"
+    source.write_text("int changed_context = 1;\n")
+
+    class TranslationUnitLoadError(Exception):
+        pass
+
+    parse_args = index_project._resolve_file_args(
+        str(source),
+        {},
+        ["-std=c++17"],
+    )
+    records: list[dict[str, object]] = []
+    relative_path = index_project._record_cpp_lexical_fallback(
+        str(source),
+        parse_args,
+        str(tmp_path),
+        TranslationUnitLoadError("native parser crashed"),
+        records,
+    )
+
+    assert relative_path == "changed_context.cpp"
+    with pytest.raises(RuntimeError, match="compile args changed"):
+        index_project.emit_cpp_lexical_fallback_documents(
+            [relative_path],
+            index=index_project.ProjectIndex(),
+            project_dir=str(tmp_path),
+            project_id="fixture/compile-args-drift",
+            compile_db=None,
+            default_args=["-std=c++20"],
+            default_build_info=None,
+            parse_recovery_records=records,
+            enriched=True,
+        )
 
 
 def test_cp1252_source_round_trips_without_clang_token_utf8_decode(

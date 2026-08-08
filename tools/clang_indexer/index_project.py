@@ -4894,6 +4894,19 @@ def _translation_unit_load_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "TranslationUnitLoadError"
 
 
+def _has_translation_unit_load_error(exc: BaseException) -> bool:
+    """Return true only when a chained failure came from libclang TU loading."""
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _translation_unit_load_error(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _load_translation_unit(
     filepath: str,
     index: Index,
@@ -10454,6 +10467,346 @@ def _resolve_file_args(filepath, compile_db, default_args):
     return _adapt_args_for_file(args, filepath)
 
 
+CPP_LEXICAL_FALLBACK_CHUNK_BYTES = 500_000
+
+
+def _cpp_lexical_fallback_compile_args_sha256(
+    compile_args: Sequence[str],
+) -> str:
+    encoded_args = json.dumps(
+        list(map(str, compile_args)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded_args).hexdigest()
+
+
+def _project_local_cpp_lexical_fallback_path(
+    project_dir: str,
+    relative_path: str,
+) -> str:
+    """Resolve one fallback source and reject root/symlink escapes."""
+
+    canonical_path = _canonical_project_path(relative_path)
+    project_root = os.path.realpath(project_dir)
+    absolute_path = os.path.realpath(os.path.join(project_root, canonical_path))
+    try:
+        is_project_local = (
+            not os.path.isabs(canonical_path)
+            and "://" not in canonical_path
+            and os.path.commonpath((project_root, absolute_path)) == project_root
+        )
+    except ValueError:
+        is_project_local = False
+    if not is_project_local:
+        raise RuntimeError(
+            "C/C++ lexical fallback path escapes the project root: "
+            f"{relative_path}"
+        )
+    return absolute_path
+
+
+def _record_cpp_lexical_fallback(
+    filepath: str,
+    compile_args: Sequence[str],
+    project_dir: str,
+    parse_error: BaseException,
+    parse_recovery_records: list[dict[str, object]],
+) -> str | None:
+    """Authorize a lossless lexical fallback for one native libclang load error.
+
+    Deliberately narrow: a bad/ambiguous compiler context must still fail loud,
+    as must every exception other than TranslationUnitLoadError.  The returned
+    path is project-relative and the receipt binds the exact source bytes that
+    the later lexical emitter must reproduce.
+    """
+
+    normalized_args = list(map(str, compile_args))
+    if (
+        not _has_translation_unit_load_error(parse_error)
+        or not _is_sane_compile_args(normalized_args)
+    ):
+        return None
+
+    relative_path = _canonical_project_path(
+        Path(os.path.relpath(filepath, project_dir)).as_posix()
+    )
+    absolute_path = _project_local_cpp_lexical_fallback_path(
+        project_dir,
+        relative_path,
+    )
+    source, source_bytes, source_encoding = _read_source_file(absolute_path)
+    fallback_fields: dict[str, object] = {
+        "status": "lexical_fallback",
+        "fallback_mode": "lossless_cpp_lexical_v1",
+        "fallback_reason": "translation_unit_load_error",
+        "compile_args_status": "sane",
+        "compile_arg_count": len(normalized_args),
+        "compile_args_sha256": _cpp_lexical_fallback_compile_args_sha256(
+            normalized_args
+        ),
+        "source_size_bytes": len(source_bytes),
+        "source_char_count": len(source),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_encoding": source_encoding,
+    }
+    existing = next(
+        (
+            record
+            for record in reversed(parse_recovery_records)
+            if record.get("relative_path") == relative_path
+            and record.get("status") == "unresolved"
+        ),
+        None,
+    )
+    if existing is None:
+        parse_recovery_records.append(
+            {
+                "relative_path": relative_path,
+                "trigger": "translation_unit_load_error",
+                **fallback_fields,
+            }
+        )
+    else:
+        existing.update(fallback_fields)
+    print(
+        "  Parse lexical fallback: "
+        f"{relative_path} bytes={len(source_bytes)} "
+        f"sha256={fallback_fields['source_sha256']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return relative_path
+
+
+def _iter_cpp_lexical_fallback_chunks(
+    filepath: str,
+    *,
+    max_chunk_bytes: int = CPP_LEXICAL_FALLBACK_CHUNK_BYTES,
+) -> Iterator[tuple[str, dict[str, int | str]]]:
+    """Yield byte-exact decoded C/C++ chunks, preferring line boundaries."""
+
+    if max_chunk_bytes < 4:
+        raise ValueError(
+            f"max_chunk_bytes must be at least 4, got {max_chunk_bytes}"
+        )
+    _source, source_bytes, source_encoding = _read_source_file(filepath)
+    if not source_bytes:
+        return
+
+    byte_start = 0
+    char_start = 0
+    chunk_index = 0
+    while byte_start < len(source_bytes):
+        byte_end = min(byte_start + max_chunk_bytes, len(source_bytes))
+        split_reason = "eof" if byte_end == len(source_bytes) else "byte_limit"
+        if byte_end < len(source_bytes):
+            newline = source_bytes.rfind(b"\n", byte_start, byte_end)
+            if newline >= byte_start:
+                byte_end = newline + 1
+                split_reason = "line_boundary"
+
+        while byte_end > byte_start:
+            try:
+                text = source_bytes[byte_start:byte_end].decode(
+                    source_encoding,
+                    errors="strict",
+                )
+            except UnicodeDecodeError:
+                byte_end -= 1
+                split_reason = "character_boundary"
+                continue
+            break
+        else:
+            raise ValueError(
+                "cannot find a decodable C/C++ lexical fallback boundary: "
+                f"{filepath} byte_start={byte_start} encoding={source_encoding}"
+            )
+
+        if text.encode(source_encoding, errors="strict") != source_bytes[
+            byte_start:byte_end
+        ]:
+            raise ValueError(
+                f"C/C++ lexical fallback chunk did not round-trip: {filepath}"
+            )
+        char_end = char_start + len(text)
+        span: dict[str, int | str] = {
+            "chunk_index": chunk_index,
+            "byte_start": byte_start,
+            "byte_end": byte_end,
+            "char_start": char_start,
+            "char_end": char_end,
+            "source_size_bytes": len(source_bytes),
+            "chunk_limit_bytes": max_chunk_bytes,
+            "split_reason": split_reason,
+            "source_encoding": source_encoding,
+        }
+        yield text, span
+        byte_start = byte_end
+        char_start = char_end
+        chunk_index += 1
+
+
+def emit_cpp_lexical_fallback_documents(
+    relative_paths: Iterable[str],
+    *,
+    index: ProjectIndex,
+    project_dir: str,
+    project_id: str,
+    compile_db: dict | None,
+    default_args: list[str] | None,
+    default_build_info: dict | None,
+    parse_recovery_records: Sequence[dict[str, object]],
+    enriched: bool,
+    emit_doc: Callable[[str | dict[str, object]], None] | None = None,
+) -> list[str | dict[str, object]]:
+    """Emit every byte of each authorized lexical fallback source exactly once."""
+
+    documents: list[str | dict[str, object]] = []
+    stable_project_id = require_project_identity(
+        project_id,
+        source="emit_cpp_lexical_fallback_documents",
+    )
+    from cppmega.data.domain_schema import ParseConfidence
+
+    for relative_path in sorted(set(map(str, relative_paths))):
+        canonical_path = _canonical_project_path(relative_path)
+        absolute_path = _project_local_cpp_lexical_fallback_path(
+            project_dir,
+            canonical_path,
+        )
+        source, source_bytes, source_encoding = _read_source_file(absolute_path)
+        record = next(
+            (
+                candidate
+                for candidate in parse_recovery_records
+                if candidate.get("relative_path") == canonical_path
+                and candidate.get("status") == "lexical_fallback"
+            ),
+            None,
+        )
+        if record is None:
+            raise RuntimeError(
+                "C/C++ lexical fallback emission lacks an authorization record: "
+                f"{canonical_path}"
+            )
+        expected_binding = (
+            int(record.get("source_size_bytes") or -1),
+            int(record.get("source_char_count") or -1),
+            str(record.get("source_sha256") or ""),
+            str(record.get("source_encoding") or ""),
+        )
+        actual_binding = (
+            len(source_bytes),
+            len(source),
+            hashlib.sha256(source_bytes).hexdigest(),
+            source_encoding,
+        )
+        if actual_binding != expected_binding:
+            raise RuntimeError(
+                "C/C++ lexical fallback source changed after parse failure: "
+                f"{canonical_path} expected={expected_binding} actual={actual_binding}"
+            )
+
+        compile_args, build_info = _compile_context_for_rel_file(
+            canonical_path,
+            project_dir=project_dir,
+            compile_db=compile_db,
+            default_args=default_args,
+            default_build_info=default_build_info,
+        )
+        expected_compile_args_binding = str(
+            record.get("compile_args_sha256") or ""
+        )
+        actual_compile_args_binding = (
+            _cpp_lexical_fallback_compile_args_sha256(compile_args)
+        )
+        if (
+            record.get("compile_args_status") != "sane"
+            or actual_compile_args_binding != expected_compile_args_binding
+        ):
+            raise RuntimeError(
+                "C/C++ lexical fallback compile args changed after parse failure: "
+                f"{canonical_path} expected={expected_compile_args_binding} "
+                f"actual={actual_compile_args_binding}"
+            )
+        emitted_bytes = bytearray()
+        chunk_count = 0
+        for text, source_span in _iter_cpp_lexical_fallback_chunks(absolute_path):
+            emitted_bytes.extend(text.encode(source_encoding, errors="strict"))
+            if enriched:
+                chunk_name = os.path.basename(canonical_path)
+                if source_span["chunk_index"]:
+                    chunk_name += f"#{source_span['chunk_index']}"
+                part: PartInfo = (
+                    text,
+                    0,
+                    0,
+                    chunk_name,
+                    None,
+                    None,
+                    None,
+                    None,
+                    canonical_path,
+                )
+                document = build_enriched_doc(
+                    [part],
+                    index,
+                    filepath=canonical_path,
+                    compile_args=compile_args,
+                    build_info=build_info,
+                    project_id=stable_project_id,
+                )
+                document["source_span"] = dict(source_span)
+                document["cpp_parse_fallback"] = {
+                    "schema": "cppmega.cpp_parse_fallback_v1",
+                    "mode": "lossless_cpp_lexical_v1",
+                    "reason": "translation_unit_load_error",
+                    "compile_args_status": "sane",
+                    "source_sha256": actual_binding[2],
+                    "source_encoding": source_encoding,
+                    "source_span": dict(source_span),
+                }
+                document["domain_confidence_ids"] = [
+                    int(ParseConfidence.HEURISTIC)
+                ] * len(text)
+                parse_info = cast(
+                    dict[str, object],
+                    document["domain_parse_info"],
+                )
+                parse_info.update(
+                    {
+                        "parser": "cpp-lexical",
+                        "fallback_reason": "translation_unit_load_error",
+                        "source_span": dict(source_span),
+                    }
+                )
+                output: str | dict[str, object] = document
+            else:
+                output = text
+            if emit_doc is None:
+                documents.append(output)
+            else:
+                emit_doc(output)
+            chunk_count += 1
+
+        if bytes(emitted_bytes) != source_bytes:
+            raise RuntimeError(
+                f"C/C++ lexical fallback emission was not lossless: {canonical_path}"
+            )
+        if source and not chunk_count:
+            raise RuntimeError(
+                f"C/C++ lexical fallback emitted no chunks: {canonical_path}"
+            )
+        print(
+            "  Emitted lossless C/C++ lexical fallback: "
+            f"{canonical_path} chunks={chunk_count} bytes={len(source_bytes)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return documents
+
+
 def _parse_file_batch(args_tuple):
     """Worker function for parallel parsing. Each worker creates its own Index."""
     filepaths, compile_db, default_args, project_dir, project_id = args_tuple
@@ -10464,6 +10817,7 @@ def _parse_file_batch(args_tuple):
     type_results: list[dict] = []
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
+    lexical_fallback_files: list[str] = []
     last_heartbeat = time.monotonic()
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
@@ -10485,12 +10839,21 @@ def _parse_file_batch(args_tuple):
         except SymbolIdentityError:
             raise
         except Exception as exc:
-            cause = exc.__cause__ or exc
-            context = f"; {exc}" if cause is not exc else ""
-            raise RuntimeError(
-                f"C/C++ parse failed for {filepath}: "
-                f"{type(cause).__name__}: {cause}{context}"
-            ) from exc
+            fallback_path = _record_cpp_lexical_fallback(
+                filepath,
+                args,
+                project_dir,
+                exc,
+                parse_recovery_records,
+            )
+            if fallback_path is None:
+                cause = exc.__cause__ or exc
+                context = f"; {exc}" if cause is not exc else ""
+                raise RuntimeError(
+                    f"C/C++ parse failed for {filepath}: "
+                    f"{type(cause).__name__}: {cause}{context}"
+                ) from exc
+            lexical_fallback_files.append(fallback_path)
         now = time.monotonic()
         if (
             idx == len(filepaths)
@@ -10508,6 +10871,7 @@ def _parse_file_batch(args_tuple):
         "typedefs": type_results,
         "external_reference_omissions": external_reference_omissions,
         "parse_recovery_records": parse_recovery_records,
+        "lexical_fallback_files": lexical_fallback_files,
     }, len(filepaths)
 
 
@@ -10677,9 +11041,13 @@ def _parse_recovery_summary(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    recovered_count = sum(
+    semantic_recovered_count = sum(
         record.get("status") == "recovered" for record in normalized
     )
+    lexical_fallback_count = sum(
+        record.get("status") == "lexical_fallback" for record in normalized
+    )
+    recovered_count = semantic_recovered_count + lexical_fallback_count
     unresolved_count = sum(
         record.get("status") == "unresolved" for record in normalized
     )
@@ -10692,10 +11060,18 @@ def _parse_recovery_summary(
         ),
         "policy": (
             "retry_missing_includes_with_header_matched_project_local_dirs_"
-            "only_without_compile_command"
+            "only_without_compile_command_then_lossless_cpp_lexical_fallback_"
+            "only_for_translation_unit_load_error_with_sane_compile_args"
         ),
         "attempted_file_count": len(normalized),
         "recovered_file_count": recovered_count,
+        "semantic_recovered_file_count": semantic_recovered_count,
+        "lexical_fallback_file_count": lexical_fallback_count,
+        "lexical_fallback_source_bytes": sum(
+            int(record.get("source_size_bytes") or 0)
+            for record in normalized
+            if record.get("status") == "lexical_fallback"
+        ),
         "unresolved_file_count": unresolved_count,
         "records_sha256": hashlib.sha256(encoded).hexdigest(),
         "records": normalized,
@@ -10765,6 +11141,7 @@ def process_project(
     quarantined_paths: set[str] = set()
     external_reference_omissions: ExternalReferenceOmissions = {}
     parse_recovery_records: list[dict[str, object]] = []
+    lexical_fallback_files: set[str] = set()
 
     invalid_domain_paths: set[str] = set()
 
@@ -10931,6 +11308,7 @@ def process_project(
                         external_reference_omissions.get(key, 0) + int(count)
                     )
                 parse_recovery_records.extend(payload["parse_recovery_records"])
+                lexical_fallback_files.update(payload["lexical_fallback_files"])
                 total_parsed += parsed_count
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
@@ -10968,16 +11346,25 @@ def process_project(
                     index_obj.add_function(func)
                 for td in typedefs:
                     index_obj.add_typedef(td)
-                parsed += 1
             except SymbolIdentityError:
                 raise
             except Exception as exc:
-                cause = exc.__cause__ or exc
-                context = f"; {exc}" if cause is not exc else ""
-                raise RuntimeError(
-                    f"C/C++ parse failed for {filepath}: "
-                    f"{type(cause).__name__}: {cause}{context}"
-                ) from exc
+                fallback_path = _record_cpp_lexical_fallback(
+                    filepath,
+                    args,
+                    project_dir,
+                    exc,
+                    parse_recovery_records,
+                )
+                if fallback_path is None:
+                    cause = exc.__cause__ or exc
+                    context = f"; {exc}" if cause is not exc else ""
+                    raise RuntimeError(
+                        f"C/C++ parse failed for {filepath}: "
+                        f"{type(cause).__name__}: {cause}{context}"
+                    ) from exc
+                lexical_fallback_files.add(fallback_path)
+            parsed += 1
             processed = parsed
             now = time.monotonic()
             if (
@@ -11076,6 +11463,20 @@ def process_project(
             emit_doc=_emit_counted if emit_doc is not None else None,
             memory_limit_gb=memory_limit_gb,
         )
+        fallback_documents = emit_cpp_lexical_fallback_documents(
+            lexical_fallback_files,
+            index=index_obj,
+            project_dir=project_dir,
+            project_id=stable_project_id,
+            compile_db=compile_db,
+            default_args=default_args,
+            default_build_info=default_build_info,
+            parse_recovery_records=parse_recovery_records,
+            enriched=enriched,
+            emit_doc=_emit_counted if emit_doc is not None else None,
+        )
+        if emit_doc is None:
+            documents.extend(fallback_documents)
     check_memory_limit(memory_limit_gb, label="index_project")
     code_doc_count = emitted_docs if emit_doc is not None else len(documents)
     print(f"  Generated {code_doc_count} code training documents", file=sys.stderr)
