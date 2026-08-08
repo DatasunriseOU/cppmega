@@ -42,9 +42,12 @@ RELATIVE_CLICKHOUSE_BINARY_SQL = "tests/queries/0_stateless/binary_fixture.sql"
 RELATIVE_GCC_PR119001 = "gcc/testsuite/gcc.dg/pr119001-1.c"
 RELATIVE_NUL_FF_BLOB = "unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
 RELATIVE_TRUNCATED_UTF32BE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake"
+RELATIVE_TRUNCATED_UTF32LE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake"
 RELATIVE_BIG5_SHELL_HEREDOC = (
     "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1"
 )
+RELATIVE_AUTOTOOLS_BIG5_SHELL_HEREDOC = "gettext-tools/tests/msgconv-1"
+RELATIVE_GIT_SHORTLOG_INVALID_UTF8 = "t/t4201-shortlog.sh"
 
 
 def _xml_bytes() -> bytes:
@@ -237,6 +240,10 @@ def _truncated_utf32be_bom_bytes() -> bytes:
     return b"\x00\x00\xfe"
 
 
+def _truncated_utf32le_bom_bytes() -> bytes:
+    return b"\xff\xfe\x00"
+
+
 def _big5_shell_heredoc_bytes() -> bytes:
     big5_translation = bytes.fromhex(
         "a6b9a55cafe0bbddad6eabeaa66eabfca977a8e2add3bfe9a44ac0c9"
@@ -297,6 +304,55 @@ def _big5_shell_heredoc_bytes() -> bytes:
         + b"result=$?\n\n"
         + b"rm -fr $tmpfiles\n\n"
         + b"exit $result\n"
+    )
+
+
+def _autotools_big5_shell_heredoc_bytes() -> bytes:
+    legacy = _big5_shell_heredoc_bytes()
+    po_marker = b"cat <<\\EOF > mco-test1.po\n"
+    ok_marker = b"cat <<\\EOF > mco-test1.ok\n"
+    po_start = legacy.index(po_marker) + len(po_marker)
+    po_end = legacy.index(b"\nEOF\n", po_start)
+    ok_start = legacy.index(ok_marker) + len(ok_marker)
+    ok_end = legacy.index(b"\nEOF\n", ok_start)
+    po_body = legacy[po_start:po_end]
+    ok_body = legacy[ok_start:ok_end]
+    return (
+        b"#! /bin/sh\n"
+        b'. "${srcdir=.}/init.sh"; path_prepend_ . ../src\n\n'
+        b"# Test conversion from BIG5 to UTF-8.\n\n"
+        b"cat <<\\EOF > mco-test1.po\n"
+        + po_body
+        + b"\nEOF\n\n"
+        + b": ${MSGCONV=msgconv}\n"
+        + b"${MSGCONV} --to-code=UTF-8 -o mco-test1.out mco-test1.po || Exit 1\n\n"
+        + b"cat <<\\EOF > mco-test1.ok\n"
+        + ok_body
+        + b"\nEOF\n\n"
+        + b": ${DIFF=diff}\n"
+        + b"# Redirect stdout, so as not to fill the user's screen with "
+        + b"non-ASCII bytes.\n"
+        + b"${DIFF} mco-test1.ok mco-test1.out >/dev/null\n"
+        + b"result=$?\n\n"
+        + b"exit $result\n"
+    )
+
+
+def _git_shortlog_invalid_utf8_bytes() -> bytes:
+    valid = b"\xf0\x9d\x84\x9e"
+    malformed = b"\xf8\x9d\x84\x9e"
+    return (
+        b"#!/bin/sh\n"
+        b"test_description='git shortlog\n'\n"
+        b"# when replacing all is by treble clefs.\n"
+        b'tr 1234 "\\360\\235\\204\\236"\n'
+        + valid * 8
+        + b"\n# now fsck up the utf8\n"
+        + b"git config i18n.commitencoding non-utf-8\n"
+        + b'tr 1234 "\\370\\235\\204\\236"\n'
+        + b"# NOTE: do not quote this heredoc, Dash 0.5.13 has a bug with heredocs\n"
+        + malformed * 8
+        + b"\n"
     )
 
 
@@ -643,6 +699,50 @@ def test_truncated_utf32be_bom_quarantine_rejects_other_payload(
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
+def test_exact_quarantine_filters_truncated_utf32le_bom(tmp_path: Path) -> None:
+    payload = _truncated_utf32le_bom_bytes()
+    candidate = tmp_path / RELATIVE_TRUNCATED_UTF32LE_BOM
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="truncated_utf32le_bom",
+        relative_path=RELATIVE_TRUNCATED_UTF32LE_BOM,
+        reason="truncated UTF-32LE BOM fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["detected_format"] == "truncated_utf32le_bom"
+
+
+def test_truncated_utf32le_bom_quarantine_rejects_other_payload(
+    tmp_path: Path,
+) -> None:
+    payload = b"\xff\xfe\x01"
+    candidate = tmp_path / RELATIVE_TRUNCATED_UTF32LE_BOM
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="truncated_utf32le_bom",
+        relative_path=RELATIVE_TRUNCATED_UTF32LE_BOM,
+        reason="forged truncated UTF-32LE BOM fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="exactly the three-byte"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_exact_quarantine_filters_big5_shell_heredoc(tmp_path: Path) -> None:
     payload = _big5_shell_heredoc_bytes()
     candidate = tmp_path / RELATIVE_BIG5_SHELL_HEREDOC
@@ -684,6 +784,104 @@ def test_big5_shell_heredoc_quarantine_rejects_changed_message(
 
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
     with pytest.raises(SourceQuarantineError, match="conversion and cleanup"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_exact_quarantine_filters_autotools_big5_shell_heredoc(
+    tmp_path: Path,
+) -> None:
+    payload = _autotools_big5_shell_heredoc_bytes()
+    candidate = tmp_path / RELATIVE_AUTOTOOLS_BIG5_SHELL_HEREDOC
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="big5_shell_heredoc",
+        relative_path=RELATIVE_AUTOTOOLS_BIG5_SHELL_HEREDOC,
+        reason="modern BIG5 shell heredoc fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["detected_format"] == "big5_shell_heredoc"
+
+
+def test_autotools_big5_shell_heredoc_rejects_changed_wrapper(
+    tmp_path: Path,
+) -> None:
+    payload = _autotools_big5_shell_heredoc_bytes().replace(
+        b"|| Exit 1", b"|| exit 1"
+    )
+    candidate = tmp_path / RELATIVE_AUTOTOOLS_BIG5_SHELL_HEREDOC
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="big5_shell_heredoc",
+        relative_path=RELATIVE_AUTOTOOLS_BIG5_SHELL_HEREDOC,
+        reason="forged modern BIG5 shell heredoc fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="conversion and cleanup"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_exact_quarantine_filters_git_shortlog_invalid_utf8(
+    tmp_path: Path,
+) -> None:
+    payload = _git_shortlog_invalid_utf8_bytes()
+    candidate = tmp_path / RELATIVE_GIT_SHORTLOG_INVALID_UTF8
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_encoding_regression_fixture",
+        detected_format="git_shortlog_invalid_utf8_shell",
+        relative_path=RELATIVE_GIT_SHORTLOG_INVALID_UTF8,
+        reason="deliberate malformed UTF-8 shell fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["detected_format"] == (
+        "git_shortlog_invalid_utf8_shell"
+    )
+
+
+def test_git_shortlog_invalid_utf8_rejects_changed_payload(
+    tmp_path: Path,
+) -> None:
+    payload = _git_shortlog_invalid_utf8_bytes().replace(
+        b"\xf8\x9d\x84\x9e", b"\xf0\x9d\x84\x9e", 1
+    )
+    candidate = tmp_path / RELATIVE_GIT_SHORTLOG_INVALID_UTF8
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_encoding_regression_fixture",
+        detected_format="git_shortlog_invalid_utf8_shell",
+        relative_path=RELATIVE_GIT_SHORTLOG_INVALID_UTF8,
+        reason="forged malformed UTF-8 shell fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
@@ -1369,18 +1567,29 @@ def test_checked_in_cmake_truncated_bom_manifest_matches_archive_receipt() -> No
             Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
         ).read_text(encoding="utf-8")
     )
-    entry = next(
+    entries = [
         item
         for item in manifest["entries"]
         if item["project_id"] == "Kitware/CMake"
-    )
+    ]
 
-    payload = _truncated_utf32be_bom_bytes()
-    assert entry["relative_path"] == RELATIVE_TRUNCATED_UTF32BE_BOM
-    assert entry["size_bytes"] == len(payload) == 3
-    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
-    assert entry["classification"] == "mislabeled_non_cpp"
-    assert entry["detected_format"] == "truncated_utf32be_bom"
+    expected = {
+        RELATIVE_TRUNCATED_UTF32BE_BOM: (
+            _truncated_utf32be_bom_bytes(),
+            "truncated_utf32be_bom",
+        ),
+        RELATIVE_TRUNCATED_UTF32LE_BOM: (
+            _truncated_utf32le_bom_bytes(),
+            "truncated_utf32le_bom",
+        ),
+    }
+    assert {entry["relative_path"] for entry in entries} == set(expected)
+    for entry in entries:
+        payload, detected_format = expected[entry["relative_path"]]
+        assert entry["size_bytes"] == len(payload) == 3
+        assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert entry["classification"] == "mislabeled_non_cpp"
+        assert entry["detected_format"] == detected_format
 
 
 def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -> None:
@@ -1489,6 +1698,47 @@ def test_checked_in_netbsd_big5_shell_manifest_matches_archive_receipt() -> None
     assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
     assert entry["classification"] == "mislabeled_non_cpp"
     assert entry["detected_format"] == "big5_shell_heredoc"
+
+
+def test_checked_in_autotools_big5_shell_manifest_matches_pinned_commit() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "autotools-mirror/gettext"
+    )
+
+    payload = _autotools_big5_shell_heredoc_bytes()
+    assert entry["relative_path"] == RELATIVE_AUTOTOOLS_BIG5_SHELL_HEREDOC
+    assert entry["size_bytes"] == len(payload) == 1001
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "mislabeled_non_cpp"
+    assert entry["detected_format"] == "big5_shell_heredoc"
+
+
+def test_checked_in_git_shortlog_manifest_matches_pinned_commit_receipt() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "git/git"
+    )
+
+    assert entry["relative_path"] == RELATIVE_GIT_SHORTLOG_INVALID_UTF8
+    assert entry["size_bytes"] == 11480
+    assert entry["sha256"] == (
+        "017c37e96a1bf295be7436f35ff9da9b42f7baa40220e353e3414dfca6af11dd"
+    )
+    assert entry["classification"] == "deliberate_encoding_regression_fixture"
+    assert entry["detected_format"] == "git_shortlog_invalid_utf8_shell"
 
 
 @pytest.mark.parametrize(

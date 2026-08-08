@@ -72,7 +72,12 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ("mislabeled_non_cpp", "nul_ff_binary_blob"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
     ("mislabeled_non_cpp", "truncated_utf32be_bom"),
+    ("mislabeled_non_cpp", "truncated_utf32le_bom"),
     ("mislabeled_non_cpp", "big5_shell_heredoc"),
+    (
+        "deliberate_encoding_regression_fixture",
+        "git_shortlog_invalid_utf8_shell",
+    ),
 }
 
 
@@ -370,6 +375,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared truncated_utf32be_bom but "
                 "the payload is not exactly the three-byte UTF-32BE BOM prefix"
+            )
+        return
+
+    if entry.detected_format == "truncated_utf32le_bom":
+        payload = path.read_bytes()
+        if payload != b"\xff\xfe\x00":
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared truncated_utf32le_bom but "
+                "the payload is not exactly the three-byte UTF-32LE BOM prefix"
             )
         return
 
@@ -762,14 +776,23 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared big5_shell_heredoc but the "
                 "shell fixture contains a NUL byte"
             )
-        prefix = (
+        legacy_prefix = (
             b"#! /bin/sh\n\n"
             b"# Test conversion from BIG5 to UTF-8.\n\n"
             b'tmpfiles=""\n'
             b"trap 'rm -fr $tmpfiles' 1 2 3 15\n\n"
             b'tmpfiles="$tmpfiles mco-test1.po"\n'
         )
-        if not payload.startswith(prefix):
+        modern_prefix = (
+            b"#! /bin/sh\n"
+            b'. "${srcdir=.}/init.sh"; path_prepend_ . ../src\n\n'
+            b"# Test conversion from BIG5 to UTF-8.\n\n"
+        )
+        if payload.startswith(legacy_prefix):
+            wrapper_variant = "legacy"
+        elif payload.startswith(modern_prefix):
+            wrapper_variant = "modern"
+        else:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared big5_shell_heredoc but the "
                 "canonical shell preamble is absent"
@@ -847,14 +870,19 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared big5_shell_heredoc but the "
                 "BIG5/UTF-8 message bodies do not match"
             )
-        middle = (
+        legacy_middle = (
             b"\ntmpfiles=\"$tmpfiles mco-test1.out\"\n"
             b": ${MSGCONV=msgconv}\n"
             b"${MSGCONV} --to-code=UTF-8 -o mco-test1.out mco-test1.po\n"
             b"test $? = 0 || { rm -fr $tmpfiles; exit 1; }\n\n"
             b'tmpfiles="$tmpfiles mco-test1.ok"\n'
         )
-        suffix = (
+        modern_middle = (
+            b"\n: ${MSGCONV=msgconv}\n"
+            b"${MSGCONV} --to-code=UTF-8 -o mco-test1.out mco-test1.po "
+            b"|| Exit 1\n\n"
+        )
+        legacy_suffix = (
             b"\n: ${DIFF=diff}\n"
             b"# Redirect stdout, so as not to fill the user's screen with "
             b"non-ASCII bytes.\n"
@@ -863,13 +891,67 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             b"rm -fr $tmpfiles\n\n"
             b"exit $result\n"
         )
+        modern_suffix = (
+            b"\n: ${DIFF=diff}\n"
+            b"# Redirect stdout, so as not to fill the user's screen with "
+            b"non-ASCII bytes.\n"
+            b"${DIFF} mco-test1.ok mco-test1.out >/dev/null\n"
+            b"result=$?\n\n"
+            b"exit $result\n"
+        )
+        expected_middle = (
+            legacy_middle if wrapper_variant == "legacy" else modern_middle
+        )
+        expected_suffix = (
+            legacy_suffix if wrapper_variant == "legacy" else modern_suffix
+        )
         if (
-            payload[po_end + len(b"\nEOF\n") : ok_decl] != middle
-            or not payload.endswith(suffix)
+            payload[po_end + len(b"\nEOF\n") : ok_decl] != expected_middle
+            or not payload.endswith(expected_suffix)
         ):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared big5_shell_heredoc but the "
                 "conversion and cleanup shell contract is incomplete"
+            )
+        return
+
+    if entry.detected_format == "git_shortlog_invalid_utf8_shell":
+        payload = path.read_bytes()
+        malformed_treble_clef = b"\xf8\x9d\x84\x9e"
+        valid_treble_clef = b"\xf0\x9d\x84\x9e"
+        required_fragments = (
+            b"#!/bin/sh\n",
+            b"test_description='git shortlog\n'",
+            b"# when replacing all is by treble clefs.",
+            b'tr 1234 "\\360\\235\\204\\236"',
+            b"# now fsck up the utf8",
+            b"git config i18n.commitencoding non-utf-8",
+            b'tr 1234 "\\370\\235\\204\\236"',
+            b"# NOTE: do not quote this heredoc, Dash 0.5.13 has a bug with heredocs",
+        )
+        if (
+            b"\x00" in payload
+            or any(fragment not in payload for fragment in required_fragments)
+            or payload.count(malformed_treble_clef) != 8
+            or payload.count(valid_treble_clef) != 8
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared git_shortlog_invalid_utf8_shell "
+                "but the deliberate malformed-UTF8 shortlog contract is incomplete"
+            )
+        try:
+            payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if exc.reason != "invalid start byte" or payload[exc.start] != 0xF8:
+                raise SourceQuarantineError(
+                    f"{entry.relative_path}: declared "
+                    "git_shortlog_invalid_utf8_shell but its first UTF-8 failure "
+                    "is not the deliberate 0xf8 leading byte"
+                ) from exc
+        else:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared git_shortlog_invalid_utf8_shell "
+                "but the shell fixture is valid UTF-8"
             )
         return
 
