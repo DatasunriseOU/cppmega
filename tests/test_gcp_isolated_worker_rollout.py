@@ -106,6 +106,18 @@ def test_backend_is_run_scoped_and_refuses_binding_drift(tmp_path: Path) -> None
         write_backend_config(path, spec=other)
 
 
+def test_lane_backend_uses_an_independent_state_prefix() -> None:
+    spec = build_rollout_spec(
+        bucket="natural-bison-491019-t9-cppmega-corpus",
+        run_id="ci-case5-smoke-001",
+        name_prefix="cppmega-corpus",
+        worker_count=1,
+        compact_placement=True,
+        state_prefix_root="terraform/lane-runs",
+    )
+    assert spec.backend_prefix == "terraform/lane-runs/ci-case5-smoke-001"
+
+
 def test_backend_metadata_must_bind_the_same_run(tmp_path: Path) -> None:
     spec = _spec()
     metadata_path = tmp_path / "terraform.tfstate"

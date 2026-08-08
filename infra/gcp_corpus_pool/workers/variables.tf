@@ -69,6 +69,61 @@ variable "worker_count" {
   }
 }
 
+variable "slots_per_worker" {
+  description = "Independent logical worker slots launched by each VM."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.slots_per_worker >= 1 && var.slots_per_worker <= 2 && floor(var.slots_per_worker) == var.slots_per_worker
+    error_message = "slots_per_worker must be either 1 or 2."
+  }
+}
+
+variable "parse_workers_per_slot" {
+  description = "Bounded parser workers per logical slot."
+  type        = number
+  default     = 8
+
+  validation {
+    condition     = var.parse_workers_per_slot >= 1 && var.parse_workers_per_slot <= 16 && floor(var.parse_workers_per_slot) == var.parse_workers_per_slot
+    error_message = "parse_workers_per_slot must be an integer between 1 and 16."
+  }
+}
+
+variable "memory_limit_gb_per_slot" {
+  description = "Memory limit for each logical slot in GiB."
+  type        = number
+  default     = 48
+
+  validation {
+    condition     = var.memory_limit_gb_per_slot > 0 && var.memory_limit_gb_per_slot <= 64
+    error_message = "memory_limit_gb_per_slot must be greater than zero and at most 64 GiB."
+  }
+}
+
+variable "cpu_budget_vcpus" {
+  description = "Aggregate logical-slot CPU budget per VM."
+  type        = number
+  default     = 16
+
+  validation {
+    condition     = var.cpu_budget_vcpus >= 1 && var.cpu_budget_vcpus <= 128 && floor(var.cpu_budget_vcpus) == var.cpu_budget_vcpus
+    error_message = "cpu_budget_vcpus must be an integer between 1 and 128."
+  }
+}
+
+variable "memory_budget_gb" {
+  description = "Aggregate logical-slot memory budget per VM in GiB."
+  type        = number
+  default     = 56
+
+  validation {
+    condition     = var.memory_budget_gb > 0 && var.memory_budget_gb <= 512
+    error_message = "memory_budget_gb must be greater than zero and at most 512 GiB."
+  }
+}
+
 variable "machine_type" {
   description = "Worker machine type. n2-standard-16 is 16 vCPU, 64 GB, and up to 32 Gbps default egress."
   type        = string

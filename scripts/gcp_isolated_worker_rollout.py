@@ -38,7 +38,7 @@ from scripts.distributed_data_prep._common import (  # noqa: E402
 )
 
 ROLL_OUT_RECEIPT_SCHEMA = "cppmega.gcp_isolated_worker_plan_v1"
-STATE_PREFIX_ROOT = "terraform/source-runs"
+STATE_PREFIX_ROOTS = frozenset({"terraform/source-runs", "terraform/lane-runs"})
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,26}[a-z0-9])?$")
 _NAME_PREFIX_RE = re.compile(r"^[a-z]([-a-z0-9]{0,21}[a-z0-9])?$")
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
@@ -53,10 +53,11 @@ class RolloutSpec:
     name_prefix: str
     worker_count: int
     compact_placement: bool
+    state_prefix_root: str
 
     @property
     def backend_prefix(self) -> str:
-        return f"{STATE_PREFIX_ROOT}/{self.run_id}"
+        return f"{self.state_prefix_root}/{self.run_id}"
 
     @property
     def run_root(self) -> str:
@@ -76,6 +77,7 @@ def build_rollout_spec(
     name_prefix: object,
     worker_count: object,
     compact_placement: object,
+    state_prefix_root: object = "terraform/source-runs",
 ) -> RolloutSpec:
     """Validate the narrow inputs that bind a plan to one physical run."""
 
@@ -95,12 +97,15 @@ def build_rollout_spec(
         raise ContractError("compact_placement must be boolean")
     if compact_placement and count > 22:
         raise ContractError("compact placement supports at most 22 workers")
+    if state_prefix_root not in STATE_PREFIX_ROOTS:
+        raise ContractError("state_prefix_root must select source-runs or lane-runs")
     return RolloutSpec(
         bucket=bucket,
         run_id=run_id,
         name_prefix=name_prefix,
         worker_count=count,
         compact_placement=compact_placement,
+        state_prefix_root=str(state_prefix_root),
     )
 
 
@@ -551,6 +556,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--name-prefix", default="cppmega-corpus")
     parser.add_argument("--worker-count", required=True, type=int)
     parser.add_argument(
+        "--state-prefix-root",
+        choices=sorted(STATE_PREFIX_ROOTS),
+        default="terraform/source-runs",
+    )
+    parser.add_argument(
         "--use-gcloud-access-token",
         action="store_true",
         help=(
@@ -577,6 +587,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             name_prefix=args.name_prefix,
             worker_count=args.worker_count,
             compact_placement=args.compact_placement,
+            state_prefix_root=args.state_prefix_root,
         )
         receipt = run_guarded_plan(
             terraform_dir=args.terraform_dir,
