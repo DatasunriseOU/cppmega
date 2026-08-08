@@ -4673,6 +4673,24 @@ def test_progress_heartbeat_is_written_while_parser_is_still_running(
             max_chunk_chars=max_chunk_chars,
         )
 
+    progress_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-08-04T00:00:00Z",
+                "fetch": {
+                    "attempt_statuses": {"done": 1},
+                    "attempts_terminal": 1,
+                    "members": 1,
+                    "chunks": 1,
+                    "occurrence_tokens": 1,
+                    "requests": 1,
+                    "sidecar_set_sha256": "a" * 64,
+                    "run_metadata": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     fetcher = ci.CIStreamFetcher(
         inventory_path=inventory,
         state_path=tmp_path / "fetch.sqlite",
@@ -4687,6 +4705,12 @@ def test_progress_heartbeat_is_written_while_parser_is_still_running(
         target_unique_tokens=1_000_000,
         sleeper=lambda _: None,
     )
+    full_summary = fetcher.state.summary
+
+    def no_full_summary() -> dict[str, object]:
+        raise AssertionError("heartbeat must not scan the full member set")
+
+    fetcher.state.summary = no_full_summary  # type: ignore[method-assign]
 
     def run_fetcher() -> None:
         try:
@@ -4705,22 +4729,110 @@ def test_progress_heartbeat_is_written_while_parser_is_still_running(
     try:
         assert parser_started.wait(2)
         for _ in range(100):
-            if progress_path.is_file():
+            heartbeat = json.loads(progress_path.read_text())
+            if heartbeat["fetch"].get("summary_kind") == "heartbeat":
                 break
             release_parser.wait(0.01)
-        assert progress_path.is_file()
+        else:
+            raise AssertionError("heartbeat progress was not written")
         heartbeat = json.loads(progress_path.read_text())
         assert heartbeat["fetch"]["attempt_statuses"] == {"processing": 1}
+        assert heartbeat["fetch"]["summary_kind"] == "heartbeat"
+        assert heartbeat["fetch"]["members"] == 1
+        assert heartbeat["fetch"]["sidecar_set_sha256"] == "a" * 64
+        assert heartbeat["fetch"]["binding_upgrades_truncated"] is False
         assert heartbeat["content_store"]["counters"][
             "exact_unique_payload_tokens"
         ] is None
     finally:
+        fetcher.state.summary = full_summary  # type: ignore[method-assign]
         release_parser.set()
         runner.join(5)
         fetcher.close()
     assert not runner.is_alive()
     assert not errors
     assert len(results) == 1
+
+
+def test_heartbeat_summary_caps_binding_upgrade_evidence(
+    tmp_path: Path,
+) -> None:
+    state = ci.FetchState(
+        tmp_path / "fetch.sqlite",
+        inventory_path=_inventory(tmp_path / "inventory.sqlite", 1),
+        content_store_path=tmp_path / "store",
+        tokenizer=ci.ExactTokenizer(_FROZEN_TOKENIZER),
+        resume=False,
+    )
+    records = [
+        {
+            "binding_key": "fetcher_script_sha256",
+            "from_sha256": "1" * 64,
+            "to_sha256": "2" * 64,
+            "reason": "first migration",
+            "upgraded_at": "2026-08-04T00:00:00Z",
+        },
+        {
+            "binding_key": "parser_script_sha256",
+            "from_sha256": "3" * 64,
+            "to_sha256": "4" * 64,
+            "reason": "second migration",
+            "upgraded_at": "2026-08-04T00:01:00Z",
+        },
+        {
+            "binding_key": "content_store_script_sha256",
+            "from_sha256": "5" * 64,
+            "to_sha256": "6" * 64,
+            "reason": "latest migration",
+            "upgraded_at": "2026-08-04T00:02:00Z",
+        },
+    ]
+    try:
+        with state._connection:
+            state._connection.executemany(
+                """
+                INSERT INTO binding_upgrades(
+                  binding_key,from_sha256,to_sha256,reason,upgraded_at
+                ) VALUES (:binding_key,:from_sha256,:to_sha256,:reason,:upgraded_at)
+                """,
+                records,
+            )
+        heartbeat = state.heartbeat_summary()
+        assert heartbeat["binding_upgrades"] == [records[-1]]
+        assert heartbeat["binding_upgrades_truncated"] is True
+        full = state.summary()
+        assert full["binding_upgrades"] == records
+        assert full["binding_upgrades_truncated"] is False
+    finally:
+        state.close()
+
+
+def test_heartbeat_cache_requires_full_summary_timestamp(tmp_path: Path) -> None:
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-08-04T00:00:00Z",
+                "fetch": {
+                    "summary_kind": "heartbeat",
+                    "attempt_statuses": {"processing": 1},
+                    "attempts_terminal": 0,
+                    "members": 1,
+                    "chunks": 1,
+                    "occurrence_tokens": 1,
+                    "requests": 1,
+                    "sidecar_set_sha256": "a" * 64,
+                    "run_metadata": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert ci.CIStreamFetcher._load_last_full_fetch_summary(progress_path) == (
+        None,
+        None,
+    )
 
 
 def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
@@ -4761,6 +4873,10 @@ def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
         )
         assert counters["exact_unique_payload_tokens"] == expected_tokens
         assert progress["fetch"]["attempt_statuses"] == {"done": 1}
+        assert progress["fetch"]["summary_kind"] == "full"
+        assert progress["fetch"]["full_summary_generated_at"] == progress[
+            "generated_at"
+        ]
         assert progress["fetch"]["members"] == 1
         assert progress["fetch"]["chunks"] == 1
         assert github.signed_url is not None
@@ -5616,9 +5732,13 @@ def test_scheduler_heartbeat_uses_remaining_progress_interval() -> None:
     started_at = time.monotonic()
     progress_times: list[float] = []
 
-    def write_progress() -> dict[str, str]:
+    def write_heartbeat() -> dict[str, str]:
         progress_times.append(time.monotonic() - started_at)
         release_slow.set()
+        return {"status": "ok"}
+
+    def write_progress() -> dict[str, str]:
+        progress_times.append(time.monotonic() - started_at)
         return {"status": "ok"}
 
     def process(attempt: str) -> None:
@@ -5627,6 +5747,7 @@ def test_scheduler_heartbeat_uses_remaining_progress_interval() -> None:
         else:
             time.sleep(1.5)
 
+    fetcher.write_heartbeat = write_heartbeat
     fetcher.write_progress = write_progress
     fetcher.process_attempt = process
 

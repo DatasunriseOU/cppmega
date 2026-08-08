@@ -2182,8 +2182,21 @@ def _convert_local_jsonl_to_parquet_path(
         return stats
 
     if not wrote_rows:
-        target.unlink(missing_ok=True)
-        log.info("empty parquet")
+        # Keep the atomic publisher's stage alive even when the input JSONL is
+        # empty (an empty gzip is still a non-empty file).  A schema-valid
+        # zero-row parquet lets the caller inspect the durable receipt and
+        # classify the unit without publishing training rows.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            rows_to_table(
+                [],
+                tokenized_rows=[],
+                identity_registry=identity_registry,
+            ),
+            target,
+            compression="snappy",
+        )
+        log.info("wrote zero-row parquet %s", target)
         return stats
     log.info(
         "wrote local parquet %s docs_in=%d docs_out=%d policy=%s",

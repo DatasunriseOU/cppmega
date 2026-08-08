@@ -2,6 +2,15 @@
   "schema": "cppmega.source_quarantine_manifest_v2",
   "entries": [
     {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake",
+      "size_bytes": 3,
+      "sha256": "91147ecbd5b9324a18f381688ca3b992bdc0a7b920f99f5732eb9d5f4245f727",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "truncated_utf32be_bom",
+      "reason": "CMake encoding regression fixture containing only a truncated UTF-32BE BOM prefix"
+    },
+    {
       "project_id": "corpus.local/Xbox_Live_Source",
       "relative_path": "Xbox Live Source/XONLINE_MAIN/public/ext/sdk/vs10rtm/SDK/bin/isvtier5appsignsdk.cc",
       "size_bytes": 21234,
@@ -65,13 +74,40 @@
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug parser_crash"
     },
     {
+      "project_id": "intel/llvm",
+      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
+      "size_bytes": 398,
+      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_diagnostic",
+      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token"
+    },
+    {
       "project_id": "eclipse-threadx/threadx",
       "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
-      "size_bytes": 61551,
-      "sha256": "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294",
+      "size_bytes": 60766,
+      "sha256": "521e056f7c839d8c4af115f7822e1f6fc484824f9292c2473f32bd9487e63c74",
       "classification": "generated_binary_blob",
       "detected_format": "mixed_utf8_utf16le_c_array",
-      "reason": "Generated UTF-16LE C byte array embedding a ThreadX module ELF, prefixed by a UTF-8 license block"
+      "reason": "Frozen ThreadX generated UTF-16LE C byte array embedding a module ELF, prefixed by a UTF-8 license block"
+    },
+    {
+      "project_id": "NetBSD/src",
+      "relative_path": "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1",
+      "size_bytes": 1155,
+      "sha256": "5c9ee72b8cd727c9d975c1bc5e8e725e2835235c2b094f2f82eeb8c066473737",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "big5_shell_heredoc",
+      "reason": "GNU gettext BIG5 conversion shell test with an encoded PO heredoc and no source extension"
+    },
+    {
+      "project_id": "python/cpython",
+      "relative_path": "Lib/test/archivetestdata/exe_with_zip",
+      "size_bytes": 990,
+      "sha256": "2f27f5c9108936a693fd496565e5c5050b5c62cfbb61d1d5da9d97c89533d637",
+      "classification": "generated_executable_archive",
+      "detected_format": "posix_shell_appended_zip",
+      "reason": "CPython executable ZIP test fixture with a UTF-8 Bash prefix and appended archive"
     },
     {
       "project_id": "python/cpython",

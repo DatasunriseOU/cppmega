@@ -791,6 +791,55 @@ def test_compute_library_conflicting_architectures_fall_back_atomically(
     }
 
 
+@pytest.mark.parametrize("quoted_standard", ['"23"', "23"])
+def test_cmake_quoted_cxx_standard_drives_truthful_parser_dialect(
+    tmp_path: Path,
+    quoted_standard: str,
+) -> None:
+    from cppmega.data.build_context import detect_build_context
+
+    index_project = _load_indexer()
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(quoted_standard LANGUAGES CXX)\n"
+        f"set(CMAKE_CXX_STANDARD {quoted_standard} CACHE INTERNAL \"\")\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "quoted_standard.cpp"
+    source.write_text(
+        "constexpr int quoted_standard(bool value) {\n"
+        "    if consteval { return 23; }\n"
+        "    return value ? 1 : 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    platform_info, detected_args, compile_index = detect_build_context(
+        str(tmp_path)
+    )
+
+    assert compile_index is None
+    assert platform_info["build_system"] == "cmake"
+    assert platform_info["standard"] == "c++23"
+    assert "-std=c++23" in detected_args
+    file_args = index_project._resolve_file_args(
+        str(source),
+        {},
+        index_project.get_default_compile_args(str(tmp_path)),
+    )
+    assert "-std=c++23" in file_args
+    translation_unit = index_project._load_translation_unit(
+        str(source),
+        index_project.Index.create(),
+        file_args,
+    )
+    assert not [
+        diagnostic
+        for diagnostic in translation_unit.diagnostics
+        if int(diagnostic.severity) >= 3
+    ]
+
+
 @pytest.mark.parametrize(
     ("iso_alias", "canonical_standard"),
     (
@@ -1351,6 +1400,43 @@ def test_lowercase_cpp_suffix_does_not_rewrite_explicit_language(
     ) == explicit_args
 
 
+def test_open_watcom_plusplus_c_suffix_uses_cpp_without_source_loss(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "bld" / "plusplus" / "bugs" / "zcc02.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "char *foo( void )\n"
+        "{\n"
+        "    return( ::new char[10] ( 'a', 'b', 'c', '\\0' ) );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-std=c11", "-std=c++20", "-fsyntax-only", "-Wno-everything"],
+        str(source),
+    )
+
+    assert adapted[:3] == ["-x", "c++", "-std=c++20"]
+    assert "-std=c11" not in adapted
+    translation_unit = index_project._load_translation_unit(
+        str(source),
+        index_project.Index.create(),
+        adapted,
+    )
+    assert translation_unit.spelling == str(source)
+
+    ordinary_c = tmp_path / "src" / "ordinary.c"
+    ordinary_c.parent.mkdir()
+    ordinary_c.write_text("int ordinary(void) { return 0; }\n", encoding="utf-8")
+    assert index_project._adapt_args_for_file(
+        ["-std=c++20", "-Wno-everything"],
+        str(ordinary_c),
+    )[:3] == ["-x", "c", "-std=c11"]
+
+
 def test_valgrind_fallback_status_is_emitted_in_source_sidecars(
     tmp_path: Path,
 ) -> None:
@@ -1468,6 +1554,65 @@ def test_source_with_nul_byte_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="source contains NUL byte"):
         index_project._decode_source_bytes(b"int value = 0;\0\n", "binary.cpp")
+
+
+@pytest.mark.parametrize(
+    ("bom", "disk_encoding"),
+    (
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+        (b"\xff\xfe\x00\x00", "utf-32-le"),
+        (b"\x00\x00\xfe\xff", "utf-32-be"),
+    ),
+)
+def test_bom_marked_wide_cpp_is_transcoded_losslessly_for_libclang(
+    tmp_path: Path,
+    bom: bytes,
+    disk_encoding: str,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "wide.cpp"
+    text = (
+        "// BOM-marked source\r\n"
+        "int wide_answer(int value) { return value + 42; }\r\n"
+    )
+    source.write_bytes(bom + text.encode(disk_encoding))
+
+    decoded, detected_encoding = index_project._decode_source_bytes(
+        source.read_bytes(),
+        str(source),
+    )
+    parser_text, parser_bytes, parser_encoding = (
+        index_project._read_source_file(str(source))
+    )
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+            str(tmp_path),
+            "fixture/wide-source",
+        )
+    )
+
+    assert detected_encoding == disk_encoding
+    assert decoded.encode(disk_encoding) == source.read_bytes()
+    assert parser_encoding == "utf-8"
+    assert parser_bytes == parser_text.encode("utf-8")
+    assert parsed_count == 1
+    assert "wide_answer" in {
+        function["name"] for function in payload["functions"]
+    }
+
+
+def test_malformed_bom_marked_wide_source_fails_closed() -> None:
+    index_project = _load_indexer()
+
+    with pytest.raises(UnicodeDecodeError):
+        index_project._decode_source_bytes(
+            b"\xff\xfe\x00",
+            "malformed-wide.cpp",
+        )
 
 
 def test_textual_nul_inside_comment_or_literal_round_trips() -> None:

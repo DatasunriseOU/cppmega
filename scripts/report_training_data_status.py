@@ -1343,12 +1343,58 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
         if unique_tokens is None:
             raise ValueError(f"{path}: CI unique-token counter is not exact")
         unique_tokens = int(unique_tokens)
+        if "summary_kind" not in progress["fetch"]:
+            # Legacy v4 records only carried a complete fetch summary.
+            fetch_summary_kind = "full"
+        else:
+            raw_fetch_summary_kind = progress["fetch"]["summary_kind"]
+            if (
+                not isinstance(raw_fetch_summary_kind, str)
+                or raw_fetch_summary_kind not in {"full", "heartbeat"}
+            ):
+                raise ValueError(
+                    f"{path}: unsupported CI fetch summary kind "
+                    f"{raw_fetch_summary_kind!r}"
+                )
+            fetch_summary_kind = raw_fetch_summary_kind
+        if fetch_summary_kind == "heartbeat":
+            if "full_summary_generated_at" not in progress["fetch"]:
+                raise ValueError(
+                    f"{path}: heartbeat CI fetch summary lacks its full "
+                    "summary timestamp"
+                )
+            full_fetch_summary_generated_at = progress["fetch"][
+                "full_summary_generated_at"
+            ]
+        else:
+            full_fetch_summary_generated_at = progress["fetch"].get(
+                "full_summary_generated_at",
+                progress["generated_at"],
+            )
+        if (
+            not isinstance(full_fetch_summary_generated_at, str)
+            or not full_fetch_summary_generated_at
+        ):
+            raise ValueError(
+                f"{path}: CI full fetch summary timestamp is invalid"
+            )
+        binding_upgrades_truncated = progress["fetch"].get(
+            "binding_upgrades_truncated", False
+        )
+        if not isinstance(binding_upgrades_truncated, bool):
+            raise ValueError(
+                f"{path}: CI binding-upgrade truncation flag is invalid"
+            )
         store_unique_upper_bound += unique_tokens
         occurrence_tokens += int(progress["fetch"]["occurrence_tokens"])
         stores.append(
             {
                 "progress": str(path),
                 "generated_at": progress["generated_at"],
+                "fetch_summary_kind": fetch_summary_kind,
+                "full_fetch_summary_generated_at": (
+                    full_fetch_summary_generated_at
+                ),
                 "interval": progress["inventory"]["interval"],
                 "inventory": {
                     "repos_closed": int(progress["inventory"]["repos_closed"]),
@@ -1380,6 +1426,7 @@ def collect_ci_status(config: Mapping[str, object]) -> dict[str, object]:
                 "parser_binding_upgrades": progress["fetch"].get(
                     "binding_upgrades", []
                 ),
+                "binding_upgrades_truncated": binding_upgrades_truncated,
                 "tokenizer": progress["token_accounting"]["tokenizer_contract"],
                 "content_store": {
                     "schema": progress["content_store"]["schema"],

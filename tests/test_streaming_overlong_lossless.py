@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import tarfile
@@ -96,6 +97,83 @@ def test_empty_index_log_rejects_lossy_build_receipt() -> None:
     )
 
     assert sr._classify_empty_index_project_log(log) == "domain_source_loss"
+
+
+def test_local_materializer_publishes_schema_valid_zero_row_parquet(
+    tmp_path: Path,
+) -> None:
+    """An empty gzip must not disappear inside the atomic output context."""
+
+    source = tmp_path / "empty.enriched.jsonl.gz"
+    with gzip.open(source, "wt", encoding="utf-8"):
+        pass
+    output = tmp_path / "empty.tok.parquet"
+    receipt = sr.materialize_stats_path(output)
+
+    summary = materializer.convert_local_jsonl_to_parquet(
+        source,
+        output,
+        tokenizer=_CharacterTokenizer(),
+        max_tokens=7,
+        overflow_policy="split",
+        materialize_tokenized_enriched=True,
+        fixed_shape_max_tokens=8,
+        stats_file=receipt,
+    )
+
+    table = pq.read_table(output)
+    assert output.stat().st_size > 0
+    assert table.num_rows == 0
+    assert table.column_names == materializer._SCHEMA.names
+    for key, value in materializer._SCHEMA.metadata.items():
+        assert table.schema.metadata[key] == value
+    assert summary["docs_in"] == summary["docs_out"] == 0
+    assert summary["materialized_rows"] == 0
+    assert sr.read_materialize_stats(output, fixed_shape_max_tokens=8) == summary
+
+
+def test_streaming_code_repo_skips_zero_materialized_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "empty.enriched.jsonl.gz"
+    with gzip.open(source, "wt", encoding="utf-8"):
+        pass
+    tokenized = tmp_path / "empty.tok.parquet"
+    materializer.convert_local_jsonl_to_parquet(
+        source,
+        tokenized,
+        tokenizer=_CharacterTokenizer(),
+        max_tokens=7,
+        overflow_policy="split",
+        materialize_tokenized_enriched=True,
+        fixed_shape_max_tokens=8,
+        stats_file=sr.materialize_stats_path(tokenized),
+    )
+
+    monkeypatch.setattr(sr, "stage_index_source", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(
+        sr,
+        "stage_materialize",
+        lambda *_args, **_kwargs: tokenized,
+    )
+
+    def unexpected_route() -> object:
+        raise AssertionError("zero-row materialization must stop before routing")
+
+    monkeypatch.setattr(sr, "_route_by_fit_impl", unexpected_route)
+    result = sr.process_one_repo(
+        "empty",
+        tmp_path / "repo",
+        (8,),
+        tmp_path / "work",
+        project_id="owner/repo",
+    )
+
+    assert result["skipped"] is True
+    assert result["skip_reason"] == "no_training_documents"
+    assert result["lengths"] == {}
+    assert result["materialize_stats"]["docs_out"] == 0
 
 
 def test_tar_member_path_collision_preserves_directory_and_file(

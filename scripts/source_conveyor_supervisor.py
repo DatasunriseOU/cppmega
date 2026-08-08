@@ -24,6 +24,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from cppmega.data.build_context import (  # noqa: E402
+    BuildContextEvidenceError,
+    validate_macos_sdk_path,
+)
 from cppmega.data.source_conveyor_composition import _load_run  # noqa: E402
 from scripts import streaming_conveyor as conveyor  # noqa: E402
 
@@ -64,6 +68,7 @@ _RECORDED_INPUT_BINDINGS = (
     "tokenizer",
     "python",
     "libclang",
+    "macos_sdk",
     "code_revision",
 )
 _REMOVED_CHILD_ENVIRONMENT = frozenset(
@@ -206,6 +211,36 @@ def _python_executable_binding(value: str) -> dict[str, Any]:
     }
 
 
+def _macos_sdk_binding(value: str | None) -> dict[str, Any] | None:
+    """Bind one explicit SDK, or return ``None`` when SDK support is unused."""
+
+    if value is None:
+        return None
+
+    try:
+        sdk = validate_macos_sdk_path(value)
+    except BuildContextEvidenceError as exc:
+        raise RuntimeError(str(exc)) from exc
+    settings = Path(sdk.settings_path)
+    try:
+        settings_stat = settings.stat()
+    except OSError as exc:
+        raise RuntimeError(f"macOS SDK settings cannot be inspected: {settings}") from exc
+    settings_sha256 = _sha256_file(settings)
+    if settings_sha256 != sdk.settings_sha256:
+        raise RuntimeError(f"macOS SDK settings changed while being bound: {settings}")
+
+    return {
+        "resolved_path": sdk.path,
+        "settings": {
+            "name": settings.name,
+            "resolved_path": str(settings),
+            "size_bytes": settings_stat.st_size,
+            "sha256": sdk.settings_sha256,
+        },
+    }
+
+
 def _parse_target_lengths(value: str) -> tuple[int, ...]:
     try:
         lengths = tuple(int(item) for item in value.split(","))
@@ -236,6 +271,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-code-revision", required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--libclang", required=True)
+    parser.add_argument(
+        "--macos-sdk",
+        default=None,
+        help="Explicit macOS SDK root for projects with bounded macOS xcconfig "
+        "evidence. Ordinary source runs do not require this option.",
+    )
     parser.add_argument(
         "--minimum-free-bytes",
         type=int,
@@ -300,6 +341,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         == Path(args.run_root).expanduser().resolve()
     ):
         raise SystemExit("--run-root must be separate from the repair base run")
+    if args.repair_base_code_run_root and args.code_index_timeout_s <= 0:
+        raise SystemExit(
+            "targeted repair requires --code-index-timeout-s > 0"
+        )
+    if args.repair_base_code_run_root and args.code_index_stall_timeout_s <= 0:
+        raise SystemExit(
+            "targeted repair requires --code-index-stall-timeout-s > 0"
+        )
     return args
 
 
@@ -326,6 +375,7 @@ def validate_inputs(
     tokenizer = _regular_file(args.tokenizer, label="tokenizer")
     python_binding = _python_executable_binding(args.python)
     libclang = _regular_file(args.libclang, label="libclang")
+    macos_sdk = _macos_sdk_binding(getattr(args, "macos_sdk", None))
 
     expected_tokenizer = (
         repo_root / "cppmega" / "tokenizer" / "tokenizer.json"
@@ -509,6 +559,7 @@ def validate_inputs(
             "path": str(libclang),
             "sha256": _sha256_file(libclang),
         },
+        "macos_sdk": macos_sdk,
         "code_revision": revision_guard.receipt,
         "free_disk_bytes": free_bytes,
     }
@@ -690,6 +741,9 @@ def validate_repair_request(
     ):
         if base_inputs[name]["sha256"] != inputs[name]["sha256"]:
             raise RuntimeError(f"repair {name} differs from its base code run")
+    base_macos_sdk = base_inputs.get("macos_sdk")
+    if base_macos_sdk is not None and base_macos_sdk != inputs.get("macos_sdk"):
+        raise RuntimeError("repair macOS SDK differs from its base code run")
     if base_inputs["archive"]["sha256"] != inputs["archive"]["sha256"]:
         raise RuntimeError("repair source archive differs from its base code run")
     if tuple(args.target_lengths) != repair_base["target_lengths"]:
@@ -789,6 +843,9 @@ def build_command(
         "--min-free-disk-gb",
         str(minimum_free_gib),
     ]
+    macos_sdk = inputs.get("macos_sdk")
+    if macos_sdk is not None:
+        command.extend(("--macos-sdk", str(macos_sdk["resolved_path"])))
     for repository in args.only_repo:
         command.extend(("--only-repo", repository))
     if args.only_repo:
@@ -827,6 +884,11 @@ def build_run_binding(
         "python_resolved_binary_path": inputs["python"]["resolved_binary_path"],
         "python_venv_config": inputs["python"]["venv_config"],
         "libclang_sha256": inputs["libclang"]["sha256"],
+        "macos_sdk": (
+            dict(inputs["macos_sdk"])
+            if inputs.get("macos_sdk") is not None
+            else None
+        ),
         "target_lengths": list(args.target_lengths),
         "dedup_policy": "exact_plus_near_default",
         "pinned_source_environment": dict(PINNED_SOURCE_ENVIRONMENT),
@@ -991,6 +1053,16 @@ def revalidate_recorded_inputs(
             raise RuntimeError(f"source launch {name}.{key} is missing")
         return binding[key]
 
+    stored_macos_sdk = stored.get("macos_sdk")
+    if stored_macos_sdk is None:
+        macos_sdk_path = None
+    elif isinstance(stored_macos_sdk, dict):
+        macos_sdk_path = stored_macos_sdk.get("resolved_path")
+        if not isinstance(macos_sdk_path, str) or not macos_sdk_path:
+            raise RuntimeError("source launch macos_sdk.resolved_path is missing")
+    else:
+        raise RuntimeError("source launch macos_sdk binding is invalid")
+
     args = argparse.Namespace(
         archive=field("archive", "resolved_path"),
         archive_sha256_receipt=field("archive_sha256_receipt", "path"),
@@ -1000,6 +1072,7 @@ def revalidate_recorded_inputs(
         tokenizer=field("tokenizer", "path"),
         python=field("python", "path"),
         libclang=field("libclang", "path"),
+        macos_sdk=macos_sdk_path,
         expected_code_revision=launch.get("code_revision"),
         run_root=str(run_root),
         minimum_free_bytes=0,
@@ -1012,7 +1085,14 @@ def revalidate_recorded_inputs(
     )
 
     def identity(inputs: dict[str, Any]) -> dict[str, Any]:
-        result = {name: dict(inputs[name]) for name in _RECORDED_INPUT_BINDINGS}
+        result = {
+            name: (
+                dict(inputs.get(name))
+                if isinstance(inputs.get(name), dict)
+                else inputs.get(name)
+            )
+            for name in _RECORDED_INPUT_BINDINGS
+        }
         result["archive"].pop("requested_path", None)
         return result
 

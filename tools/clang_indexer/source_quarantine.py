@@ -1,4 +1,4 @@
-"""Exact, receipt-bound quarantine for non-parser inputs and crash fixtures.
+"""Exact, receipt-bound quarantine for non-parser inputs and compiler fixtures.
 
 The quarantine is deliberately narrow: it only accepts files whose relative
 path, byte size, SHA-256 digest, and independently verifiable format match an
@@ -62,10 +62,17 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "binary_protocol_test_fixture",
         "clickhouse_dollar_quoted_binary_sql",
     ),
+    (
+        "deliberate_compiler_diagnostic_fixture",
+        "clang_embedded_nul_diagnostic",
+    ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
+    ("mislabeled_non_cpp", "nul_ff_binary_blob"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
+    ("mislabeled_non_cpp", "truncated_utf32be_bom"),
+    ("mislabeled_non_cpp", "big5_shell_heredoc"),
 }
 
 
@@ -357,6 +364,80 @@ def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
 
 
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
+    if entry.detected_format == "truncated_utf32be_bom":
+        payload = path.read_bytes()
+        if payload != b"\x00\x00\xfe":
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared truncated_utf32be_bom but "
+                "the payload is not exactly the three-byte UTF-32BE BOM prefix"
+            )
+        return
+
+    if entry.detected_format == "clang_embedded_nul_diagnostic":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_diagnostic "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        source_line = "int x[sizeof\0int];"
+        rendered_source_line = "// CHECK-NEXT: int x[sizeof<U+0000>int];"
+        run_line = (
+            "// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | "
+            "FileCheck -strict-whitespace %s"
+        )
+        warning_line = "// CHECK: warning: null character ignored"
+        caret_line = "// CHECK-NEXT:             ^"
+        error_line = (
+            "// CHECK: error: expected parentheses around type name in "
+            "sizeof expression"
+        )
+        required_lines = {
+            run_line,
+            source_line,
+            warning_line,
+            rendered_source_line,
+            caret_line,
+            error_line,
+            "// CHECK-NEXT:             (          )",
+        }
+        if (
+            payload.count(b"\0") != 1
+            or not required_lines.issubset(lines)
+            or lines.count(run_line) != 1
+            or lines.count(warning_line) != 1
+            or lines.count(source_line) != 1
+            or lines.count(rendered_source_line) != 2
+            or lines.count(caret_line) != 2
+            or lines.count(error_line) != 1
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_diagnostic "
+                "but the embedded-NUL diagnostic contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "nul_ff_binary_blob":
+        seen_values: set[int] = set()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                values = set(chunk)
+                if not values <= {0x00, 0xFF}:
+                    raise SourceQuarantineError(
+                        f"{entry.relative_path}: declared nul_ff_binary_blob but the "
+                        "payload is not a non-empty mixture of only 0x00 and 0xff bytes"
+                    )
+                seen_values.update(values)
+        if seen_values != {0x00, 0xFF}:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared nul_ff_binary_blob but the "
+                "payload is not a non-empty mixture of only 0x00 and 0xff bytes"
+            )
+        return
+
     if entry.detected_format == "xml_utf16le":
         with path.open("rb") as source:
             prefix = source.read(8192)
@@ -671,6 +752,124 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared posix_shell_appended_zip "
                 f"but ZIP CRC validation failed for {first_bad_member!r}"
+            )
+        return
+
+    if entry.detected_format == "big5_shell_heredoc":
+        payload = path.read_bytes()
+        if b"\x00" in payload:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "shell fixture contains a NUL byte"
+            )
+        prefix = (
+            b"#! /bin/sh\n\n"
+            b"# Test conversion from BIG5 to UTF-8.\n\n"
+            b'tmpfiles=""\n'
+            b"trap 'rm -fr $tmpfiles' 1 2 3 15\n\n"
+            b'tmpfiles="$tmpfiles mco-test1.po"\n'
+        )
+        if not payload.startswith(prefix):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "canonical shell preamble is absent"
+            )
+        po_marker = b"cat <<\\EOF > mco-test1.po\n"
+        ok_marker = b"cat <<\\EOF > mco-test1.ok\n"
+        if payload.count(po_marker) != 1 or payload.count(ok_marker) != 1:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "two expected heredoc declarations are not unique"
+            )
+        po_start = payload.index(po_marker) + len(po_marker)
+        po_end = payload.find(b"\nEOF\n", po_start)
+        ok_decl = payload.index(ok_marker)
+        ok_start = ok_decl + len(ok_marker)
+        ok_end = payload.find(b"\nEOF\n", ok_start)
+        if (
+            po_end < 0
+            or ok_end < 0
+            or po_end >= ok_start
+            or payload.count(b"\nEOF\n") != 2
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but heredoc "
+                "boundaries are invalid"
+            )
+        try:
+            po_text = payload[po_start:po_end].decode("big5")
+            ok_text = payload[ok_start:ok_end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but an "
+                f"heredoc payload has invalid encoding: {exc}"
+            ) from exc
+        common_prefix = (
+            '# Chinese translation for GNU gettext messages.\n'
+            '#\n'
+            'msgid ""\n'
+            'msgstr ""\n'
+            '"MIME-Version: 1.0\\n"\n'
+        )
+        common_suffix = (
+            '"Content-Transfer-Encoding: 8bit\\n"\n'
+            '\n'
+            '#: src/msgcmp.c:155 src/msgmerge.c:273\n'
+            'msgid "exactly 2 input files required"\n'
+        )
+        po_contract = (
+            common_prefix
+            + '"Content-Type: text/plain; charset=big5\\n"\n'
+            + common_suffix
+        )
+        ok_contract = (
+            common_prefix
+            + '"Content-Type: text/plain; charset=UTF-8\\n"\n'
+            + common_suffix
+        )
+        if not po_text.startswith(po_contract) or not ok_text.startswith(
+            ok_contract
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "gettext message contract is incomplete"
+            )
+        expected_translation = (
+            'msgstr "\u6b64\u529f\u80fd\u9700\u8981\u6070\u597d'
+            '\u6307\u5b9a\u5169\u500b\u8f38\u5165\u6a94"'
+        )
+        if (
+            not po_text.endswith(expected_translation)
+            or not ok_text.endswith(expected_translation)
+            or not any(byte >= 0x80 for byte in payload[po_start:po_end])
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "BIG5/UTF-8 message bodies do not match"
+            )
+        middle = (
+            b"\ntmpfiles=\"$tmpfiles mco-test1.out\"\n"
+            b": ${MSGCONV=msgconv}\n"
+            b"${MSGCONV} --to-code=UTF-8 -o mco-test1.out mco-test1.po\n"
+            b"test $? = 0 || { rm -fr $tmpfiles; exit 1; }\n\n"
+            b'tmpfiles="$tmpfiles mco-test1.ok"\n'
+        )
+        suffix = (
+            b"\n: ${DIFF=diff}\n"
+            b"# Redirect stdout, so as not to fill the user's screen with "
+            b"non-ASCII bytes.\n"
+            b"${DIFF} mco-test1.ok mco-test1.out >/dev/null\n"
+            b"result=$?\n\n"
+            b"rm -fr $tmpfiles\n\n"
+            b"exit $result\n"
+        )
+        if (
+            payload[po_end + len(b"\nEOF\n") : ok_decl] != middle
+            or not payload.endswith(suffix)
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared big5_shell_heredoc but the "
+                "conversion and cleanup shell contract is incomplete"
             )
         return
 

@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import codecs
 import ctypes.util
 import glob
 import gzip
@@ -67,9 +68,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from cppmega.data.build_context import (
+    BuildContextEvidenceError,
     detect_build_context,
     find_compile_commands_file,
     load_compile_commands_file,
+    normalize_macos_sdk_path_argument,
+    validate_macos_sdk_path,
 )
 from cppmega.data.language_info import detect_language_info
 from cppmega.data.source_identity import source_identity, source_identity_for_path
@@ -2595,20 +2599,45 @@ def _sanitize_compile_args_for_clang(args: list[str] | None) -> list[str]:
     return sanitized
 
 
+_WIDE_SOURCE_BOM_CODECS = (
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+_WIDE_SOURCE_CODECS = frozenset(
+    encoding for _bom, encoding in _WIDE_SOURCE_BOM_CODECS
+)
+
+
+def _wide_source_codec(raw: bytes) -> str | None:
+    for bom, encoding in _WIDE_SOURCE_BOM_CODECS:
+        if raw.startswith(bom):
+            return encoding
+    return None
+
+
 def _decode_source_bytes(raw: bytes, filename: str) -> tuple[str, str]:
     """Decode source with a byte-exact fallback for mixed legacy text."""
 
-    try:
-        text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
-    except UnicodeDecodeError:
+    encoding = _wide_source_codec(raw)
+    if encoding is not None:
+        # Use the explicit endian codec so the decoded U+FEFF round-trips to
+        # the original BOM. Malformed BOM-declared input must fail closed
+        # instead of falling through to a single-byte codec.
+        text = raw.decode(encoding, errors="strict")
+    else:
         try:
-            text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
+            text, encoding = raw.decode("utf-8", errors="strict"), "utf-8"
         except UnicodeDecodeError:
-            # Historical source trees can mix Shift-JIS comments with raw
-            # single-byte font tables in one translation unit. No semantic
-            # codec covers that mixture; ISO-8859-1 preserves every byte and
-            # keeps libclang byte offsets exact.
-            text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
+            try:
+                text, encoding = raw.decode("cp1252", errors="strict"), "cp1252"
+            except UnicodeDecodeError:
+                # Historical source trees can mix Shift-JIS comments with raw
+                # single-byte font tables in one translation unit. No semantic
+                # codec covers that mixture; ISO-8859-1 preserves every byte and
+                # keeps libclang byte offsets exact.
+                text, encoding = raw.decode("latin-1", errors="strict"), "latin-1"
     if "\0" in text and "\0" in _mask_non_code(text):
         raise ValueError(f"source contains NUL byte: {filename}")
     return text, encoding
@@ -2620,6 +2649,12 @@ def _read_source_file(filename: str) -> tuple[str, bytes, str]:
     source, source_encoding = _decode_source_bytes(source_bytes, filename)
     if source.encode(source_encoding, errors="strict") != source_bytes:
         raise ValueError(f"source decoding did not round-trip exactly: {filename}")
+    if source_encoding in _WIDE_SOURCE_CODECS:
+        # libclang rejects UTF-16/32 source files even when they carry a BOM.
+        # Parse an equivalent UTF-8 unsaved buffer and make every offset mapper
+        # and text extractor use those same parser bytes.
+        source_bytes = source.encode("utf-8", errors="strict")
+        source_encoding = "utf-8"
     return source, source_bytes, source_encoding
 
 
@@ -5107,9 +5142,20 @@ def _load_translation_unit(
     index: Index,
     compile_args: Sequence[str],
 ) -> TranslationUnit:
+    with open(filepath, "rb") as source_file:
+        prefix = source_file.read(4)
+    unsaved_files = None
+    if _wide_source_codec(prefix) is not None:
+        source, _parser_bytes, parser_encoding = _read_source_file(filepath)
+        if parser_encoding != "utf-8":
+            raise ValueError(
+                f"wide source was not normalized for libclang: {filepath}"
+            )
+        unsaved_files = [(filepath, source)]
     return index.parse(
         filepath,
         args=list(compile_args),
+        unsaved_files=unsaved_files,
         # Corpus indexing parses each translation unit once. PCH preamble
         # caches are a native-memory win only for repeated reparses; here they
         # make many parallel clang workers retain large buffers.
@@ -5703,9 +5749,16 @@ def _harmonize_build_info_with_compile_args(
     return harmonized
 
 
-def get_default_compile_args(project_dir: str) -> list[str]:
+def get_default_compile_args(
+    project_dir: str,
+    *,
+    macos_sdk_path: str | None = None,
+) -> list[str]:
     """Generate default compile args for projects without compile_commands.json."""
-    platform_info, args, _compile_index = detect_build_context(project_dir)
+    platform_info, args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     result, _build_info = _resolve_default_compile_context(
         project_dir,
         platform_info,
@@ -5714,10 +5767,18 @@ def get_default_compile_args(project_dir: str) -> list[str]:
     return result
 
 
+def _is_legacy_cpp_c_path(filepath: str) -> bool:
+    """Return whether an upstream path explicitly declares a .c file as C++."""
+
+    parts = tuple(part.casefold() for part in Path(filepath).parts)
+    return any(
+        parts[index : index + 2] == ("bld", "plusplus")
+        for index in range(len(parts) - 1)
+    )
+
+
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
-    """Adapt compile args based on file extension — .c files need C mode, not C++,
-    and headers need an explicit header language (otherwise libclang can infer
-    the wrong mode for a standalone .h/.hpp translation unit)."""
+    """Adapt compile args to the file's extension or explicit path dialect."""
     raw_ext = os.path.splitext(filepath)[1]
     ext = raw_ext.lower()
     if ext in HEADER_EXTENSIONS:
@@ -5776,7 +5837,9 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
+        force_cpp = _is_legacy_cpp_c_path(filepath)
         has_c_standard = False
+        has_cpp_standard = False
         for arg in args:
             if skip_next:
                 skip_next = False
@@ -5797,12 +5860,22 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 else None
             )
             if standard_context is not None:
-                if standard_context[1] == 'c':
+                if standard_context[1] == 'c' and not force_cpp:
                     adapted.append(arg)
                     has_c_standard = True
-                # A non-C standard cannot describe the C translation unit.
+                elif standard_context[1] == 'c++' and force_cpp:
+                    adapted.append(arg)
+                    has_cpp_standard = True
+                # A standard for the other language cannot describe this TU.
                 continue
             adapted.append(arg)
+        if force_cpp:
+            # Open Watcom keeps C++ regression inputs under bld/plusplus with
+            # .c suffixes. Parsing those as C can make libclang loop forever.
+            prefix = ['-x', 'c++']
+            if not has_cpp_standard:
+                prefix.append('-std=c++17')
+            return prefix + adapted
         # Ensure C mode is set, and use the established parser fallback only
         # when the build context did not supply a valid C dialect.
         prefix = ['-x', 'c']
@@ -11273,6 +11346,7 @@ def process_project(
     skip_invalid_domain_inputs: bool = False,
     source_quarantine_manifest: str | None = None,
     source_quarantine_receipt: str | None = None,
+    macos_sdk_path: str | None = None,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -11435,7 +11509,10 @@ def process_project(
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
     compile_db = load_compile_commands(project_dir)
-    _platform_info, _raw_args, _compile_index = detect_build_context(project_dir)
+    _platform_info, _raw_args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     default_args, default_build_info = _resolve_default_compile_context(
         project_dir,
         _platform_info,
@@ -11728,6 +11805,14 @@ def main() -> int:
                         help='Number of parallel parse workers within each project (default: 8)')
     parser.add_argument('--libclang-path', type=str, default=None,
                         help='Path to libclang.so (auto-detected if not set)')
+    parser.add_argument(
+        '--macos-sdk',
+        type=normalize_macos_sdk_path_argument,
+        default=None,
+        help='Explicit macOS SDK root used only for projects whose bounded '
+             '.xcconfig evidence requires a macOS build context. No ambient '
+             'SDK lookup is performed.',
+    )
     parser.add_argument('--append', action='store_true',
                         help='Append to output file instead of overwriting')
     parser.add_argument('--enriched', action='store_true',
@@ -11792,6 +11877,11 @@ def main() -> int:
                              'unchanged when absent.')
 
     args = parser.parse_args()
+    if args.macos_sdk is not None:
+        try:
+            validate_macos_sdk_path(args.macos_sdk)
+        except BuildContextEvidenceError as exc:
+            parser.error(str(exc))
     start_memory_guard(args.memory_limit_gb, label="index_project")
 
     try:
@@ -11995,6 +12085,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         ): (pd, project_id)
                         for pd, project_id in project_specs
                     }
@@ -12024,6 +12115,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         )
                         for doc in docs:
                             _write_doc(doc)

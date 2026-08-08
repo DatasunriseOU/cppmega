@@ -33,12 +33,18 @@ RELATIVE_INDEX_REMAP_CRASH_FIXTURE = (
 RELATIVE_PARSER_CRASH_FIXTURE = (
     "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
 )
+RELATIVE_NUL_DIAGNOSTIC_FIXTURE = "clang/test/Misc/diag-null-bytes-in-line.cpp"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
 RELATIVE_CLICKHOUSE_BINARY_SQL = "tests/queries/0_stateless/binary_fixture.sql"
 RELATIVE_GCC_PR119001 = "gcc/testsuite/gcc.dg/pr119001-1.c"
+RELATIVE_NUL_FF_BLOB = "unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
+RELATIVE_TRUNCATED_UTF32BE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake"
+RELATIVE_BIG5_SHELL_HEREDOC = (
+    "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1"
+)
 
 
 def _xml_bytes() -> bytes:
@@ -151,6 +157,24 @@ def _gcc_pr119001_fixture_bytes() -> bytes:
     )
 
 
+def _clang_embedded_nul_diagnostic_bytes() -> bytes:
+    return (
+        b"// RUN: not %clang_cc1 -fsyntax-only %s 2>&1 | "
+        b"FileCheck -strict-whitespace %s\n"
+        b"\n"
+        b"int x[sizeof\0int];\n"
+        b"// CHECK: warning: null character ignored\n"
+        b"// CHECK-NEXT: int x[sizeof<U+0000>int];\n"
+        b"// CHECK-NEXT:             ^\n"
+        b"\n"
+        b"// CHECK: error: expected parentheses around type name in "
+        b"sizeof expression\n"
+        b"// CHECK-NEXT: int x[sizeof<U+0000>int];\n"
+        b"// CHECK-NEXT:             ^\n"
+        b"// CHECK-NEXT:             (          )\n"
+    )
+
+
 def _der(tag: int, payload: bytes) -> bytes:
     if len(payload) < 0x80:
         length = bytes([len(payload)])
@@ -206,6 +230,73 @@ def _clickhouse_binary_sql_bytes(
         + input_format.encode("ascii")
         + b", 'value UInt64',\n$$\x00\xffbinary-protocol-fixture$$); -- { "
         b"serverError " + server_error.encode("ascii") + b" }\n"
+    )
+
+
+def _truncated_utf32be_bom_bytes() -> bytes:
+    return b"\x00\x00\xfe"
+
+
+def _big5_shell_heredoc_bytes() -> bytes:
+    big5_translation = bytes.fromhex(
+        "a6b9a55cafe0bbddad6eabeaa66eabfca977a8e2add3bfe9a44ac0c9"
+    )
+    utf8_translation = (
+        "\u6b64\u529f\u80fd\u9700\u8981\u6070\u597d\u6307\u5b9a"
+        "\u5169\u500b\u8f38\u5165\u6a94"
+    ).encode("utf-8")
+    po_body = (
+        b"# Chinese translation for GNU gettext messages.\n"
+        b"#\n"
+        b'msgid ""\n'
+        b'msgstr ""\n'
+        b'"MIME-Version: 1.0\\n"\n'
+        b'"Content-Type: text/plain; charset=big5\\n"\n'
+        b'"Content-Transfer-Encoding: 8bit\\n"\n\n'
+        b"#: src/msgcmp.c:155 src/msgmerge.c:273\n"
+        b'msgid "exactly 2 input files required"\n'
+        b'msgstr "'
+        + big5_translation
+        + b'"\n'
+    )
+    ok_body = (
+        b"# Chinese translation for GNU gettext messages.\n"
+        b"#\n"
+        b'msgid ""\n'
+        b'msgstr ""\n'
+        b'"MIME-Version: 1.0\\n"\n'
+        b'"Content-Type: text/plain; charset=UTF-8\\n"\n'
+        b'"Content-Transfer-Encoding: 8bit\\n"\n\n'
+        b"#: src/msgcmp.c:155 src/msgmerge.c:273\n"
+        b'msgid "exactly 2 input files required"\n'
+        b'msgstr "'
+        + utf8_translation
+        + b'"\n'
+    )
+    return (
+        b"#! /bin/sh\n\n"
+        b"# Test conversion from BIG5 to UTF-8.\n\n"
+        b'tmpfiles=""\n'
+        b"trap 'rm -fr $tmpfiles' 1 2 3 15\n\n"
+        b'tmpfiles="$tmpfiles mco-test1.po"\n'
+        b"cat <<\\EOF > mco-test1.po\n"
+        + po_body
+        + b"EOF\n\n"
+        + b'tmpfiles="$tmpfiles mco-test1.out"\n'
+        + b": ${MSGCONV=msgconv}\n"
+        + b"${MSGCONV} --to-code=UTF-8 -o mco-test1.out mco-test1.po\n"
+        + b"test $? = 0 || { rm -fr $tmpfiles; exit 1; }\n\n"
+        + b'tmpfiles="$tmpfiles mco-test1.ok"\n'
+        + b"cat <<\\EOF > mco-test1.ok\n"
+        + ok_body
+        + b"EOF\n"
+        + b"\n: ${DIFF=diff}\n"
+        + b"# Redirect stdout, so as not to fill the user's screen with "
+        + b"non-ASCII bytes.\n"
+        + b"${DIFF} mco-test1.ok mco-test1.out >/dev/null\n"
+        + b"result=$?\n\n"
+        + b"rm -fr $tmpfiles\n\n"
+        + b"exit $result\n"
     )
 
 
@@ -485,6 +576,177 @@ def test_exact_quarantine_filters_verified_non_cpp_and_builds_receipt(
     ]
 
 
+def test_exact_quarantine_filters_nul_ff_binary_blob(tmp_path: Path) -> None:
+    payload = b"\0\xff" * 386 + b"\0"
+    candidate = tmp_path / RELATIVE_NUL_FF_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="nul_ff_binary_blob",
+        relative_path=RELATIVE_NUL_FF_BLOB,
+        reason="binary 0x00/0xff payload stored under a header suffix",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["detected_format"] == "nul_ff_binary_blob"
+
+
+def test_exact_quarantine_filters_truncated_utf32be_bom(tmp_path: Path) -> None:
+    payload = _truncated_utf32be_bom_bytes()
+    candidate = tmp_path / RELATIVE_TRUNCATED_UTF32BE_BOM
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="truncated_utf32be_bom",
+        relative_path=RELATIVE_TRUNCATED_UTF32BE_BOM,
+        reason="truncated UTF-32BE BOM fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["detected_format"] == "truncated_utf32be_bom"
+
+
+def test_truncated_utf32be_bom_quarantine_rejects_other_payload(
+    tmp_path: Path,
+) -> None:
+    payload = b"\x00\x00\xff"
+    candidate = tmp_path / RELATIVE_TRUNCATED_UTF32BE_BOM
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="truncated_utf32be_bom",
+        relative_path=RELATIVE_TRUNCATED_UTF32BE_BOM,
+        reason="forged truncated UTF-32BE BOM fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="exactly the three-byte"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_exact_quarantine_filters_big5_shell_heredoc(tmp_path: Path) -> None:
+    payload = _big5_shell_heredoc_bytes()
+    candidate = tmp_path / RELATIVE_BIG5_SHELL_HEREDOC
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="big5_shell_heredoc",
+        relative_path=RELATIVE_BIG5_SHELL_HEREDOC,
+        reason="BIG5 shell heredoc fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["detected_format"] == "big5_shell_heredoc"
+
+
+def test_big5_shell_heredoc_quarantine_rejects_changed_message(
+    tmp_path: Path,
+) -> None:
+    payload = _big5_shell_heredoc_bytes().replace(b"--to-code=UTF-8", b"--to-code=BIG5")
+    candidate = tmp_path / RELATIVE_BIG5_SHELL_HEREDOC
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="big5_shell_heredoc",
+        relative_path=RELATIVE_BIG5_SHELL_HEREDOC,
+        reason="forged BIG5 shell heredoc fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="conversion and cleanup"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_nul_ff_binary_blob_verification_streams_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"\0" * (1024 * 1024) + b"\xff" * (1024 * 1024)
+    candidate = tmp_path / RELATIVE_NUL_FF_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="nul_ff_binary_blob",
+        relative_path=RELATIVE_NUL_FF_BLOB,
+        reason="binary 0x00/0xff payload stored under a header suffix",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    original_read_bytes = Path.read_bytes
+
+    def reject_candidate_read_bytes(path: Path) -> bytes:
+        if path == candidate:
+            raise AssertionError("nul_ff_binary_blob verification must stream input")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_candidate_read_bytes)
+
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"\0" * 4, b"\xff" * 4, b"\0\xff\x01"],
+)
+def test_nul_ff_binary_blob_requires_both_values_and_no_others(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    candidate = tmp_path / RELATIVE_NUL_FF_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="nul_ff_binary_blob",
+        relative_path=RELATIVE_NUL_FF_BLOB,
+        reason="binary 0x00/0xff payload stored under a header suffix",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="only 0x00 and 0xff"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_quarantine_hash_mismatch_fails_without_filtering(
     tmp_path: Path,
 ) -> None:
@@ -639,6 +901,36 @@ def test_gcc_pr119001_quarantine_rejects_unrelated_flexible_array_source(
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
     with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
         policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_exact_quarantine_filters_clang_embedded_nul_diagnostic(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes()
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="fixture intentionally embeds a NUL for Clang diagnostics",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == (
+        "deliberate_compiler_diagnostic_fixture"
+    )
+    assert receipt["entries"][0]["detected_format"] == (
+        "clang_embedded_nul_diagnostic"
+    )
 
 
 def test_exact_quarantine_filters_der_x509_certificate_pair(
@@ -1046,6 +1338,51 @@ def test_checked_in_gcc_pr119001_manifest_matches_pinned_fixture() -> None:
     )
 
 
+def test_checked_in_intel_nul_diagnostic_manifest_matches_reference_fixture() -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "intel/llvm"
+        and item["relative_path"] == RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    )
+
+    assert len(payload) == 398
+    assert hashlib.sha256(payload).hexdigest() == (
+        "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a"
+    )
+    assert entry["relative_path"] == RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
+    assert entry["detected_format"] == "clang_embedded_nul_diagnostic"
+
+
+def test_checked_in_cmake_truncated_bom_manifest_matches_archive_receipt() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "Kitware/CMake"
+    )
+
+    payload = _truncated_utf32be_bom_bytes()
+    assert entry["relative_path"] == RELATIVE_TRUNCATED_UTF32BE_BOM
+    assert entry["size_bytes"] == len(payload) == 3
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "mislabeled_non_cpp"
+    assert entry["detected_format"] == "truncated_utf32be_bom"
+
+
 def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -> None:
     manifest = json.loads(
         (
@@ -1071,7 +1408,7 @@ def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -
     assert collection["detected_format"] == "asn1_der_x509_certificate_pair"
 
 
-def test_checked_in_threadx_generated_blob_manifest_matches_upstream_receipt() -> None:
+def test_checked_in_threadx_generated_blob_manifest_matches_frozen_receipt() -> None:
     manifest = json.loads(
         (
             Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
@@ -1083,9 +1420,9 @@ def test_checked_in_threadx_generated_blob_manifest_matches_upstream_receipt() -
         if item["project_id"] == "eclipse-threadx/threadx"
     )
 
-    assert entry["size_bytes"] == 61551
+    assert entry["size_bytes"] == 60766
     assert entry["sha256"] == (
-        "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294"
+        "521e056f7c839d8c4af115f7822e1f6fc484824f9292c2473f32bd9487e63c74"
     )
     assert entry["classification"] == "generated_binary_blob"
     assert entry["detected_format"] == "mixed_utf8_utf16le_c_array"
@@ -1134,9 +1471,35 @@ def test_checked_in_clickhouse_binary_sql_manifest_matches_diagnosis_receipts() 
         assert entry["detected_format"] == "clickhouse_dollar_quoted_binary_sql"
 
 
+def test_checked_in_netbsd_big5_shell_manifest_matches_archive_receipt() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "NetBSD/src"
+    )
+
+    payload = _big5_shell_heredoc_bytes()
+    assert entry["relative_path"] == RELATIVE_BIG5_SHELL_HEREDOC
+    assert entry["size_bytes"] == len(payload) == 1155
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "mislabeled_non_cpp"
+    assert entry["detected_format"] == "big5_shell_heredoc"
+
+
 @pytest.mark.parametrize(
     ("project_id", "relative_path", "size_bytes", "sha256"),
     [
+        (
+            "python/cpython",
+            "Lib/test/archivetestdata/exe_with_zip",
+            990,
+            "2f27f5c9108936a693fd496565e5c5050b5c62cfbb61d1d5da9d97c89533d637",
+        ),
         (
             "python/cpython",
             "Lib/test/archivetestdata/exe_with_z64",
@@ -1163,7 +1526,10 @@ def test_checked_in_executable_archive_manifest_matches_archive_receipt(
         ).read_text(encoding="utf-8")
     )
     entry = next(
-        item for item in manifest["entries"] if item["project_id"] == project_id
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == project_id
+        and item["relative_path"] == relative_path
     )
 
     assert entry["relative_path"] == relative_path
@@ -1194,6 +1560,60 @@ def test_clang_crash_quarantine_requires_independent_fixture_signature(
     with pytest.raises(
         SourceQuarantineError,
         match="crash-test contract is incomplete",
+    ):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_clang_embedded_nul_quarantine_requires_diagnostic_signature(
+    tmp_path: Path,
+) -> None:
+    payload = b"int x[sizeof\0int];\n"
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="forged diagnostic fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(
+        SourceQuarantineError,
+        match="embedded-NUL diagnostic contract is incomplete",
+    ):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_clang_embedded_nul_quarantine_requires_both_caret_markers(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes().replace(
+        b"// CHECK-NEXT:             ^\n",
+        b"// CHECK-NEXT:             x\n",
+        1,
+    )
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_embedded_nul_diagnostic",
+        relative_path=RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="forged diagnostic fixture missing one caret marker",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(
+        SourceQuarantineError,
+        match="embedded-NUL diagnostic contract is incomplete",
     ):
         policy.filter_candidates(tmp_path, [str(candidate)])
 
@@ -1298,6 +1718,34 @@ def test_process_project_writes_atomic_bound_receipt(
             manifest_sha256=manifest_sha256,
             source_snapshot={"kind": "git_mirror", "tree": "0" * 40},
         )
+
+
+def test_process_project_quarantines_clang_embedded_nul_diagnostic(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_embedded_nul_diagnostic_bytes()
+    candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+    receipt_path = tmp_path / "receipts/source.json"
+
+    documents = ip.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="intel/llvm",
+        source_quarantine_manifest=str(manifest),
+        source_quarantine_receipt=str(receipt_path),
+    )
+
+    assert documents == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["project_id"] == "intel/llvm"
+    assert receipt["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["relative_path"] == (
+        RELATIVE_NUL_DIAGNOSTIC_FIXTURE
+    )
 
 
 def test_process_project_quarantines_non_cpp_executable_archive(
