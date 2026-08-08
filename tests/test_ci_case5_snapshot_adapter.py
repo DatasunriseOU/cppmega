@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from scripts.ci_stream_fetch import ExactTokenizer
+from scripts.distributed_data_prep import ci_case5_snapshot as snapshot_module
 from scripts.distributed_data_prep._common import ContractError, atomic_write_json, sha256_file
 from scripts.distributed_data_prep.ci_case5_snapshot import (
     ADAPTER_OUTPUT_SCHEMA,
@@ -306,3 +307,52 @@ def test_worker_ledger_resume_does_not_invoke_completed_case5_adapter(
         object_store=case5_fixture["store"],
     )
     assert resumed == first
+
+
+def test_cli_builds_manifest_from_existing_immutable_snapshot(
+    case5_fixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp_path = case5_fixture["tmp_path"]
+    receipt_path = tmp_path / "existing-snapshot-set.json"
+    manifest_path = tmp_path / "existing-snapshot-manifest.json"
+    atomic_write_json(receipt_path, case5_fixture["prepared"]["receipt"])
+
+    args = [
+        "--build-manifest",
+        "--snapshot-receipt",
+        str(receipt_path),
+        "--manifest",
+        str(manifest_path),
+        "--gcs-output-prefix",
+        "gs://case5-output/existing-snapshot",
+        "--code-revision",
+        "b" * 40,
+        "--worker-count",
+        "2",
+        "--records-per-item",
+        "1",
+    ]
+    assert snapshot_module._main(args) == 0
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["input_snapshot_set_sha256"] == case5_fixture["prepared"][
+        "input_snapshot_set_sha256"
+    ]
+    assert len(manifest["assignments"]) == 2
+    assert manifest["pipeline"]["training_ready"] is False
+    summary = json.loads(capsys.readouterr().out)
+    assert summary == {
+        "assignment_count": 2,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "training_ready": False,
+    }
+
+    # A byte-compatible resume reuses the immutable manifest.
+    assert snapshot_module._main(args) == 0
+
+    # Semantic equality is insufficient for a receipt whose exact bytes are
+    # bound by downstream completion receipts.
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+    with pytest.raises(ContractError, match="immutable receipt differs"):
+        snapshot_module._write_immutable_receipt(manifest_path, manifest)

@@ -18,6 +18,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import copy
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -523,9 +524,12 @@ def _write_immutable_receipt(path: Path, receipt: Mapping[str, object]) -> None:
 
     target = Path(path).expanduser()
     if target.exists() or target.is_symlink():
-        _raw, existing = load_json_object(target, where="CASE5 snapshot receipt")
-        if existing != dict(receipt):
-            raise ContractError("existing CASE5 snapshot receipt differs from resume")
+        raw, existing = load_json_object(target, where="CASE5 immutable receipt")
+        expected = (
+            json.dumps(dict(receipt), indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if existing != dict(receipt) or raw != expected:
+            raise ContractError("existing CASE5 immutable receipt differs from resume")
         return
     atomic_write_json(target, receipt)
 
@@ -1296,6 +1300,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--request", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--prepare", action="store_true")
+    parser.add_argument("--build-manifest", action="store_true")
     parser.add_argument("--store-root", type=Path)
     parser.add_argument("--store-receipt", type=Path)
     parser.add_argument("--fetch-state", type=Path)
@@ -1320,13 +1325,57 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--records-per-item", type=int)
     args = parser.parse_args(argv)
     adapter_requested = args.request is not None or args.output is not None
-    if adapter_requested and (args.request is None or args.output is None or args.prepare):
+    if adapter_requested and (
+        args.request is None
+        or args.output is None
+        or args.prepare
+        or args.build_manifest
+    ):
         parser.error("adapter mode requires --request and --output only")
-    if not adapter_requested and not args.prepare:
-        parser.error("use --request/--output for adapter mode or --prepare")
+    if args.prepare and args.build_manifest:
+        parser.error("--prepare and --build-manifest are mutually exclusive")
+    if not adapter_requested and not args.prepare and not args.build_manifest:
+        parser.error(
+            "use --request/--output for adapter mode, --prepare, or "
+            "--build-manifest"
+        )
     try:
         if adapter_requested:
             run_ci_case5_adapter(request_path=args.request, output_path=args.output)
+            return 0
+        if args.build_manifest:
+            required = {
+                "--snapshot-receipt": args.snapshot_receipt,
+                "--manifest": args.manifest,
+                "--gcs-output-prefix": args.gcs_output_prefix,
+                "--code-revision": args.code_revision,
+                "--worker-count": args.worker_count,
+                "--records-per-item": args.records_per_item,
+            }
+            missing = [flag for flag, value in required.items() if value is None]
+            if missing:
+                parser.error("--build-manifest requires " + ", ".join(missing))
+            _raw, snapshot_receipt = load_json_object(
+                Path(args.snapshot_receipt), where="CASE5 snapshot receipt"
+            )
+            manifest = build_ci_case5_manifest(
+                snapshot_receipt,
+                worker_count=int(args.worker_count),
+                records_per_item=int(args.records_per_item),
+                gcs_output_prefix=str(args.gcs_output_prefix),
+                code_revision=str(args.code_revision),
+                adapter_path=Path(__file__).resolve(),
+            )
+            _write_immutable_receipt(Path(args.manifest), manifest)
+            print(
+                canonical_json_bytes(
+                    {
+                        "manifest_sha256": manifest["manifest_sha256"],
+                        "assignment_count": len(manifest["assignments"]),
+                        "training_ready": False,
+                    }
+                ).decode("ascii")
+            )
             return 0
         required = {
             "--store-root": args.store_root,
@@ -1380,7 +1429,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 code_revision=str(args.code_revision),
                 adapter_path=Path(__file__).resolve(),
             )
-            atomic_write_json(args.manifest, manifest)
+            _write_immutable_receipt(Path(args.manifest), manifest)
         print(
             canonical_json_bytes(
                 {
