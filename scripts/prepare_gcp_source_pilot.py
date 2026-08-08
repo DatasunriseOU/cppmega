@@ -21,6 +21,7 @@ if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
 from scripts.distributed_data_prep._common import (
     ContractError,
     atomic_write_json,
+    require_sha256,
     run_checked,
     sha256_file,
 )
@@ -37,6 +38,41 @@ RUNNER_PLACEHOLDERS = {
     "__CPPMEGA_OVERLAY_SHA256__": "overlay",
     "__CPPMEGA_MANIFEST_SHA256__": "manifest",
 }
+OPTIONAL_RUNNER_PLACEHOLDERS = {
+    "__CPPMEGA_REPAIR_CONTRACT_SHA256__": "none",
+}
+
+
+def render_runner(
+    template: str,
+    hashes: dict[str, str],
+    *,
+    repair_contract_sha256: str | None = None,
+) -> str:
+    """Render every immutable runner input, including an optional repair gate."""
+
+    rendered = template
+    for placeholder, key in RUNNER_PLACEHOLDERS.items():
+        if rendered.count(placeholder) != 1:
+            raise ContractError(f"runner template placeholder drifted: {placeholder}")
+        rendered = rendered.replace(
+            placeholder,
+            require_sha256(hashes.get(key), where=f"runner {key} SHA-256"),
+        )
+    for placeholder, absent_value in OPTIONAL_RUNNER_PLACEHOLDERS.items():
+        if rendered.count(placeholder) != 1:
+            raise ContractError(f"runner template placeholder drifted: {placeholder}")
+        replacement = (
+            require_sha256(
+                repair_contract_sha256, where="runner repair contract SHA-256"
+            )
+            if repair_contract_sha256 is not None
+            else absent_value
+        )
+        rendered = rendered.replace(placeholder, replacement)
+    if "__CPPMEGA_" in rendered:
+        raise ContractError("runner contains an unresolved placeholder")
+    return rendered
 
 
 def _regular_file(path: Path, *, where: str) -> Path:
@@ -132,7 +168,9 @@ def prepare_pilot(
     revision = _tracked_clean(repo_root)
     if output_root.exists():
         raise ContractError(f"pilot output already exists: {output_root}")
-    _raw = json.loads(_regular_file(repositories_path, where="repositories").read_text())
+    _raw = json.loads(
+        _regular_file(repositories_path, where="repositories").read_text()
+    )
     repositories = _raw.get("repositories")
     if not isinstance(repositories, list):
         raise ContractError("repositories document needs a repositories list")
@@ -140,10 +178,6 @@ def prepare_pilot(
     template = _regular_file(runner_template, where="runner template").read_text(
         encoding="utf-8"
     )
-    for placeholder in RUNNER_PLACEHOLDERS:
-        if template.count(placeholder) != 1:
-            raise ContractError(f"runner template placeholder drifted: {placeholder}")
-
     output_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=f".{output_root.name}.", dir=output_root.parent
@@ -188,11 +222,7 @@ def prepare_pilot(
             "overlay": sha256_file(overlay),
             "manifest": sha256_file(manifest_path),
         }
-        rendered = template
-        for placeholder, key in RUNNER_PLACEHOLDERS.items():
-            rendered = rendered.replace(placeholder, hashes[key])
-        if "__CPPMEGA_" in rendered:
-            raise ContractError("runner contains an unresolved placeholder")
+        rendered = render_runner(template, hashes)
         runner = bootstrap / "source-worker-runner"
         runner.write_text(rendered, encoding="utf-8", newline="\n")
         runner.chmod(0o555)
@@ -254,7 +284,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
             cpu_budget_vcpus=args.cpu_budget_vcpus,
             memory_budget_gb=args.memory_budget_gb,
         )
-    except (ContractError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        ContractError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         parser.exit(2, f"GCP source pilot preparation failed: {exc}\n")
     return 0
 

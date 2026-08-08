@@ -18,6 +18,7 @@ from scripts.distributed_data_prep._common import (
     require_exact_fields,
     require_int,
     require_sha256,
+    sha256_file,
 )
 from scripts.distributed_data_prep.source_worker import (
     ObjectStore,
@@ -141,6 +142,64 @@ def assignment_outcome_uri(
         require_sha256(job["assignment_sha256"], where="assignment_sha256"),
         f"{attempt:04d}-{require_sha256(claim_sha256, where='claim_sha256')}.outcome.json",
     )
+
+
+def assignment_diagnostic_uri(
+    manifest: Mapping[str, object],
+    job: Mapping[str, object],
+    attempt: int,
+    claim_sha256: str,
+) -> str:
+    """Return the immutable raw-log URI for one failed claimed attempt."""
+
+    return gcs_join(
+        str(manifest["gcs_output_prefix"]),
+        "source-assignment-attempt-diagnostics",
+        str(manifest["manifest_sha256"]),
+        require_sha256(job["assignment_sha256"], where="assignment_sha256"),
+        f"{require_int(attempt, where='diagnostic attempt'):04d}-"
+        f"{require_sha256(claim_sha256, where='claim_sha256')}.diagnostic.log",
+    )
+
+
+def publish_assignment_diagnostic(
+    *,
+    manifest: Mapping[str, object],
+    lease: AssignmentLease,
+    log_path: Path,
+    object_store: ObjectStore,
+) -> dict[str, object]:
+    """Publish and verify the exact raw log before a terminal outcome exists."""
+
+    if log_path.is_symlink() or not log_path.is_file():
+        raise ContractError(f"assignment diagnostic must be a regular file: {log_path}")
+    uri = assignment_diagnostic_uri(
+        manifest,
+        lease.job,
+        require_int(lease.claim["attempt"], where="claim attempt"),
+        lease.claim_sha256,
+    )
+    metadata = dict(object_store.publish_if_absent(log_path, uri))
+    if metadata.get("uri") != uri:
+        raise ContractError("published assignment diagnostic URI drifted")
+    if (
+        require_int(metadata.get("size_bytes"), where="diagnostic size", minimum=0)
+        != log_path.stat().st_size
+    ):
+        raise ContractError("published assignment diagnostic size drifted")
+    generation = metadata.get("generation")
+    if (
+        not isinstance(generation, str)
+        or not generation.isdecimal()
+        or int(generation) < 1
+    ):
+        raise ContractError("published assignment diagnostic generation is invalid")
+    return {
+        "uri": uri,
+        "generation": generation,
+        "size_bytes": log_path.stat().st_size,
+        "sha256": sha256_file(log_path),
+    }
 
 
 def build_assignment_claim(
@@ -795,10 +854,12 @@ __all__ = [
     "AssignmentLease",
     "ClaimDecision",
     "assignment_claim_uri",
+    "assignment_diagnostic_uri",
     "assignment_heartbeat_uri",
     "assignment_outcome_uri",
     "build_assignment_claim",
     "claim_assignment",
+    "publish_assignment_diagnostic",
     "publish_assignment_heartbeat",
     "publish_assignment_outcome",
     "validate_assignment_claim",

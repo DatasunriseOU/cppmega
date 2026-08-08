@@ -8,8 +8,10 @@ from scripts.distributed_data_prep._common import ContractError, atomic_write_js
 from scripts.distributed_data_prep.source_manifest import build_source_manifest
 from scripts.distributed_data_prep.source_work_queue import (
     assignment_claim_uri,
+    assignment_diagnostic_uri,
     build_assignment_claim,
     claim_assignment,
+    publish_assignment_diagnostic,
     publish_assignment_heartbeat,
     publish_assignment_outcome,
     validate_assignment_claim,
@@ -203,6 +205,52 @@ def test_exit_75_advances_the_attempt_but_exit_2_stops_all_retries(
     )
     assert stopped.state == "deterministic"
     assert stopped.outcome == deterministic
+
+
+def test_failed_attempt_log_is_immutably_published_before_outcome(
+    tmp_path: Path,
+) -> None:
+    manifest, job = _manifest()
+    store = LocalObjectStore(tmp_path / "objects")
+    decision = _claim(
+        manifest=manifest,
+        job=job,
+        executor=_executor(0),
+        instance="vm-0.boot-diagnostic",
+        now=3_000,
+        store=store,
+        root=tmp_path / "verify",
+    )
+    assert decision.lease is not None
+    log_path = tmp_path / "attempt.log"
+    log_path.write_bytes(b"exact deterministic parser failure\n")
+
+    receipt = publish_assignment_diagnostic(
+        manifest=manifest,
+        lease=decision.lease,
+        log_path=log_path,
+        object_store=store,
+    )
+    expected_uri = assignment_diagnostic_uri(
+        manifest,
+        job,
+        0,
+        decision.lease.claim_sha256,
+    )
+    assert receipt["uri"] == expected_uri
+    assert receipt["size_bytes"] == log_path.stat().st_size
+    downloaded = tmp_path / "downloaded.log"
+    store.download(expected_uri, downloaded, generation=str(receipt["generation"]))
+    assert downloaded.read_bytes() == log_path.read_bytes()
+
+    log_path.write_bytes(b"different bytes\n")
+    with pytest.raises(ContractError, match="immutable object collision"):
+        publish_assignment_diagnostic(
+            manifest=manifest,
+            lease=decision.lease,
+            log_path=log_path,
+            object_store=store,
+        )
 
 
 def test_expired_owner_cannot_publish_an_outcome_after_takeover_window(

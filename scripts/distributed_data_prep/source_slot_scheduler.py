@@ -59,6 +59,7 @@ from scripts.distributed_data_prep.source_work_queue import (  # noqa: E402
     AssignmentLease,
     claim_assignment,
     publish_assignment_heartbeat,
+    publish_assignment_diagnostic,
     publish_assignment_outcome,
 )
 
@@ -1192,6 +1193,17 @@ def _run_dynamic_source_scheduler(
                     completed_assignments.add(assignment_sha256)
                     terminal_assignments.pop(assignment_sha256, None)
                     continue
+                log_path = entry["log_path"]
+                assert isinstance(log_path, Path)
+                # An attempt outcome closes this claimed execution.  Publish
+                # its exact raw log first so every new repair failure remains
+                # diagnosable even after Local SSD teardown.
+                publish_assignment_diagnostic(
+                    manifest=manifest,
+                    lease=lease,
+                    log_path=log_path,
+                    object_store=object_store,
+                )
                 outcome = publish_assignment_outcome(
                     manifest=manifest,
                     lease=lease,
@@ -1200,8 +1212,6 @@ def _run_dynamic_source_scheduler(
                     object_store=object_store,
                     verification_root=slot_roots[entry_spec.worker] / "verify",
                 )
-                log_path = entry["log_path"]
-                assert isinstance(log_path, Path)
                 if code == 75:
                     transient_failures.append((assignment_sha256, log_path))
                 else:

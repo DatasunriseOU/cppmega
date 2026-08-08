@@ -6,6 +6,7 @@ umask 027
 readonly BUNDLE_SHA256="__CPPMEGA_BUNDLE_SHA256__"
 readonly OVERLAY_SHA256="__CPPMEGA_OVERLAY_SHA256__"
 readonly MANIFEST_SHA256="__CPPMEGA_MANIFEST_SHA256__"
+readonly REPAIR_CONTRACT_SHA256="__CPPMEGA_REPAIR_CONTRACT_SHA256__"
 readonly STAGE_ROOT="${CPPMEGA_STAGE_ROOT:?CPPMEGA_STAGE_ROOT is required}"
 readonly RUN_ROOT="${CPPMEGA_RUN_ROOT:?CPPMEGA_RUN_ROOT is required}"
 readonly WORKER_CONFIG="${CPPMEGA_WORKER_CONFIG:?CPPMEGA_WORKER_CONFIG is required}"
@@ -27,6 +28,7 @@ repo_root="$work_root/cppmega"
 bundle="$input_root/cppmega.bundle"
 overlay="$input_root/distributed-data-prep.tar.zst"
 manifest="$input_root/source-manifest.json"
+repair_contract="$input_root/repair-contract.json"
 
 failure_receipt="$STAGE_ROOT/receipts/$worker_name.$BOOT_ID.failed.json"
 readonly MAX_TRANSPORT_RETRIES=4
@@ -236,11 +238,46 @@ gcs_read_exact "$RUN_ROOT/bootstrap/$BUNDLE_SHA256.cppmega.bundle" "$bundle"
 gcs_read_exact "$RUN_ROOT/bootstrap/$OVERLAY_SHA256.distributed-data-prep.tar.zst" "$overlay"
 gcs_read_exact "$RUN_ROOT/manifests/$MANIFEST_SHA256.source-manifest.json" "$manifest"
 
+if [[ "$REPAIR_CONTRACT_SHA256" != "none" ]]; then
+  if [[ ! "$REPAIR_CONTRACT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "invalid embedded repair contract SHA-256" >&2
+    exit 2
+  fi
+  gcs_read_exact \
+    "$RUN_ROOT/manifests/$REPAIR_CONTRACT_SHA256.repair-contract.json" \
+    "$repair_contract"
+fi
+
 printf '%s  %s\n' "$BUNDLE_SHA256" "$bundle" | sha256sum --check --strict
 printf '%s  %s\n' "$OVERLAY_SHA256" "$overlay" | sha256sum --check --strict
 printf '%s  %s\n' "$MANIFEST_SHA256" "$manifest" | sha256sum --check --strict
+if [[ "$REPAIR_CONTRACT_SHA256" != "none" ]]; then
+  printf '%s  %s\n' "$REPAIR_CONTRACT_SHA256" "$repair_contract" | \
+    sha256sum --check --strict
+  jq -e \
+    --arg manifest_file_sha256 "$MANIFEST_SHA256" \
+    --arg run_root "$RUN_ROOT" \
+    '.schema == "cppmega.gcp_source_repair_contract_v1" and
+     .status == "preflighted" and .training_ready == false and
+     .evidence.status == "verified" and .evidence.training_ready == false and
+     .repair.manifest_file_sha256 == $manifest_file_sha256 and
+     .repair.gcs_output_prefix == $run_root and
+     .repair.repository_count == 54 and
+     .repair.target_lengths == [1024,2048,4096,8192,16384,32768,65536] and
+     .repair.old_assignment_identity_reuse == false and
+     .repair.old_output_identity_reuse == false' \
+    "$repair_contract" >/dev/null
+fi
 
 code_revision="$(jq -er '.code_revision' "$manifest")"
+if [[ "$REPAIR_CONTRACT_SHA256" != "none" ]]; then
+  jq -e \
+    --arg manifest_sha256 "$(jq -er '.manifest_sha256' "$manifest")" \
+    --arg code_revision "$code_revision" \
+    '.repair.manifest_sha256 == $manifest_sha256 and
+     .repair.code_revision == $code_revision' \
+    "$repair_contract" >/dev/null
+fi
 if [[ -e "$repo_root" ]]; then
   if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
     ! git -C "$repo_root" rev-parse "$code_revision^{commit}" >/dev/null 2>&1; then
