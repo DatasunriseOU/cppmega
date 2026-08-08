@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 027
+
+readonly BUNDLE_SHA256="__CPPMEGA_BUNDLE_SHA256__"
+readonly OVERLAY_SHA256="__CPPMEGA_OVERLAY_SHA256__"
+readonly MANIFEST_SHA256="__CPPMEGA_MANIFEST_SHA256__"
+readonly MANIFEST_LOGICAL_SHA256="__CPPMEGA_MANIFEST_LOGICAL_SHA256__"
+readonly CODE_REVISION="__CPPMEGA_CODE_REVISION__"
+readonly ADAPTER_SHA256="__CPPMEGA_ADAPTER_SHA256__"
+readonly REQUIREMENTS_SHA256="__CPPMEGA_REQUIREMENTS_SHA256__"
+readonly FETCH_RECEIPT_SHA256="__CPPMEGA_FETCH_RECEIPT_SHA256__"
+readonly TOKENIZERS_VERSION="__CPPMEGA_TOKENIZERS_VERSION__"
+readonly ASSIGNMENT_POOL_SIZE="__CPPMEGA_ASSIGNMENT_POOL_SIZE__"
+readonly STAGE_ROOT="${CPPMEGA_STAGE_ROOT:?CPPMEGA_STAGE_ROOT is required}"
+readonly RUN_ROOT="${CPPMEGA_RUN_ROOT:?CPPMEGA_RUN_ROOT is required}"
+readonly WORKER_CONFIG="${CPPMEGA_WORKER_CONFIG:?CPPMEGA_WORKER_CONFIG is required}"
+readonly MAX_RETRIES=4
+
+worker_index="$(jq -er '.worker_index' "$WORKER_CONFIG")"
+deployed_count="$(jq -er '.worker_count' "$WORKER_CONFIG")"
+physical_count="$ASSIGNMENT_POOL_SIZE"
+slots="$(jq -er '.slots_per_worker' "$WORKER_CONFIG")"
+physical_id="$(printf 'physical-%04d' "$worker_index")"
+input_root="$STAGE_ROOT/input/cloud-lane-$MANIFEST_LOGICAL_SHA256"
+work_root="$STAGE_ROOT/work/cloud-lane-$MANIFEST_LOGICAL_SHA256"
+receipt_root="$STAGE_ROOT/receipts/cloud-lane-$MANIFEST_LOGICAL_SHA256"
+repo_root="$work_root/cppmega"
+bundle="$input_root/cppmega.bundle"
+overlay="$input_root/bootstrap-evidence.tar.zst"
+manifest="$input_root/cloud-lane-manifest.json"
+evidence_root="$input_root/bootstrap-evidence"
+requirements="$evidence_root/ci-case5-linux-cp311-requirements.txt"
+fetch_receipt="$evidence_root/fetch-receipt.json"
+venv="$work_root/venv-$REQUIREMENTS_SHA256"
+adapter="$repo_root/scripts/distributed_data_prep/ci_case5_snapshot.py"
+worker_stderr="$receipt_root/$physical_id.stderr"
+
+mkdir -p "$input_root" "$work_root" "$receipt_root"
+
+is_confirmed_429() {
+  grep -Eq '(^|[^0-9])429([^0-9]|$)' "$1"
+}
+
+retry_delay() {
+  local attempt=$1
+  local delay=$((5 << attempt))
+  (( delay > 300 )) && delay=300
+  printf '%s' "$delay"
+}
+
+download_pinned() {
+  local uri=$1 destination=$2 expected_sha=$3
+  local attempt log="$destination.download.log" stage="$destination.download"
+  for ((attempt=0; attempt<=MAX_RETRIES; attempt++)); do
+    if gcloud storage cp "$uri" "$stage" --quiet >"$log" 2>&1; then
+      if [[ "$(sha256sum "$stage" | awk '{print $1}')" != "$expected_sha" ]]; then
+        echo "bootstrap object SHA-256 drifted: $uri" >&2
+        return 2
+      fi
+      mv -f "$stage" "$destination"
+      return 0
+    fi
+    if ! is_confirmed_429 "$log"; then
+      sed -n '1,120p' "$log" >&2
+      return 2
+    fi
+    if (( attempt == MAX_RETRIES )); then
+      echo "bootstrap object retained confirmed HTTP 429 after retries: $uri" >&2
+      return 75
+    fi
+    sleep "$(retry_delay "$attempt")"
+  done
+  return 75
+}
+
+write_failure_receipt() {
+  local stage=$1 exit_code=$2 diagnostic=$3 destination=$4
+  /usr/bin/python3 - "$stage" "$exit_code" "$diagnostic" "$destination" \
+    "$MANIFEST_LOGICAL_SHA256" "$MANIFEST_SHA256" "$physical_id" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+stage, exit_code, diagnostic, destination, logical, raw, worker = sys.argv[1:]
+diagnostic_bytes = Path(diagnostic).read_bytes()
+value = {
+    "schema": "cppmega.cloud_lane_bootstrap_failure_v1",
+    "status": "failed",
+    "stage": stage,
+    "exit_code": int(exit_code),
+    "manifest_sha256": logical,
+    "manifest_file_sha256": raw,
+    "physical_worker": worker,
+    "diagnostic_sha256": hashlib.sha256(diagnostic_bytes).hexdigest(),
+    "confirmed_http_429": int(exit_code) == 75,
+    "training_ready": False,
+}
+encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+value["receipt_sha256"] = hashlib.sha256(encoded).hexdigest()
+target = Path(destination)
+target.parent.mkdir(parents=True, exist_ok=True)
+temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, target)
+PY
+}
+
+publish_exact() {
+  local source=$1 uri=$2 publication=$3
+  local log="$source.publish.log"
+  if PYTHONPATH="$repo_root" /usr/bin/python3 - "$source" "$uri" "$publication" \
+      >"$log" 2>&1 <<'PY'
+import json
+from pathlib import Path
+import sys
+
+from scripts.distributed_data_prep._common import atomic_write_json, sha256_file
+from scripts.distributed_data_prep.source_worker import GcloudObjectStore
+
+source, uri, publication = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+store = GcloudObjectStore()
+metadata = store.publish_if_absent(source, uri)
+generation = str(metadata["generation"])
+readback = publication.with_name(f".{publication.name}.readback")
+observed = store.download(uri, readback, generation=generation)
+if (
+    str(observed["generation"]) != generation
+    or readback.stat().st_size != source.stat().st_size
+    or sha256_file(readback) != sha256_file(source)
+):
+    raise RuntimeError("immutable publication exact-generation readback failed")
+atomic_write_json(
+    publication,
+    {
+        "uri": uri,
+        "generation": generation,
+        "size_bytes": source.stat().st_size,
+        "sha256": sha256_file(source),
+    },
+)
+readback.unlink()
+PY
+  then
+    return 0
+  fi
+  if is_confirmed_429 "$log"; then
+    return 75
+  fi
+  sed -n '1,120p' "$log" >&2
+  return 2
+}
+
+publish_runner_failure() {
+  local stage=$1 exit_code=$2 diagnostic=$3
+  local failure="$receipt_root/$physical_id.$stage.pending.failure.json"
+  local failure_sha publication_exit=0
+  write_failure_receipt "$stage" "$exit_code" "$diagnostic" "$failure"
+  failure_sha="$(sha256sum "$failure" | awk '{print $1}')"
+  publish_exact "$failure" \
+    "$RUN_ROOT/control/cloud-lane-runner-failures/$MANIFEST_LOGICAL_SHA256/$physical_id/$failure_sha.failure.json" \
+    "$failure.published.json" || publication_exit=$?
+  if (( publication_exit == 75 )); then
+    return 75
+  fi
+  if (( publication_exit != 0 )); then
+    return 2
+  fi
+  return "$exit_code"
+}
+
+download_pinned \
+  "$RUN_ROOT/bootstrap/$BUNDLE_SHA256.cppmega.bundle" "$bundle" "$BUNDLE_SHA256"
+download_pinned \
+  "$RUN_ROOT/bootstrap/$OVERLAY_SHA256.cloud-lane-bootstrap.tar.zst" "$overlay" "$OVERLAY_SHA256"
+download_pinned \
+  "$RUN_ROOT/manifests/$MANIFEST_SHA256.cloud-lane-manifest.json" "$manifest" "$MANIFEST_SHA256"
+
+if [[ ! -e "$repo_root" ]]; then
+  git clone --no-checkout "$bundle" "$repo_root"
+fi
+git -C "$repo_root" bundle verify "$bundle"
+git -C "$repo_root" checkout --detach "$CODE_REVISION"
+if [[ "$(git -C "$repo_root" rev-parse HEAD)" != "$CODE_REVISION" ]] || \
+   [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]]; then
+  echo "cloud lane checkout differs from the pinned manifest revision" >&2
+  exit 2
+fi
+
+mkdir -p "$evidence_root"
+zstd -dc -- "$overlay" | tar -xf - -C "$evidence_root" --no-same-owner
+printf '%s  %s\n' "$REQUIREMENTS_SHA256" "$requirements" | sha256sum --check --strict
+printf '%s  %s\n' "$FETCH_RECEIPT_SHA256" "$fetch_receipt" | sha256sum --check --strict
+printf '%s  %s\n' "$ADAPTER_SHA256" "$adapter" | sha256sum --check --strict
+
+/usr/bin/python3 - "$repo_root" "$manifest" "$MANIFEST_LOGICAL_SHA256" \
+  "$MANIFEST_SHA256" "$worker_index" "$deployed_count" "$physical_count" "$slots" <<'PY'
+from pathlib import Path
+import sys
+
+repo, manifest_path, logical, raw, physical_index, deployed_count, physical_count, slots = sys.argv[1:]
+sys.path.insert(0, repo)
+from scripts.distributed_data_prep.cloud_lane import load_cloud_lane_manifest
+
+manifest, observed_raw = load_cloud_lane_manifest(Path(manifest_path))
+if observed_raw != raw or manifest["manifest_sha256"] != logical:
+    raise SystemExit("cloud lane manifest raw/logical binding drifted")
+workers = manifest["workers"]
+physical_index = int(physical_index)
+deployed_count = int(deployed_count)
+physical_count = int(physical_count)
+slots = int(slots)
+assigned = workers[physical_index::physical_count] if physical_count else []
+if (
+    physical_index < 0
+    or deployed_count < 1
+    or deployed_count > physical_count
+    or physical_index >= deployed_count
+    or physical_count < 1
+    or physical_index >= physical_count
+    or physical_count > len(workers)
+    or slots < 1
+    or slots > min(16, len(assigned))
+):
+    raise SystemExit("physical worker topology exceeds the lane manifest")
+PY
+
+if [[ ! -x "$venv/bin/python" ]]; then
+  /usr/bin/python3 -m venv "$venv"
+fi
+pip_log="$receipt_root/dependency-install.stderr"
+if ! "$venv/bin/python" -m pip install --disable-pip-version-check \
+    --require-hashes --only-binary=:all: -r "$requirements" >"$pip_log" 2>&1; then
+  dependency_exit=2
+  is_confirmed_429 "$pip_log" && dependency_exit=75
+  publish_runner_failure dependencies "$dependency_exit" "$pip_log" || exit $?
+  exit "$dependency_exit"
+fi
+
+tokenizer_log="$receipt_root/tokenizer-contract.stderr"
+if ! PYTHONPATH="$repo_root" "$venv/bin/python" - "$fetch_receipt" \
+  "$repo_root/cppmega/tokenizer/tokenizer.json" "$TOKENIZERS_VERSION" \
+  >"$receipt_root/tokenizer-contract.stdout" 2>"$tokenizer_log" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+import numpy
+import pyarrow
+import tokenizers
+
+from scripts.ci_stream_fetch import ExactTokenizer
+import scripts.export_ci_content_store_case5  # noqa: F401
+
+fetch_receipt, tokenizer_path, expected_version = sys.argv[1:]
+if tokenizers.__version__ != expected_version:
+    raise SystemExit("tokenizers version differs from frozen fetch receipt")
+expected = json.loads(Path(fetch_receipt).read_text(encoding="utf-8"))["tokenizer_contract"]
+observed = ExactTokenizer(tokenizer_path).contract
+if observed != expected:
+    raise SystemExit("Linux tokenizer contract differs from frozen fetch receipt")
+print(
+    json.dumps(
+        {
+            "numpy": numpy.__version__,
+            "pyarrow": pyarrow.__version__,
+            "tokenizers": tokenizers.__version__,
+            "tokenizer_contract": observed,
+        },
+        sort_keys=True,
+    )
+)
+PY
+then
+  tokenizer_exit=2
+  is_confirmed_429 "$tokenizer_log" && tokenizer_exit=75
+  publish_runner_failure tokenizer "$tokenizer_exit" "$tokenizer_log" || exit $?
+  exit "$tokenizer_exit"
+fi
+
+worker_exit=0
+PYTHONPATH="$repo_root" "$venv/bin/python" \
+  "$repo_root/scripts/distributed_data_prep/cloud_lane_pool_worker.py" \
+  --manifest "$manifest" \
+  --adapter "$adapter" \
+  --repo-root "$repo_root" \
+  --physical-index "$worker_index" \
+  --physical-count "$physical_count" \
+  --slots "$slots" \
+  --control-prefix "$RUN_ROOT" \
+  --stage-root "$work_root/pool" \
+  >"$receipt_root/$physical_id.stdout" 2>"$worker_stderr" || worker_exit=$?
+
+if (( worker_exit != 0 )); then
+  classified_exit=2
+  is_confirmed_429 "$worker_stderr" && classified_exit=75
+  publish_runner_failure worker "$classified_exit" "$worker_stderr" || exit $?
+  exit "$classified_exit"
+fi
+
+completion="$work_root/pool/receipts/$physical_id.complete.json"
+completion_sha="$(/usr/bin/python3 - "$completion" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))["receipt_sha256"])
+PY
+)"
+publication="$completion.publication.json"
+publish_exact "$completion" \
+  "$RUN_ROOT/control/cloud-lane-runner-completions/$MANIFEST_LOGICAL_SHA256/$physical_id/$completion_sha.complete.json" \
+  "$publication" || exit $?
+
+exit 0

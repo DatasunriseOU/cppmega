@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+exec > >(tee -a /var/log/cppmega-bootstrap.log | logger -t cppmega-bootstrap -s 2>/dev/console) 2>&1
+
+BUCKET=${jsonencode(bucket_name)}
+GCS_PREFIX=${jsonencode(gcs_prefix)}
+RUN_ID=${jsonencode(run_id)}
+WORKER_NAME=${jsonencode(worker_name)}
+WORKER_INDEX=${worker_index}
+WORKER_COUNT=${worker_count}
+SLOTS_PER_WORKER=${slots_per_worker}
+PARSE_WORKERS_PER_SLOT=${parse_workers_per_slot}
+MEMORY_LIMIT_GB_PER_SLOT=${memory_limit_gb_per_slot}
+CPU_BUDGET_VCPUS=${cpu_budget_vcpus}
+MEMORY_BUDGET_GB=${memory_budget_gb}
+EXPECTED_LOCAL_SSDS=${local_ssd_count}
+BOOTSTRAP_URI=${jsonencode(bootstrap_script_gcs_uri)}
+BOOTSTRAP_SHA256=${jsonencode(bootstrap_script_sha256)}
+EXPECTED_BUNDLE_SHA256=${jsonencode(bootstrap_bundle_sha256)}
+EXPECTED_OVERLAY_SHA256=${jsonencode(bootstrap_overlay_sha256)}
+EXPECTED_MANIFEST_SHA256=${jsonencode(bootstrap_manifest_sha256)}
+RUNNER_ROLE=${jsonencode(runner_role)}
+STAGE_ROOT=/mnt/cppmega-stage
+RUN_ROOT="gs://$BUCKET/$GCS_PREFIX/$RUN_ID"
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)
+MAX_TRANSPORT_RETRIES=4
+
+retry_sleep() {
+  local attempt=$1
+  local delay=$((5 << attempt))
+  (( delay > 300 )) && delay=300
+  sleep "$delay"
+}
+
+is_http_429() {
+  grep -Eq '(^|[^0-9])429([^0-9]|$)' "$1"
+}
+
+gcs_create_if_absent() {
+  local source=$1
+  local uri=$2
+  local relative bucket object encoded token response status error curl_exit attempt
+  relative=$${uri#gs://}
+  bucket=$${relative%%/*}
+  object=$${relative#*/}
+  if [[ -z "$bucket" || -z "$object" || "$object" == "$relative" ]]; then
+    echo "invalid GCS object URI: $uri" >&2
+    return 2
+  fi
+  encoded=$(python3 -c \
+    'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+    "$object")
+  for ((attempt=0; attempt<=MAX_TRANSPORT_RETRIES; attempt++)); do
+    token=$(gcloud auth print-access-token)
+    response=$(mktemp)
+    error=$(mktemp)
+    if status=$(curl --silent --show-error --output "$response" \
+      --write-out '%%{http_code}' --request POST \
+      --header "Authorization: Bearer $token" \
+      --header 'Content-Type: application/octet-stream' \
+      --upload-file "$source" \
+      "https://storage.googleapis.com/upload/storage/v1/b/$bucket/o?uploadType=media&name=$encoded&ifGenerationMatch=0" \
+      2>"$error"); then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+    if [[ "$status" == 200 && "$curl_exit" -eq 0 ]] && \
+      jq -e --arg expected "$object" '.name == $expected and (.generation | length > 0)' "$response" >/dev/null; then
+      rm -f "$response" "$error"
+      return 0
+    fi
+    if ! is_http_429 "$response" && ! is_http_429 "$error"; then
+      cat "$response" >&2 || true
+      cat "$error" >&2 || true
+      rm -f "$response" "$error"
+      return 2
+    fi
+    rm -f "$response" "$error"
+    (( attempt == MAX_TRANSPORT_RETRIES )) && return 75
+    retry_sleep "$attempt"
+  done
+  return 75
+}
+
+gcs_read_exact() {
+  local uri=$1
+  local destination=$2
+  local relative bucket object encoded token stage status error curl_exit attempt
+  relative=$${uri#gs://}
+  bucket=$${relative%%/*}
+  object=$${relative#*/}
+  if [[ -z "$bucket" || -z "$object" || "$object" == "$relative" ]]; then
+    echo "invalid GCS object URI: $uri" >&2
+    return 2
+  fi
+  encoded=$(python3 -c \
+    'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+    "$object")
+  stage="$destination.$BOOT_ID.tmp"
+  for ((attempt=0; attempt<=MAX_TRANSPORT_RETRIES; attempt++)); do
+    token=$(gcloud auth print-access-token)
+    error=$(mktemp)
+    if status=$(curl --silent --show-error --location \
+      --header "Authorization: Bearer $token" \
+      --output "$stage" --write-out '%%{http_code}' \
+      "https://storage.googleapis.com/download/storage/v1/b/$bucket/o/$encoded?alt=media" \
+      2>"$error"); then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+    if [[ "$status" == 200 && "$curl_exit" -eq 0 ]]; then
+      rm -f "$error"
+      mv -f "$stage" "$destination"
+      return 0
+    fi
+    rm -f "$stage"
+    if ! is_http_429 "$error"; then
+      cat "$error" >&2 || true
+      rm -f "$error"
+      return 2
+    fi
+    rm -f "$error"
+    (( attempt == MAX_TRANSPORT_RETRIES )) && return 75
+    retry_sleep "$attempt"
+  done
+  return 75
+}
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates curl git gnupg jq libclang-dev mdadm pigz \
+  python3 python3-clang python3-venv rsync zstd
+
+if ! command -v gcloud >/dev/null 2>&1; then
+  install -d -m 0755 /usr/share/keyrings
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    >/etc/apt/sources.list.d/google-cloud-sdk.list
+  apt-get update
+  apt-get install -y --no-install-recommends google-cloud-cli
+fi
+
+if ! id cppmega >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash cppmega
+fi
+
+mapfile -t DEVICES < <(
+  find -L /dev/disk/by-id -maxdepth 1 -type b -name 'google-local-nvme-ssd-*' -print | sort
+)
+
+if [[ $${#DEVICES[@]} -ne $EXPECTED_LOCAL_SSDS ]]; then
+  echo "expected $EXPECTED_LOCAL_SSDS Local SSD devices, found $${#DEVICES[@]}" >&2
+  printf 'device=%s\n' "$${DEVICES[@]:-}" >&2
+  exit 1
+fi
+
+RAID_DEVICE=/dev/md/cppmega-stage
+if [[ ! -e "$RAID_DEVICE" ]]; then
+  mdadm --assemble "$RAID_DEVICE" "$${DEVICES[@]}" || \
+    mdadm --create "$RAID_DEVICE" --run --level=0 \
+      --raid-devices="$EXPECTED_LOCAL_SSDS" "$${DEVICES[@]}"
+fi
+
+if ! blkid -p -s TYPE -o value "$RAID_DEVICE" | grep -qx ext4; then
+  mkfs.ext4 -F -L cppmega-stage "$RAID_DEVICE"
+fi
+
+install -d -m 0755 "$STAGE_ROOT"
+if ! mountpoint -q "$STAGE_ROOT"; then
+  mount -o noatime,nodiratime,discard "$RAID_DEVICE" "$STAGE_ROOT"
+fi
+chown cppmega:cppmega "$STAGE_ROOT"
+chmod 0770 "$STAGE_ROOT"
+
+if ! grep -qE '^[^#]+[[:space:]]+/mnt/cppmega-stage[[:space:]]' /etc/fstab; then
+  RAID_UUID=$(blkid -s UUID -o value "$RAID_DEVICE")
+  echo "UUID=$RAID_UUID $STAGE_ROOT ext4 defaults,noatime,nodiratime,discard,nofail 0 2" >>/etc/fstab
+fi
+
+install -d -m 0770 -o cppmega -g cppmega \
+  "$STAGE_ROOT/input" \
+  "$STAGE_ROOT/work" \
+  "$STAGE_ROOT/output" \
+  "$STAGE_ROOT/receipts"
+
+install -d -m 0755 /etc/cppmega
+jq -n \
+  --arg bucket "$BUCKET" \
+  --arg gcs_prefix "$GCS_PREFIX" \
+  --arg run_id "$RUN_ID" \
+  --arg run_root "$RUN_ROOT" \
+  --arg stage_root "$STAGE_ROOT" \
+  --arg worker_name "$WORKER_NAME" \
+  --argjson worker_index "$WORKER_INDEX" \
+  --argjson worker_count "$WORKER_COUNT" \
+  --argjson slots_per_worker "$SLOTS_PER_WORKER" \
+  --argjson parse_workers_per_slot "$PARSE_WORKERS_PER_SLOT" \
+  --argjson memory_limit_gb_per_slot "$MEMORY_LIMIT_GB_PER_SLOT" \
+  --argjson cpu_budget_vcpus "$CPU_BUDGET_VCPUS" \
+  --argjson memory_budget_gb "$MEMORY_BUDGET_GB" \
+  '{bucket: $bucket, gcs_prefix: $gcs_prefix, run_id: $run_id,
+    run_root: $run_root, stage_root: $stage_root, worker_name: $worker_name,
+    worker_index: $worker_index, worker_count: $worker_count,
+    slots_per_worker: $slots_per_worker,
+    parse_workers_per_slot: $parse_workers_per_slot,
+    memory_limit_gb_per_slot: $memory_limit_gb_per_slot,
+    cpu_budget_vcpus: $cpu_budget_vcpus,
+    memory_budget_gb: $memory_budget_gb}' \
+  >/etc/cppmega/worker.json
+chmod 0644 /etc/cppmega/worker.json
+
+READY_RECEIPT="$STAGE_ROOT/receipts/$WORKER_NAME.ready.json"
+jq -n \
+  --arg boot_id "$BOOT_ID" \
+  --arg created_at "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg run_id "$RUN_ID" \
+  --arg worker_name "$WORKER_NAME" \
+  --argjson local_ssd_count "$EXPECTED_LOCAL_SSDS" \
+  --argjson local_stage_bytes "$(df --block-size=1 --output=size "$STAGE_ROOT" | tail -n 1)" \
+  '{schema_version: 1, state: "ready", run_id: $run_id,
+    worker_name: $worker_name, boot_id: $boot_id, created_at: $created_at,
+    local_ssd_count: $local_ssd_count, local_stage_bytes: $local_stage_bytes}' \
+  >"$READY_RECEIPT"
+gcs_create_if_absent \
+  "$READY_RECEIPT" \
+  "$RUN_ROOT/control/ready/$WORKER_NAME.$BOOT_ID.json"
+
+if [[ -n "$BOOTSTRAP_URI" ]]; then
+  install -d -m 0755 /opt/cppmega
+  gcs_read_exact "$BOOTSTRAP_URI" /opt/cppmega/worker-runner
+  echo "$BOOTSTRAP_SHA256  /opt/cppmega/worker-runner" | sha256sum --check --strict
+  grep -Fqx "readonly BUNDLE_SHA256=\"$EXPECTED_BUNDLE_SHA256\"" /opt/cppmega/worker-runner
+  grep -Fqx "readonly OVERLAY_SHA256=\"$EXPECTED_OVERLAY_SHA256\"" /opt/cppmega/worker-runner
+  grep -Fqx "readonly MANIFEST_SHA256=\"$EXPECTED_MANIFEST_SHA256\"" /opt/cppmega/worker-runner
+  chmod 0555 /opt/cppmega/worker-runner
+  chown root:root /opt/cppmega/worker-runner
+  case "$RUNNER_ROLE" in
+    source|cloud-lane) ;;
+    *) echo "unsupported runner role: $RUNNER_ROLE" >&2; exit 2 ;;
+  esac
+  RUNNER_SERVICE="cppmega-$RUNNER_ROLE-worker.service"
+  cat >"/etc/systemd/system/$RUNNER_SERVICE" <<EOF
+[Unit]
+Description=CppMega resumable $RUNNER_ROLE worker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cppmega
+Group=cppmega
+Environment="HOME=/home/cppmega"
+Environment="CPPMEGA_WORKER_CONFIG=/etc/cppmega/worker.json"
+Environment="CPPMEGA_STAGE_ROOT=$STAGE_ROOT"
+Environment="CPPMEGA_RUN_ROOT=$RUN_ROOT"
+ExecStart=/opt/cppmega/worker-runner
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=30min
+TimeoutStopSec=300s
+KillMode=mixed
+UMask=0027
+SyslogIdentifier=cppmega-$RUNNER_ROLE-worker
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "/etc/systemd/system/$RUNNER_SERVICE"
+  systemctl daemon-reload
+  systemctl enable --now "$RUNNER_SERVICE"
+fi

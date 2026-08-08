@@ -1,0 +1,56 @@
+{
+  "adjudication_sha256": "f49a8df27f7a7464b730e24697d67d19f2d6816479ab065d567d73bafeec70d9",
+  "authoritative": {
+    "archive": {
+      "generation": "1785783190042979",
+      "sha256": "97b7b8943d1fe32b82719401ef5feba3068d79a8465d0483319661fde446b1cd",
+      "size_bytes": 33884162,
+      "uri": "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002/reducer-artifacts/581c6b4685a8975c6414f0e17a909d0f84577b8b91defa4feeebe4f5810862ff/97b7b8943d1fe32b82719401ef5feba3068d79a8465d0483319661fde446b1cd.tar.zst"
+    },
+    "artifact_set_sha256": "581c6b4685a8975c6414f0e17a909d0f84577b8b91defa4feeebe4f5810862ff",
+    "publication_receipt": {
+      "generation": "1785783193773475",
+      "sha256": "5a05717799b1c868ce557516697dfbc6055abbfe97d5827fd7ca85d90c8ce07b",
+      "size_bytes": 2261,
+      "uri": "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002/reducer-receipts/581c6b4685a8975c6414f0e17a909d0f84577b8b91defa4feeebe4f5810862ff/5a05717799b1c868ce557516697dfbc6055abbfe97d5827fd7ca85d90c8ce07b.receipt.json"
+    },
+    "qualification": "sidecar_free_closed_sqlite_snapshot"
+  },
+  "blocking_gates": [
+    "semantic_function_and_chunk_dedup_parity",
+    "packed_sidecar_validation",
+    "megatron_sealing"
+  ],
+  "run": {
+    "gcs_prefix": "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002",
+    "manifest_file_sha256": "8b928428520138ab90700640af3f2811bc988e3de883442eed938f28eb054ae2",
+    "manifest_sha256": "83541fc49aedab353d1580695494618f8b7d344a69ef9424fa561586eda29b13",
+    "run_id": "source-pilot-20260803-002",
+    "worker_receipts_sha256": "4ecdae82d069e643e8482324706b56d7dba8360055f147ce63a23dcabf87241d"
+  },
+  "schema": "cppmega.source_pilot_canonical_adjudication_v1",
+  "status": "adjudicated",
+  "superseded": [
+    {
+      "archive": {
+        "generation": "1785782990336466",
+        "sha256": "c51b34b142aa245b4c49cf267d1969129bb4e3c84d57664e234d74f5c1d3042c",
+        "size_bytes": 33884234,
+        "uri": "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002/reducer-artifacts/c88ace50fbde8a9aba775ae8b6b31e7526c7312a37f79aad6386b18b063f2209/c51b34b142aa245b4c49cf267d1969129bb4e3c84d57664e234d74f5c1d3042c.tar.zst"
+      },
+      "artifact_set_sha256": "c88ace50fbde8a9aba775ae8b6b31e7526c7312a37f79aad6386b18b063f2209",
+      "disqualifying_members": [
+        "global_dedup.sqlite-shm",
+        "global_dedup.sqlite-wal"
+      ],
+      "publication_receipt": {
+        "generation": "1785782994111343",
+        "sha256": "30e192630760a85589dd438c3d636ed39710b5f9f04fd247cdf17df379a17e77",
+        "size_bytes": 2585,
+        "uri": "gs://natural-bison-491019-t9-cppmega-corpus/runs/source-pilot-20260803-002/reducer-receipts/c88ace50fbde8a9aba775ae8b6b31e7526c7312a37f79aad6386b18b063f2209/30e192630760a85589dd438c3d636ed39710b5f9f04fd247cdf17df379a17e77.receipt.json"
+      },
+      "reason": "unreceipted_sqlite_sidecars"
+    }
+  ],
+  "training_ready": false
+}
