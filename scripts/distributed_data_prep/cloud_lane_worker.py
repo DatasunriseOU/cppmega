@@ -117,29 +117,68 @@ def _download_snapshots(
     object_store: ObjectStore,
     input_root: Path,
 ) -> list[dict[str, object]]:
+    import fcntl
+
     plan = validate_cloud_lane_manifest(manifest)
     input_root.mkdir(parents=True, exist_ok=True)
-    results: list[dict[str, object]] = []
-    for index, raw in enumerate(plan["input_snapshots"]):
-        assert isinstance(raw, Mapping)
-        snapshot = dict(raw)
-        destination = input_root / f"{index:04d}-{snapshot['name']}.snapshot"
-        metadata = object_store.download(
-            str(snapshot["uri"]),
-            destination,
-            generation=str(snapshot["generation"]),
-        )
-        if (
-            str(metadata.get("generation")) != snapshot["generation"]
-            or int(metadata.get("size_bytes", -1)) != snapshot["size_bytes"]
-            or destination.stat().st_size != snapshot["size_bytes"]
-            or sha256_file(destination) != snapshot["sha256"]
-        ):
-            raise ContractError(
-                f"input snapshot {snapshot['name']} exact-generation verification failed"
-            )
-        results.append({**snapshot, "local_path": str(destination)})
-    return results
+    if input_root.is_symlink() or not input_root.is_dir():
+        raise ContractError("cloud lane snapshot cache must be a regular directory")
+    lock_path = input_root / ".snapshot-cache.lock"
+    if lock_path.is_symlink():
+        raise ContractError("cloud lane snapshot cache lock must not be a symlink")
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        results: list[dict[str, object]] = []
+        for index, raw in enumerate(plan["input_snapshots"]):
+            assert isinstance(raw, Mapping)
+            snapshot = dict(raw)
+            destination = input_root / f"{index:04d}-{snapshot['name']}.snapshot"
+            cached = False
+            if destination.exists() and not destination.is_symlink():
+                before = destination.stat()
+                observed_sha256 = sha256_file(destination)
+                after = destination.stat()
+                cached = (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                ) == (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                ) and (
+                    after.st_size == snapshot["size_bytes"]
+                    and observed_sha256 == snapshot["sha256"]
+                )
+            if not cached:
+                descriptor, raw_stage = tempfile.mkstemp(
+                    prefix=f".{destination.name}.", suffix=".download", dir=input_root
+                )
+                os.close(descriptor)
+                stage = Path(raw_stage)
+                try:
+                    metadata = object_store.download(
+                        str(snapshot["uri"]),
+                        stage,
+                        generation=str(snapshot["generation"]),
+                    )
+                    if (
+                        str(metadata.get("generation")) != snapshot["generation"]
+                        or int(metadata.get("size_bytes", -1))
+                        != snapshot["size_bytes"]
+                        or stage.stat().st_size != snapshot["size_bytes"]
+                        or sha256_file(stage) != snapshot["sha256"]
+                    ):
+                        raise ContractError(
+                            f"input snapshot {snapshot['name']} exact-generation verification failed"
+                        )
+                    os.replace(stage, destination)
+                finally:
+                    stage.unlink(missing_ok=True)
+            results.append({**snapshot, "local_path": str(destination)})
+        return results
 
 
 def _snapshot_identities(snapshots: Sequence[Mapping[str, object]]) -> dict[str, tuple[int, str]]:

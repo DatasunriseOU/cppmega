@@ -18,6 +18,7 @@ from scripts.distributed_data_prep.cloud_lane import build_cloud_lane_manifest
 from scripts.distributed_data_prep.cloud_lane_worker import (
     ADAPTER_OUTPUT_SCHEMA,
     WORKER_COMPLETION_SCHEMA,
+    _download_snapshots,
     run_cloud_lane_worker,
 )
 from scripts.distributed_data_prep.source_worker import LocalObjectStore
@@ -169,6 +170,39 @@ def test_worker_publishes_and_exactly_resumes_all_assignments(worker_fixture) ->
 
     second = _run(worker_fixture, env={"FAIL_IF_CALLED": "1"})
     assert second == first
+
+
+def test_snapshot_cache_reuses_verified_bytes_and_repairs_tampering(
+    worker_fixture,
+) -> None:
+    class CountingStore:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.downloads = 0
+
+        def download(self, uri, destination, *, generation=None):
+            self.downloads += 1
+            return self.delegate.download(uri, destination, generation=generation)
+
+    store = CountingStore(worker_fixture["store"])
+    cache = worker_fixture["tmp_path"] / "shared-snapshot-cache"
+    first = _download_snapshots(
+        worker_fixture["manifest"], object_store=store, input_root=cache
+    )
+    assert store.downloads == len(worker_fixture["manifest"]["input_snapshots"])
+
+    second = _download_snapshots(
+        worker_fixture["manifest"], object_store=store, input_root=cache
+    )
+    assert store.downloads == len(worker_fixture["manifest"]["input_snapshots"])
+    assert second == first
+
+    Path(str(first[0]["local_path"])).write_bytes(b"tampered\n")
+    repaired = _download_snapshots(
+        worker_fixture["manifest"], object_store=store, input_root=cache
+    )
+    assert store.downloads == len(worker_fixture["manifest"]["input_snapshots"]) + 1
+    assert repaired == first
 
 
 def test_worker_rejects_adapter_output_outside_assignment(worker_fixture) -> None:
