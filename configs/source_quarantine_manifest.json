@@ -11,6 +11,15 @@
       "reason": "CMake encoding regression fixture containing only a truncated UTF-32BE BOM prefix"
     },
     {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake",
+      "size_bytes": 3,
+      "sha256": "ba778c0261008c8f71ae4061ad0162ffcbe63b52c91f89f236738131d1217ec7",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "truncated_utf32le_bom",
+      "reason": "CMake encoding regression fixture containing only a truncated UTF-32LE BOM prefix"
+    },
+    {
       "project_id": "corpus.local/Xbox_Live_Source",
       "relative_path": "Xbox Live Source/XONLINE_MAIN/public/ext/sdk/vs10rtm/SDK/bin/isvtier5appsignsdk.cc",
       "size_bytes": 21234,
@@ -99,6 +108,24 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "big5_shell_heredoc",
       "reason": "GNU gettext BIG5 conversion shell test with an encoded PO heredoc and no source extension"
+    },
+    {
+      "project_id": "autotools-mirror/gettext",
+      "relative_path": "gettext-tools/tests/msgconv-1",
+      "size_bytes": 1001,
+      "sha256": "7bb62b1cdbfe9df2082e11fd3fe2251ee847f569a1531472f5fa757eb485de7a",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "big5_shell_heredoc",
+      "reason": "GNU gettext BIG5 conversion shell test with encoded PO heredocs and no source extension"
+    },
+    {
+      "project_id": "git/git",
+      "relative_path": "t/t4201-shortlog.sh",
+      "size_bytes": 11480,
+      "sha256": "017c37e96a1bf295be7436f35ff9da9b42f7baa40220e353e3414dfca6af11dd",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "git_shortlog_invalid_utf8_shell",
+      "reason": "Git shortlog regression fixture deliberately embeds impossible UTF-8 leading bytes in expected shell-test output"
     },
     {
       "project_id": "python/cpython",
