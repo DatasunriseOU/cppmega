@@ -584,15 +584,24 @@ def _load_content_store_ci_export_allowlist(
 
     case5 = manifest.get("case5_contract")
     case5_buckets = case5.get("buckets") if isinstance(case5, dict) else None
+    # Allowed contracts: the historical default ladder, or the audited
+    # large-context extension. Requested buckets must always be present in the
+    # contract. Large-context exports require an exact ladder request so partial
+    # loads cannot silently drop 32k/64k shards.
+    allowed_ladders = {DEFAULT_BUCKETS, SUPPORTED_CI_BUCKETS}
     if (
         not isinstance(case5, dict)
         or not isinstance(case5_buckets, list)
         or not case5_buckets
         or len(set(case5_buckets)) != len(case5_buckets)
-        or any(bucket not in SUPPORTED_CI_BUCKETS for bucket in case5_buckets)
+        or tuple(case5_buckets) not in allowed_ladders
         or not buckets
         or len(set(buckets)) != len(buckets)
         or any(bucket not in case5_buckets for bucket in buckets)
+        or (
+            tuple(case5_buckets) == SUPPORTED_CI_BUCKETS
+            and tuple(buckets) != SUPPORTED_CI_BUCKETS
+        )
         or case5.get("overflow_rows") != 0
         or case5.get("parquet_shard_max_rows") != 512
         or case5.get("parquet_layout")
