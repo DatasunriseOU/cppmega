@@ -248,12 +248,22 @@ def test_gcc_case_label_ast_recursion_uses_bound_lossless_lexical_fallback(
 
     monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
     monkeypatch.setattr(index_project, "Index", FakeIndex)
+    visitor_namespace: dict[str, object] = {}
+    exec(
+        compile(
+            "def _visit():\n"
+            "    raise RecursionError('maximum recursion depth exceeded')\n",
+            index_project.__file__,
+            "exec",
+        ),
+        visitor_namespace,
+    )
+    visitor = visitor_namespace["_visit"]
+    assert callable(visitor)
     monkeypatch.setattr(
         index_project,
         "parse_translation_unit",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RecursionError("maximum recursion depth exceeded in _visit")
-        ),
+        lambda *_args, **_kwargs: visitor(),
     )
     compile_args = ["-std=c11", "-fsyntax-only", "-Wno-everything"]
 
@@ -312,6 +322,42 @@ def test_gcc_case_label_ast_recursion_uses_bound_lossless_lexical_fallback(
     assert documents[0]["domain_parse_info"]["fallback_reason"] == (
         "ast_recursion_error"
     )
+
+
+def test_unrelated_recursion_error_still_fails_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    source = tmp_path / "unrelated-recursion.cpp"
+    source.write_text("int value = 1;\n", encoding="utf-8")
+
+    class FakeIndex:
+        @staticmethod
+        def create() -> object:
+            return object()
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
+    monkeypatch.setattr(index_project, "Index", FakeIndex)
+    monkeypatch.setattr(
+        index_project,
+        "parse_translation_unit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RecursionError("unrelated recursion bug")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="RecursionError"):
+        index_project._parse_file_batch(
+            (
+                [str(source)],
+                {},
+                ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+                str(tmp_path),
+                "fixture/unrelated-recursion",
+            )
+        )
 
 
 def test_non_translation_unit_error_still_fails_loud(
@@ -513,7 +559,13 @@ def test_cpp_lexical_fallback_rechecks_compile_args_digest(
         {},
         ["-std=c++17"],
     )
-    records: list[dict[str, object]] = []
+    records: list[dict[str, object]] = [
+        {
+            "relative_path": "changed_context.cpp",
+            "trigger": "missing_include_diagnostic",
+            "status": "unresolved",
+        }
+    ]
     relative_path = index_project._record_cpp_lexical_fallback(
         str(source),
         parse_args,
@@ -523,6 +575,7 @@ def test_cpp_lexical_fallback_rechecks_compile_args_digest(
     )
 
     assert relative_path == "changed_context.cpp"
+    assert records[0]["trigger"] == "translation_unit_load_error"
     with pytest.raises(RuntimeError, match="compile args changed"):
         index_project.emit_cpp_lexical_fallback_documents(
             [relative_path],
