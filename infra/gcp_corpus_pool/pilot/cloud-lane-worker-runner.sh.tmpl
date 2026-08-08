@@ -12,13 +12,15 @@ readonly ADAPTER_SHA256="__CPPMEGA_ADAPTER_SHA256__"
 readonly REQUIREMENTS_SHA256="__CPPMEGA_REQUIREMENTS_SHA256__"
 readonly FETCH_RECEIPT_SHA256="__CPPMEGA_FETCH_RECEIPT_SHA256__"
 readonly TOKENIZERS_VERSION="__CPPMEGA_TOKENIZERS_VERSION__"
+readonly ASSIGNMENT_POOL_SIZE="__CPPMEGA_ASSIGNMENT_POOL_SIZE__"
 readonly STAGE_ROOT="${CPPMEGA_STAGE_ROOT:?CPPMEGA_STAGE_ROOT is required}"
 readonly RUN_ROOT="${CPPMEGA_RUN_ROOT:?CPPMEGA_RUN_ROOT is required}"
 readonly WORKER_CONFIG="${CPPMEGA_WORKER_CONFIG:?CPPMEGA_WORKER_CONFIG is required}"
 readonly MAX_RETRIES=4
 
 worker_index="$(jq -er '.worker_index' "$WORKER_CONFIG")"
-physical_count="$(jq -er '.worker_count' "$WORKER_CONFIG")"
+deployed_count="$(jq -er '.worker_count' "$WORKER_CONFIG")"
+physical_count="$ASSIGNMENT_POOL_SIZE"
 slots="$(jq -er '.slots_per_worker' "$WORKER_CONFIG")"
 physical_id="$(printf 'physical-%04d' "$worker_index")"
 input_root="$STAGE_ROOT/input/cloud-lane-$MANIFEST_LOGICAL_SHA256"
@@ -195,11 +197,11 @@ printf '%s  %s\n' "$FETCH_RECEIPT_SHA256" "$fetch_receipt" | sha256sum --check -
 printf '%s  %s\n' "$ADAPTER_SHA256" "$adapter" | sha256sum --check --strict
 
 /usr/bin/python3 - "$repo_root" "$manifest" "$MANIFEST_LOGICAL_SHA256" \
-  "$MANIFEST_SHA256" "$worker_index" "$physical_count" "$slots" <<'PY'
+  "$MANIFEST_SHA256" "$worker_index" "$deployed_count" "$physical_count" "$slots" <<'PY'
 from pathlib import Path
 import sys
 
-repo, manifest_path, logical, raw, physical_index, physical_count, slots = sys.argv[1:]
+repo, manifest_path, logical, raw, physical_index, deployed_count, physical_count, slots = sys.argv[1:]
 sys.path.insert(0, repo)
 from scripts.distributed_data_prep.cloud_lane import load_cloud_lane_manifest
 
@@ -208,11 +210,15 @@ if observed_raw != raw or manifest["manifest_sha256"] != logical:
     raise SystemExit("cloud lane manifest raw/logical binding drifted")
 workers = manifest["workers"]
 physical_index = int(physical_index)
+deployed_count = int(deployed_count)
 physical_count = int(physical_count)
 slots = int(slots)
 assigned = workers[physical_index::physical_count] if physical_count else []
 if (
     physical_index < 0
+    or deployed_count < 1
+    or deployed_count > physical_count
+    or physical_index >= deployed_count
     or physical_count < 1
     or physical_index >= physical_count
     or physical_count > len(workers)

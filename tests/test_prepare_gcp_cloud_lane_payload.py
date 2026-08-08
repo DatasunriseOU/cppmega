@@ -152,7 +152,8 @@ def test_prepare_cloud_lane_payload_is_content_addressed_and_pool_bound(
         region="us-central1",
         zone="us-central1-a",
         physical_worker_count=1,
-        slots_per_worker=2,
+        assignment_pool_size=4,
+        slots_per_worker=1,
         machine_type="n2-standard-16",
         local_ssd_count=2,
     )
@@ -174,6 +175,7 @@ def test_prepare_cloud_lane_payload_is_content_addressed_and_pool_bound(
     assert "__CPPMEGA_" not in runner_text
     assert "cloud_lane_pool_worker.py" in runner_text
     assert "cloud_lane_worker.py" not in runner_text
+    assert 'readonly ASSIGNMENT_POOL_SIZE="4"' in runner_text
     subprocess.run(["bash", "-n", str(runner)], check=True)
 
     overlay = next((output / "bootstrap").glob("*.cloud-lane-bootstrap.tar.zst"))
@@ -191,7 +193,7 @@ def test_prepare_cloud_lane_payload_is_content_addressed_and_pool_bound(
     )
     assert tfvars["runner_role"] == "cloud-lane"
     assert tfvars["worker_count"] == 1
-    assert tfvars["slots_per_worker"] == 2
+    assert tfvars["slots_per_worker"] == 1
     assert tfvars["bootstrap_script_gcs_uri"].endswith(
         f"/{sha256_file(runner)}.cloud-lane-worker-runner"
     )
@@ -218,6 +220,7 @@ def test_prepare_cloud_lane_payload_rejects_manifest_revision_drift(
             region="us-central1",
             zone="us-central1-a",
             physical_worker_count=1,
+            assignment_pool_size=None,
             slots_per_worker=1,
             machine_type="n2-standard-16",
             local_ssd_count=2,

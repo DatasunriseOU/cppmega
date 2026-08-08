@@ -45,6 +45,7 @@ RUNNER_PLACEHOLDERS = {
     "__CPPMEGA_REQUIREMENTS_SHA256__": "requirements_sha256",
     "__CPPMEGA_FETCH_RECEIPT_SHA256__": "fetch_receipt_sha256",
     "__CPPMEGA_TOKENIZERS_VERSION__": "tokenizers_version",
+    "__CPPMEGA_ASSIGNMENT_POOL_SIZE__": "assignment_pool_size",
 }
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,26}[a-z0-9])?$")
 
@@ -172,6 +173,7 @@ def prepare_cloud_lane_payload(
     region: str,
     zone: str,
     physical_worker_count: int,
+    assignment_pool_size: int | None,
     slots_per_worker: int,
     machine_type: str,
     local_ssd_count: int,
@@ -219,8 +221,15 @@ def prepare_cloud_lane_payload(
     logical_count = len(manifest["workers"])
     if physical_count > logical_count:
         raise ContractError("physical worker count exceeds logical workers")
+    assignment_count = require_int(
+        physical_count if assignment_pool_size is None else assignment_pool_size,
+        where="assignment_pool_size",
+        minimum=physical_count,
+    )
+    if assignment_count > logical_count:
+        raise ContractError("assignment pool size exceeds logical workers")
     slots = require_int(slots_per_worker, where="slots_per_worker", minimum=1)
-    smallest_share = logical_count // physical_count
+    smallest_share = logical_count // assignment_count
     if slots > min(16, smallest_share):
         raise ContractError("slots exceed the smallest physical worker share")
     if not isinstance(local_ssd_count, int) or local_ssd_count not in {2, 4, 8, 16, 24}:
@@ -280,6 +289,7 @@ def prepare_cloud_lane_payload(
             "requirements_sha256": sha256_file(requirements_path),
             "fetch_receipt_sha256": sha256_file(fetch_receipt_path),
             "tokenizers_version": tokenizers_version,
+            "assignment_pool_size": assignment_count,
         }
         rendered = template
         for placeholder, key in RUNNER_PLACEHOLDERS.items():
@@ -343,6 +353,7 @@ def prepare_cloud_lane_payload(
             "adapter_sha256": adapter_sha256,
             "logical_worker_count": logical_count,
             "physical_worker_count": physical_count,
+            "assignment_pool_size": assignment_count,
             "slots_per_worker": slots,
             "training_ready": False,
             "artifacts": artifacts,
@@ -365,6 +376,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--region", default="us-central1")
     parser.add_argument("--zone", default="us-central1-a")
     parser.add_argument("--physical-worker-count", type=int, default=4)
+    parser.add_argument("--assignment-pool-size", type=int)
     parser.add_argument("--slots-per-worker", type=int, default=2)
     parser.add_argument("--machine-type", default="n2-standard-16")
     parser.add_argument("--local-ssd-count", type=int, default=2)
@@ -387,6 +399,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             region=args.region,
             zone=args.zone,
             physical_worker_count=args.physical_worker_count,
+            assignment_pool_size=args.assignment_pool_size,
             slots_per_worker=args.slots_per_worker,
             machine_type=args.machine_type,
             local_ssd_count=args.local_ssd_count,
