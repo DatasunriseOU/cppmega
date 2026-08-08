@@ -1,0 +1,1691 @@
+# Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
+
+Дата среза evidence: `2026-08-09`  
+Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`  
+Целевой результат: lossless Parquet и Megatron для `code`, GitHub PR, GitLab MR и CI на длинах `1024, 2048, 4096, 8192, 16384, 32768, 65536`, с immutable receipts, независимым GCS/Nebius readback и без оставленных дорогих transient VM.
+
+## Как читать отчёт
+
+- `W001–W100` восстанавливают исходный замысел: что система должна была уметь и каким доказательством это предполагалось закрыть.
+- `D001–D050` перечисляют только уже существующие commits, файлы, receipts, manifests, тестовые результаты или readback. Завершённый промежуточный слой не приравнивается к готовому датасету.
+- `N001–N100` — исполнимый дальнейший план. Каждый пункт называет код или инфраструктурный объект, способ проверки и критерий завершения.
+- `training_ready=true` запрещён для нового общего корпуса до финального `N099`; staged CAS, verified SQLite, partial Parquet, работающий worker и отправленное assignment не считаются training-ready.
+- Автоматический retry допустим только для immutable attempt с подтверждённым HTTP 429/exit `75`. Exit `2`, drift contract, 401/403 и parser defect требуют нового revision/run, а не повтора in-place.
+
+## Авторитетные контуры и идентичности
+
+| Назначение | Контур | Ограничение |
+|---|---|---|
+| Исходный код | `/Volumes/external/sources/cppmega` | Runtime запускается только из pinned clean worktree. |
+| Сборщики и live status | `/Volumes/external/sources/cppmega.mlx` | Stores и outputs не смешиваются с Git worktree. |
+| Тяжёлые данные | `/Volumes/external/cppmega_data` | Partial и immutable roots физически разделяются. |
+| GCP project | `natural-bison-491019-t9` | Run ID обязателен во всех backend/GCS/resource names. |
+| GCS | `gs://natural-bison-491019-t9-cppmega-corpus` | Публикация create-only, затем exact-generation readback. |
+| Terraform operator | `nanochat-automation@natural-bison-491019-t9.iam.gserviceaccount.com` | Использовать scoped credential override, не менять глобальный account. |
+| GCE worker | `cppmega-corpus-worker@natural-bison-491019-t9.iam.gserviceaccount.com` | Только необходимые object viewer/creator permissions в run prefix. |
+| Human Git/GCP | `david@jewelmusic.art` | Не делать unattended production зависимым от интерактивной reauth. |
+| GitHub | token ledger/env в `cppmega.mlx` | В receipts хранить имя источника и fingerprint, не PAT. |
+| GitLab | отдельный host-scoped `read_api` token для каждого из трёх hosts | 401 не является пустым успешным результатом. |
+| Nebius | существующий S3 profile/env | Секреты не сериализуются; endpoint/bucket/key/hash фиксируются. |
+
+---
+
+## Часть I. Что изначально хотели построить — 100 пунктов
+
+### Архитектура, истинность и границы
+
+### W001 — Разделить корпус на четыре независимые data lanes
+
+- **Замысел:** обрабатывать `code`, GitHub PR, GitLab MR и CI отдельно, чтобы сбой одного producer не загрязнял три других.
+- **Где/чем:** `scripts/distributed_data_prep/`, lane-specific roots в `/Volumes/external/cppmega_data`, отдельные GCS prefixes.
+- **Изначальный критерий:** четыре terminal lane manifests с непересекающимися artifact sets и общим final seal только поверх immutable ссылок.
+
+### W002 — Ввести строгую лестницу состояний готовности
+
+- **Замысел:** различать fetched, staged, verified store, packed, sealed и release-ready вместо одного расплывчатого флага.
+- **Где/чем:** `configs/training_data_status.json`, `scripts/report_training_data_status.py`, completion/seal receipts.
+- **Изначальный критерий:** status никогда не прибавляет overlapping snapshots и не выставляет release-ready без lossless seal.
+
+### W003 — Зафиксировать точный corpus scope
+
+- **Замысел:** связать каждый run с canonical списком repositories, commit/tree и digest, исключив «примерно 500» как критерий.
+- **Где/чем:** source manifest, `outputs/pr_ingest/repo_list.json`, GitLab `repo_list.json`, CI inventory receipts.
+- **Изначальный критерий:** accepted, excluded, active и unresolved образуют дизъюнктное полное разбиение bound scope.
+
+### W004 — Сделать семь sequence lengths обязательным контрактом
+
+- **Замысел:** выпускать реальные или verified-zero buckets для 1K, 2K, 4K, 8K, 16K, 32K и 64K.
+- **Где/чем:** `scripts/distributed_data_prep/seal_outputs.py`, packers, Parquet manifests и Megatron prefixes.
+- **Изначальный критерий:** для каждого из четырёх kinds существует ровно семь materialized/verified-zero состояний, всего 28.
+
+### W005 — Закрепить один tokenizer contract
+
+- **Замысел:** исключить расхождение token IDs между локальной упаковкой, GCP workers и Megatron.
+- **Где/чем:** `scripts/nanochat_data/token_budget.py`, canonical tokenizer artifact и tokenizer receipts.
+- **Изначальный критерий:** tokenizer digest одинаков у producer, auditor, converter и restore; token IDs лежат в `[0, 65536)`.
+
+### W006 — Сохранить end-to-end provenance
+
+- **Замысел:** провести repo, commit, file, PR/MR, CI run/job/step и document IDs от входа до training sample.
+- **Где/чем:** provenance columns, sidecars, graph edges, `scripts/data/verify_provenance.py`.
+- **Изначальный критерий:** любой Megatron sample трассируется до immutable source object и producer receipt без неоднозначного join.
+
+### W007 — Сделать receipts первичным источником истины
+
+- **Замысел:** не доверять process state, SQLite count или имени директории без bound terminal receipt.
+- **Где/чем:** `cppmega/receipt_binding.py`, run-scoped JSON receipts, content hashes.
+- **Изначальный критерий:** verifier отклоняет отсутствующий, mutable, stale, duplicate или не соответствующий artifact receipt.
+
+### W008 — Развести transient и deterministic failures
+
+- **Замысел:** повторять только подтверждённые сетевые/rate-limit сбои и не зацикливать parser defects.
+- **Где/чем:** exit taxonomy `75/2`, assignment diagnostics, watchdog recovery policy.
+- **Изначальный критерий:** transient retry создаёт новый attempt; deterministic repair требует нового pinned code revision и residual run.
+
+### W009 — Наблюдать pipeline каждые 30 минут
+
+- **Замысел:** автоматически проверять local map/reducer/export, GCP receipts и упавшие управляющие агенты.
+- **Где/чем:** `com.datasunrise.cppmega-pipeline-watchdog`, `com.codex.multi-429-watchdog`, immutable current reports.
+- **Изначальный критерий:** два последовательных среза не старше 35 минут, last exit `0`, а recovery не создаёт duplicate writers.
+
+### W010 — Встроить cost teardown в критерий завершения
+
+- **Замысел:** не оставлять VM, Local SSD, static IP и placement policy после сохранения и readback результатов.
+- **Где/чем:** `infra/gcp_corpus_pool/workers`, isolated Terraform backends, destroy receipts.
+- **Изначальный критерий:** terminal readback предшествует destroy; пост-проверка показывает отсутствие только run-scoped ресурсов.
+
+### Source scope, получение и parser conveyor
+
+### W011 — Нормализовать число source repositories
+
+- **Замысел:** объяснить различие между 501 локальным corpus scope, 482 cloud assignments и повторными attempt records.
+- **Где/чем:** source list, `_done.json`, GCP source manifests и composition verifier.
+- **Изначальный критерий:** один canonical identity ledger связывает scope, exclusions и attempts без сложения несопоставимых чисел.
+
+### W012 — Поддержать прямое получение repository без обязательного tar.zst
+
+- **Замысел:** на GCP клонировать следующий repo непосредственно из GitHub/GitLab, обрабатывать и освобождать scratch.
+- **Где/чем:** source worker bootstrap, pinned remote URL/commit, Local SSD workspace.
+- **Изначальный критерий:** clone receipt связывает remote, commit/tree и checkout hash; отсутствие tar не меняет corpus membership.
+
+### W013 — Сохранить максимальную полезную git history
+
+- **Замысел:** собирать не только HEAD code, но commit messages, diffs и source evolution в разрешённых границах.
+- **Где/чем:** `scripts/nanochat_data/extract_git_history.py`, commit conveyor и source composition.
+- **Изначальный критерий:** history depth явно записан, shallow fallback не проходит как полный результат.
+
+### W014 — Изолировать каждый parser checkout
+
+- **Замысел:** не запускать долгий child process из worktree, который другой агент может удалить или переключить.
+- **Где/чем:** pinned detached worktrees, launch receipt с cwd/tree digest, durable output root.
+- **Изначальный критерий:** preflight и heartbeat проверяют существование cwd; resume восстанавливает тот же revision в новом immutable path.
+
+### W015 — Классифицировать source files по обучающей роли
+
+- **Замысел:** отдельно маршрутизировать C/C++ source, headers, build, shell, SQL, diagnostics и auxiliary Python.
+- **Где/чем:** `scripts/nanochat_data/route_packed_source_docs.py`, route sidecars.
+- **Изначальный критерий:** категории взаимно исключаются, totals сохраняются, auxiliary не смешивается с primary code без явного policy.
+
+### W016 — Построить clang-based semantic index
+
+- **Замысел:** извлекать declarations, references, diagnostics и graph entities поверх текста файлов.
+- **Где/чем:** `tools/clang_indexer/index_project.py`, compiler database discovery, entity sidecars.
+- **Изначальный критерий:** fixture tests подтверждают координаты, file identity и отсутствие cross-repo edges.
+
+### W017 — Извлекать build-system контекст
+
+- **Замысел:** сохранить CMake, Meson, Bazel, Make, Ninja и toolchain targets рядом с кодом.
+- **Где/чем:** build classifiers, command/target sidecars, repository parser.
+- **Изначальный критерий:** build documents имеют repo/commit provenance и не маскируются как C++ source.
+
+### W018 — Материализовать commit lane отдельно от code lane
+
+- **Замысел:** не смешивать history/diff documents с snapshot code при dedup и packing.
+- **Где/чем:** commit conveyor, `cppmega/data/source_conveyor_composition.py`, separate route roots.
+- **Изначальный критерий:** code и commit manifests имеют distinct IDs, totals и Megatron prefixes.
+
+### W019 — Сохранить compiler/linker/sanitizer diagnostics
+
+- **Замысел:** превратить реальные диагностические цепочки в структурированные training documents.
+- **Где/чем:** diagnostic parsers, CI/source sidecars, occurrence records.
+- **Изначальный критерий:** сообщение, location, toolchain и source binding восстанавливаются из sidecar без потери.
+
+### W020 — Сохранить graph edges и chunk boundaries
+
+- **Замысел:** удержать структуру AST/call/include/build graph и границы документов после packing.
+- **Где/чем:** graph CSR sidecars, document/chunk offsets, `scripts/data/verify_side_channel_shapes.py`.
+- **Изначальный критерий:** offsets монотонны, находятся в sample capacity и согласованы с `.bin/.idx`.
+
+### W021 — Сделать source conveyor потоковым
+
+- **Замысел:** не хранить сотни гигабайт промежуточных checkout/archive, а писать content-addressed outputs по мере обработки.
+- **Где/чем:** `scripts/streaming_conveyor.py`, `scripts/source_conveyor_supervisor.py`, atomic staging.
+- **Изначальный критерий:** crash-resume принимает только hash-verified done artifacts и не повторяет завершённые repositories.
+
+### W022 — Ограничить память каждого source assignment
+
+- **Замысел:** избежать системного OOM и BrokenProcessPool при крупных монорепозиториях.
+- **Где/чем:** `scripts/data/memory_guard.py`, worker resource limits, per-repo profiles.
+- **Изначальный критерий:** memory exit классифицирован и имеет bounded diagnostic; scheduler может направить heavy repo в отдельный class.
+
+### W023 — Ввести exact quarantine вместо широких ignore rules
+
+- **Замысел:** исключать только доказанно проблемные bytes/diagnostics, не целые extensions или directories.
+- **Где/чем:** `configs/source_quarantine_manifest.json`, `tools/clang_indexer/source_quarantine.py`.
+- **Изначальный критерий:** one-byte drift ломает quarantine match; negative fixtures не отбрасываются.
+
+### W024 — Выполнить worker-local exact dedup безопасно
+
+- **Замысел:** экономить повторную обработку внутри assignment, не объявляя локальную SQLite глобальным dedup.
+- **Где/чем:** per-worker dedup DB, content hashes, candidate receipts.
+- **Изначальный критерий:** DB проходит integrity check, но final membership определяется только single-writer reducer.
+
+### W025 — Реализовать crash-resume локального conveyor
+
+- **Замысел:** продолжать после restart с последнего подтверждённого repository/shard.
+- **Где/чем:** `_done.json`, progress log, launch/repair receipts и shared-base lock.
+- **Изначальный критерий:** resume не мутирует accepted artifacts и отклоняет drift repo list/code revision.
+
+### W026 — Классифицировать каждую source failure
+
+- **Замысел:** разделить transport, parser defect, OOM/signal, corrupt input и operator interruption.
+- **Где/чем:** bounded stderr digests, exit receipts, source failure inventory.
+- **Изначальный критерий:** перед repair нет `unknown`, а каждый failure связан с repo/commit/failing file.
+
+### W027 — Авторизовать bounded repair
+
+- **Замысел:** чинить только unresolved set и никогда не перезапускать successful repos.
+- **Где/чем:** repair contract, source composition inputs, pinned repair branch.
+- **Изначальный критерий:** authorization содержит finite repo set и отвергается при изменении base receipt.
+
+### W028 — Собрать логическую source composition
+
+- **Замысел:** объединить base, local repair и GCP runs через receipts, не копированием output trees.
+- **Где/чем:** `cppmega/data/source_conveyor_composition.py`, artifact-set bindings.
+- **Изначальный критерий:** ровно один accepted producer на repo/document; unresolved и duplicates равны нулю.
+
+### W029 — Закрыть source token conservation
+
+- **Замысел:** доказать путь каждого документа через accepted, duplicate, quarantine, auxiliary и packed outcomes.
+- **Где/чем:** reducer/route receipts, `scripts/report_training_data_status.py`.
+- **Изначальный критерий:** valid/trained/pad equations сходятся без необъяснённой дельты.
+
+### W030 — Выдать source-only handoff
+
+- **Замысел:** передать PR/MR/CI lanes immutable code/commit composition, не выставляя общий флаг готовности.
+- **Где/чем:** source lane manifest, GCS readback, A→B/C receipt.
+- **Изначальный критерий:** handoff перечисляет семь buckets и остаётся `training_ready=false` до final integration.
+
+### GCP foundation и распределённая source обработка
+
+### W031 — Создать отдельный Terraform foundation
+
+- **Замысел:** один раз подготовить project APIs, bucket, service accounts и базовую сеть отдельно от transient workers.
+- **Где/чем:** `infra/gcp_corpus_pool/foundation`.
+- **Изначальный критерий:** `terraform validate/test` зелёные, foundation state не уничтожается вместе с run.
+
+### W032 — Создать run-scoped Terraform workers module
+
+- **Замысел:** разворачивать несколько одинаковых workers с изолированным backend prefix.
+- **Где/чем:** `infra/gcp_corpus_pool/workers`, `backend.tf`, `workers.tftest.hcl`.
+- **Изначальный критерий:** два run IDs не могут адресовать одинаковые VM/IP/state objects.
+
+### W033 — Обеспечить быстрый сетевой путь
+
+- **Замысел:** выбирать machine/network topology, способную использовать Google backbone и высокую egress/PD throughput.
+- **Где/чем:** worker machine type, gVNIC/network tier, region/zone variables.
+- **Изначальный критерий:** bootstrap receipt фиксирует effective NIC/network tier; throughput benchmark не является обещанием «10 Gbit» без измерения.
+
+### W034 — Назначить статические run-scoped addresses
+
+- **Замысел:** сделать SSH/control endpoints стабильными во время run и удаляемыми после него.
+- **Где/чем:** `google_compute_address.worker`, outputs и destroy plan.
+- **Изначальный критерий:** address name содержит run ID и отсутствует после verified destroy.
+
+### W035 — Использовать CPU workers порядка 16 vCPU/64 GB
+
+- **Замысел:** начать с `n2-standard-16` и масштабировать число VM, а heavy repos выделять отдельно.
+- **Где/чем:** worker tfvars, scheduler resource classes.
+- **Изначальный критерий:** benchmark связывает repo throughput, CPU utilization, memory high-water mark и стоимость.
+
+### W036 — Использовать transient Local SSD как scratch
+
+- **Замысел:** быстро клонировать/распаковывать/indexировать без накопления долговечных локальных сотен гигабайт.
+- **Где/чем:** Local SSD/NVMe mounts в `startup.sh.tftpl`.
+- **Изначальный критерий:** mount/read-write benchmark проходит; accepted artifacts загружены до destroy VM.
+
+### W037 — Сделать boot disk воспроизводимым
+
+- **Замысел:** хранить только OS/bootstrap/cache, а не уникальные training outputs.
+- **Где/чем:** pinned image, disk type/size variables, bootstrap payload receipt.
+- **Изначальный критерий:** новый worker из того же payload воспроизводит tool versions и source hashes.
+
+### W038 — Развести operator и worker IAM
+
+- **Замысел:** Terraform operator создаёт ресурсы, worker читает/создаёт только объекты разрешённого run prefix.
+- **Где/чем:** две service accounts, IAM bindings и no-secret metadata.
+- **Изначальный критерий:** negative IAM tests запрещают worker изменять Terraform state/foundation.
+
+### W039 — Использовать GCS как control/data plane
+
+- **Замысел:** хранить immutable manifests, claims, heartbeats, outcomes, candidates и reducer artifacts вне VM.
+- **Где/чем:** `gs://natural-bison-491019-t9-cppmega-corpus/runs/<RUN_ID>`.
+- **Изначальный критерий:** object creation использует generation precondition и readback inventory hash.
+
+### W040 — Раздать source assignments детерминированно
+
+- **Замысел:** каждый repo получает assignment digest, home shard и resource envelope.
+- **Где/чем:** `scripts/distributed_data_prep/source_manifest.py`, `source_work_queue.py`.
+- **Изначальный критерий:** assignment set digest равен manifest; unknown или duplicate assignment отвергается.
+
+### W041 — Добавить dynamic work stealing
+
+- **Замысел:** не держать VM пустой, если её home shard закончен, пока в очереди есть runnable work.
+- **Где/чем:** `source_slot_scheduler.py`, claims и leases в GCS.
+- **Изначальный критерий:** lease исключает двойного winner; stale claim может быть заменён только по contract.
+
+### W042 — Публиковать heartbeat на active assignment
+
+- **Замысел:** отличать долгий large-repo parser от зависшего worker.
+- **Где/чем:** attempt-specific heartbeat objects и monitor report.
+- **Изначальный критерий:** heartbeat содержит assignment/attempt/lease digests и не может завершить assignment.
+
+### W043 — Разделить assignment и worker completion
+
+- **Замысел:** не считать repo готовым по dispatch/claim или завершению одного slot process.
+- **Где/чем:** assignment receipts, assignment completions, slot receipts, worker terminal receipts.
+- **Изначальный критерий:** scheduler закрывает run только при полном expected set и verified artifacts.
+
+### W044 — Запустить single-writer cloud reducer
+
+- **Замысел:** детерминированно выбрать winners и выполнить global dedup после map phase.
+- **Где/чем:** `scripts/distributed_data_prep/source_reducer.py`, reducer receipts.
+- **Изначальный критерий:** повторный reducer на том же input inventory даёт byte-identical manifest.
+
+### W045 — Удалить source pool после readback
+
+- **Замысел:** остановить расходы сразу после composition, artifact upload и независимой проверки.
+- **Где/чем:** isolated Terraform destroy plan для каждого source run.
+- **Изначальный критерий:** VM/IP/policy absent, GCS inventory и source handoff продолжают верифицироваться.
+
+### GitHub PR и GitLab MR
+
+### W046 — Зафиксировать GitHub repository scope
+
+- **Замысел:** сканировать PR только для canonical GitHub repos и связать список с source scope.
+- **Где/чем:** `scripts/pr_ingest/build_repo_list.py`, `outputs/pr_ingest/repo_list.json`.
+- **Изначальный критерий:** repo count/set digest совпадает во scan, store и completion receipt.
+
+### W047 — Выполнить exhaustive GitHub GraphQL stream
+
+- **Замысел:** получить PR metadata, reviews, comments, links и diffs с resumable pagination.
+- **Где/чем:** `scripts/pr_ingest/graphql_pr_stream.py`, token ledger, PR store.
+- **Изначальный критерий:** terminal completion связывает все cursors/pages и не содержит unverified production rows.
+
+### W048 — Закрыть truncated GraphQL gaps
+
+- **Замысел:** отдельно дособрать PR, где основной stream достиг API truncation/лимитов.
+- **Где/чем:** `scripts/pr_ingest/github_graphql_fallback.py`, gap target manifest.
+- **Изначальный критерий:** target=completed, unresolved/skipped/missed равны нулю, record hashes входят в exact scan.
+
+### W049 — Сделать GitHub store проверяемым, но не training-ready
+
+- **Замысел:** хранить exact records в SQLite как source-of-materialization, не как готовый training artifact.
+- **Где/чем:** `scripts/pr_ingest/pr_store.py`, `prs.sqlite`, completion verifier.
+- **Изначальный критерий:** integrity/count/hash green; eligible Parquet остаётся нулём до membership/export.
+
+### W050 — Вычислить exact GitHub primary membership
+
+- **Замысел:** выбирать PR только по allowlisted commit/source provenance, а не по наличию строки в store.
+- **Где/чем:** `cppmega/data/pr_primary_membership.py`, source composition и PR completion.
+- **Изначальный критерий:** portable membership Parquet имеет unique `(repo, pr_number)` и bound source/store hashes.
+
+### W051 — Материализовать GitHub PR documents losslessly
+
+- **Замысел:** экспортировать только exact primary members, сохранив discussion, diff, review и provenance.
+- **Где/чем:** `scripts/pr_ingest/export_pr_parquet.py`, membership receipt, isolated output root.
+- **Изначальный критерий:** rendered document count совпадает с membership, а nonmembers физически не входят в shards.
+
+### W052 — Рендерить discussion детерминированно
+
+- **Замысел:** получить стабильный текст PR без зависимости от SQLite row order или текущего API ответа.
+- **Где/чем:** `scripts/pr_ingest/render_discussion.py`, canonical ordering rules.
+- **Изначальный критерий:** повторный render одинакового record даёт тот же byte hash и role boundaries.
+
+### W053 — Сохранить PR sidecars
+
+- **Замысел:** вынести actors, timestamps, review states, linked issues, files и commit links в проверяемые side channels.
+- **Где/чем:** PR export sidecars и `scripts/audit_sidecar_parquet.py`.
+- **Изначальный критерий:** row/document IDs и sidecar shapes совпадают для всех семи buckets.
+
+### W054 — Ограничить GitLab scope Eigen/Mesa/Tor
+
+- **Замысел:** добавить три важных C/C++ проекта, которые живут на разных GitLab hosts.
+- **Где/чем:** `gitlab.com/libeigen/Eigen`, `gitlab.freedesktop.org/mesa/mesa`, `gitlab.torproject.org/tpo/core/tor`.
+- **Изначальный критерий:** canonical repo list содержит ровно три host/project identities и собственный digest.
+
+### W055 — Использовать отдельную auth policy для каждого GitLab host
+
+- **Замысел:** не подменять токен одного инстанса другим и не считать 401 пустым inventory.
+- **Где/чем:** host→env-name mapping в `scripts/pr_ingest/gitlab_mr_stream.py`.
+- **Изначальный критерий:** preflight 200 для каждого host; receipt хранит fingerprint, но не значение token.
+
+### W056 — Сначала построить GitLab inventory
+
+- **Замысел:** отделить дешёвый список MR и candidate classification от тяжёлого detail fetch.
+- **Где/чем:** GitLab scanner manifest, pagination receipts и deterministic gzip sidecars.
+- **Изначальный критерий:** declared=candidate+noncandidate, pagination terminal, host coverage полная.
+
+### W057 — Физически разделить primary и ancillary GitLab stores
+
+- **Замысел:** не допустить попадания ancillary/error/terminal records в primary training membership.
+- **Где/чем:** distinct `primary.sqlite`, `ancillary.sqlite` и sidecar root.
+- **Изначальный критерий:** store files имеют разные paths/hashes; route conservation и store counts проверены.
+
+### W058 — Выполнить authenticated smoke до production GitLab scan
+
+- **Замысел:** доказать доступ к candidate details на каждом host ограниченным run.
+- **Где/чем:** отдельные smoke roots и host-scoped tokens.
+- **Изначальный критерий:** smoke completion восстанавливается из store/manifest; 401/403/429 классифицированы правильно.
+
+### W059 — Вычислить exact GitLab primary MR membership
+
+- **Замысел:** связать MR с accepted source/commit evidence тем же fail-closed принципом, что и GitHub.
+- **Где/чем:** `scripts/pr_ingest/build_gitlab_primary_membership.py`, membership bridge.
+- **Изначальный критерий:** membership receipt unique, input-bound и не принимает legacy inventory без current contract.
+
+### W060 — Запечатать GitHub PR и GitLab MR раздельно
+
+- **Замысел:** не смешивать платформы до общего release manifest.
+- **Где/чем:** два lane manifests, два GCS prefixes, отдельные conservation/readback receipts.
+- **Изначальный критерий:** каждый lane покрывает семь lengths и остаётся `training_ready=false` до C integration.
+
+### CI fetch, CASE5 и sidecars
+
+### W061 — Собирать CI по всему bound repository scope
+
+- **Замысел:** получить workflow/job logs и metadata для всех поддерживаемых GitHub repositories, а не sample.
+- **Где/чем:** `scripts/ci_stream_fetch.py`, repo partitions и token ledger.
+- **Изначальный критерий:** terminal fetch inventory покрывает exact repo set и все pages/runs до freeze boundary.
+
+### W062 — Параллелить CI fetch безопасными shards
+
+- **Замысел:** использовать несколько fetchers без общей mutable cursor/state гонки.
+- **Где/чем:** shard-specific fetch state, `scripts/merge_ci_stream_shards.py`.
+- **Изначальный критерий:** shard sets непересекаются либо dedupятся по canonical key; merge receipt закрывает union.
+
+### W063 — Сохранить hierarchy repo/run/workflow/job/step
+
+- **Замысел:** не превращать CI log в текст без структуры исполнения.
+- **Где/чем:** CI metadata tables, `scripts/ci_log_sidecars.py`.
+- **Изначальный критерий:** parent-child keys валидны и каждый log chunk связан с job/step.
+
+### W064 — Сохранить actor и runner context
+
+- **Замысел:** различать автора, triggering actor, runner type/labels и execution environment.
+- **Где/чем:** actor/runner sidecars.
+- **Изначальный критерий:** nullable/unknown values явны, а не заменены выдуманными defaults.
+
+### W065 — Извлечь язык, платформу и toolchain
+
+- **Замысел:** классифицировать compiler, OS, architecture, runtime и build system каждого CI occurrence.
+- **Где/чем:** `scripts/ci_source_sidecars.py`, command classifiers.
+- **Изначальный критерий:** classifier version и evidence spans записаны; totals консервативны.
+
+### W066 — Извлечь команды и targets
+
+- **Замысел:** сохранить реальные configure/build/test invocations и target names.
+- **Где/чем:** shell parser, command/target sidecars.
+- **Изначальный критерий:** redaction убирает secrets, но сохраняет executable/args/working-directory semantics.
+
+### W067 — Извлечь test outcomes
+
+- **Замысел:** представить pass/fail/skip/flaky и framework details структурированно.
+- **Где/чем:** `scripts/ci_source_binding_projection.py`, test-result parsers.
+- **Изначальный критерий:** result связан с exact log byte range и не выводится только из exit code при неоднозначности.
+
+### W068 — Извлечь compiler/linker/sanitizer diagnostics из CI
+
+- **Замысел:** собрать occurrence records с source binding и context lines.
+- **Где/чем:** `scripts/fetch_ci_diagnostics.py`, CASE5 occurrence schema.
+- **Изначальный критерий:** oversized metadata bounded, duplicate occurrence keys детерминированно объединены.
+
+### W069 — Построить CI entities и graph edges
+
+- **Замысел:** связать commands, targets, files, diagnostics и tests в обучающий graph.
+- **Где/чем:** entity/edge sidecars, canonical ID namespace.
+- **Изначальный критерий:** edges не ссылаются на отсутствующие nodes и проходят shape verifier.
+
+### W070 — Сохранить chunk boundaries CI logs
+
+- **Замысел:** делить большие logs без потери строк, diagnostics или document isolation.
+- **Где/чем:** chunk sidecars, line/byte offsets и tokenizer spans.
+- **Изначальный критерий:** concatenation/conservation возвращает canonical normalized log content.
+
+### W071 — Использовать content-addressed CI store
+
+- **Замысел:** дедуплицировать одинаковые payloads при сохранении всех occurrence bindings.
+- **Где/чем:** `scripts/ci_content_store.py`, CAS blobs и occurrence DB.
+- **Изначальный критерий:** blob hash проверен, occurrence count не уменьшается из-за payload dedup.
+
+### W072 — Заморозить CASE5 threshold snapshot
+
+- **Замысел:** получить immutable срез достаточно большого CI corpus для воспроизводимого export.
+- **Где/чем:** `scripts/distributed_data_prep/ci_case5_snapshot.py`, frozen receipt.
+- **Изначальный критерий:** snapshot закрывает writers, hashes stores и не складывается с overlapping live upper bound.
+
+### W073 — Перенести CASE5 inputs в GCS
+
+- **Замысел:** не требовать сотни гигабайт свободного места на Mac для cloud materialization.
+- **Где/чем:** GCS run inputs prefix, publication receipt.
+- **Изначальный критерий:** exact-generation readback подтверждает каждый input before worker launch.
+
+### W074 — Материализовать CASE5 на GCP
+
+- **Замысел:** использовать CPU/Local SSD workers для reducer/export/packing рядом с GCS.
+- **Где/чем:** cloud lane manifests, `cloud_lane_pool_worker.py`, isolated Terraform run.
+- **Изначальный критерий:** smoke создаёт assignment, output и terminal receipts; production масштабируется только после smoke.
+
+### W075 — Выдать CI lane seal
+
+- **Замысел:** завершить global union/dedup, lossless Parquet и семь Megatron prefixes до интеграции.
+- **Где/чем:** CI export receipt, sidecar audits, CI lane manifest.
+- **Изначальный критерий:** frozen input conservation и artifact readback green, `training_ready=false` до four-kind seal.
+
+### Parquet, sidecars и Megatron
+
+### W076 — Зафиксировать canonical Parquet schema
+
+- **Замысел:** унифицировать tokens, labels, document IDs, provenance и objective columns между lanes.
+- **Где/чем:** exporters, `scripts/canonical_parquet_ledger.py`, schema receipts.
+- **Изначальный критерий:** schema/version/dtypes одинаково интерпретируются auditor и Megatron converter.
+
+### W077 — Использовать ZSTD и атомарную публикацию Parquet
+
+- **Замысел:** минимизировать storage/network без partial files в authoritative root.
+- **Где/чем:** `scripts/data/atomic_publish.py`, Parquet writer options.
+- **Изначальный критерий:** regular file, footer readable, codec ZSTD, final hash стабилен после rename/fsync.
+
+### W078 — Доказать document/token losslessness
+
+- **Замысел:** объяснить каждый исходный token как trained, masked, padded, duplicate или quarantined.
+- **Где/чем:** export/reducer/conservation receipts.
+- **Изначальный критерий:** equations сходятся по lane, bucket и global union без silent truncation.
+
+### W079 — Аудировать все sidecars
+
+- **Замысел:** не допустить рассинхронизации token rows и graph/provenance/objective data.
+- **Где/чем:** `scripts/audit_sidecar_parquet.py`, `verify_side_channel_shapes.py`.
+- **Изначальный критерий:** counts, offsets, IDs и hashes согласованы на каждом shard.
+
+### W080 — Выполнить global dedup один раз
+
+- **Замысел:** применять deterministic exact/near dedup после canonical composition, не складывать worker-local totals.
+- **Где/чем:** reducer и `scripts/data/verify_global_dedup_store.py`.
+- **Изначальный критерий:** winner policy/version/input order bound; rerun даёт тот же set digest.
+
+### W081 — Материализовать 1K bucket
+
+- **Замысел:** оптимизировать короткие документы, сохраняя document isolation.
+- **Где/чем:** packer, Parquet route `1024`, Megatron prefix.
+- **Изначальный критерий:** capacity/labels/sidecars audited и `.bin/.idx` readback green.
+
+### W082 — Материализовать 2K bucket
+
+- **Замысел:** поддержать средние snippets и discussions отдельной geometry.
+- **Где/чем:** route `2048`, same canonical packer/converter.
+- **Изначальный критерий:** bucket membership disjoint, conservation и MMIDIDX integrity green.
+
+### W083 — Материализовать 4K bucket
+
+- **Замысел:** сохранить более длинные code/CI contexts без неоправданного split.
+- **Где/чем:** route `4096`.
+- **Изначальный критерий:** exact capacity, trained mask и sidecar coordinates доказаны.
+
+### W084 — Материализовать 8K bucket
+
+- **Замысел:** покрыть длинные files, PR discussions и logs.
+- **Где/чем:** route `8192`.
+- **Изначальный критерий:** split/overflow receipt lossless и Megatron files nonempty либо verified-zero.
+
+### W085 — Материализовать 16K bucket
+
+- **Замысел:** сохранить крупные semantic/diagnostic documents.
+- **Где/чем:** route `16384`.
+- **Изначальный критерий:** long-context packing tests и readback проходят.
+
+### W086 — Материализовать 32K bucket
+
+- **Замысел:** убрать историческое ограничение пяти buckets и реально выпускать 32K.
+- **Где/чем:** route `32768`, bundle builder, long-context verifier.
+- **Изначальный критерий:** positive data или exact verified-zero receipt; manifest-only запись запрещена.
+
+### W087 — Материализовать 64K bucket
+
+- **Замысел:** выпускать максимальный training context без скрытого truncation.
+- **Где/чем:** route `65536`, packer/converter/readback.
+- **Изначальный критерий:** lossless split, valid token range и physical `.bin/.idx` либо verified-zero.
+
+### W088 — Конвертировать Parquet в Megatron MMIDIDX
+
+- **Замысел:** получить train-consumable `.bin/.idx` плюс полный sidecar profile.
+- **Где/чем:** `scripts/data_prep_parquet_to_megatron.py`.
+- **Изначальный критерий:** sequence/document counts и byte sizes вычисляются из manifest и совпадают при reread.
+
+### W089 — Выполнить независимый Megatron readback
+
+- **Замысел:** не считать успешный write достаточным доказательством.
+- **Где/чем:** `scripts/data/verify_dataset_megacpp.py`, empty restore directory.
+- **Изначальный критерий:** offsets monotonic, data bounds valid, sidecars align и artifact hashes совпадают.
+
+### W090 — Зафиксировать batch geometry
+
+- **Замысел:** считать full batches/remainder для каждой длины без изменения training tokens.
+- **Где/чем:** training status и batch size contract.
+- **Изначальный критерий:** rows=full_batches×batch_size+remainder; padding не считается valid/trained.
+
+### Publication, release и эксплуатация
+
+### W091 — Собрать четыре lane manifests
+
+- **Замысел:** дать integration sealer content-addressed inventories вместо mutable paths.
+- **Где/чем:** `scripts/distributed_data_prep/seal_outputs.py`.
+- **Изначальный критерий:** каждый manifest перечисляет Parquet, Megatron, sidecars, audits и lineage.
+
+### W092 — Выполнить four-kind integration seal
+
+- **Замысел:** проверить полную матрицу `4×7`, global tokenizer и provenance contracts.
+- **Где/чем:** distributed sealer и release manifest.
+- **Изначальный критерий:** один immutable release receipt с 28 materialized/verified-zero states и без mutable dependency.
+
+### W093 — Опубликовать artifacts в GCS create-only
+
+- **Замысел:** сделать GCS главным облачным источником для workers/reducers и долговременных receipts.
+- **Где/чем:** run-scoped object prefixes и generation preconditions.
+- **Изначальный критерий:** existing mismatch никогда не перезаписывается; publication receipt хранит generation/hash/size.
+
+### W094 — Выполнить exact-generation GCS readback
+
+- **Замысел:** проверить именно загруженную generation, а не latest object с тем же key.
+- **Где/чем:** GCS readback verifier и sorted inventory digest.
+- **Изначальный критерий:** server/local checksums, sizes и generations совпадают для каждого artifact.
+
+### W095 — Опубликовать финальный bundle в Nebius
+
+- **Замысел:** передать сжатые проверенные Parquet/Megatron outputs туда, где будет обучение.
+- **Где/чем:** `scripts/data/publish_megatron_bundle_to_nebius_s3.py`.
+- **Изначальный критерий:** multipart/object receipt связан с release manifest, endpoint/bucket/key и checksum.
+
+### W096 — Восстановить bundle из Nebius в пустой root
+
+- **Замысел:** доказать, что remote copy самодостаточна и не зависит от uploader cache.
+- **Где/чем:** `scripts/data/restore_megatron_bundle_from_nebius_s3.py --require-empty-output-root`.
+- **Изначальный критерий:** safe member set, hashes, Parquet footers, MMIDIDX и sidecars проходят повторно.
+
+### W097 — Публиковать честный training-data status
+
+- **Замысел:** показывать live/staged/sealed отдельно и не суммировать overlapping snapshots.
+- **Где/чем:** `outputs/training_data_status/current.md` и status SHA.
+- **Изначальный критерий:** counters выводятся только из receipts; blockers перечислены явно.
+
+### W098 — Исключить secrets из control plane
+
+- **Замысел:** не записывать PAT, GitLab token, OAuth access token и Authorization headers в metadata/logs/receipts.
+- **Где/чем:** wrappers, secret scans, service-account identity.
+- **Изначальный критерий:** receipts содержат только env names/fingerprints; redaction tests и repository scan green.
+
+### W099 — Выполнить полный cost/resource cleanup
+
+- **Замысел:** удалить transient source/CI/reducer VM, disks, IP и placement policies после remote readback.
+- **Где/чем:** run-specific Terraform destroy receipts и GCP inventory.
+- **Изначальный критерий:** foundation/bucket сохранены, expensive run resources отсутствуют, data readback остаётся green.
+
+### W100 — Выдать финальный release handoff
+
+- **Замысел:** передать training owner один immutable manifest вместо набора локальных директорий.
+- **Где/чем:** release receipt, GCS/Nebius pointers, tokenizer/Megatron commit bindings.
+- **Изначальный критерий:** только этот receipt имеет `training_ready=true`; все предыдущие receipts остаются исторически false.
+
+---
+
+## Часть II. Что уже сделано и подтверждено — 50 пунктов
+
+Срез `outputs/training_data_status/current.md` сгенерирован `2026-08-08T23:11:36Z`, SHA-256 `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`. Он является главным источником текущих token totals. Для GitHub/GitLab/GCP используются отдельные receipts, названные в пунктах ниже.
+
+### Код распределённого runtime и infrastructure-as-code
+
+### D001 — Source/GCP repair stack интегрирован в основную историю
+
+- **Сделано:** ветка integration landed через commit `ac41718b` и последующие merges; `origin/main` на evidence-срезе содержит source repair/runtime stack.
+- **Доказательство:** `git log --all`, merge `10066e88` и текущий `origin/main` `b045e547`.
+- **Честная граница:** наличие кода в main не означает, что все source assignments завершены.
+
+### D002 — Terraform foundation оформлен отдельным модулем
+
+- **Сделано:** существуют versioned `main.tf`, `variables.tf`, `outputs.tf`, lock file, examples и `foundation.tftest.hcl`.
+- **Доказательство:** `infra/gcp_corpus_pool/foundation/` в `origin/main`.
+- **Честная граница:** этот факт доказывает наличие IaC-контракта, но не текущие IAM права активного локального account.
+
+### D003 — Terraform workers оформлен run-scoped модулем
+
+- **Сделано:** workers module содержит backend, startup template, outputs, tfvars examples и `workers.tftest.hcl`.
+- **Доказательство:** `infra/gcp_corpus_pool/workers/`.
+- **Честная граница:** module сам по себе не доказывает отсутствие старых VM; для этого нужен GCP readback/destroy receipt.
+
+### D004 — Receipt-bound GCP source monitor реализован
+
+- **Сделано:** monitor умеет считать claims, heartbeats, outcomes, assignment receipts и recovery policy по immutable objects.
+- **Доказательство:** commit `f9b59646` и live report schema `cppmega.gcp_source_run_monitor_report_v1`.
+- **Честная граница:** monitor может показать `blocked_deterministic`; он не исправляет parser defect автоматически.
+
+### D005 — Dynamic source work stealing реализован
+
+- **Сделано:** scheduler поддерживает claim queue/leases вместо жёсткого ожидания home shard.
+- **Доказательство:** commit `23d864de` и live `scheduler_mode: dynamic_claim_queue` в repair report.
+- **Честная граница:** work stealing повышает utilization, но не делает deterministic exit успешным.
+
+### D006 — Receipt-bound cloud lane materializer добавлен
+
+- **Сделано:** codebase содержит подготовку payload, lane worker и materializer с manifest binding.
+- **Доказательство:** commits `f5a37ea9`/`aef67a72`, `scripts/distributed_data_prep/lane_materializer.py`.
+- **Честная граница:** production output должен быть доказан отдельным terminal receipt.
+
+### D007 — CASE5 cloud snapshot adapter добавлен
+
+- **Сделано:** CI frozen inputs могут быть описаны cloud-lane snapshot manifest.
+- **Доказательство:** commit `259f793f`, `scripts/distributed_data_prep/ci_case5_snapshot.py`.
+- **Честная граница:** adapter не равен завершённому CASE5 Parquet export.
+
+### D008 — GitHub PR cloud lane добавлен
+
+- **Сделано:** код умеет представить membership-bound PR materialization как receipt-bound cloud lane.
+- **Доказательство:** commit `3a5f7309` и связанные distributed scripts/tests.
+- **Честная граница:** текущий training status всё ещё показывает GitHub PR Parquet `0`.
+
+### D009 — Pool execution для CASE5 workers реализован
+
+- **Сделано:** добавлен pooled worker path для распределения lane assignments.
+- **Доказательство:** commit `8ba86ec5`, `cloud_lane_pool_worker.py`.
+- **Честная граница:** smoke `.003` обязан доказать, что assignments реально claim/complete в текущем bootstrap.
+
+### D010 — CASE5 smoke topology изолирована от production
+
+- **Сделано:** smoke использует отдельный run ID/backend/resource set и не мутирует production state.
+- **Доказательство:** commit `7942cd81`, isolated plan/apply receipts для `ci-case5-smoke-20260808-003`.
+- **Честная граница:** изоляция устраняет collision, но не доказывает throughput или output receipt.
+
+### D011 — Resource topology CASE5 привязана к lane contract
+
+- **Сделано:** worker topology входит в manifest/receipt binding и не может тихо измениться между plan и run.
+- **Доказательство:** commit `2d6d1cfd`.
+- **Честная граница:** bound topology ещё нужно benchmark/validate на реальном production volume.
+
+### D012 — Source failure receipts сделаны attempt-unique
+
+- **Сделано:** разные attempts deterministic failure больше не конфликтуют по одному object key.
+- **Доказательство:** commit `b3e15f9c` в `origin/main`; отдельная repair branch также сохранила fix lineage.
+- **Честная граница:** уникальность receipt не исправляет первопричину failure.
+
+### D013 — CASE5 contract допускает корректный prefix ladder
+
+- **Сделано:** verifier различает поддерживаемую семибакетную лестницу и конкретный materialized prefix/subset.
+- **Доказательство:** commits `de666288`, `2595f5d4`, `0485fb3c`.
+- **Честная граница:** 32K/64K всё равно должны быть физически materialized или verified-zero перед final seal.
+
+### D014 — Tokenizer resolution больше не зависит от process cwd
+
+- **Сделано:** canonical tokenizer находится через стабильный path contract, а не только текущую директорию.
+- **Доказательство:** commit `2890ce5f`.
+- **Честная граница:** удалённый cwd всё ещё ломает сам process spawn; этот fix закрывает только tokenizer lookup.
+
+### D015 — Добавлены round-trip и sidecar alignment tests tokenizer
+
+- **Сделано:** тесты проверяют packed source tokenizer round-trip и целостность sidecar alignment.
+- **Доказательство:** commit `b045e547`, новые `tests/test_packed_source_tokenizer_sidecar_integrity.py` и `tests/test_token_budget_tokenizer_path.py`.
+- **Честная граница:** эти unit/regression tests не заменяют production artifact conservation audit.
+
+### Локальный source corpus и существующий sealed bundle
+
+### D016 — Честный machine-readable training status выпускается
+
+- **Сделано:** status раздельно показывает live source, sealed Megatron, GitHub PR, GitLab MR и CI.
+- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md` с собственным SHA-256.
+- **Честная граница:** status прямо сохраняет `release ready=false` для новых live/PR/MR/CI lanes.
+
+### D017 — Live source Parquet 1K физически существует
+
+- **Сделано:** учтено 440 файлов, 3,085,794 rows, 3,054,269,011 valid и 3,038,224,353 trained tokens.
+- **Доказательство:** таблица `Live source Parquet`, root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`.
+- **Честная граница:** bucket `packed_unsealed`, а completion totals расходятся с physical Parquet.
+
+### D018 — Live source Parquet 2K физически существует
+
+- **Сделано:** учтено 438 файлов, 449,658 rows, 640,701,360 valid и 640,251,702 trained tokens.
+- **Доказательство:** тот же status/root.
+- **Честная граница:** данные входят в незавершённый overlapping live snapshot.
+
+### D019 — Live source Parquet 4K физически существует
+
+- **Сделано:** учтено 435 файлов, 221,983 rows, 627,003,170 valid и 626,781,187 trained tokens.
+- **Доказательство:** physical status inventory.
+- **Честная граница:** global composition/dedup/seal ещё не закрыты.
+
+### D020 — Live source Parquet 8K физически существует
+
+- **Сделано:** учтено 437 файлов, 97,963 rows, 552,562,497 valid и 552,464,534 trained tokens.
+- **Доказательство:** physical status inventory.
+- **Честная граница:** наличие rows не доказывает terminal repository coverage.
+
+### D021 — Live source Parquet 16K физически существует
+
+- **Сделано:** учтено 428 файлов, 100,016 rows, 1,415,781,331 valid и 1,415,681,315 trained tokens.
+- **Доказательство:** physical status inventory.
+- **Честная граница:** 32K/64K в этом live root ещё не материализованы.
+
+### D022 — Live source token accounting посчитан
+
+- **Сделано:** status фиксирует 6,290,317,369 valid и 6,273,403,091 trained tokens без сложения с overlapping sealed snapshot.
+- **Доказательство:** summary и sum пяти physical bucket tables.
+- **Честная граница:** totals относятся к `packed_unsealed`, не к release-ready corpus.
+
+### D023 — Source documents разложены по восьми категориям
+
+- **Сделано:** посчитаны bash, build, headers, C/C++ source, diagnostics, Python auxiliary, shell other и SQL.
+- **Доказательство:** category table, включая 13,073,135 header documents и 3,570,482 source documents.
+- **Честная граница:** status отмечает, что Python auxiliary пока смешан с main rows.
+
+### D024 — Source blockers не скрыты
+
+- **Сделано:** current status явно сообщает mismatch completion/physical totals, failed units и auxiliary mixing.
+- **Доказательство:** секция `Blockers` live source.
+- **Честная граница:** это завершённая диагностика/прозрачность, а не устранение blockers.
+
+### D025 — Существующий sealed Megatron manifest сохранён
+
+- **Сделано:** manifest `outputs/megatron_ready/macro_routes_v1_20260713/manifest.json` остаётся отдельным sealed snapshot.
+- **Доказательство:** status классифицирует его `sealed_megatron`, release-ready для его исторического scope.
+- **Честная граница:** snapshot overlaps live source и покрывает только 1K–16K, поэтому не является новым four-lane release.
+
+### D026 — Sealed Megatron 1K физически учтён
+
+- **Сделано:** manifest связывает 2,366 files, 1,804,082 rows, 1,712,299,227 valid и 1,704,343,213 trained tokens.
+- **Доказательство:** `Sealed Megatron bundle` table в current status.
+- **Честная граница:** этот bucket относится к историческому source-only bundle.
+
+### D027 — Sealed Megatron 2K физически учтён
+
+- **Сделано:** manifest связывает 2,367 files, 441,140 rows, 629,504,765 valid и 629,063,625 trained tokens.
+- **Доказательство:** sealed bundle table.
+- **Честная граница:** он не содержит новые PR/MR/CI lanes.
+
+### D028 — Sealed Megatron 4K физически учтён
+
+- **Сделано:** manifest связывает 2,363 files, 230,004 rows, 653,341,457 valid и 653,111,453 trained tokens.
+- **Доказательство:** sealed bundle table.
+- **Честная граница:** это не доказательство 32K/64K поддержки.
+
+### D029 — Sealed Megatron 8K физически учтён
+
+- **Сделано:** manifest связывает 2,358 files, 110,040 rows, 621,715,449 valid и 621,605,409 trained tokens.
+- **Доказательство:** sealed bundle table.
+- **Честная граница:** bucket нельзя складывать с live 8K из-за overlap.
+
+### D030 — Sealed Megatron 16K физически учтён
+
+- **Сделано:** manifest связывает 2,317 files, 46,197 rows, 515,886,337 valid и 515,840,140 trained tokens.
+- **Доказательство:** sealed bundle table.
+- **Честная граница:** исторический manifest не содержит 32K/64K physical artifacts.
+
+### D031 — Totals sealed bundle посчитаны без overlap
+
+- **Сделано:** status фиксирует 4,132,747,235 valid и 4,123,963,840 trained tokens.
+- **Доказательство:** summary current status и сумма D026–D030.
+- **Честная граница:** эти totals не прибавляются к 6.29B live source.
+
+### GitHub PR и GitLab MR evidence
+
+### D032 — GitHub exact PR store полностью verified
+
+- **Сделано:** completion receipt содержит declared=stored=`2,794,562`, unverified=`0`, status `verified`.
+- **Доказательство:** `outputs/pr_ingest/exact_29c6869/pr_completion.verify7.json`, scan ID `1c103e…d1901`.
+- **Честная граница:** verified SQLite store не является Parquet и даёт eligible packed tokens `0`.
+
+### D033 — GitHub scope из 460 repositories связан digest
+
+- **Сделано:** completion receipt фиксирует `expected_repo_count=460` и set SHA `d0720b…17ced`.
+- **Доказательство:** `pr_completion.verify7.json` плюс bound repo list/store hashes.
+- **Честная граница:** 460 — GitHub PR scope, а не число всех local source attempts.
+
+### D034 — Все 33,388 GraphQL gaps закрыты
+
+- **Сделано:** gap completion имеет target count `33,388`; каждый completed record хранит repo/PR/hash.
+- **Доказательство:** `graphql_gap_completion.verify6.json`, SHA bound из PR completion.
+- **Честная граница:** gap closure завершает fetch verification, но не primary membership.
+
+### D035 — GitHub unresolved/unverified production rows равны нулю
+
+- **Сделано:** exact completion не содержит unverified production PR; gap verification не оставляет unresolved targets.
+- **Доказательство:** `unverified_store_pr_count=0` и terminal gap receipt.
+- **Честная граница:** это не означает, что все 2.79M records должны войти в training set.
+
+### D036 — 227 вне-scan GitHub rows помещены в recoverable quarantine
+
+- **Сделано:** rows вынесены в ZSTD Parquet с SHA `f8fe3916…a59d1`; production store после операции имеет unverified `0`.
+- **Доказательство:** `unverified_store_quarantine_227.receipt.json`, status `complete`.
+- **Честная граница:** quarantine audit-only и не является training membership.
+
+### D037 — GitLab three-host inventory завершён по legacy contract
+
+- **Сделано:** verified receipt фиксирует 46,978 declared MR по Eigen/Mesa/Tor и три expected hosts/repositories.
+- **Доказательство:** `/Volumes/external/cppmega_data/gitlab_mr_stream_prod_v1_20260804/completion_receipt.json`.
+- **Честная граница:** contract SHA legacy; current production scan по hardened contract ещё нужен.
+
+### D038 — GitLab candidate classification завершена
+
+- **Сделано:** из 46,978 inventory records выделен 821 candidate, 46,157 noncandidate.
+- **Доказательство:** legacy completion receipt и route conservation.
+- **Честная граница:** candidate не равен primary training member.
+
+### D039 — GitLab primary/ancillary stores физически разделены
+
+- **Сделано:** receipt связывает distinct `primary.sqlite` и `ancillary.sqlite`; validation `primary_ancillary_physical_separation=true`.
+- **Доказательство:** legacy completion receipt, primary/ancillary counts `0/11`.
+- **Честная граница:** legacy primary `0` показывает незавершённость auth/membership, а не отсутствие MR у проектов.
+
+### D040 — GitLab deterministic sidecars материализованы
+
+- **Сделано:** сохранено 47,799 canonical-json-gzip files, `gzip_mtime=0`, с logical/physical set hashes.
+- **Доказательство:** legacy completion receipt, physical size 91,503,709 bytes.
+- **Честная граница:** sidecars являются verified inventory evidence, но eligible Parquet tokens остаются `0`.
+
+### D041 — Authenticated Eigen smoke нашёл primary MR
+
+- **Сделано:** отдельный one-host smoke verified 2,736 declared records, 2 candidates и 2 stored primary MR.
+- **Доказательство:** `/Volumes/external/cppmega_data/gitlab_mr_stream_eigen_auth_20260804_001/completion_receipt.json`.
+- **Честная граница:** smoke не покрывает Mesa/Tor и использует legacy contract SHA.
+
+### D042 — GitLab primary-membership bridge закоммичен и pushed
+
+- **Сделано:** branch `feat/gitlab-primary-membership-bridge-20260808` существует локально и на `origin` с commit `4ec96cf5`.
+- **Доказательство:** `git branch -a --contains 4ec96cf5`.
+- **Честная граница:** bridge ожидает terminal source composition и current GitLab production inputs.
+
+### D043 — Focused bridge regression suite воспроизводимо проходит
+
+- **Сделано:** `tests/test_gitlab_primary_membership_bridge.py` повторно запущен из detached clean worktree commit `4ec96cf5` в project venv с explicit portable profile; результат `5 passed in 3.33s`.
+- **Доказательство:** команда использовала `/Volumes/external/sources/cppmega.mlx/.venv/bin/python`, `CPPMEGA_TEST_PROFILE=portable-data` и временный worktree, удалённый после проверки.
+- **Честная граница:** это focused bridge suite; current GitLab scanner/exporter и production bytes требуют собственных N047–N056 тестов/receipts.
+
+### CI, watchdog и GCP operational evidence
+
+### D044 — CI live CAS имеет измеренный store-local upper bound
+
+- **Сделано:** current status считает 295,701,087,270 exact unique payload tokens внутри live stores.
+- **Доказательство:** секция `CI` current status.
+- **Честная граница:** это store-local upper bound, не global union/dedup и не training tokens.
+
+### D045 — Frozen CASE5 threshold snapshot сохранён
+
+- **Сделано:** frozen receipt фиксирует 61,311,228,208 exact unique payload tokens.
+- **Доказательство:** current status и GCS run `ci-case5-threshold-20260804-001`.
+- **Честная граница:** eligible packed Parquet valid/trained tokens остаются `0/0`.
+
+### D046 — Legacy CI sample Parquet существует для 1K–16K
+
+- **Сделано:** status учитывает sample из 1,855 jobs с physical rows во всех пяти historical buckets.
+- **Доказательство:** таблица `Legacy 1,855-job sample`.
+- **Честная граница:** sample не является production CASE5, 32K/64K отсутствуют и release-ready не выставлен.
+
+### D047 — 30-минутный pipeline watchdog установлен и исполняется
+
+- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 235 runs и last exit `0` на evidence-срезе.
+- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist` и `launchctl print`.
+- **Честная граница:** launchd `state=not running` между interval invocations нормален; freshness проверяется timestamps reports.
+
+### D048 — Codex 429 watchdog установлен
+
+- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 2 runs и last exit `0`.
+- **Доказательство:** `com.codex.multi-429-watchdog.plist` и `launchctl print`.
+- **Честная граница:** watchdog повторяет controller session; он не даёт права retry deterministic parser assignment.
+
+### D049 — Obsolete CASE5 smoke `.002` уничтожен и readback-verified
+
+- **Сделано:** Terraform destroy удалил VM, static address и compact placement policy; managed state пуст.
+- **Доказательство:** `ci-case5-smoke-20260808-002.destroy-receipt.json`, status `destroyed_verified`, plan `0/0/3`.
+- **Честная граница:** сохранённые GCS evidence содержат ready receipt, но assignment/output `0/0`; это cleanup, не data completion.
+
+### D050 — GCP source repair `.001` имеет immutable operational snapshot
+
+- **Сделано:** monitor зафиксировал 4 physical/ready workers, 34 claims, 8 assignment receipts, 18 deterministic outcomes, 8 fresh heartbeats и 0 transient outcomes.
+- **Доказательство:** `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/gcp-source-repair-20260808-001.current.json`, inventory SHA-256 fields.
+- **Честная граница:** state `blocked_deterministic`, completed workers/slot receipts `0`; snapshot доказывает работу/диагностику, не завершение run.
+
+---
+
+## Часть III. Детальный дальнейший план — 100 пунктов
+
+### Немедленное восстановление и завершение source/code lane
+
+### N001 — Заморозить новый общий runtime checkpoint
+
+- **Действие:** hash текущих `_done.json`, launch/repair contracts, live status, local locks и GCP monitor reports без остановки writers.
+- **Код/инфра/аккаунт:** source root в `/Volumes/external/cppmega_data`, `scripts/report_training_data_status.py`, read-only GCS через scoped operator identity.
+- **Проверка:** stat-before/hash/stat-after; mutable file получает отдельную observed-version запись, а не ложный stable hash.
+- **Готово когда:** `N001-runtime-checkpoint.json` перечисляет local/GCP/PR/MR/CI evidence и везде сохраняет `training_ready=false`.
+
+### N002 — Восстановить durable pinned worktree локального conveyor
+
+- **Действие:** создать новый worktree из сохранённого pushed repair commit вместо исчезнувшего `/Volumes/external/cppmega_data/worktrees/cppmega-gcp-deterministic-repair-20260806`.
+- **Код/инфра/аккаунт:** `git worktree`, branch/commit lineage repair stack; output root не перемещать.
+- **Проверка:** `git rev-parse HEAD`, clean status, все scripts/tokenizer/config paths существуют и hashes совпадают launch contract либо явно superseded новым receipt.
+- **Готово когда:** durable path записан в новый launch receipt, а старый missing cwd помечен причиной остановки, не success.
+
+### N003 — Убрать lifetime-зависимость child processes от удаляемого worktree
+
+- **Действие:** изменить supervisor так, чтобы child cwd был durable run workspace или проверялся/восстанавливался до spawn.
+- **Код/инфра/аккаунт:** `scripts/source_conveyor_supervisor.py`, `scripts/streaming_conveyor.py`, worktree lifecycle helper.
+- **Проверка:** regression удаляет исходный checkout после staging; resume обязан либо продолжить из durable cwd, либо fail deterministic до writer mutation.
+- **Готово когда:** focused tests проходят, а `FileNotFoundError: cwd` больше не создаёт каскад ложных repo failures.
+
+### N004 — Закрепить restart/lock semantics тестами
+
+- **Действие:** покрыть единственного supervisor, shared-base repair lock, stale PID и restart после crash.
+- **Код/инфра/аккаунт:** `tests/test_source_conveyor_supervisor.py`, `tests/test_streaming_conveyor_revision.py`.
+- **Проверка:** два concurrent writers отвергаются; stale lock снимается только с bound evidence; accepted shard hash не меняется.
+- **Готово когда:** clean pinned worktree выдаёт pytest exit `0` и test receipt с source tree SHA.
+
+### N005 — Безопасно возобновить локальный conveyor
+
+- **Действие:** остановить только сломанный controller generation, сохранить long-running accepted child outcome и запустить resume по N001/N002 binding.
+- **Код/инфра/аккаунт:** supervisor CLI, existing run root, local operator; не использовать broad kill pattern.
+- **Проверка:** process identity/lock/output generation совпадают; первые новые progress records ссылаются на resume receipt.
+- **Готово когда:** два 30-минутных watchdog среза показывают forward progress без новых cwd failures или duplicate writers.
+
+### N006 — Нормализовать 501 scope против progress attempts
+
+- **Действие:** построить canonical ledger repo→attempts→accepted/unresolved/excluded и объяснить raw `440 done / 66 failed`.
+- **Код/инфра/аккаунт:** source list, `_done.json`, `cppmega/data/source_conveyor_composition.py`.
+- **Проверка:** неизвестные repos, duplicate accepted producer и unresolved+accepted overlap блокируют ledger.
+- **Готово когда:** дизъюнктное разбиение ровно равно bound source scope; 506 progress records не выдаются за 506 repositories.
+
+### N007 — Пересобрать exact local failure inventory
+
+- **Действие:** для каждого unresolved attempt сохранить exit, bounded stderr, repo/commit, failing file и classification.
+- **Код/инфра/аккаунт:** supervisor logs, parser diagnostics, quarantine receipts.
+- **Проверка:** transport/429, OOM, deterministic parser, corrupt input и operator interruption различаются; `unknown=0` до authorization.
+- **Готово когда:** inventory SHA связан с N006 и может породить finite repair contract.
+
+### N008 — Довести KeyDB repair до production receipt
+
+- **Действие:** взять уже исправленный code path, повторить 27 focused tests из clean worktree, commit/push и запустить только KeyDB residual assignment.
+- **Код/инфра/аккаунт:** repair branch, KeyDB fixture, source quarantine/parser tests.
+- **Проверка:** regression воспроизводит исходный failure до fix и accepted candidate после fix; unrelated repo hashes не меняются.
+- **Готово когда:** immutable KeyDB completion/artifact receipt проходит composition verifier.
+
+### N009 — Закрыть ImHex и Haiku deterministic failures
+
+- **Действие:** разделить их симптомы, создать минимальные fixtures и применить parser/quarantine fix без project-wide ignore.
+- **Код/инфра/аккаунт:** `tools/clang_indexer/`, exact quarantine manifest, per-repo repair branch.
+- **Проверка:** positive fixture проходит, one-byte/diagnostic negative mutation не попадает под quarantine.
+- **Готово когда:** два distinct terminal receipts приняты, а repair diff не расширяет scope молча.
+
+### N010 — Закрыть MXNet и unix-history failures
+
+- **Действие:** проверить gitlink/history/input-shape причины отдельно и исправить assembly/receipt binding.
+- **Код/инфра/аккаунт:** commit/source conveyor, `f5dfe56c` lineage, repository fixtures.
+- **Проверка:** missing gitlink, historical encoding и malformed archive cases имеют deterministic tests.
+- **Готово когда:** MXNet и unix-history получают accepted или explicit source-scope exclusion receipts с policy approval.
+
+### N011 — Закрыть AOSP native parser fallback
+
+- **Действие:** закончить отдельный `fix/aosp-native-parser-fallback-20260809`, не подменяя native semantics plain-text fallback без маркировки.
+- **Код/инфра/аккаунт:** worktree `/Volumes/external/cppmega_data/worktrees/cppmega-aosp-native-parser-fallback-20260809`.
+- **Проверка:** fixture сравнивает native/fallback provenance, diagnostics и graph availability; fallback reason попадает в sidecar.
+- **Готово когда:** branch committed/pushed, tests green, residual assignment bound exact commit.
+
+### N012 — Выделить heavy repository resource class
+
+- **Действие:** профилировать Boost, ClickHouse, GCC, FreeBSD, ReactOS, Filament и аналогичные repos по RAM/CPU/time.
+- **Код/инфра/аккаунт:** scheduler resource envelope, GCP `n2-standard-16` baseline и отдельный heavy tfvars при необходимости.
+- **Проверка:** сравнить heartbeat/progress/memory high-water; изменение class не меняет assignment content digest.
+- **Готово когда:** heavy jobs перестают блокировать обычную очередь и имеют bounded cost/time estimate.
+
+### N013 — Довести local base+repair до terminal coverage
+
+- **Действие:** дождаться/возобновить все runnable assignments, применить только авторизованные fixes N008–N011.
+- **Код/инфра/аккаунт:** local conveyor base root и repair generations.
+- **Проверка:** accepted+excluded равно local scope; active/unresolved/duplicate accepted равны нулю.
+- **Готово когда:** terminal local composition input receipt опубликован atomically.
+
+### N014 — Повторно проверить оба 30-минутных watchdog
+
+- **Действие:** проверить launchd labels, actual report timestamps, exit history и duplicate legacy schedulers.
+- **Код/инфра/аккаунт:** два plists, dispatcher scripts и Application Support report roots.
+- **Проверка:** два consecutive reports ≤35 минут; secret scan logs; recovery не запускает deterministic assignment.
+- **Готово когда:** watchdog health receipt содержит plist/script hashes и test transient 429 dry-run.
+
+### N015 — Снять свежий GCP repair `.001` inventory scoped identity
+
+- **Действие:** использовать credential override operator SA, потому что текущий global gcloud account не имеет `compute.instances.list`.
+- **Код/инфра/аккаунт:** project `natural-bison-491019-t9`, `nanochat-automation@…`, GCE/GCS read-only commands.
+- **Проверка:** account/project printed без token value; instances, addresses, policies и GCS receipts inventory связаны timestamp/digest.
+- **Готово когда:** current report не старше 35 минут и reconciles с Compute API inventory.
+
+### N016 — Дать `.001` завершить только уже активную полезную работу
+
+- **Действие:** не retry 18 exit-2 outcomes in-place; сохранить outputs текущих eight fresh assignments и новых runnable claims.
+- **Код/инфра/аккаунт:** GCS run `source-repair-20260808-001`, dynamic claim queue.
+- **Проверка:** heartbeat freshness, assignment digest, terminal candidate/hash; no automatic replacement flag.
+- **Готово когда:** все не-deterministic runnable assignments имеют terminal accepted/outcome receipt, а active=0.
+
+### N017 — Заморозить terminal `.001` composition inventory
+
+- **Действие:** построить sorted set claims/outcomes/candidates/receipts и закрыть run для новых claims.
+- **Код/инфра/аккаунт:** source monitor, GCS object generations, repair contract.
+- **Проверка:** expected set reconciliation; duplicates, missing outcome diagnostics и mutable objects блокируют freeze.
+- **Готово когда:** immutable `.001-terminal-inventory.json` помечает exact accepted и deterministic residual sets.
+
+### N018 — Создать новый pinned repair revision для residual set
+
+- **Действие:** объединить только проверенные fixes N008–N011 в clean branch без runtime/doc noise.
+- **Код/инфра/аккаунт:** Git branch `fix/source-residual-<date>`, source parser/quarantine code.
+- **Проверка:** focused + full source tests, `git diff --check`, commit/tree hash, no secret scan matches.
+- **Готово когда:** commit pushed и referenced immutable residual authorization.
+
+### N019 — Опубликовать новый GCP residual run `.002`
+
+- **Действие:** создать новый run ID/backend/payload только для unresolved set N017; старый `.001` не переиспользовать.
+- **Код/инфра/аккаунт:** `scripts/prepare_gcp_source_pilot.py`, `infra/gcp_corpus_pool/workers`, GCS create-only prefix.
+- **Проверка:** plan receipt связывает code, source manifest, assignments, topology, service accounts; prefix/state collision fail exit `2`.
+- **Готово когда:** apply/readiness receipts подтверждают exact worker count и no unexpected resources.
+
+### N020 — Довести residual `.002` до terminal outcomes
+
+- **Действие:** monitor каждые 30 минут, retry только immutable attempt с exit `75`, классифицировать новый exit `2` в следующий revision.
+- **Код/инфра/аккаунт:** source monitor/watchdog, GCS receipts и worker diagnostics.
+- **Проверка:** assignment set полностью покрыт completion/outcome; accepted artifacts проходят hash/readback.
+- **Готово когда:** unresolved/active/missing artifacts равны нулю или существует approved explicit exclusion receipt.
+
+### N021 — Собрать canonical local+GCP source composition
+
+- **Действие:** логически объединить local base/repair, `.001` accepted и `.002` residual outputs.
+- **Код/инфра/аккаунт:** `cppmega/data/source_conveyor_composition.py` и composition tests.
+- **Проверка:** один primary producer на repo/artifact; tokenizer/repo-list/revision drift и duplicate winners отвергаются.
+- **Готово когда:** terminal composition receipt покрывает exact source scope и семь target lengths.
+
+### N022 — Выполнить single-writer global source dedup/reducer
+
+- **Действие:** feed composition candidates в canonical order, применить exact/near dedup один раз.
+- **Код/инфра/аккаунт:** `scripts/distributed_data_prep/source_reducer.py`, `verify_global_dedup_store.py`.
+- **Проверка:** deterministic rerun, winner/duplicate/quarantine conservation, portable dedup receipt.
+- **Готово когда:** reducer manifest hash стабилен и не зависит от worker-local DB ordering.
+
+### N023 — Физически отделить Python auxiliary и route classes
+
+- **Действие:** перепаковать source documents по policy, вынеся auxiliary из primary rows.
+- **Код/инфра/аккаунт:** `route_packed_source_docs.py`, category sidecars и training status.
+- **Проверка:** category totals до/после сходятся; code/commit/aux roots distinct; no lost document IDs.
+- **Готово когда:** blocker `Python auxiliary documents are still mixed into main rows` исчезает по receipt, не ручной правке status.
+
+### N024 — Материализовать source Parquet на всех семи lengths
+
+- **Действие:** перепаковать canonical reducer output в 1K–64K с real 32K/64K или exact verified-zero.
+- **Код/инфра/аккаунт:** packer, `build_macro_routes_megatron_bundle.py`, atomic Parquet publication.
+- **Проверка:** footer/schema/ZSTD, no partial/symlink, bucket membership disjoint, token range valid.
+- **Готово когда:** seven-bucket inventory имеет physical hashes и не содержит manifest-only 32K/64K.
+
+### N025 — Закрыть source Parquet/sidecar conservation
+
+- **Действие:** аудировать каждый shard и equations documents/valid/trained/pad/duplicates/quarantine.
+- **Код/инфра/аккаунт:** `scripts/audit_sidecar_parquet.py`, provenance/side-shape verifiers.
+- **Проверка:** graph offsets, document isolation, labels, file/row/token totals; один bad shard блокирует lane.
+- **Готово когда:** aggregate conservation receipt объясняет нулевую дельту для code, commit и auxiliary routes.
+
+### N026 — Построить source/commit Megatron prefixes 1K–64K
+
+- **Действие:** конвертировать каждый nonempty audited bucket через canonical tokenizer с полным sidecar profile.
+- **Код/инфра/аккаунт:** `scripts/data_prep_parquet_to_megatron.py`, distinct code/commit output generations.
+- **Проверка:** MMIDIDX header/offset/data bytes, sequence/document counts и sidecar shapes reread из файлов.
+- **Готово когда:** fourteen code/commit bucket states physical или verified-zero и связаны N024/N025 hashes.
+
+### N027 — Опубликовать source lane в GCS create-only
+
+- **Действие:** загрузить composition, Parquet, Megatron, sidecars и audits в content-addressed run prefix.
+- **Код/инфра/аккаунт:** GCS bucket, scoped operator upload identity, publication helper.
+- **Проверка:** `ifGenerationMatch=0`, server checksum/size/generation и sorted inventory digest.
+- **Готово когда:** независимый exact-generation readback воспроизводит source artifact-set SHA.
+
+### N028 — Выполнить source bundle Nebius publish/restore
+
+- **Действие:** опубликовать source-only bundle и восстановить в новый пустой root до удаления workers.
+- **Код/инфра/аккаунт:** `publish_megatron_bundle_to_nebius_s3.py`, `restore_megatron_bundle_from_nebius_s3.py`, Nebius S3 profile.
+- **Проверка:** no secrets, safe archive paths, per-member hashes, Parquet/MMIDIDX/sidecars reread.
+- **Готово когда:** remote restore artifact-set hash совпадает с N027 manifest.
+
+### N029 — Удалить все source transient resources
+
+- **Действие:** после N027/N028 построить/apply destroy для `.001`, `.002` и других retained source worker runs.
+- **Код/инфра/аккаунт:** каждый isolated Terraform backend; foundation/bucket вне destroy scope.
+- **Проверка:** plan addresses only run VM/IP/policy/disks; Compute readback absent; remote data всё ещё verifiable.
+- **Готово когда:** per-run `destroyed_verified` receipts и zero source worker cost inventory.
+
+### N030 — Выдать immutable source A→B/C handoff
+
+- **Действие:** связать composition, seven-bucket Parquet/Megatron, GCS/Nebius readback и destroy receipts.
+- **Код/инфра/аккаунт:** source lane manifest и handoff schema.
+- **Проверка:** consumer загружает только receipt paths/generations, не «latest» directories.
+- **Готово когда:** B/C verifier принимает handoff; global `training_ready` остаётся false.
+
+### GitHub PR lane
+
+### N031 — Принять source composition как единственный membership input
+
+- **Действие:** валидировать N030 и извлечь code/commit allowlists без ручного выбора shards.
+- **Код/инфра/аккаунт:** `cppmega/data/pr_primary_membership.py`, source composition loader.
+- **Проверка:** missing/changed bucket, dedup or artifact-set receipt fail closed.
+- **Готово когда:** `github-source-handoff.accepted.json` связывает все семь source buckets.
+
+### N032 — Повторно верифицировать GitHub completion bytes
+
+- **Действие:** открыть store read-only и перепроверить exact completion/gap/quarantine bindings перед export.
+- **Код/инфра/аккаунт:** `verify_pr_completion.py`, `pr_completion.verify7.json`, `prs.sqlite`.
+- **Проверка:** stored=declared=2,794,562, repos=460, unverified=0, input hashes unchanged.
+- **Готово когда:** новый revalidation receipt не мутирует WAL/store и совпадает с scan ID.
+
+### N033 — Выполнить bounded SQLite health check
+
+- **Действие:** `mode=ro`, WAL checkpoint state, `quick_check` и bounded integrity verification без vacuum/reindex.
+- **Код/инфра/аккаунт:** `scripts/pr_ingest/pr_store.py`, 49 GB PR store.
+- **Проверка:** file size/hash до/после одинаковы; scan count matches N032.
+- **Готово когда:** store-health receipt green, но явно `training_ready=false`.
+
+### N034 — Повторно доказать GraphQL gap/quarantine boundaries
+
+- **Действие:** сверить 33,388 target record hashes и физическое исключение 227 quarantined rows.
+- **Код/инфра/аккаунт:** gap verify6 и quarantine receipt/Parquet.
+- **Проверка:** target=completed, unresolved/skipped/missed=0; quarantined keys absent in exact scan.
+- **Готово когда:** boundary receipt связывает оба set digests с N032.
+
+### N035 — Вычислить exact GitHub primary membership
+
+- **Действие:** построить unique `(repo, pr_number)` из accepted commit provenance N031 и exact store N032.
+- **Код/инфра/аккаунт:** `build_primary_pr_membership`, clean bridge worktree.
+- **Проверка:** every key exists in exact scan; unmatched counters preserved; repo sums equal global unique count.
+- **Готово когда:** deterministic membership summary >0 и ≤2,794,562 с input digests.
+
+### N036 — Опубликовать portable GitHub membership Parquet
+
+- **Действие:** atomically записать ZSTD membership и canonical receipt в новый immutable root.
+- **Код/инфра/аккаунт:** `publish_primary_pr_membership_inputs`, B run root.
+- **Проверка:** schema, unique/sorted key set, file SHA/size и revalidation после close.
+- **Готово когда:** membership receipt проходит portable verifier и не ссылается на mutable temp path.
+
+### N037 — Запустить bounded GitHub export canary
+
+- **Действие:** materialize 100 membership-bound PR во всех семи target lengths в отдельный canary root.
+- **Код/инфра/аккаунт:** `scripts/pr_ingest/export_pr_parquet.py --limit 100`.
+- **Проверка:** only members read, rendered discussion deterministic, provenance/sidecars align, 32K/64K contract exercised.
+- **Готово когда:** canary conservation/audit receipt green; canary artifacts не копируются в production root.
+
+### N038 — Закрыть exporter long-context/zero semantics
+
+- **Действие:** исправить любые five-bucket assumptions; true empty выдаёт verified-zero, nonempty 32K/64K physical shard.
+- **Код/инфра/аккаунт:** exporter, packer, `tests/test_pr_export_batches.py`.
+- **Проверка:** positive 32K/64K, true zero, forged zero, oversized doc и split-conservation fixtures.
+- **Готово когда:** focused tests green и producer revision pinned для production.
+
+### N039 — Выполнить полный resumable GitHub export
+
+- **Действие:** обработать все N036 keys батчами, не читая nonmembers как training docs.
+- **Код/инфра/аккаунт:** production B root локально/GCP, batch-size manifest, worker SA при cloud run.
+- **Проверка:** resume принимает только verified done artifacts; input hashes N031/N032/N036 stable.
+- **Готово когда:** completed unique keys ровно membership count, duplicate/missing=0.
+
+### N040 — Мониторить GitHub attempts по retry contract
+
+- **Действие:** каждые 30 минут фиксировать progress/heartbeat/exit; новый attempt только при exit `75` с diagnostics.
+- **Код/инфра/аккаунт:** pipeline watchdog, export `_done.json`, attempt receipts.
+- **Проверка:** exit `2`, OOM без 429 и artifact drift не retry in-place.
+- **Готово когда:** complete timeline покрывает все attempts и ни один accepted shard не перезаписан.
+
+### N041 — Аудировать GitHub Parquet и sidecars
+
+- **Действие:** проверять footer/schema/ZSTD/token ranges/provenance/graph boundaries каждого production shard.
+- **Код/инфра/аккаунт:** `scripts/audit_sidecar_parquet.py`, independent auditor process.
+- **Проверка:** no partial/symlink, stable SHA, document isolation и sidecar coordinate agreement.
+- **Готово когда:** per-shard receipts и seven-bucket aggregate inventory green.
+
+### N042 — Закрыть GitHub conservation
+
+- **Действие:** сверить membership keys, rendered docs, packed docs, valid/trained/pad и routed bucket IDs.
+- **Код/инфра/аккаунт:** export terminal manifest и conservation reducer.
+- **Проверка:** rendered count=membership; bucket sets disjoint; no unexplained token/document delta.
+- **Готово когда:** GitHub terminal export receipt имеет status complete и seven-state matrix.
+
+### N043 — Построить GitHub Megatron 1K–64K
+
+- **Действие:** конвертировать audited PR Parquet с полным objective/provenance sidecar profile.
+- **Код/инфра/аккаунт:** canonical converter и GitHub-specific prefixes.
+- **Проверка:** MMIDIDX reread, sample/document counts, long-context receipts.
+- **Готово когда:** seven physical/verified-zero prefix states связаны N042.
+
+### N044 — Опубликовать и прочитать GitHub lane из GCS
+
+- **Действие:** create-only upload membership, Parquet, Megatron, sidecars и audits.
+- **Код/инфра/аккаунт:** `gs://…/runs/<B_RUN_ID>/github-pr`, scoped upload SA.
+- **Проверка:** exact-generation remote readback and artifact-set digest.
+- **Готово когда:** GitHub lane manifest `lane_ready=true`, global training false.
+
+### N045 — Выдать GitHub B→C handoff
+
+- **Действие:** опубликовать immutable handoff на N036/N042/N043/N044.
+- **Код/инфра/аккаунт:** B lane handoff schema.
+- **Проверка:** C verifier не требует SQLite или local absolute path.
+- **Готово когда:** consumer принимает portable receipts и rehashes remote artifacts.
+
+### GitLab MR lane
+
+### N046 — Заморозить legacy GitLab roots как superseded evidence
+
+- **Действие:** запретить запись в `gitlab_mr_stream_prod_v1_20260804` и Eigen smoke; сохранить hashes/reasons.
+- **Код/инфра/аккаунт:** два completion receipts и stores read-only.
+- **Проверка:** legacy contract SHA `915700…6459` отличается от current version contract; no writer locks.
+- **Готово когда:** supersession receipt объясняет primary 0/ancillary 11 и Eigen primary 2 без merge stores.
+
+### N047 — Pin current GitLab scanner/exporter revision
+
+- **Действие:** создать clean worktree `cppmega.mlx` на hardened checkpoint с `GITLAB_CONTRACT_VERSION=3`.
+- **Код/инфра/аккаунт:** `scripts/pr_ingest/gitlab_mr_stream.py`, exporter/store code.
+- **Проверка:** source subtree clean, commit/tree/script hashes recorded.
+- **Готово когда:** code-binding receipt становится input всех новых smoke/production runs.
+
+### N048 — Повторить полный focused GitLab suite
+
+- **Действие:** прогнать auth, pagination, deterministic gzip, store separation, receipt rebuild и exit taxonomy tests.
+- **Код/инфра/аккаунт:** `tests/test_gitlab_mr_stream.py` и membership bridge tests.
+- **Проверка:** 401/403→2, exhausted 429→75, contract drift→2; no network fixtures deterministic.
+- **Готово когда:** test receipt exit `0` связан N047 source hashes.
+
+### N049 — Выпустить canonical three-host repo scope
+
+- **Действие:** создать новый repo list только для Eigen/Mesa/Tor с exact host/project URLs.
+- **Код/инфра/аккаунт:** new GitLab B root, repo-list builder.
+- **Проверка:** count=3, duplicates/unknown/unresolved=0, sorted digest stable.
+- **Готово когда:** scope receipt используется preflight и production manifest.
+
+### N050 — Проверить host-scoped credential mapping
+
+- **Действие:** сопоставить каждый host отдельному token env name без public fallback.
+- **Код/инфра/аккаунт:** GitLab auth resolver, три `read_api` credentials; values не логировать.
+- **Проверка:** missing/extra/overlap empty; secret scan wrappers/logs/receipts.
+- **Готово когда:** auth-scope receipt хранит host→env name/fingerprint и no secret values.
+
+### N051 — Выполнить bounded API preflight на трёх GitLab hosts
+
+- **Действие:** по одному inventory и candidate-detail probe на host до полного fetch.
+- **Код/инфра/аккаунт:** `_preflight_project_access`, scoped credentials N050.
+- **Проверка:** exact HTTPS host/project, status 200, bounded body/decompression; 401/403/429 taxonomy.
+- **Готово когда:** три redacted preflight receipts green либо deterministic blocker явно закрывает production launch.
+
+### N052 — Выполнить три независимых authenticated smoke
+
+- **Действие:** отдельный one-repo root для Eigen, Mesa и Tor, чтобы fault одного host не маскировал другие.
+- **Код/инфра/аккаунт:** GitLab scanner, three smoke run IDs/stores.
+- **Проверка:** completion receipt rebuild из manifest/store/sidecars; no cross-root SQLite copy.
+- **Готово когда:** каждый host имеет terminal verified smoke или исправленный deterministic defect с новым smoke generation.
+
+### N053 — Зарезервировать новый GitLab production root
+
+- **Действие:** создать collision-free local/GCS roots, не дописывая legacy production.
+- **Код/инфра/аккаунт:** `/Volumes/external/cppmega_data/gitlab-mr-<RUN_ID>` и GCS B prefix.
+- **Проверка:** roots absent/empty, create-only policy, run ID bound N047/N049/N050.
+- **Готово когда:** output allocation receipt принят до первого API page.
+
+### N054 — Выполнить full authenticated three-host scan
+
+- **Действие:** inventory/detail fetch для всех N049 projects с resumable per-host pagination.
+- **Код/инфра/аккаунт:** `gitlab_mr_stream.py`, token env mappings, primary/ancillary stores.
+- **Проверка:** page cursors/ETags where available, rate-limit receipts, deterministic gzip, route conservation.
+- **Готово когда:** terminal scan manifest имеет full host coverage и no unresolved page/candidate.
+
+### N055 — Перестроить GitLab completion receipt из bytes
+
+- **Действие:** после close stores пересчитать counts/hashes/sidecar sets независимо от writer memory.
+- **Код/инфра/аккаунт:** completion verifier, N053 root.
+- **Проверка:** quick/integrity checks, inventory=candidate+noncandidate, primary+ancillary+excluded+terminal conservation.
+- **Готово когда:** current-contract completion status verified, но membership gate всё ещё false.
+
+### N056 — Построить exact GitLab primary membership
+
+- **Действие:** применить bridge commit `4ec96cf5` к N030 source composition и N055 production receipt.
+- **Код/инфра/аккаунт:** `build_gitlab_primary_membership.py`, clean bridge worktree.
+- **Проверка:** source/store/contract bindings, unique host/project/IID keys, unmatched counters.
+- **Готово когда:** portable membership receipt проходит полный текущий focused suite и production verifier; count тестов берётся из pinned revision, а не исторического handoff.
+
+### N057 — Запустить GitLab export canary
+
+- **Действие:** materialize bounded members всех hosts в seven-bucket canary.
+- **Код/инфра/аккаунт:** PR exporter GitLab mode, N056 membership.
+- **Проверка:** only primary store reads, ancillary key exclusion, 32K/64K/verified-zero semantics, sidecars.
+- **Готово когда:** canary audit/conservation green и production root остаётся untouched.
+
+### N058 — Выполнить полный GitLab MR export
+
+- **Действие:** resumable batches по N056 membership в immutable production root.
+- **Код/инфра/аккаунт:** exporter, local/GCP worker, 30-minute watchdog.
+- **Проверка:** completed unique keys=membership; no legacy/smoke artifact accepted; attempts follow 75/2 rules.
+- **Готово когда:** terminal export receipt покрывает семь buckets.
+
+### N059 — Аудировать и конвертировать GitLab lane
+
+- **Действие:** Parquet/sidecar conservation, затем Megatron 1K–64K.
+- **Код/инфра/аккаунт:** sidecar auditor, canonical converter, GitLab prefixes.
+- **Проверка:** footer/schema/ZSTD, document/token equations, MMIDIDX reread и long-context receipts.
+- **Готово когда:** GitLab lane manifest имеет seven physical/verified-zero states.
+
+### N060 — Опубликовать GitLab lane и B→C handoff
+
+- **Действие:** create-only GCS upload, exact-generation readback и portable handoff.
+- **Код/инфра/аккаунт:** `gs://…/<B_RUN_ID>/gitlab-mr`, scoped operator SA.
+- **Проверка:** artifact-set hash and remote generations; C не требует local SQLite.
+- **Готово когда:** GitLab handoff accepted, global training false.
+
+### CI CASE5 lane
+
+### N061 — Заморозить inventory живых CI stores/fetchers
+
+- **Действие:** снять per-store sizes/hashes/cursors/process-safe checkpoints, не суммируя overlapping stores.
+- **Код/инфра/аккаунт:** `scripts/ci_stream_inventory.py`, fetch state/receipts, local data roots.
+- **Проверка:** checkpoint after writer flush/close либо explicitly live upper-bound; repo partitions identified.
+- **Готово когда:** exact input ledger отделяет frozen threshold, live shards и legacy sample.
+
+### N062 — Перенести CASE5 materialization input в GCS вместо локальной копии
+
+- **Действие:** publish manifest-bound frozen stores/archives chunks directly to cloud.
+- **Код/инфра/аккаунт:** `prepare_gcp_cloud_lane_payload.py`, GCS inputs prefix.
+- **Проверка:** create-only upload, chunk/archive hash, exact-generation readback, no local 500 GiB requirement.
+- **Готово когда:** cloud workers могут стартовать только с GCS inputs + manifest.
+
+### N063 — Диагностировать stalled smoke `.003`
+
+- **Действие:** прочитать bootstrap serial logs, systemd/process state, GCS control prefix и Terraform apply receipt.
+- **Код/инфра/аккаунт:** `ci-case5-smoke-20260808-003`, scoped Compute/GCS identity.
+- **Проверка:** определить, почему за прежний срез не было assignment/output/failure receipts и использовалось эффективно одно CPU.
+- **Готово когда:** immutable diagnostic receipt классифицирует bootstrap, scheduling, resource или code failure.
+
+### N064 — Исправить effective single-core execution
+
+- **Действие:** передать реальный pool size/cgroup affinity и проверить, что worker видит 16 vCPU.
+- **Код/инфра/аккаунт:** Terraform startup template, cloud-lane runner, Python process pool settings.
+- **Проверка:** smoke benchmark CPU utilization/process count, deterministic output hashes против serial fixture.
+- **Готово когда:** pool использует ожидаемые cores без oversubscription/OOM и topology receipt отражает факт.
+
+### N065 — Закрепить CASE5 bootstrap тестами
+
+- **Действие:** тестировать payload download/readback, venv/dependency setup, Local SSD mounts, worker invocation и failure receipt.
+- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/pilot/cloud-lane-worker-runner.sh.tmpl`, startup tests.
+- **Проверка:** corrupted payload, missing assignment, wrong manifest, no SSD и permission denied возвращают terminal diagnostics.
+- **Готово когда:** bootstrap focused suite green и payload receipt связан с code commit.
+
+### N066 — Пересоздать smoke новым run ID при deterministic fix
+
+- **Действие:** сохранить `.003` evidence, destroy его resources после diagnosis и запустить `.004`, не mutate `.003`.
+- **Код/инфра/аккаунт:** isolated Terraform backends and GCS prefixes.
+- **Проверка:** `.003` destroy plan scoped; `.004` plan binds fixed revision; foundation untouched.
+- **Готово когда:** old run `destroyed_verified`, new run ready with exact topology.
+
+### N067 — Получить terminal CASE5 smoke output
+
+- **Действие:** обработать bounded frozen subset через assignment→materializer→auditor.
+- **Код/инфра/аккаунт:** cloud lane pool worker, CASE5 exporter, Local SSD scratch.
+- **Проверка:** assignment claim/completion, output artifact, failure taxonomy, Parquet footer и sidecar conservation.
+- **Готово когда:** terminal smoke receipt имеет nonzero output и independently readback GCS artifact.
+
+### N068 — Повторно верифицировать frozen threshold snapshot
+
+- **Действие:** проверить 61,311,228,208-token input receipt, stores/archives и occurrence bindings до production.
+- **Код/инфра/аккаунт:** `ci_case5_snapshot.py`, GCS threshold inputs.
+- **Проверка:** no writer, hashes stable, exact unique calculation reproducible, no overlap addition.
+- **Готово когда:** production input receipt принят CASE5 materializer.
+
+### N069 — Спланировать production CASE5 pool по benchmark
+
+- **Действие:** оценить machines/shards/Local SSD/runtime/cost из N067, а не из theoretical 10 Gbit claim.
+- **Код/инфра/аккаунт:** `scripts/estimate_distributed_data_prep.py`, workers tfvars.
+- **Проверка:** CPU, memory, disk, GCS throughput и reducer bottleneck; quotas/regions confirmed.
+- **Готово когда:** plan receipt содержит worker count, assignments, estimated wall time/cost и teardown policy.
+
+### N070 — Развернуть production CASE5 workers
+
+- **Действие:** apply isolated backend с run-scoped VM/IP/policies и worker SA.
+- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/workers`, operator SA credential override.
+- **Проверка:** Terraform plan digest, ready receipts, no unexpected instances, IAM least privilege.
+- **Готово когда:** expected slots готовы и GCS control plane read/write smoke green.
+
+### N071 — Довести local CI fetch shards до terminal freeze
+
+- **Действие:** продолжать существующие fetchers, retry только confirmed 429, затем закрыть cursors/WAL и publish terminal receipts.
+- **Код/инфра/аккаунт:** `ci_stream_fetch.py`, token ledger, shard states.
+- **Проверка:** exact repo coverage, page/run boundary, no duplicate active writer, no secret logs.
+- **Готово когда:** каждый shard terminal verified или finite residual inventory создан.
+
+### N072 — Обработать CI fetch residuals
+
+- **Действие:** новый residual run для missing repos/pages/jobs, не broad refetch successful shards.
+- **Код/инфра/аккаунт:** fetch state migration/resume scripts, immutable authorization.
+- **Проверка:** residual set digest, 75/2 taxonomy, existing shard hashes unchanged.
+- **Готово когда:** repo/run/workflow/job inventory scope закрыт без unresolved records.
+
+### N073 — Слить CI shards логически
+
+- **Действие:** построить canonical union manifests/CAS occurrence ledger без копирования mutable SQLite trees.
+- **Код/инфра/аккаунт:** `scripts/merge_ci_stream_shards.py`, `clone_ci_stream_union_for_resume.py` только по contract.
+- **Проверка:** key uniqueness, shard coverage, duplicate payload/occurrence distinction, input hashes.
+- **Готово когда:** terminal union receipt воспроизводим и read-only.
+
+### N074 — Проверить CI CAS и preserved archives
+
+- **Действие:** hash blobs, validate zlib/gzip, recover only receipt-authorized preserved archives.
+- **Код/инфра/аккаунт:** `ci_content_store.py`, `ci_zlib_evidence.py`, `recover_ci_preserved_archives.py`.
+- **Проверка:** CAS blob hash, decompression bounds, orphan/set-based receipt checks.
+- **Готово когда:** corrupt/missing/quarantined sets explicit, unexplained missing payload=0.
+
+### N075 — Выполнить global CI payload/occurrence dedup
+
+- **Действие:** вычислить exact global union, сохранив все repo/run/job/step occurrence bindings.
+- **Код/инфра/аккаунт:** CI reducer, canonical manifest order, portable dedup store.
+- **Проверка:** store-local 295.7B upper bound заменён exact global totals; payload dedup не теряет occurrences.
+- **Готово когда:** deterministic dedup receipt имеет winner/duplicate/conservation equations.
+
+### N076 — Материализовать production CASE5 Parquet
+
+- **Действие:** запустить `export_ci_content_store_case5.py` поверх N068/N075 inputs в cloud workers N070.
+- **Код/инфра/аккаунт:** CASE5 exporter, GCS input/output prefixes, Local SSD scratch.
+- **Проверка:** resumable done receipts, no mutable store reads after freeze, document/token conservation.
+- **Готово когда:** terminal export receipt покрывает весь exact CASE5 membership, а partial generations не authoritative.
+
+### N077 — Материализовать полный CI sidecar set
+
+- **Действие:** выпустить repo/run/workflow/job/step/actor/runner, language/platform/toolchain/build, commands/targets, tests, diagnostics, entities/edges и chunks.
+- **Код/инфра/аккаунт:** `ci_log_sidecars.py`, `ci_source_sidecars.py`, `ci_source_binding_projection.py`.
+- **Проверка:** shape/foreign-key/offset/hash audits и secret redaction; nullable fields explicit.
+- **Готово когда:** каждый Parquet document имеет согласованный sidecar binding либо schema-authorized absence.
+
+### N078 — Закрыть CI seven-length ladder
+
+- **Действие:** route/pack CASE5 documents на 1K–64K; 32K/64K physical либо exact verified-zero.
+- **Код/инфра/аккаунт:** canonical packer и distributed sealing contract.
+- **Проверка:** disjoint routed IDs, lossless oversized split, capacity/token range, no forged empty.
+- **Готово когда:** CI Parquet inventory содержит семь audited states и exact totals.
+
+### N079 — Построить CI Megatron 1K–64K
+
+- **Действие:** конвертировать N078 с полными objective/graph/provenance sidecars.
+- **Код/инфра/аккаунт:** `data_prep_parquet_to_megatron.py`, CI-specific prefixes.
+- **Проверка:** MMIDIDX reread, `.bin/.idx` counts/bytes, document isolation, long-context receipts.
+- **Готово когда:** seven physical/verified-zero prefixes связаны с CI export/dedup receipts.
+
+### N080 — Запечатать CI lane, прочитать из GCS и удалить CI pool
+
+- **Действие:** create-only publish N076–N079, exact-generation readback, затем scoped Terraform destroy N070.
+- **Код/инфра/аккаунт:** CI lane manifest, GCS, isolated backend.
+- **Проверка:** artifact-set hash remote=local; VM/IP/policy absent after destroy; foundation/input/output preserved.
+- **Готово когда:** CI C-lane handoff portable, `lane_ready=true`, global training false, transient CI cost zero.
+
+### Общий four-lane seal и публикация
+
+### N081 — Принять source handoff fail-closed
+
+- **Действие:** C загружает N030 и независимо revalidates composition, source artifacts/readbacks и source teardown.
+- **Код/инфра/аккаунт:** integration worktree, `seal_outputs.py`, GCS read-only.
+- **Проверка:** no local mutable paths, seven-state source matrix, artifact hashes/generations exact.
+- **Готово когда:** source input acceptance receipt green.
+
+### N082 — Принять GitHub handoff fail-closed
+
+- **Действие:** revalidate N045 membership, conservation, Parquet/Megatron and GCS readback.
+- **Код/инфра/аккаунт:** integration sealer GitHub lane input.
+- **Проверка:** exact scan/source bindings and seven-state matrix; no SQLite dependency.
+- **Готово когда:** GitHub input acceptance receipt green.
+
+### N083 — Принять GitLab handoff fail-closed
+
+- **Действие:** revalidate N060 current contract, three-host coverage, membership and artifacts.
+- **Код/инфра/аккаунт:** integration sealer GitLab lane input.
+- **Проверка:** legacy/smoke roots cannot satisfy production input; seven-state matrix complete.
+- **Готово когда:** GitLab input acceptance receipt green.
+
+### N084 — Принять CI handoff fail-closed
+
+- **Действие:** revalidate N080 frozen input, global dedup, sidecars, Parquet/Megatron and destroy receipt.
+- **Код/инфра/аккаунт:** integration sealer CI lane input.
+- **Проверка:** no store-local upper-bound used as exact total; seven-state matrix complete.
+- **Готово когда:** CI input acceptance receipt green.
+
+### N085 — Собрать полную матрицу 4×7
+
+- **Действие:** перечислить `code`, `github_pr`, `gitlab_mr`, `ci` × семь lengths как materialized/verified-zero.
+- **Код/инфра/аккаунт:** `scripts/distributed_data_prep/seal_outputs.py`.
+- **Проверка:** exactly 28 unique cells; missing, duplicate, manifest-only, forged-zero fail.
+- **Готово когда:** matrix coverage receipt green и связан N081–N084.
+
+### N086 — Повторно открыть каждый Parquet artifact
+
+- **Действие:** independent integration auditor перечитывает footer/schema/row groups/compression и пересчитывает totals.
+- **Код/инфра/аккаунт:** `audit_sidecar_parquet.py`, remote-restored files.
+- **Проверка:** no symlink/partial, physical bytes/hash, valid/trained/pad/capacity and sidecar alignment.
+- **Готово когда:** один aggregate physical Parquet audit покрывает все materialized cells N085.
+
+### N087 — Проверить единый tokenizer/objective contract
+
+- **Действие:** сравнить tokenizer, vocab, token range, label masking и objective artifact across four lanes.
+- **Код/инфра/аккаунт:** tokenizer verifier, objective manifests, Megatron converter receipts.
+- **Проверка:** mismatch hash/version/range/column semantics fail; no cwd-dependent lookup.
+- **Готово когда:** global tokenizer/objective receipt green.
+
+### N088 — Проверить global provenance и cross-lane dedup policy
+
+- **Действие:** доказать, что document IDs/lineage уникальны и intentional cross-lane duplicates обработаны policy.
+- **Код/инфра/аккаунт:** provenance verifier, lane dedup receipts and release policy.
+- **Проверка:** sample→lane→source object traversal, no dangling graph/provenance keys, conservation preserved.
+- **Готово когда:** global provenance/dedup receipt имеет zero unexplained collision/delta.
+
+### N089 — Собрать content-addressed release manifest
+
+- **Действие:** перечислить все Parquet, Megatron, sidecars, receipts, tokenizer и code/toolchain bindings.
+- **Код/инфра/аккаунт:** release manifest builder, no mutable absolute paths.
+- **Проверка:** sorted deterministic entries, safe relative paths, role/format/size/SHA/generation complete.
+- **Готово когда:** manifest artifact-set SHA воспроизводим из N081–N088.
+
+### N090 — Выполнить финальный distributed seal
+
+- **Действие:** запустить production sealer только на N089 и acceptance receipts.
+- **Код/инфра/аккаунт:** `seal_outputs.py`, pinned clean integration commit.
+- **Проверка:** full sealer regression suite, 28 cells, tokenizer/provenance/token conservation and no mutable dependencies.
+- **Готово когда:** immutable seal receipt status complete, но training flag остаётся false до remote restore/smoke.
+
+### N091 — Опубликовать release objects в финальный GCS prefix
+
+- **Действие:** create-only upload/reuse only exact content-addressed generations; затем publish pointer последним.
+- **Код/инфра/аккаунт:** final GCS release prefix, operator SA.
+- **Проверка:** generation/size/server checksum/local SHA каждого object; mismatched existing key fail.
+- **Готово когда:** GCS publication/readback receipt artifact-set SHA=N089.
+
+### N092 — Опубликовать финальный bundle в Nebius
+
+- **Действие:** сжать manifest-bound artifacts и resumably upload по S3 profile.
+- **Код/инфра/аккаунт:** `publish_megatron_bundle_to_nebius_s3.py`, Nebius endpoint/bucket/prefix.
+- **Проверка:** dry-run, multipart checksums, object inventory, no credentials in logs/receipts.
+- **Готово когда:** Nebius publication receipt связан N089/N090/N091.
+
+### N093 — Выполнить независимый Nebius restore
+
+- **Действие:** на пустом output root скачать release без доступа к uploader cache/original paths.
+- **Код/инфра/аккаунт:** restore script `--require-empty-output-root`, exact release ID.
+- **Проверка:** archive path safety, members/hash, Parquet footer, MMIDIDX, all sidecars and 28-state inventory.
+- **Готово когда:** restore receipt artifact-set SHA=N089 и zero missing/corrupt members.
+
+### N094 — Запустить bounded Megatron consumption smoke
+
+- **Действие:** открыть каждый nonempty lane/length prefix через training data loader и прочитать bounded batches.
+- **Код/инфра/аккаунт:** pinned Megatron commit/environment, restored Nebius root.
+- **Проверка:** index/data/sidecars load, token range, batch geometry, no cross-document labels; no model training claim.
+- **Готово когда:** 28 cells materialized/verified-zero и все materialized cells имеют green loader smoke.
+
+### N095 — Удалить оставшиеся reducer/export transient resources
+
+- **Действие:** после N093/N094 уничтожить final reducer/export VM, disks, IP, policies и temporary staging resources.
+- **Код/инфра/аккаунт:** all remaining isolated Terraform backends and cloud inventories.
+- **Проверка:** destroy plans scoped; Compute readback absent; GCS/Nebius readbacks remain green.
+- **Готово когда:** expensive transient inventory=0 и per-run destroy receipts сохранены.
+
+### Финальная эксплуатационная приёмка
+
+### N096 — Прогнать полный Terraform/bootstrap verification
+
+- **Действие:** `terraform fmt -check`, init `-backend=false`, validate/test foundation/workers и bootstrap fixtures.
+- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/foundation`, `infra/gcp_corpus_pool/workers`, `infra/gcp_corpus_pool/pilot`.
+- **Проверка:** pinned Terraform/providers, no drift in startup templates, no secret material in plans.
+- **Готово когда:** CI/local test receipt exit `0` связан release code commit.
+
+### N097 — Провести IAM/network/cost audit
+
+- **Действие:** проверить operator/worker roles, firewall/network tier, static addresses, quotas и billing inventory.
+- **Код/инфра/аккаунт:** GCP scoped credentials, foundation outputs, Cloud Billing/Compute read-only views.
+- **Проверка:** worker least privilege, no public secrets, no orphan IP/VM/SSD/policy, final cost report per run.
+- **Готово когда:** security/cost audit receipt green либо explicit non-expensive retained foundation list.
+
+### N098 — Обновить watchdog и честный status после cleanup
+
+- **Действие:** pipeline watchdog проверяет terminal receipts/readbacks вместо старых active runs; status пересобирается из seals.
+- **Код/инфра/аккаунт:** launchd dispatchers, `report_training_data_status.py`, status config.
+- **Проверка:** two fresh 30-minute reports, no retry of terminal/deterministic runs, no overlapping token addition.
+- **Готово когда:** current status перечисляет exact ready valid/trained по четырём lanes и все blockers resolved.
+
+### N099 — Выполнить requirement-by-requirement completion audit
+
+- **Действие:** сопоставить W001–W100/N001–N098 с authoritative receipts/tests/readbacks и отметить missing/contradicted evidence.
+- **Код/инфра/аккаунт:** этот документ, release manifest, Git/GCP/GCS/Nebius/test evidence.
+- **Проверка:** ни одно требование не закрывается intent, partial store, narrow test или отсутствием найденной ошибки.
+- **Готово когда:** все explicit requirements доказаны; только тогда final release receipt получает `training_ready=true`.
+
+### N100 — Передать training owner финальный immutable handoff
+
+- **Действие:** выдать название release, GCS/Nebius exact pointers, manifest/seal/restore/smoke/destroy receipts и restoration command contract.
+- **Код/инфра/аккаунт:** signed/content-addressed handoff document и changelog в Git.
+- **Проверка:** независимый consumer по одному handoff восстанавливает inventory и подтверждает artifact-set SHA без локальных Mac paths.
+- **Готово когда:** handoff accepted, docs/code commits pushed, worktrees clean, active corpus goal можно закрыть по полному evidence.
+
+---
+
+## Критический путь
+
+```text
+local cwd/restart fix -> exact source residual -> source composition/dedup
+  -> source 1K–64K seal -> exact GitHub/GitLab membership
+  -> PR/MR 1K–64K seals -> CASE5 cloud smoke -> CI production seal
+  -> 4×7 integration -> GCS/Nebius readback -> loader smoke
+  -> destroy transient compute -> final completion audit/handoff
+```
+
+Главная неопределённость по времени — deterministic parser repair и CI CASE5 reducer/export, а не сам факт наличия дополнительных VM. Добавление workers ускоряет только runnable assignments; оно не превращает exit `2`, непроверенный membership или staged CAS в готовые training artifacts.
