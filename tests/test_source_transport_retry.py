@@ -10,29 +10,34 @@ from scripts.distributed_data_prep.source_worker import (
     GcloudObjectStore,
     TransientTransportError,
     _is_transient_curl_failure,
+    _is_transient_gcloud_failure,
     _is_transient_git_failure,
     _run_git_network_command,
 )
 from scripts.distributed_data_prep._common import ContractError
 
 
-def _completed(command: list[str], returncode: int, *, stdout: str = "", stderr: str = ""):
+def _completed(
+    command: list[str], returncode: int, *, stdout: str = "", stderr: str = ""
+):
     return subprocess.CompletedProcess(
         command, returncode, stdout=stdout, stderr=stderr
     )
 
 
-def test_git_transport_retries_429_and_503_then_succeeds() -> None:
+def test_git_transport_retries_explicit_429_then_succeeds() -> None:
     results = [
         _completed([], 1, stderr="RPC failed; HTTP 429"),
-        _completed([], 1, stderr="remote returned error: 503"),
+        _completed([], 1, stderr="remote returned error: 429"),
         _completed([], 0),
     ]
-    calls: list[dict[str, object]] = []
+    calls: list[list[str]] = []
+    prompt_values: list[str] = []
     sleeps: list[float] = []
 
     def runner(command, **kwargs):
-        calls.append({"command": command, **kwargs})
+        calls.append(list(command))
+        prompt_values.append(kwargs["env"]["GIT_TERMINAL_PROMPT"])
         return results.pop(0)
 
     result = _run_git_network_command(
@@ -46,7 +51,40 @@ def test_git_transport_retries_429_and_503_then_succeeds() -> None:
     assert result.returncode == 0
     assert sleeps == [1.0, 2.0]
     assert len(calls) == 3
-    assert calls[0]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert prompt_values == ["0", "0", "0"]
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "remote returned error: 503",
+        "remote returned error: 408",
+        "curl 7 Failed to connect to example.invalid",
+        "connection reset by peer",
+        "HTTP 429 followed by HTTP 401 Unauthorized",
+        "HTTP 429 followed by HTTP 403 Forbidden",
+        "HTTP 429 followed by HTTP 503 Service Unavailable",
+        "HTTP 429 Authentication failed",
+    ],
+)
+def test_git_non_pure_429_transport_failures_do_not_retry(stderr: str) -> None:
+    calls: list[int] = []
+
+    def runner(command, **kwargs):
+        calls.append(1)
+        return _completed(command, 1, stderr=stderr)
+
+    with pytest.raises(RuntimeError) as raised:
+        _run_git_network_command(
+            ["git", "fetch", "origin"],
+            operation="mirror fetch",
+            runner=runner,
+            sleeper=lambda _delay: pytest.fail("non-429 Git failure was retried"),
+            max_retries=3,
+        )
+
+    assert not isinstance(raised.value, TransientTransportError)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -70,19 +108,37 @@ def test_git_auth_and_contract_failures_do_not_retry(stderr: str) -> None:
     assert len(calls) == 1
 
 
-def test_transport_classifiers_reject_auth_and_accept_network_statuses() -> None:
-    assert _is_transient_git_failure(
-        returncode=1, stdout="", stderr="HTTP 429"
+def test_transport_classifiers_accept_only_explicit_http_429() -> None:
+    assert _is_transient_git_failure(returncode=1, stdout="", stderr="HTTP 429")
+    for diagnostic in (
+        "HTTP 503",
+        "HTTP 408",
+        "HTTP 401 Unauthorized",
+        "curl 7 Failed to connect",
+        "connection reset by peer",
+    ):
+        assert not _is_transient_git_failure(returncode=1, stdout="", stderr=diagnostic)
+        assert not _is_transient_gcloud_failure(
+            returncode=1, stdout="", stderr=diagnostic
+        )
+    assert _is_transient_gcloud_failure(
+        returncode=1, stdout="", stderr="returned error: 429"
     )
-    assert _is_transient_git_failure(
-        returncode=1, stdout="", stderr="HTTP/2 503"
-    )
-    assert not _is_transient_git_failure(
-        returncode=1, stdout="", stderr="HTTP 401 Unauthorized"
-    )
+    for mixed_diagnostic in (
+        "HTTP 429 followed by HTTP 401 Unauthorized",
+        "HTTP 429 followed by HTTP 403 Forbidden",
+        "HTTP 429 followed by HTTP 503 Service Unavailable",
+        "HTTP 429 Authentication failed",
+    ):
+        assert not _is_transient_git_failure(
+            returncode=1, stdout="", stderr=mixed_diagnostic
+        )
+        assert not _is_transient_gcloud_failure(
+            returncode=1, stdout="", stderr=mixed_diagnostic
+        )
     assert _is_transient_curl_failure(returncode=22, status=429)
-    assert _is_transient_curl_failure(returncode=7, status=None)
-    assert not _is_transient_curl_failure(returncode=22, status=403)
+    for returncode, status in ((22, 503), (22, 408), (7, None), (1, None)):
+        assert not _is_transient_curl_failure(returncode=returncode, status=status)
 
 
 def test_gcs_metadata_retries_429_without_retrying_terminal_401(tmp_path: Path) -> None:
@@ -107,16 +163,17 @@ def test_gcs_metadata_retries_429_without_retrying_terminal_401(tmp_path: Path) 
         )
         return _completed(command, 0, stdout="200")
 
-    store = GcloudObjectStore(
-        runner=runner, sleeper=sleeps.append, max_retries=2
-    )
+    store = GcloudObjectStore(runner=runner, sleeper=sleeps.append, max_retries=2)
     metadata = store.describe_if_present("gs://bucket/object")
     assert metadata is not None
     assert metadata["generation"] == "7"
     assert sleeps == [1.0]
     assert curl_attempts == 2
     metadata_command = next(command for command in calls if command[0] == "curl")
-    assert "https://storage.googleapis.com/storage/v1/b/bucket/o/object" in metadata_command
+    assert (
+        "https://storage.googleapis.com/storage/v1/b/bucket/o/object"
+        in metadata_command
+    )
 
     terminal_calls = 0
 
@@ -138,6 +195,73 @@ def test_gcs_metadata_retries_429_without_retrying_terminal_401(tmp_path: Path) 
     with pytest.raises(RuntimeError):
         terminal_store.describe_if_present("gs://bucket/object")
     assert terminal_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("returncode", "status", "stderr"),
+    [
+        (0, "503", "service unavailable"),
+        (0, "408", "request timeout"),
+        (7, "000", "curl: (7) Failed to connect"),
+        (1, "000", "generic network error"),
+    ],
+)
+def test_gcs_non_429_failures_do_not_retry(
+    tmp_path: Path, returncode: int, status: str, stderr: str
+) -> None:
+    curl_calls = 0
+
+    def runner(command, **kwargs):
+        nonlocal curl_calls
+        command = list(command)
+        if command[0] == "gcloud":
+            return _completed(command, 0, stdout="token")
+        curl_calls += 1
+        output = Path(command[command.index("--output") + 1])
+        output.write_text('{"message":"failed"}', encoding="utf-8")
+        return _completed(
+            command,
+            returncode,
+            stdout=status,
+            stderr=stderr,
+        )
+
+    store = GcloudObjectStore(
+        runner=runner,
+        sleeper=lambda _delay: pytest.fail("non-429 GCS failure was retried"),
+        max_retries=3,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        store.describe_if_present("gs://bucket/object")
+
+    assert not isinstance(raised.value, TransientTransportError)
+    assert curl_calls == 1
+
+
+def test_gcs_exhausted_explicit_429_is_resumable() -> None:
+    curl_calls = 0
+    sleeps: list[float] = []
+
+    def runner(command, **kwargs):
+        nonlocal curl_calls
+        command = list(command)
+        if command[0] == "gcloud":
+            return _completed(command, 0, stdout="token")
+        curl_calls += 1
+        output = Path(command[command.index("--output") + 1])
+        output.write_text('{"message":"rate limited"}', encoding="utf-8")
+        return _completed(command, 0, stdout="429")
+
+    store = GcloudObjectStore(
+        runner=runner,
+        sleeper=sleeps.append,
+        max_retries=1,
+    )
+    with pytest.raises(TransientTransportError):
+        store.describe_if_present("gs://bucket/object")
+
+    assert curl_calls == 2
+    assert sleeps == [1.0]
 
 
 def test_gcs_download_streams_to_target_filesystem_without_second_copy(
@@ -171,9 +295,7 @@ def test_gcs_download_streams_to_target_filesystem_without_second_copy(
     )
     store = GcloudObjectStore(runner=runner)
 
-    metadata = store.download(
-        "gs://bucket/snapshot", destination, generation="7"
-    )
+    metadata = store.download("gs://bucket/snapshot", destination, generation="7")
 
     assert metadata["size_bytes"] == len(payload)
     assert destination.read_bytes() == payload
@@ -237,7 +359,9 @@ def test_gcs_download_failure_preserves_small_json_error_body(tmp_path: Path) ->
 
 class _PublishFixtureStore(GcloudObjectStore):
     def __init__(self, source_bytes: bytes, statuses: list[int]):
-        super().__init__(runner=lambda *_args, **_kwargs: _completed([], 0, stdout="token"))
+        super().__init__(
+            runner=lambda *_args, **_kwargs: _completed([], 0, stdout="token")
+        )
         self.source_bytes = source_bytes
         self.statuses = list(statuses)
         self.existing = False
@@ -293,9 +417,27 @@ def test_immutable_upload_reconciles_lost_success_and_rejects_different_bytes(
         absent.publish_if_absent(source, "gs://bucket/object")
 
 
-def test_exhausted_git_transport_is_resumable_exit_class() -> None:
+def test_immutable_upload_503_without_committed_object_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "payload"
+    source.write_bytes(b"same bytes")
+    store = _PublishFixtureStore(source.read_bytes(), [503])
+
+    with pytest.raises(RuntimeError) as raised:
+        store.publish_if_absent(source, "gs://bucket/object")
+
+    assert not isinstance(raised.value, TransientTransportError)
+    assert store.post_calls == 1
+
+
+def test_exhausted_git_429_is_resumable_exit_class() -> None:
+    calls = 0
+
     def runner(command, **kwargs):
-        return _completed(command, 1, stderr="HTTP 503")
+        nonlocal calls
+        calls += 1
+        return _completed(command, 1, stderr="HTTP 429")
 
     with pytest.raises(TransientTransportError):
         _run_git_network_command(
@@ -305,3 +447,39 @@ def test_exhausted_git_transport_is_resumable_exit_class() -> None:
             sleeper=lambda _delay: None,
             max_retries=1,
         )
+
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_exit"),
+    [
+        (TransientTransportError("confirmed HTTP 429 exhausted"), 75),
+        (RuntimeError("HTTP 503 is deterministic"), 2),
+    ],
+)
+def test_cli_maps_transport_failure_class_to_exit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: RuntimeError,
+    expected_exit: int,
+) -> None:
+    def fail_load(_path: Path):
+        raise failure
+
+    monkeypatch.setattr(source_worker, "load_source_manifest", fail_load)
+    with pytest.raises(SystemExit) as raised:
+        source_worker._main(
+            [
+                "--manifest",
+                str(tmp_path / "manifest.json"),
+                "--worker",
+                "worker-0000",
+                "--scratch-root",
+                str(tmp_path / "scratch"),
+                "--receipt-root",
+                str(tmp_path / "receipts"),
+            ]
+        )
+
+    assert raised.value.code == expected_exit

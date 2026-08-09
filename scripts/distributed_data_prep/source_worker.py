@@ -76,42 +76,19 @@ _TRANSPORT_MAX_RETRIES = 4
 _TRANSPORT_RETRY_BASE_SECONDS = 1.0
 _TRANSPORT_RETRY_MAX_SECONDS = 16.0
 _MAX_BINARY_RESPONSE_JSON_DIAGNOSTIC_BYTES = 64 * 1024
-_TRANSIENT_CURL_RETURN_CODES = frozenset({5, 6, 7, 18, 28, 35, 47, 52, 55, 56, 92})
 _GIT_HTTP_STATUS_RE = re.compile(
     r"(?:\bHTTP(?:/[0-9.]+)?(?:\s+error)?\s*|\breturned error:\s*)([1-5][0-9]{2})",
     re.IGNORECASE,
 )
-_GIT_CURL_TRANSPORT_RE = re.compile(
-    r"\bcurl\s+(5|6|7|18|28|35|47|52|55|56|92)\b", re.IGNORECASE
-)
-_TRANSIENT_GIT_MARKERS = (
-    "connection reset",
-    "connection timed out",
-    "could not resolve host",
-    "early eof",
-    "empty reply from server",
-    "internal server error",
-    "network is unreachable",
-    "operation timed out",
-    "remote end hung up",
-    "server closed the connection",
-    "temporary failure",
-    "tls connection was non-properly terminated",
-    "unexpected disconnect",
-)
-_TRANSIENT_GCLOUD_MARKERS = _TRANSIENT_GIT_MARKERS + (
-    "deadline exceeded",
-    "resource exhausted",
-    "service unavailable",
-    "unavailable",
-)
-_NONRETRYABLE_GIT_MARKERS = (
+_NONRETRYABLE_NETWORK_MARKERS = (
+    "access denied",
     "authentication failed",
     "could not read username",
-    "destination path",
-    "not found",
+    "forbidden",
+    "invalid credentials",
     "permission denied",
     "repository not found",
+    "unauthorized",
 )
 QUARANTINE_PROJECTION_MODE_OFF = "off"
 _QUARANTINE_PROJECTION_MODES = frozenset(
@@ -147,7 +124,7 @@ _SOURCE_TREE_ENTRY_EXCLUSIONS_POLICY = (
 
 
 class TransientTransportError(RuntimeError):
-    """A bounded transport retry budget was exhausted and may resume later."""
+    """A bounded, explicitly confirmed HTTP 429 budget was exhausted."""
 
 
 class _GcsRequestError(RuntimeError):
@@ -200,8 +177,18 @@ def _validate_retry_settings(
     )
 
 
-def _is_transient_http_status(status: int | None) -> bool:
-    return status in {408, 429} or (status is not None and 500 <= status <= 599)
+def _is_confirmed_http_429(status: int | None) -> bool:
+    return status == 429
+
+
+def _contains_only_confirmed_http_429(detail: str) -> bool:
+    """Fail closed when a diagnostic mixes 429 with deterministic evidence."""
+
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _NONRETRYABLE_NETWORK_MARKERS):
+        return False
+    statuses = [int(value) for value in _GIT_HTTP_STATUS_RE.findall(lowered)]
+    return bool(statuses) and all(_is_confirmed_http_429(status) for status in statuses)
 
 
 def _parse_curl_status(value: str) -> int | None:
@@ -214,31 +201,19 @@ def _parse_curl_status(value: str) -> int | None:
 
 
 def _is_transient_curl_failure(*, returncode: int, status: int | None) -> bool:
-    if status in {401, 403, 404, 409, 412}:
-        return False
-    if _is_transient_http_status(status):
-        return True
-    return returncode in _TRANSIENT_CURL_RETURN_CODES
+    del returncode
+    return _is_confirmed_http_429(status)
 
 
 def _is_transient_git_failure(
     *, returncode: int, stdout: str | None, stderr: str | None
 ) -> bool:
-    """Classify only known retryable Git transport failures as transient."""
+    """Authorize retry only for an explicit HTTP 429 Git diagnostic."""
 
     if returncode == 0:
         return False
-    detail = f"{stdout or ''}\n{stderr or ''}".lower()
-    if any(marker in detail for marker in _NONRETRYABLE_GIT_MARKERS):
-        return False
-    statuses = [int(value) for value in _GIT_HTTP_STATUS_RE.findall(detail)]
-    if any(status in {401, 403, 404, 409, 412} for status in statuses):
-        return False
-    if any(_is_transient_http_status(status) for status in statuses):
-        return True
-    if _GIT_CURL_TRANSPORT_RE.search(detail):
-        return True
-    return any(marker in detail for marker in _TRANSIENT_GIT_MARKERS)
+    detail = f"{stdout or ''}\n{stderr or ''}"
+    return _contains_only_confirmed_http_429(detail)
 
 
 def _is_transient_gcloud_failure(
@@ -246,15 +221,8 @@ def _is_transient_gcloud_failure(
 ) -> bool:
     if returncode == 0:
         return False
-    detail = f"{stdout or ''}\n{stderr or ''}".lower()
-    if any(marker in detail for marker in _NONRETRYABLE_GIT_MARKERS):
-        return False
-    statuses = [int(value) for value in _GIT_HTTP_STATUS_RE.findall(detail)]
-    if any(status in {401, 403, 404, 409, 412} for status in statuses):
-        return False
-    if any(_is_transient_http_status(status) for status in statuses):
-        return True
-    return any(marker in detail for marker in _TRANSIENT_GCLOUD_MARKERS)
+    detail = f"{stdout or ''}\n{stderr or ''}"
+    return _contains_only_confirmed_http_429(detail)
 
 
 def _run_git_network_command(
@@ -268,7 +236,7 @@ def _run_git_network_command(
     retry_base_seconds: float = _TRANSPORT_RETRY_BASE_SECONDS,
     retry_max_seconds: float = _TRANSPORT_RETRY_MAX_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a Git clone/fetch command with bounded retry for transport failures."""
+    """Run a Git clone/fetch command with bounded retry for confirmed HTTP 429."""
 
     _validate_retry_settings(
         max_retries=max_retries,
@@ -308,12 +276,13 @@ def _run_git_network_command(
             maximum_seconds=retry_max_seconds,
         )
         print(
-            f"Git {operation} transient failure; retrying in {delay:.1f}s "
+            f"Git {operation} confirmed HTTP 429; retrying in {delay:.1f}s "
             f"({attempt + 1}/{max_retries})",
             file=sys.stderr,
             flush=True,
         )
         sleeper(delay)
+    raise AssertionError("unreachable")
 
 
 def _remove_partial_path(path: Path) -> None:
@@ -414,7 +383,8 @@ class GcloudObjectStore:
                 )
             if attempt >= self.max_retries:
                 raise TransientTransportError(
-                    "gcloud access-token command exhausted its transport retry budget: "
+                    "gcloud access-token command exhausted its confirmed HTTP 429 "
+                    "retry budget: "
                     f"{detail}"
                 )
             delay = _retry_delay_seconds(
@@ -423,7 +393,7 @@ class GcloudObjectStore:
                 maximum_seconds=self.retry_max_seconds,
             )
             print(
-                "gcloud access-token transient failure; "
+                "gcloud access-token confirmed HTTP 429; "
                 f"retrying in {delay:.1f}s ({attempt + 1}/{self.max_retries})",
                 file=sys.stderr,
                 flush=True,
@@ -517,7 +487,8 @@ class GcloudObjectStore:
                 )
             if attempt >= self.max_retries:
                 raise TransientTransportError(
-                    f"GCS {operation} exhausted {attempt + 1} transport attempt(s) for "
+                    f"GCS {operation} exhausted {attempt + 1} confirmed HTTP 429 "
+                    "attempt(s) for "
                     f"{uri}: curl_exit={completed.returncode} http={status}: {detail}"
                 )
             delay = _retry_delay_seconds(
@@ -526,7 +497,7 @@ class GcloudObjectStore:
                 maximum_seconds=self.retry_max_seconds,
             )
             print(
-                f"GCS {operation} transient failure; retrying in {delay:.1f}s "
+                f"GCS {operation} confirmed HTTP 429; retrying in {delay:.1f}s "
                 f"({attempt + 1}/{self.max_retries})",
                 file=sys.stderr,
                 flush=True,
@@ -669,10 +640,16 @@ class GcloudObjectStore:
                     status=status,
                 )
                 detail = _tail_response(response, completed.stderr or "")
-                # A failed POST may have committed before the connection broke.
-                # Reconcile every transient response and HTTP 412 by hashing the
-                # immutable object before retrying or accepting it.
-                if transient or status == 412:
+                # A failed POST may have committed before the response was lost.
+                # Reconcile ambiguous server/transport responses and HTTP 412 by
+                # hashing the immutable object, but authorize an actual retry only
+                # for an explicit HTTP 429.
+                ambiguous_commit = (
+                    status == 412
+                    or completed.returncode != 0
+                    or (status is not None and 500 <= status <= 599)
+                )
+                if transient or ambiguous_commit:
                     with tempfile.TemporaryDirectory(
                         prefix="cppmega-gcs-publish-verify-", dir=source.parent
                     ) as verify_tmp:
@@ -708,7 +685,8 @@ class GcloudObjectStore:
                 if attempt >= self.max_retries:
                     raise TransientTransportError(
                         "GCS immutable publication exhausted "
-                        f"{attempt + 1} transport attempt(s) for {validated}: {detail}"
+                        f"{attempt + 1} confirmed HTTP 429 attempt(s) for "
+                        f"{validated}: {detail}"
                     )
                 delay = _retry_delay_seconds(
                     attempt,
@@ -716,7 +694,7 @@ class GcloudObjectStore:
                     maximum_seconds=self.retry_max_seconds,
                 )
                 print(
-                    "GCS immutable publication transient failure; "
+                    "GCS immutable publication confirmed HTTP 429; "
                     f"retrying in {delay:.1f}s ({attempt + 1}/{self.max_retries})",
                     file=sys.stderr,
                     flush=True,
