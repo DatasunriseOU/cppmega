@@ -17,10 +17,11 @@
 ## Оперативный срез на момент factual refresh
 
 - Новый общий four-lane release ещё не готов к обучению: `training_ready=false`. Исторический source-only bundle 1K–16K не переносит свой legacy `release_ready` на новый scope.
-- `origin/main` на момент проверки — `a13fb7332e3e21f0e6791bf6a80967ec9519e478`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить.
+- `origin/main` на момент последней проверки — `a65db87ca4e95de7b8a3eb1949786dac813d8d83`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить.
 - Два локальных CI fetcher продолжают писать в физически отдельные stores. Их store-local token counters нельзя складывать как глобальный union; frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
-- CASE5 `ci-case5-smoke-20260808-003` остаётся полезной дорогой materialization, а `ci-case5-smoke-20260809-004` имеет только sustained heartbeat/apply evidence. Ни один из них не объявляется completed без assignment completion, physical output, exact-generation readback и terminal receipt.
-- CASE5 heartbeat/429 hardening подготовлен в `/Volumes/external/cppmega_data/worktrees/cppmega-case5-persistent-session-20260809`: related suite `128 passed`, focused suite `25 passed`, Pyright `0 errors`, `py_compile`, `bash -n`, `shellcheck`, Terraform validate/tests и `git diff --check` прошли; шесть файлов ещё должны быть зафиксированы и pushed отдельным commit.
+- CASE5 `ci-case5-smoke-20260808-003` остаётся полезной дорогой materialization, а `ci-case5-smoke-20260809-004` имеет sustained heartbeat/apply evidence (`sequence=40` на срезе `2026-08-09T18:45:46Z`). Ни один из них не объявляется completed без assignment completion, physical output, exact-generation readback и terminal receipt.
+- CASE5 heartbeat/429 hardening уже landed в `main`: implementation commit `306179407570f97d4d7a571a447e95e0e9d05aed`, merge PR `#133` — `a65db87ca4e95de7b8a3eb1949786dac813d8d83`. Focused suite `25 passed`, related CASE5/cloud suite `116 passed`, Pyright `0 errors`; `py_compile`, `bash -n`, `shellcheck`, Terraform fmt/validate/tests, CodeQL и GitHub CI прошли. Следующий runtime обязан pin exact landed revision; merge сам по себе не завершает текущие `.003/.004`.
+- Source-worker taxonomy «retry только при подтверждённом HTTP 429» начата отдельно в `/Volumes/external/cppmega_data/worktrees/cppmega-source-confirmed-429-only-20260809`: пока изменён только `source_worker.py`, tests/commit/push ещё не выполнены, поэтому это состояние относится к N007, а не к подтверждённым D-пунктам.
 - GCP source runs дают полезные assignment completions, но terminal slot/run receipts всё ещё отсутствуют. Широкий Terraform destroy запрещён: сначала worker-by-worker Local SSD diagnostics, exact backend lineage/serial и instance-only plan.
 
 ## Авторитетные контуры и идентичности
@@ -668,7 +669,7 @@
 ### D001 — Source/GCP repair stack интегрирован в основную историю
 
 - **Сделано:** ветка integration landed через commit `ac41718b` и последующие merges; `origin/main` на evidence-срезе содержит source repair/runtime stack.
-- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547`; commits `ac41718b`, `10066e88`, `b045e547` и прежний срез `88f4d8e7` являются ancestors текущего `origin/main` `a13fb733`.
+- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547`; commits `ac41718b`, `10066e88`, `b045e547`, прежний срез `88f4d8e7` и CASE5 merge `a65db87c` находятся в текущей основной истории.
 - **Честная граница:** наличие кода в main не означает, что все source assignments завершены.
 
 ### D002 — Terraform foundation оформлен отдельным модулем
@@ -713,11 +714,11 @@
 - **Доказательство:** локальный commit object `3a5f7309` содержит связанные distributed scripts/tests; `git merge-base --is-ancestor 3a5f7309 origin/main` возвращает `1`, а refs, содержащие commit, отсутствуют.
 - **Честная граница:** prototype не pushed и не landed, поэтому не считается доступной production-возможностью; текущий training status по-прежнему показывает GitHub PR Parquet `0`.
 
-### D009 — Pool execution для CASE5 workers реализован
+### D009 — Pool execution и immutable heartbeat для CASE5 workers реализованы
 
-- **Сделано:** добавлен pooled worker path для распределения lane assignments.
-- **Доказательство:** commit `8ba86ec5`, `cloud_lane_pool_worker.py`.
-- **Честная граница:** `ci-case5-smoke-20260809-002` опубликовал heartbeats, но завершился deterministic exit `2` без assignment/output completion; активные `ci-case5-smoke-20260808-003` и `ci-case5-smoke-20260809-004` ещё обязаны доказать claim/completion/output/readback в текущем bootstrap.
+- **Сделано:** pooled worker path дополнен immutable self-digested heartbeat, create-only publication с exact-generation readback, единым fail-closed 429/deterministic classifier, idempotent acceptance completed assignment и bounded cooperative shutdown.
+- **Доказательство:** исходный pool commit `8ba86ec5`; hardening commit `306179407570f97d4d7a571a447e95e0e9d05aed`, merged PR `#133`/`a65db87ca4e95de7b8a3eb1949786dac813d8d83`; focused `25 passed`, related CASE5/cloud `116 passed`, Pyright `0 errors`, shell/Python/Terraform/CI/CodeQL проверки green.
+- **Честная граница:** `ci-case5-smoke-20260809-002` завершился deterministic exit `2` без assignment/output completion; активные `.003`/`.004` запущены на более ранних pinned revisions. Landed hardening защищает следующие attempts, но не переписывает и не завершает уже запущенные VM.
 
 ### D010 — CASE5 smoke topology изолирована от production
 
@@ -1459,12 +1460,12 @@
 - **Проверка:** systemd/PID/cgroup/Local SSD/SQLite phase evidence; claim/completion/output receipt; exact-generation GCS readback. Retry только при `confirmed_http_429=true`/exit `75`.
 - **Готово когда:** каждый smoke имеет terminal+readback+scoped destroy receipt либо immutable supersession diagnostic; минимум один fixed-revision smoke имеет nonzero audited Parquet output.
 
-### N069 — Commit/push CASE5 heartbeat/429/bootstrap hardening
+### N069 — Привязать landed CASE5 hardening к следующему runtime attempt
 
-- **Действие:** зафиксировать шесть подготовленных файлов после rebase на `a13fb733`, не смешивая другие worktrees; push с `--force-with-lease` только rebase-ветки.
-- **Код/инфра/аккаунт:** `/Volumes/external/cppmega_data/worktrees/cppmega-case5-persistent-session-20260809`, `cloud_lane_pool_worker.py`, новый `cloud_lane_heartbeat.py`, runner template и три test files.
-- **Проверка:** related `128 passed`, focused `25 passed`, Pyright `0 errors`, `py_compile`, `bash -n`, `shellcheck`, `git diff --check`, Terraform fmt/validate/tests; mixed 429+deterministic остаётся exit `2`.
-- **Готово когда:** clean pushed commit/tree SHA входит в следующий payload/apply receipt и regression receipt сохранён immutable.
+- **Действие:** использовать уже landed merge `a65db87c` или более новый descendant при формировании следующего CASE5 payload; не перезапускать `.003/.004` только ради подмены revision и не смешивать их evidence с новым attempt.
+- **Код/инфра/аккаунт:** `cloud_lane_pool_worker.py`, `cloud_lane_heartbeat.py`, runner template, payload manifest, run-specific GCS prefix и isolated Terraform backend.
+- **Проверка:** payload/code revision/tree SHA совпадают с apply/claim/heartbeat/completion receipts; immutable heartbeat проходит self-digest и exact-generation readback; mixed 429+deterministic остаётся exit `2`, только pure confirmed 429 может дать `75`.
+- **Готово когда:** clean landed commit/tree SHA входит в новый payload/apply receipt, regression receipt сохранён immutable, а новый worker публикует heartbeat и terminal evidence по hardened contract.
 
 ### N070 — Спланировать production CASE5 pool по measured smoke
 
