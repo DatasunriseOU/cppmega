@@ -581,10 +581,12 @@ def _resolve_recorded_repository_artifact(
     if target.is_symlink():
         raise ValueError(f"{label} historical cache artifact must not be a symlink")
     if target.exists():
-        if not target.is_file() or _sha256(target) != expected_sha256:
+        if not target.is_file():
             raise ValueError(f"{label} historical cache artifact drifted")
         if target.stat().st_size > max_bytes:
             raise ValueError(f"{label} historical cache artifact exceeds the metadata bound")
+        if _sha256(target) != expected_sha256:
+            raise ValueError(f"{label} historical cache artifact drifted")
         return target
 
     object_spec = f"{recorded_revision}:{relative_path.as_posix()}"

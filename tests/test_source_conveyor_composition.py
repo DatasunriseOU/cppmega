@@ -1071,6 +1071,38 @@ def test_historical_repository_artifact_is_size_checked_before_read(
     assert len(commands) == 1
 
 
+def test_historical_repository_cache_is_size_checked_before_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "configs").mkdir(parents=True)
+    cache_root = tmp_path / "private-cache"
+    cache_root.mkdir()
+    expected_sha256 = "a" * 64
+    cached = cache_root / f"source_quarantine_manifest.{expected_sha256}.json"
+    cached.write_bytes(b"oversized")
+
+    def unexpected_hash(_path: Path) -> str:
+        pytest.fail("oversized cached metadata was hashed before its size check")
+
+    monkeypatch.setattr(
+        "cppmega.data.source_conveyor_composition._sha256",
+        unexpected_hash,
+    )
+
+    with pytest.raises(ValueError, match="historical cache artifact exceeds"):
+        _resolve_recorded_repository_artifact(
+            recorded_path=repo / "configs" / "source_quarantine_manifest.json",
+            expected_sha256=expected_sha256,
+            repository_root=repo,
+            recorded_revision="b" * 40,
+            cache_root=cache_root,
+            label="historical quarantine",
+            max_bytes=4,
+        )
+
+
 def test_source_composition_allows_repair_quarantine_but_not_tokenizer_drift(
     tmp_path: Path,
 ) -> None:
