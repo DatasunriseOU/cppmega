@@ -198,6 +198,24 @@
       "classification": "binary_protocol_test_fixture",
       "detected_format": "clickhouse_dollar_quoted_binary_sql",
       "reason": "ClickHouse Native-format fuzz regression fixture with a dollar-quoted binary protocol payload"
+    },
+    {
+      "project_id": "llvm/llvm-project",
+      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
+      "size_bytes": 398,
+      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_diagnostic",
+      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token (same fixture as intel/llvm)"
+    },
+    {
+      "project_id": "ROCm/llvm-project",
+      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
+      "size_bytes": 398,
+      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_diagnostic",
+      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token (same fixture as intel/llvm)"
     }
   ],
   "collections": [

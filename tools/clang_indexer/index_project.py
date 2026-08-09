@@ -98,6 +98,32 @@ from cppmega.symbol_identity import (
 from scripts.data.atomic_publish import atomic_output_file
 from scripts.data.memory_guard import check_memory_limit, start_memory_guard
 
+
+def ensure_durable_process_cwd() -> Path:
+    """Ensure getcwd() is valid before ProcessPool spawn.
+
+    Sibling work-dir CLEANUP can delete the parent cwd while parse workers are
+    still launching. Spawn preparation calls os.getcwd() and fails closed with
+    FileNotFoundError. Prefer the current directory when it still exists;
+    otherwise relocate to a durable root (env override or system temp).
+    """
+    try:
+        cwd = Path.cwd()
+        if cwd.exists():
+            return cwd.resolve()
+    except OSError:
+        pass
+    durable = Path(
+        os.environ.get("CPPMEGA_PROCESS_CWD")
+        or os.environ.get("TMPDIR")
+        or "/tmp"
+    ).expanduser()
+    durable.mkdir(parents=True, exist_ok=True)
+    os.chdir(durable)
+    return durable.resolve()
+
+
+
 if __package__:
     from .source_quarantine import ProjectSourceQuarantine
 else:
@@ -11605,6 +11631,7 @@ def process_project(
             )
 
         total_parsed = 0
+        ensure_durable_process_cwd()
         with ProcessPoolExecutor(max_workers=effective_workers) as executor:
             for payload, parsed_count in _iter_parse_batch_results(
                 executor,
@@ -12124,6 +12151,7 @@ def main() -> int:
                 total_docs += 1
 
             if args.workers > 1 and len(project_specs) > 1:
+                ensure_durable_process_cwd()
                 with ProcessPoolExecutor(max_workers=args.workers) as executor:
                     futures = {
                         executor.submit(
