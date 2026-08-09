@@ -80,6 +80,21 @@ class CountingStore:
         return self.delegate.download(uri, destination, generation=generation)
 
 
+class FailOneDeferredReceiptStore(CountingStore):
+    def __init__(self, delegate: LocalObjectStore) -> None:
+        super().__init__(delegate)
+        self.failed = False
+        self.deferred_receipt_attempts = 0
+
+    def publish_if_absent(self, source: Path, uri: str):
+        if "/lane-receipts/" in uri:
+            self.deferred_receipt_attempts += 1
+            if not self.failed and self.deferred_receipt_attempts == 2:
+                self.failed = True
+                raise RuntimeError("HTTP 429 Too Many Requests")
+        return super().publish_if_absent(source, uri)
+
+
 @pytest.fixture
 def pool_fixture(tmp_path: Path):
     repo = tmp_path / "repo"
@@ -155,7 +170,7 @@ def pool_fixture(tmp_path: Path):
     }
 
 
-def _run(pool_fixture, *, store=None):
+def _run(pool_fixture, *, store=None, adapter_session_factory=None):
     return run_cloud_lane_pool_worker(
         manifest_path=pool_fixture["manifest_path"],
         adapter_path=pool_fixture["adapter"],
@@ -166,7 +181,39 @@ def _run(pool_fixture, *, store=None):
         control_prefix="gs://control/lane-001",
         stage_root=pool_fixture["tmp_path"] / "stage",
         object_store=store or pool_fixture["delegate"],
+        adapter_session_factory=adapter_session_factory,
     )
+
+
+class RecordingAdapterSession:
+    def __init__(self, session_root: Path) -> None:
+        self.session_root = session_root
+        self.requests = 0
+        self.closes = 0
+
+    def run(self, *, request_path: Path, output_path: Path):
+        self.requests += 1
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        assignment = request["assignment"]
+        with output_path.open("x", encoding="utf-8") as stream:
+            for ordinal in range(
+                assignment["record_start"],
+                assignment["record_start"] + assignment["record_count"],
+            ):
+                value = {
+                    "schema": request["output_schema"],
+                    "source_record_ordinal": ordinal,
+                    "document_ordinal": 0,
+                    "valid_tokens": ordinal + 1,
+                    "payload": {"ordinal": ordinal},
+                }
+                stream.write(
+                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+                )
+        return {"status": "complete"}
+
+    def close(self) -> None:
+        self.closes += 1
 
 
 def test_pool_worker_maps_logical_workers_and_reuses_one_snapshot_cache(
@@ -192,6 +239,128 @@ def test_pool_worker_maps_logical_workers_and_reuses_one_snapshot_cache(
     repeated = _run(pool_fixture, store=store)
     assert repeated == result
     assert store.input_downloads == len(pool_fixture["manifest"]["input_snapshots"])
+
+
+def test_pool_worker_shares_one_persistent_adapter_session(pool_fixture) -> None:
+    sessions: list[RecordingAdapterSession] = []
+
+    def factory(root: Path) -> RecordingAdapterSession:
+        session = RecordingAdapterSession(root)
+        sessions.append(session)
+        return session
+
+    store = CountingStore(pool_fixture["delegate"])
+    result = _run(
+        pool_fixture,
+        store=store,
+        adapter_session_factory=factory,
+    )
+
+    receipt = result["receipt"]
+    assert isinstance(receipt, dict)
+    totals = receipt["totals"]
+    assert isinstance(totals, dict)
+    assert totals["assignment_receipt_count"] == 2
+    assert len(sessions) == 1
+    assert sessions[0].requests == 2
+    assert sessions[0].closes == 1
+    assert store.input_downloads == len(pool_fixture["manifest"]["input_snapshots"])
+
+
+def test_pool_worker_refuses_completion_when_adapter_session_close_fails(
+    pool_fixture,
+) -> None:
+    class CloseFailureSession(RecordingAdapterSession):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("session closing snapshot verification failed")
+
+    with pytest.raises(ContractError, match="deterministic diagnostics"):
+        _run(
+            pool_fixture,
+            adapter_session_factory=CloseFailureSession,
+        )
+
+    failure = json.loads(
+        (
+            pool_fixture["tmp_path"] / "stage/receipts/physical-0000.failed.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert failure["retry_exit_code"] == 2
+    assert failure["diagnostics"] == [
+        {
+            "confirmed_http_429": False,
+            "diagnostic_sha256": failure["diagnostics"][0]["diagnostic_sha256"],
+            "error_type": "RuntimeError",
+            "worker": "physical-0000-adapter-session",
+        }
+    ]
+    assert not (
+        pool_fixture["tmp_path"] / "stage/receipts/physical-0000.complete.json"
+    ).exists()
+    published_paths = [
+        path.as_posix()
+        for path in (pool_fixture["tmp_path"] / "objects").rglob("*")
+        if path.is_file()
+    ]
+    assert not any("/lane-receipts/" in path for path in published_paths)
+    assert not any("/worker-completions/" in path for path in published_paths)
+
+
+def test_pool_worker_retries_deferred_receipts_after_confirmed_429(
+    pool_fixture,
+) -> None:
+    sessions: list[RecordingAdapterSession] = []
+
+    def factory(root: Path) -> RecordingAdapterSession:
+        session = RecordingAdapterSession(root)
+        sessions.append(session)
+        return session
+
+    store = FailOneDeferredReceiptStore(pool_fixture["delegate"])
+    with pytest.raises(ConfirmedHttp429, match="confirmed HTTP 429 diagnostics"):
+        _run(
+            pool_fixture,
+            store=store,
+            adapter_session_factory=factory,
+        )
+
+    completed_ledger = json.loads(
+        (
+            pool_fixture["tmp_path"]
+            / "stage/receipts/ledgers/worker-0000.ledger.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert completed_ledger["status"] == "complete"
+    assert len(completed_ledger["assignments"]) == 1
+    pending_ledger = json.loads(
+        (
+            pool_fixture["tmp_path"]
+            / "stage/receipts/ledgers/worker-0002.ledger.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert pending_ledger["status"] == "in_progress"
+    assert pending_ledger["assignments"] == []
+    assert (
+        pool_fixture["tmp_path"]
+        / "stage/receipts/logical/worker-0000.complete.json"
+    ).is_file()
+    assert not (
+        pool_fixture["tmp_path"]
+        / "stage/receipts/logical/worker-0002.complete.json"
+    ).exists()
+
+    result = _run(
+        pool_fixture,
+        store=store,
+        adapter_session_factory=factory,
+    )
+    receipt = result["receipt"]
+    assert isinstance(receipt, dict)
+    assert receipt["status"] == "complete"
+    assert len(sessions) == 2
+    assert all(session.closes == 1 for session in sessions)
+    assert [session.requests for session in sessions] == [2, 1]
 
 
 def test_pool_worker_marks_only_explicit_429_as_retryable(
@@ -230,3 +399,23 @@ def test_pool_worker_keeps_deterministic_failure_at_exit_two(
     )
     assert failure["retry_exit_code"] == 2
     assert not any(item["confirmed_http_429"] for item in failure["diagnostics"])
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "expected"),
+    [
+        ("HTTP 429", True),
+        ("HTTPError 429: Too Many Requests", True),
+        ("response status code: 429", True),
+        ("429 Too Many Requests", True),
+        ("deterministic receipt abc429def", False),
+        ("assignment ordinal 429 failed validation", False),
+    ],
+)
+def test_pool_worker_requires_http_context_for_429_retry(
+    diagnostic: str, expected: bool
+) -> None:
+    import scripts.distributed_data_prep.cloud_lane_pool_worker as module
+
+    _digest, confirmed = module._diagnostic(RuntimeError(diagnostic))
+    assert confirmed is expected

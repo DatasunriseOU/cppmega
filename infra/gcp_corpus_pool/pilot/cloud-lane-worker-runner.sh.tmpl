@@ -13,6 +13,7 @@ readonly REQUIREMENTS_SHA256="__CPPMEGA_REQUIREMENTS_SHA256__"
 readonly FETCH_RECEIPT_SHA256="__CPPMEGA_FETCH_RECEIPT_SHA256__"
 readonly TOKENIZERS_VERSION="__CPPMEGA_TOKENIZERS_VERSION__"
 readonly ASSIGNMENT_POOL_SIZE="__CPPMEGA_ASSIGNMENT_POOL_SIZE__"
+readonly HEARTBEAT_SECONDS=300
 readonly STAGE_ROOT="${CPPMEGA_STAGE_ROOT:?CPPMEGA_STAGE_ROOT is required}"
 readonly RUN_ROOT="${CPPMEGA_RUN_ROOT:?CPPMEGA_RUN_ROOT is required}"
 readonly WORKER_CONFIG="${CPPMEGA_WORKER_CONFIG:?CPPMEGA_WORKER_CONFIG is required}"
@@ -40,7 +41,7 @@ worker_stderr="$receipt_root/$physical_id.stderr"
 mkdir -p "$input_root" "$work_root" "$receipt_root"
 
 is_confirmed_429() {
-  grep -Eq '(^|[^0-9])429([^0-9]|$)' "$1"
+  grep -Eiq '(HTTP(Error)?([^0-9]{0,32})429|status([[:space:]]+code)?[[:space:]:=_-]*429|429[[:space:]:_-]+Too[[:space:]]+Many[[:space:]]+Requests)' "$1"
 }
 
 retry_delay() {
@@ -172,6 +173,70 @@ publish_runner_failure() {
   return "$exit_code"
 }
 
+publish_worker_heartbeat() {
+  local sequence=$1
+  local heartbeat="$receipt_root/$physical_id.heartbeat.$(printf '%06d' "$sequence").json"
+  local receipt_sha publication_exit=0
+  receipt_sha="$("$venv/bin/python" - "$heartbeat" "$sequence" \
+      "$MANIFEST_LOGICAL_SHA256" "$MANIFEST_SHA256" "$CODE_REVISION" \
+      "$physical_id" "$physical_count" <<'PY'
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+target, sequence, logical, raw, revision, worker, physical_count = sys.argv[1:]
+value = {
+    "schema": "cppmega.cloud_lane_worker_heartbeat_v1",
+    "status": "running",
+    "phase": "cloud-lane-pool-worker",
+    "sequence": int(sequence),
+    "manifest_sha256": logical,
+    "manifest_file_sha256": raw,
+    "code_revision": revision,
+    "physical_worker": worker,
+    "physical_worker_count": int(physical_count),
+    "emitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "training_ready": False,
+}
+encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+value["receipt_sha256"] = hashlib.sha256(encoded).hexdigest()
+path = Path(target)
+temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+print(value["receipt_sha256"])
+PY
+)"
+  publish_exact "$heartbeat" \
+    "$RUN_ROOT/control/cloud-lane-heartbeats/$MANIFEST_LOGICAL_SHA256/$physical_id/$(printf '%06d' "$sequence")-$receipt_sha.heartbeat.json" \
+    "$heartbeat.publication.json" || publication_exit=$?
+  return "$publication_exit"
+}
+
+worker_heartbeat_loop() {
+  local sequence=0 heartbeat_exit
+  while true; do
+    heartbeat_exit=0
+    publish_worker_heartbeat "$sequence" || heartbeat_exit=$?
+    if (( heartbeat_exit != 0 )); then
+      echo "cloud lane heartbeat publication failed with exit $heartbeat_exit" >&2
+    fi
+    sequence=$((sequence + 1))
+    sleep "$HEARTBEAT_SECONDS"
+  done
+}
+
+stop_worker_heartbeat() {
+  if [[ -n "${heartbeat_pid:-}" ]]; then
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    heartbeat_pid=""
+  fi
+}
+
 download_pinned \
   "$RUN_ROOT/bootstrap/$BUNDLE_SHA256.cppmega.bundle" "$bundle" "$BUNDLE_SHA256"
 download_pinned \
@@ -281,22 +346,43 @@ then
   exit "$tokenizer_exit"
 fi
 
-worker_exit=0
-PYTHONPATH="$repo_root" "$venv/bin/python" \
-  "$repo_root/scripts/distributed_data_prep/cloud_lane_pool_worker.py" \
-  --manifest "$manifest" \
-  --adapter "$adapter" \
-  --repo-root "$repo_root" \
-  --physical-index "$worker_index" \
-  --physical-count "$physical_count" \
-  --slots "$slots" \
-  --control-prefix "$RUN_ROOT" \
-  --stage-root "$work_root/pool" \
-  >"$receipt_root/$physical_id.stdout" 2>"$worker_stderr" || worker_exit=$?
+heartbeat_pid=""
+worker_heartbeat_loop \
+  >>"$receipt_root/$physical_id.heartbeat.log" 2>&1 &
+heartbeat_pid=$!
+trap stop_worker_heartbeat EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+set +e
+{
+  PYTHONPATH="$repo_root" "$venv/bin/python" \
+    "$repo_root/scripts/distributed_data_prep/cloud_lane_pool_worker.py" \
+    --manifest "$manifest" \
+    --adapter "$adapter" \
+    --repo-root "$repo_root" \
+    --physical-index "$worker_index" \
+    --physical-count "$physical_count" \
+    --slots "$slots" \
+    --persistent-case5-session \
+    --control-prefix "$RUN_ROOT" \
+    --stage-root "$work_root/pool" \
+    >"$receipt_root/$physical_id.stdout"
+} 2>&1 | tee "$worker_stderr" >&2
+worker_pipeline_status=("${PIPESTATUS[@]}")
+set -e
+worker_exit="${worker_pipeline_status[0]}"
+if (( worker_pipeline_status[1] != 0 )); then
+  echo "cloud lane worker stderr capture failed" >&2
+  worker_exit=2
+fi
+
+stop_worker_heartbeat
+trap - EXIT INT TERM
 
 if (( worker_exit != 0 )); then
   classified_exit=2
-  is_confirmed_429 "$worker_stderr" && classified_exit=75
+  (( worker_exit == 75 )) && classified_exit=75
   publish_runner_failure worker "$classified_exit" "$worker_stderr" || exit $?
   exit "$classified_exit"
 fi

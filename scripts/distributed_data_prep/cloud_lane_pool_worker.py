@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
     _ROOT = Path(__file__).resolve().parents[2]
@@ -40,16 +40,25 @@ from scripts.distributed_data_prep.cloud_lane import (  # noqa: E402
     load_cloud_lane_manifest,
 )
 from scripts.distributed_data_prep.cloud_lane_worker import (  # noqa: E402
+    AdapterSession,
     WORKER_COMPLETION_SCHEMA,
+    prepare_verified_snapshot_cache,
+    publish_deferred_worker_completion,
     run_cloud_lane_worker,
     worker_completion_sha256,
 )
 from scripts.distributed_data_prep.source_worker import GcloudObjectStore  # noqa: E402
 
-
 POOL_COMPLETION_SCHEMA = "cppmega.distributed_cloud_lane_pool_completion_v1"
 POOL_FAILURE_SCHEMA = "cppmega.distributed_cloud_lane_pool_failure_v1"
-_HTTP_429_RE = re.compile(r"(?<![0-9])429(?![0-9])")
+_HTTP_429_RE = re.compile(
+    r"(?:"
+    r"\bHTTP(?:Error)?(?:/\d(?:\.\d)?)?\s*(?:status(?:\s+code)?)?\s*[:=]?\s*429\b"
+    r"|\bstatus(?:\s+code)?\s*[:=]?\s*429\b"
+    r"|\b429\s+Too\s+Many\s+Requests\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 class ConfirmedHttp429(RuntimeError):
@@ -155,6 +164,8 @@ def _run_logical_worker(
     ledger_root: Path,
     publication_scratch: Path,
     object_store: ObjectStore,
+    adapter_session: AdapterSession | None,
+    verified_snapshots: Sequence[Mapping[str, object]] | None,
 ) -> dict[str, object]:
     try:
         completion = run_cloud_lane_worker(
@@ -166,11 +177,18 @@ def _run_logical_worker(
             receipt_root=receipt_root,
             ledger_path=ledger_root / f"{worker}.ledger.json",
             object_store=object_store,
+            adapter_session=adapter_session,
+            verified_snapshots=verified_snapshots,
+            defer_completion_publication=adapter_session is not None,
         )
+        if adapter_session is not None:
+            return {"prepared": completion}
         completion_path = receipt_root / f"{worker}.complete.json"
         publication = _publish_exact(
             completion_path,
-            _worker_completion_uri(completion=completion, manifest=manifest_path_to_value(manifest_path)),
+            _worker_completion_uri(
+                completion=completion, manifest=manifest_path_to_value(manifest_path)
+            ),
             object_store=object_store,
             scratch_root=publication_scratch / worker,
         )
@@ -191,6 +209,21 @@ def _diagnostic(error: BaseException) -> tuple[str, bool]:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(), bool(
         _HTTP_429_RE.search(text)
     )
+
+
+def _case5_adapter_session(
+    *, adapter_path: Path, repo_root: Path, session_root: Path
+) -> AdapterSession | None:
+    expected = (
+        repo_root / "scripts" / "distributed_data_prep" / "ci_case5_snapshot.py"
+    ).resolve()
+    if adapter_path != expected:
+        return None
+    from scripts.distributed_data_prep.ci_case5_snapshot import (
+        CiCase5AdapterSession,
+    )
+
+    return CiCase5AdapterSession(session_root=session_root)
 
 
 def _write_failure_receipt(
@@ -241,6 +274,8 @@ def run_cloud_lane_pool_worker(
     control_prefix: str,
     stage_root: Path,
     object_store: ObjectStore,
+    adapter_session_factory: Callable[[Path], AdapterSession] | None = None,
+    enable_case5_session: bool = False,
 ) -> dict[str, object]:
     manifest, manifest_file_sha256 = load_cloud_lane_manifest(manifest_path)
     pipeline = manifest["pipeline"]
@@ -271,7 +306,32 @@ def run_cloud_lane_pool_worker(
     for directory in (scratch_root, receipt_root, ledger_root, publication_scratch):
         directory.mkdir(parents=True, exist_ok=True)
         if directory.is_symlink() or not directory.is_dir():
-            raise ContractError("cloud lane stage directories must be regular directories")
+            raise ContractError(
+                "cloud lane stage directories must be regular directories"
+            )
+
+    session_root = scratch_root / "adapter-session"
+    if adapter_session_factory is not None:
+        adapter_session = adapter_session_factory(session_root)
+    elif enable_case5_session:
+        adapter_session = _case5_adapter_session(
+            adapter_path=adapter_path,
+            repo_root=repo_root.resolve(),
+            session_root=session_root,
+        )
+        if adapter_session is None:
+            raise ContractError(
+                "persistent CASE5 session requires the canonical CASE5 adapter"
+            )
+    else:
+        adapter_session = None
+    verified_snapshots: list[dict[str, object]] | None = None
+    if adapter_session is not None:
+        verified_snapshots = prepare_verified_snapshot_cache(
+            manifest,
+            object_store=object_store,
+            input_root=scratch_root / "inputs" / str(manifest["manifest_sha256"]),
+        )
 
     results: dict[str, dict[str, object]] = {}
     failures: list[_LogicalWorkerFailure] = []
@@ -288,6 +348,8 @@ def run_cloud_lane_pool_worker(
                 ledger_root=ledger_root,
                 publication_scratch=publication_scratch,
                 object_store=object_store,
+                adapter_session=adapter_session,
+                verified_snapshots=verified_snapshots,
             ): worker
             for worker in assigned
         }
@@ -297,6 +359,45 @@ def run_cloud_lane_pool_worker(
                 results[worker] = future.result()
             except _LogicalWorkerFailure as error:
                 failures.append(error)
+    if adapter_session is not None:
+        try:
+            adapter_session.close()
+        except BaseException as error:
+            failures.append(
+                _LogicalWorkerFailure(
+                    f"physical-{physical_index:04d}-adapter-session", error
+                )
+            )
+
+    if not failures and adapter_session is not None:
+        for worker in assigned:
+            try:
+                prepared = results[worker]["prepared"]
+                if not isinstance(prepared, Mapping):
+                    raise ContractError("deferred logical worker result is malformed")
+                completion = publish_deferred_worker_completion(
+                    prepared,
+                    manifest_path=manifest_path,
+                    ledger_path=ledger_root / f"{worker}.ledger.json",
+                    receipt_root=receipt_root,
+                    object_store=object_store,
+                    scratch_root=publication_scratch / worker / "deferred",
+                )
+                completion_path = receipt_root / f"{worker}.complete.json"
+                publication = _publish_exact(
+                    completion_path,
+                    _worker_completion_uri(
+                        completion=completion, manifest=manifest
+                    ),
+                    object_store=object_store,
+                    scratch_root=publication_scratch / worker,
+                )
+                results[worker] = {
+                    "completion": completion,
+                    "publication": publication,
+                }
+            except BaseException as error:
+                failures.append(_LogicalWorkerFailure(worker, error))
 
     if failures:
         failure_path = (
@@ -407,6 +508,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--physical-index", required=True, type=int)
     parser.add_argument("--physical-count", required=True, type=int)
     parser.add_argument("--slots", type=int, default=2)
+    parser.add_argument("--persistent-case5-session", action="store_true")
     parser.add_argument("--control-prefix", required=True)
     parser.add_argument("--stage-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -421,6 +523,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             control_prefix=args.control_prefix,
             stage_root=args.stage_root,
             object_store=GcloudObjectStore(),
+            enable_case5_session=args.persistent_case5_session,
         )
     except ConfirmedHttp429 as exc:
         print(f"cloud lane pool worker retryable failure: {exc}", file=sys.stderr)
