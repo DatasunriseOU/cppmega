@@ -26,7 +26,7 @@ import tempfile
 import time
 import urllib.parse
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
     _ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +75,7 @@ _SORT_FIELDS = (
 _TRANSPORT_MAX_RETRIES = 4
 _TRANSPORT_RETRY_BASE_SECONDS = 1.0
 _TRANSPORT_RETRY_MAX_SECONDS = 16.0
+_MAX_BINARY_RESPONSE_JSON_DIAGNOSTIC_BYTES = 64 * 1024
 _TRANSIENT_CURL_RETURN_CODES = frozenset({5, 6, 7, 18, 28, 35, 47, 52, 55, 56, 92})
 _GIT_HTTP_STATUS_RE = re.compile(
     r"(?:\bHTTP(?:/[0-9.]+)?(?:\s+error)?\s*|\breturned error:\s*)([1-5][0-9]{2})",
@@ -476,6 +477,7 @@ class GcloudObjectStore:
         response: Path,
         config: str,
         accepted_statuses: frozenset[int],
+        binary_response: bool = False,
     ) -> int:
         for attempt in range(self.max_retries + 1):
             response.unlink(missing_ok=True)
@@ -492,7 +494,17 @@ class GcloudObjectStore:
                 returncode=completed.returncode,
                 status=status,
             )
-            detail = _tail_response(response, completed.stderr or "")
+            if binary_response:
+                detail = (completed.stderr or "")[-4000:]
+                try:
+                    response_size = response.stat().st_size
+                    if 0 < response_size <= _MAX_BINARY_RESPONSE_JSON_DIAGNOSTIC_BYTES:
+                        json.loads(response.read_text(encoding="utf-8"))
+                        detail = _tail_response(response, completed.stderr or "")
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+            else:
+                detail = _tail_response(response, completed.stderr or "")
             if not transient:
                 raise _GcsRequestError(
                     operation=operation,
@@ -662,7 +674,7 @@ class GcloudObjectStore:
                 # immutable object before retrying or accepting it.
                 if transient or status == 412:
                     with tempfile.TemporaryDirectory(
-                        prefix="cppmega-gcs-publish-verify-"
+                        prefix="cppmega-gcs-publish-verify-", dir=source.parent
                     ) as verify_tmp:
                         existing = self.describe_if_present(validated)
                         if existing is not None:
@@ -724,22 +736,20 @@ class GcloudObjectStore:
             f".{destination.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
         )
         try:
-            with tempfile.TemporaryDirectory(prefix="cppmega-gcs-download-") as raw_tmp:
-                response = Path(raw_tmp) / "response.body"
-                self._request_with_retry(
-                    operation="exact download",
-                    uri=validated,
-                    endpoint=endpoint,
-                    response=response,
-                    config=curl_config,
-                    accepted_statuses=frozenset({200}),
+            self._request_with_retry(
+                operation="exact download",
+                uri=validated,
+                endpoint=endpoint,
+                response=stage,
+                config=curl_config,
+                accepted_statuses=frozenset({200}),
+                binary_response=True,
+            )
+            metadata = self.describe(validated, generation=requested)
+            if stage.stat().st_size != int(metadata["size_bytes"]):
+                raise ContractError(
+                    f"downloaded GCS object size mismatch: {validated}"
                 )
-                metadata = self.describe(validated, generation=requested)
-                if response.stat().st_size != int(metadata["size_bytes"]):
-                    raise ContractError(
-                        f"downloaded GCS object size mismatch: {validated}"
-                    )
-                shutil.copyfile(response, stage)
             os.replace(stage, destination)
             return metadata
         finally:
