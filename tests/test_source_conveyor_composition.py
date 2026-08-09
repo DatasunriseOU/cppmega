@@ -1004,6 +1004,35 @@ def test_historical_repository_artifact_is_materialized_from_git_blob(
         )
 
 
+def test_historical_repository_artifact_timeout_is_structured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    manifest = repo / "configs" / "source_quarantine_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"entries":[]}' + "\n", encoding="utf-8")
+
+    def raise_timeout(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+    monkeypatch.setattr(
+        "cppmega.data.source_conveyor_composition.subprocess.run",
+        raise_timeout,
+    )
+
+    with pytest.raises(ValueError, match="historical Git blob lookup timed out"):
+        _resolve_recorded_repository_artifact(
+            recorded_path=manifest,
+            expected_sha256=hashlib.sha256(b'{"entries":["old"]}\n').hexdigest(),
+            repository_root=repo,
+            recorded_revision="a" * 40,
+            cache_root=tmp_path / "run" / "frozen_inputs",
+            label="historical quarantine",
+            max_bytes=4 * 1024 * 1024,
+        )
+
+
 def test_source_composition_allows_repair_quarantine_but_not_tokenizer_drift(
     tmp_path: Path,
 ) -> None:

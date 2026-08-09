@@ -577,18 +577,21 @@ def _resolve_recorded_repository_artifact(
             raise ValueError(f"{label} historical cache artifact exceeds the metadata bound")
         return target
 
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repository_root),
-            "show",
-            f"{recorded_revision}:{relative_path.as_posix()}",
-        ],
-        check=False,
-        capture_output=True,
-        timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository_root),
+                "show",
+                f"{recorded_revision}:{relative_path.as_posix()}",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"{label} historical Git blob lookup timed out") from exc
     if completed.returncode != 0:
         raise ValueError(f"{label} historical Git blob is unavailable")
     payload = completed.stdout
