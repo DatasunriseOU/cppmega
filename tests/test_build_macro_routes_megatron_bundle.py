@@ -3049,3 +3049,25 @@ def test_stage_source_composition_binds_salvage_and_pr_artifacts(
             provenance_root=wrong_size_partial / "provenance",
         )
     salvage["original_exit_receipt_size_bytes"] = original_size
+
+    pr_completion = run_receipt["pr_completion"]
+    completion_sha256 = pr_completion["receipt_sha256"]
+    pr_completion["receipt_sha256"] = 123
+    malformed_pr_partial = tmp_path / "malformed-pr.partial"
+    with pytest.raises(RuntimeError, match="malformed PR provenance"):
+        builder._stage_source_composition(
+            composition,
+            partial_dir=malformed_pr_partial,
+            provenance_root=malformed_pr_partial / "provenance",
+        )
+    pr_completion["receipt_sha256"] = completion_sha256
+
+    pr_repo_list = artifacts.pop("pr_repo_list")
+    missing_pr_partial = tmp_path / "missing-pr.partial"
+    with pytest.raises(RuntimeError, match="artifact set drifted"):
+        builder._stage_source_composition(
+            composition,
+            partial_dir=missing_pr_partial,
+            provenance_root=missing_pr_partial / "provenance",
+        )
+    artifacts["pr_repo_list"] = pr_repo_list

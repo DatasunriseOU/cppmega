@@ -3300,12 +3300,19 @@ def _stage_source_composition(
                 raise RuntimeError(
                     f"source composition run {run_id} has malformed PR provenance"
                 )
-            expected_hashes.update(
-                {
-                    "pr_completion": str(pr_completion["receipt_sha256"]),
-                    "pr_repo_list": str(pr_completion["repo_list_sha256"]),
-                }
-            )
+            for artifact_name, field in (
+                ("pr_completion", "receipt_sha256"),
+                ("pr_repo_list", "repo_list_sha256"),
+            ):
+                digest = pr_completion.get(field)
+                if (
+                    not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise RuntimeError(
+                        f"source composition run {run_id} has malformed PR provenance"
+                    )
+                expected_hashes[artifact_name] = digest
         if set(files) != set(expected_hashes):
             raise RuntimeError(
                 f"source composition run {run_id} artifact set drifted"
