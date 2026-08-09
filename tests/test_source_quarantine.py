@@ -2060,3 +2060,49 @@ def test_process_project_quarantines_clickhouse_binary_sql_before_domain_discove
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["quarantined_count"] == 1
     assert receipt["entries"][0]["relative_path"] == RELATIVE_CLICKHOUSE_BINARY_SQL
+
+
+def test_utf16le_source_text_format_accepts_bom_comment_header(tmp_path):
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+    import hashlib
+    # UTF-16LE BOM + "// hello\n"
+    payload = b"\xff\xfe" + "// hello\n".encode("utf-16le")
+    path = tmp_path / "resource.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="example/repo",
+        relative_path="resource.h",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="mislabeled_non_cpp",
+        detected_format="utf16le_source_text",
+        reason="test fixture",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_utf16le_source_text_rejects_missing_bom(tmp_path):
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+    import hashlib
+    import pytest
+    payload = b"// no bom\n"
+    path = tmp_path / "resource.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="example/repo",
+        relative_path="resource.h",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="mislabeled_non_cpp",
+        detected_format="utf16le_source_text",
+        reason="test fixture",
+    )
+    with pytest.raises(SourceQuarantineError, match="UTF-16LE BOM"):
+        _verify_detected_format(path, entry)

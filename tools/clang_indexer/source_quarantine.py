@@ -69,6 +69,7 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
+    ("mislabeled_non_cpp", "utf16le_source_text"),
     ("mislabeled_non_cpp", "nul_ff_binary_blob"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
     ("mislabeled_non_cpp", "truncated_utf32be_bom"),
@@ -472,6 +473,50 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
         if not decoded.lstrip("\ufeff \t\r\n").startswith(("<", "<?xml")):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared xml_utf16le but XML prefix is absent"
+            )
+        return
+
+    if entry.detected_format == "utf16le_source_text":
+        with path.open("rb") as source:
+            prefix = source.read(8192)
+        if not prefix.startswith(b"\xff\xfe"):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared utf16le_source_text but UTF-16LE BOM "
+                "is absent"
+            )
+        if len(prefix) % 2:
+            prefix = prefix[:-1]
+        try:
+            decoded = prefix.decode("utf-16")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared utf16le_source_text but prefix is "
+                f"invalid: {exc}"
+            ) from exc
+        body = decoded.lstrip("\ufeff \t\r\n")
+        starts_ok = body.startswith(
+            (
+                "//",
+                "/*",
+                "#",
+                "using ",
+                "namespace ",
+                "struct ",
+                "class ",
+                "int ",
+                "void ",
+            )
+        ) or any(ch.isalpha() for ch in body[:64])
+        if not starts_ok:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared utf16le_source_text but decoded "
+                "prefix is not C/C++-like text"
+            )
+        full = path.read_bytes()
+        if b"\x00" not in full:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared utf16le_source_text but payload "
+                "has no NUL bytes"
             )
         return
 

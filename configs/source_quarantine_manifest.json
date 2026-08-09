@@ -216,6 +216,24 @@
       "classification": "deliberate_compiler_diagnostic_fixture",
       "detected_format": "clang_embedded_nul_diagnostic",
       "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token (same fixture as intel/llvm)"
+    },
+    {
+      "project_id": "cnr-isti-vclab/meshlab",
+      "relative_path": "unsupported/plugins_experimental/edit_panosample/resource.h",
+      "size_bytes": 904,
+      "sha256": "9317cacbde78b0a29b806ee3b3e8a8966c5de89be09deef2d441d160ba6d8877",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "utf16le_source_text",
+      "reason": "UTF-16LE C/C++ header mislabeled as source; contains embedded NULs (github tip hash; rebind if archive pin differs)"
+    },
+    {
+      "project_id": "mlpack/mlpack",
+      "relative_path": "doc/examples/sample-ml-app/sample-ml-app/stdafx.h",
+      "size_bytes": 1140,
+      "sha256": "e46c61caa08acfb05e5a813718aa820046629f447ff07686eca3986dde72347b",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "utf16le_source_text",
+      "reason": "UTF-16LE C/C++ header mislabeled as source; contains embedded NULs (github tip hash; rebind if archive pin differs)"
     }
   ],
   "collections": [
