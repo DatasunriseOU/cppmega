@@ -735,7 +735,16 @@ def _sha256_private_cache_artifact(
                 f"{label} historical cache artifact exceeds the metadata bound"
             )
         digest = hashlib.sha256()
-        while payload := os.read(descriptor, 1024 * 1024):
+        hashed_bytes = 0
+        while payload := os.read(
+            descriptor,
+            min(1024 * 1024, max_bytes - hashed_bytes + 1),
+        ):
+            hashed_bytes += len(payload)
+            if hashed_bytes > max_bytes:
+                raise ValueError(
+                    f"{label} historical cache artifact exceeds the metadata bound"
+                )
             digest.update(payload)
         return digest.hexdigest()
     finally:
