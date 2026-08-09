@@ -2538,9 +2538,12 @@ def run_monitor(
             kind="outcome", inventory=outcome_inventory, state=state
         )
         outcome_records: list[dict[str, object]] = []
-        for metadata in outcome_inventory.values():
+        outcome_metadata_rows = list(outcome_inventory.values())
+        for metadata, (raw, value) in zip(
+            outcome_metadata_rows,
+            _read_json_rows(run_client, outcome_metadata_rows),
+        ):
             cached = _cached_receipt(kind="outcome", metadata=metadata, state=state)
-            raw, value = run_client.read_json(metadata)
             record = _assignment_outcome(
                 raw=raw,
                 value=value,

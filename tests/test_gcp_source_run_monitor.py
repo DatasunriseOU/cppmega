@@ -1573,7 +1573,7 @@ def test_terminal_assignment_outcome_is_not_counted_as_current_claim(
         job=job,
         physical_worker_index=1,
     )
-    _add_outcome(
+    outcome_uri = _add_outcome(
         client,
         manifest=manifest,
         manifest_file_sha256=str(config["manifest_file_sha256"]),
@@ -1597,6 +1597,7 @@ def test_terminal_assignment_outcome_is_not_counted_as_current_claim(
     assert result["workers"][1]["current_claimed_assignments"] == 0
     assert result["counts"]["fresh_heartbeat_assignments"] == 0
     assert result["state"] == "blocked_deterministic"
+    assert outcome_uri in [uri for batch in client.batch_calls for uri in batch]
 
 
 def test_validated_assignment_outcome_cannot_disappear(tmp_path: Path) -> None:
