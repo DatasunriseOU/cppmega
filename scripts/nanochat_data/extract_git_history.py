@@ -556,9 +556,14 @@ def get_commit_file_changes(
     repo_path: str,
     commit_hash: str,
 ) -> Optional[list[_CommitFileChange]]:
-    """Return deterministic primary-domain candidates, including A/D/R changes."""
+    """Return deterministic primary-domain candidates, including A/D/R changes.
 
-    name_status = run_git_unit(
+    Raw diff records carry the file modes, which lets us discard gitlinks
+    before blob reads.  Submodule entries are commits (mode ``160000``), not
+    blobs, and are intentionally outside the commit-content corpus.
+    """
+
+    raw_diff = run_git_unit(
         repo_path,
         [
             "diff-tree",
@@ -568,7 +573,7 @@ def get_commit_file_changes(
             "--find-renames=50%",
             "-l0",
             "--diff-filter=ACDMRT",
-            "--name-status",
+            "--raw",
             "-z",
             commit_hash,
         ],
@@ -576,7 +581,7 @@ def get_commit_file_changes(
         filepath=None,
         operation="commit_paths",
     )
-    fields = name_status.split("\0")
+    fields = raw_diff.split("\0")
     if fields and fields[-1] == "":
         fields.pop()
     if not fields:
@@ -585,8 +590,21 @@ def get_commit_file_changes(
     changes: list[_CommitFileChange] = []
     index = 0
     while index < len(fields):
-        raw_status = fields[index]
+        raw_header = fields[index]
         index += 1
+        header = raw_header.split(None, 4)
+        if not raw_header or len(header) != 5 or not raw_header.startswith(":"):
+            raise UnitExtractionError(
+                repo_path=repo_path,
+                commit_hash=commit_hash,
+                filepath=None,
+                operation="commit_paths_parse",
+                error_type="MalformedGitOutput",
+                detail=f"invalid raw diff header at NUL field {index - 1}: "
+                f"{raw_header!r}",
+            )
+        old_mode, new_mode, _old_oid, _new_oid, raw_status = header
+        old_mode = old_mode[1:]
         if not raw_status:
             raise UnitExtractionError(
                 repo_path=repo_path,
@@ -594,7 +612,7 @@ def get_commit_file_changes(
                 filepath=None,
                 operation="commit_paths_parse",
                 error_type="MalformedGitOutput",
-                detail=f"empty status field at NUL field {index - 1}",
+                detail=f"empty raw status at NUL field {index - 1}",
             )
         status = raw_status[0]
         required_paths = 2 if status in {"R", "C"} else 1
@@ -612,6 +630,8 @@ def get_commit_file_changes(
             )
         paths = fields[index:index + required_paths]
         index += required_paths
+        if old_mode == "160000" or new_mode == "160000":
+            continue
         if status in {"R", "C"}:
             old_filepath, new_filepath = paths
         else:
