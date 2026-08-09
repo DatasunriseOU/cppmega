@@ -299,7 +299,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--repair-poll-seconds",
         type=float,
         default=DEFAULT_REPAIR_POLL_SECONDS,
-        help="Seconds between terminal repair receipt checks after commit extraction.",
+        help="Seconds between terminal repair receipt checks before commit extraction.",
     )
     return parser
 
@@ -1218,6 +1218,33 @@ def _run(args: argparse.Namespace) -> int:
             historical_revisions.update(
                 _historical_code_revisions(code_run_root, repair_run_roots)
             )
+        repair_required = bool(code_run.get("repair_required"))
+        initial_identity = code_run["identity"]
+        if repair_required:
+            current_code_run = wait_for_terminal_code_run(
+                code_run_root,
+                repair_run_roots,
+                poll_seconds=args.repair_poll_seconds,
+                execution_code_revision=execution_code_revision,
+                allowed_historical_code_revisions=historical_revisions,
+            )
+        else:
+            current_code_run = load_terminal_code_run(
+                code_run_root,
+                execution_code_revision=(
+                    execution_code_revision
+                    if args.expected_code_revision is not None
+                    else None
+                ),
+                allowed_historical_code_revisions=historical_revisions,
+            )
+        current_identities = current_code_run.get(
+            "identities",
+            [current_code_run["identity"]],
+        )
+        if not current_identities or current_identities[0] != initial_identity:
+            raise RuntimeError("base code run changed before commit extraction")
+        code_run = current_code_run
         free_bytes = shutil.disk_usage(run_root).free
         if free_bytes < args.minimum_free_bytes:
             raise RuntimeError(
@@ -1339,7 +1366,7 @@ def _run(args: argparse.Namespace) -> int:
             return return_code
 
         try:
-            if code_run.get("repair_required"):
+            if repair_required:
                 current_code_run = wait_for_terminal_code_run(
                     code_run_root,
                     repair_run_roots,

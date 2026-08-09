@@ -1078,10 +1078,11 @@ def test_historical_repository_cache_is_size_checked_before_hash(
     repo = tmp_path / "repo"
     (repo / "configs").mkdir(parents=True)
     cache_root = tmp_path / "private-cache"
-    cache_root.mkdir()
+    cache_root.mkdir(mode=0o700)
     expected_sha256 = "a" * 64
     cached = cache_root / f"source_quarantine_manifest.{expected_sha256}.json"
     cached.write_bytes(b"oversized")
+    cached.chmod(0o600)
 
     def unexpected_hash(_path: Path) -> str:
         pytest.fail("oversized cached metadata was hashed before its size check")
@@ -1100,6 +1101,52 @@ def test_historical_repository_cache_is_size_checked_before_hash(
             cache_root=cache_root,
             label="historical quarantine",
             max_bytes=4,
+        )
+
+
+def test_historical_repository_cache_rejects_non_private_root(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "configs").mkdir(parents=True)
+    cache_root = tmp_path / "shared-cache"
+    cache_root.mkdir(mode=0o700)
+    cache_root.chmod(0o777)
+
+    with pytest.raises(ValueError, match="cache root permissions must be 0700"):
+        _resolve_recorded_repository_artifact(
+            recorded_path=repo / "configs" / "source_quarantine_manifest.json",
+            expected_sha256="a" * 64,
+            repository_root=repo,
+            recorded_revision="b" * 40,
+            cache_root=cache_root,
+            label="historical quarantine",
+            max_bytes=4 * 1024 * 1024,
+        )
+
+
+def test_historical_repository_cache_does_not_follow_artifact_symlink(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "configs").mkdir(parents=True)
+    cache_root = tmp_path / "private-cache"
+    cache_root.mkdir(mode=0o700)
+    expected_sha256 = "a" * 64
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}\n", encoding="utf-8")
+    cached = cache_root / f"source_quarantine_manifest.{expected_sha256}.json"
+    cached.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="historical cache artifact drifted"):
+        _resolve_recorded_repository_artifact(
+            recorded_path=repo / "configs" / "source_quarantine_manifest.json",
+            expected_sha256=expected_sha256,
+            repository_root=repo,
+            recorded_revision="b" * 40,
+            cache_root=cache_root,
+            label="historical quarantine",
+            max_bytes=4 * 1024 * 1024,
         )
 
 
