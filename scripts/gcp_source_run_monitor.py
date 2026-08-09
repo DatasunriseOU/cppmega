@@ -1462,7 +1462,11 @@ def _control_receipt(
         }
     else:  # pragma: no cover - internal dispatch
         raise AssertionError(kind)
-    require_exact_fields(receipt, expected, where=f"GCP {kind} control receipt")
+    if kind == "failed" and set(receipt) == expected | {"attempt_id"}:
+        attempt_scoped_failure = True
+    else:
+        require_exact_fields(receipt, expected, where=f"GCP {kind} control receipt")
+        attempt_scoped_failure = False
     expected_state = "complete" if kind == "completed" else kind
     if receipt["schema_version"] != 1 or receipt["state"] != expected_state:
         raise MonitorError(f"GCP {kind} control receipt schema/state drifted")
@@ -1487,6 +1491,24 @@ def _control_receipt(
         if receipt["worker"] != f"worker-{worker_index:04d}":
             raise MonitorError(f"{kind} receipt physical worker identity drifted")
     if kind == "failed":
+        attempt_id = None
+        if attempt_scoped_failure:
+            attempt_id = require_nonempty(
+                receipt["attempt_id"], where="failed receipt attempt_id"
+            )
+            if _UUID_RE.fullmatch(attempt_id) is None:
+                raise MonitorError("failed receipt attempt_id is invalid")
+        expected_filename = f"{worker_name}.{boot_id}"
+        if attempt_id is not None:
+            expected_filename += f".{attempt_id}"
+        expected_uri = gcs_join(
+            str(config["run_root"]),
+            "control",
+            "failed",
+            f"{expected_filename}.json",
+        )
+        if metadata["uri"] != expected_uri:
+            raise MonitorError("failed receipt URI binding drifted")
         exit_code = receipt["exit_code"]
         if (
             isinstance(exit_code, bool)

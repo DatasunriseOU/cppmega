@@ -865,20 +865,31 @@ def _add_ready(client: FakeRunClient) -> None:
         )
 
 
-def _add_failure(client: FakeRunClient, *, worker_index: int, exit_code: int) -> None:
+def _add_failure(
+    client: FakeRunClient,
+    *,
+    worker_index: int,
+    exit_code: int,
+    attempt_id: str | None = None,
+) -> None:
     worker = PHYSICAL_WORKERS[worker_index]
     boot_id = _boot_id(worker_index)
+    suffix = f"{worker}.{boot_id}"
+    receipt = {
+        "schema_version": 1,
+        "state": "failed",
+        "worker": f"worker-{worker_index:04d}",
+        "worker_name": worker,
+        "boot_id": boot_id,
+        "created_at": "2026-08-04T11:30:00Z",
+        "exit_code": exit_code,
+    }
+    if attempt_id is not None:
+        suffix += f".{attempt_id}"
+        receipt["attempt_id"] = attempt_id
     client.add_json(
-        f"{RUN_ROOT}/control/failed/{worker}.{boot_id}.json",
-        {
-            "schema_version": 1,
-            "state": "failed",
-            "worker": f"worker-{worker_index:04d}",
-            "worker_name": worker,
-            "boot_id": boot_id,
-            "created_at": "2026-08-04T11:30:00Z",
-            "exit_code": exit_code,
-        },
+        f"{RUN_ROOT}/control/failed/{suffix}.json",
+        receipt,
         updated="2026-08-04T11:30:00Z",
     )
 
@@ -2057,6 +2068,93 @@ def test_stolen_completion_cannot_recover_a_different_worker_after_exit_75(
     assert failed["state"] == "transient_failure_diagnostics_preserved"
     assert failed["recovery_evidence"] == "exit_75"
     assert failed["replacement_permitted"] is True
+
+
+def test_attempt_scoped_failure_receipt_is_accepted_and_classified(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    attempt_id = _boot_id(100)
+    _add_failure(
+        client,
+        worker_index=0,
+        exit_code=2,
+        attempt_id=attempt_id,
+    )
+
+    result = run_monitor(
+        config,
+        client=client,
+        object_store=LocalObjectStore(tmp_path / "gcs"),
+        now=lambda: 100,
+    )
+
+    failed = result["workers"][0]
+    assert failed["failed_receipts"] == 1
+    assert failed["state"] == "deterministic_failure_manual_review"
+    assert failed["replacement_permitted"] is False
+
+
+def test_attempt_scoped_failure_receipt_rejects_invalid_attempt_id(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    _add_failure(
+        client,
+        worker_index=0,
+        exit_code=2,
+        attempt_id="not-a-uuid",
+    )
+
+    with pytest.raises(MonitorError, match="attempt_id is invalid"):
+        run_monitor(
+            config,
+            client=client,
+            object_store=LocalObjectStore(tmp_path / "gcs"),
+            now=lambda: 100,
+        )
+
+
+def test_attempt_scoped_failure_receipt_rejects_uri_binding_drift(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _manifest_value = _manifest(tmp_path)
+    config = _config(tmp_path, manifest_path)
+    client = FakeRunClient()
+    _add_ready(client)
+    worker = PHYSICAL_WORKERS[0]
+    boot_id = _boot_id(0)
+    attempt_id = _boot_id(100)
+    mismatched_attempt_id = _boot_id(101)
+    client.add_json(
+        f"{RUN_ROOT}/control/failed/"
+        f"{worker}.{boot_id}.{mismatched_attempt_id}.json",
+        {
+            "schema_version": 1,
+            "state": "failed",
+            "worker": "worker-0000",
+            "worker_name": worker,
+            "boot_id": boot_id,
+            "attempt_id": attempt_id,
+            "created_at": "2026-08-04T11:30:00Z",
+            "exit_code": 2,
+        },
+        updated="2026-08-04T11:30:00Z",
+    )
+
+    with pytest.raises(MonitorError, match="URI binding drifted"):
+        run_monitor(
+            config,
+            client=client,
+            object_store=LocalObjectStore(tmp_path / "gcs"),
+            now=lambda: 100,
+        )
 
 
 def test_exit_2_never_becomes_retryable_even_when_serial_contains_429(
