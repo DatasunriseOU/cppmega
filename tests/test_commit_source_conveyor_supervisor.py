@@ -268,6 +268,8 @@ def test_commit_run_waits_for_terminal_repair_before_starting_child(
 
     def wait_for_terminal(*args: object, **kwargs: object) -> dict[str, object]:
         events.append("terminal")
+        assert kwargs["execution_repository_root"] is None
+        assert kwargs["execution_code_revision"] is None
         return terminal_code_run
 
     monkeypatch.setattr(

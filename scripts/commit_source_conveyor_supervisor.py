@@ -1244,6 +1244,11 @@ def _run(args: argparse.Namespace) -> int:
         execution_repository_root = (
             _REPO_ROOT if args.expected_code_revision is not None else None
         )
+        execution_validation_revision = (
+            execution_code_revision
+            if execution_repository_root is not None
+            else None
+        )
         if args.allow_code_revision_upgrade_from is not None and (
             args.resume_from_run_root is None
         ):
@@ -1293,7 +1298,7 @@ def _run(args: argparse.Namespace) -> int:
                 repair_run_roots,
                 poll_seconds=args.repair_poll_seconds,
                 execution_repository_root=execution_repository_root,
-                execution_code_revision=execution_code_revision,
+                execution_code_revision=execution_validation_revision,
                 allowed_historical_code_revisions=historical_revisions,
             )
         else:
@@ -1441,7 +1446,7 @@ def _run(args: argparse.Namespace) -> int:
                     repair_run_roots,
                     poll_seconds=args.repair_poll_seconds,
                     execution_repository_root=execution_repository_root,
-                    execution_code_revision=execution_code_revision,
+                    execution_code_revision=execution_validation_revision,
                     allowed_historical_code_revisions=historical_revisions,
                 )
             else:
