@@ -340,6 +340,84 @@ def test_targeted_repair_reuses_base_outputs_and_binds_receipts(
         output_root.mkdir()
 
 
+def test_salvaged_exit_receipt_preserves_and_binds_legacy_abort(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "repair"
+    conveyor_root = run_root / "conveyor"
+    conveyor_root.mkdir(parents=True)
+    launch_path = run_root / "launch_receipt.json"
+    manifest_path = conveyor_root / "_done.json"
+    original_path = run_root / "exit_receipt.json"
+    salvaged_path = run_root / supervisor.SALVAGED_EXIT_FILENAME
+    repair_base = {
+        "launch_sha256": "1" * 64,
+        "exit_sha256": "2" * 64,
+        "manifest_sha256": "3" * 64,
+    }
+    _write_json(
+        launch_path,
+        {
+            "schema": supervisor.TARGETED_LAUNCH_SCHEMA,
+            "status": "running",
+            "code_revision": "a" * 40,
+            "selected_repositories": ["alpha", "beta"],
+            "expected_selected_repository_count": 2,
+            "repair_base_code_run": repair_base,
+            "outputs": {"conveyor_manifest": str(manifest_path)},
+        },
+    )
+    _write_json(
+        manifest_path,
+        {
+            "done": {"alpha::code": {"artifact_filename": "alpha.parquet"}},
+            "failed": {"beta::code": {"stage": "index_project"}},
+            "legacy_padding": "x" * (4 * 1024 * 1024),
+        },
+    )
+    _write_json(
+        original_path,
+        {
+            "status": "operator_abort",
+            "exit_code": 130,
+            "reason": "archive decompressor exited",
+            "ts": "2026-08-09T07:34:59Z",
+            "done_count": 1,
+            "failed_count": 1,
+            "done_units": ["alpha::code"],
+            "failed_units": ["beta::code"],
+        },
+    )
+    original_bytes = original_path.read_bytes()
+
+    receipt = supervisor.write_salvaged_exit_receipt(
+        salvaged_path,
+        original_exit_path=original_path,
+        launch_path=launch_path,
+        manifest_path=manifest_path,
+        reason="bind the operator abort to its immutable launch and manifest",
+    )
+
+    assert original_path.read_bytes() == original_bytes
+    assert receipt["schema"] == supervisor.TARGETED_EXIT_SCHEMA
+    assert receipt["finished_at"] == "2026-08-09T07:34:59Z"
+    assert receipt["done_manifest"]["sha256"] == _sha256(manifest_path)
+    assert receipt["salvage"]["schema"] == supervisor.EXIT_SALVAGE_SCHEMA
+    assert receipt["salvage"]["original_exit_receipt"] == {
+        "path": str(original_path.resolve()),
+        "sha256": hashlib.sha256(original_bytes).hexdigest(),
+        "size_bytes": len(original_bytes),
+    }
+    with pytest.raises(RuntimeError, match="already exists"):
+        supervisor.write_salvaged_exit_receipt(
+            salvaged_path,
+            original_exit_path=original_path,
+            launch_path=launch_path,
+            manifest_path=manifest_path,
+            reason="must not overwrite immutable salvage evidence",
+        )
+
+
 def test_targeted_repair_requires_finite_index_and_file_parse_bounds(
     tmp_path: Path,
 ) -> None:
@@ -515,6 +593,55 @@ def test_supervisor_historical_revalidation_changes_only_code_revision(
             execution_code_revision="b" * 40,
             allowed_historical_code_revisions={"c" * 40},
         )
+
+
+def test_supervisor_historical_revalidation_accepts_git_bound_quarantine(
+    tmp_path: Path,
+) -> None:
+    repo, argv = _input_fixture(tmp_path)
+    quarantine = repo / "configs" / "source_quarantine_manifest.json"
+    quarantine.parent.mkdir()
+    _write_json(quarantine, {"schema": "fixture", "entries": ["old"]})
+    _git(repo, "add", str(quarantine.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "old quarantine")
+    historical_revision = _git(repo, "rev-parse", "HEAD")
+    argv[argv.index("--source-quarantine-manifest") + 1] = str(quarantine)
+    argv[argv.index("--expected-code-revision") + 1] = historical_revision
+    historical_args = supervisor.parse_args(argv)
+    historical_inputs = supervisor.validate_inputs(
+        historical_args,
+        repo_root=repo,
+    )
+
+    _write_json(quarantine, {"schema": "fixture", "entries": ["new"]})
+    _git(repo, "add", str(quarantine.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "new quarantine")
+    execution_revision = _git(repo, "rev-parse", "HEAD")
+
+    live, revalidation_args = supervisor.revalidate_recorded_inputs(
+        {
+            "code_revision": historical_revision,
+            "inputs": historical_inputs,
+        },
+        run_root=Path(historical_args.run_root),
+        repo_root=repo,
+        execution_code_revision=execution_revision,
+        allowed_historical_code_revisions={historical_revision},
+    )
+
+    assert live["source_quarantine_manifest"]["sha256"] == _sha256(quarantine)
+    assert (
+        historical_inputs["source_quarantine_manifest"]["sha256"]
+        != live["source_quarantine_manifest"]["sha256"]
+    )
+    historical_sha256 = historical_inputs["source_quarantine_manifest"]["sha256"]
+    frozen_manifest = (
+        Path(historical_args.run_root)
+        / "frozen_inputs"
+        / f"source_quarantine_manifest.{historical_sha256}.json"
+    )
+    assert _sha256(frozen_manifest) == historical_sha256
+    assert revalidation_args.expected_code_revision == execution_revision
 
 
 def test_supervisor_rejects_incompatible_resume_binding(

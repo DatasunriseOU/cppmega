@@ -28,13 +28,20 @@ from cppmega.data.build_context import (  # noqa: E402
     BuildContextEvidenceError,
     validate_macos_sdk_path,
 )
-from cppmega.data.source_conveyor_composition import _load_run  # noqa: E402
+from cppmega.data.source_conveyor_composition import (  # noqa: E402
+    _load_json_object_streaming,
+    _load_run,
+    _MAX_MANIFEST_BYTES,
+    _resolve_recorded_repository_artifact,
+)
 from scripts import streaming_conveyor as conveyor  # noqa: E402
 
 LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
 TARGETED_LAUNCH_SCHEMA = "cppmega.canonical_source_targeted_retry_launch_v1"
 TARGETED_EXIT_SCHEMA = "cppmega.canonical_source_targeted_retry_exit_v1"
+EXIT_SALVAGE_SCHEMA = "cppmega.source_exit_salvage_attestation_v1"
+SALVAGED_EXIT_FILENAME = "exit_receipt.salvaged.json"
 FAILURE_SCHEMA = "cppmega.canonical_source_supervisor_failure_v1"
 ARCHIVE_SHA_SCHEMA = "cppmega.source_archive_sha256_verification_v1"
 ARCHIVE_INVENTORY_SCHEMA = "cppmega.source_archive_inventory_binding_v1"
@@ -1046,9 +1053,9 @@ def revalidate_recorded_inputs(
     """Re-run production input validation for an existing launch receipt.
 
     A controlled downstream resume may execute with a newer clean checkout
-    while preserving an older source-run receipt. In that mode every recorded
-    input except the historical code-revision binding must remain identical,
-    and the historical commit must be explicitly allow-listed by the caller.
+    while preserving an older source-run receipt. The historical commit must
+    be explicitly allow-listed. A changed quarantine manifest is accepted only
+    when its recorded bytes are still provable from that historical Git tree.
     """
 
     stored = launch.get("inputs")
@@ -1140,6 +1147,33 @@ def revalidate_recorded_inputs(
     if execution_code_revision is not None:
         live_identity.pop("code_revision", None)
         stored_identity.pop("code_revision", None)
+        if live_identity.get("source_quarantine_manifest") != stored_identity.get(
+            "source_quarantine_manifest"
+        ):
+            historical_quarantine = stored_identity.get(
+                "source_quarantine_manifest"
+            )
+            if not isinstance(historical_quarantine, dict):
+                raise RuntimeError(
+                    "historical source quarantine binding is invalid"
+                )
+            raw_path = historical_quarantine.get("path")
+            raw_sha256 = historical_quarantine.get("sha256")
+            if not isinstance(raw_path, str) or not isinstance(raw_sha256, str):
+                raise RuntimeError(
+                    "historical source quarantine binding is incomplete"
+                )
+            _resolve_recorded_repository_artifact(
+                recorded_path=Path(raw_path),
+                expected_sha256=raw_sha256,
+                repository_root=repo_root,
+                recorded_revision=recorded_code_revision,
+                cache_root=run_root / "frozen_inputs",
+                label="historical source quarantine manifest",
+                max_bytes=MAX_METADATA_BYTES,
+            )
+            live_identity.pop("source_quarantine_manifest", None)
+            stored_identity.pop("source_quarantine_manifest", None)
     if _canonical_sha256(live_identity) != _canonical_sha256(stored_identity):
         raise RuntimeError("source launch inputs drifted")
     return live, args
@@ -1287,6 +1321,155 @@ def write_exit_receipt(
                 "path": str(artifact.resolve()),
                 "sha256": _sha256_file(artifact),
             }
+    _atomic_json(path, receipt)
+    return receipt
+
+
+def write_salvaged_exit_receipt(
+    path: Path,
+    *,
+    original_exit_path: Path,
+    launch_path: Path,
+    manifest_path: Path,
+    reason: str,
+) -> dict[str, Any]:
+    """Attest a legacy abort receipt without replacing its original bytes."""
+
+    path = path.expanduser()
+    if path.name != SALVAGED_EXIT_FILENAME:
+        raise RuntimeError(
+            f"salvaged exit must be named {SALVAGED_EXIT_FILENAME}"
+        )
+    if path.exists() or path.is_symlink():
+        raise RuntimeError(f"salvaged exit already exists: {path}")
+    try:
+        root = path.parent.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"salvaged exit parent cannot be resolved: {path.parent}") from exc
+
+    original_exit_path = original_exit_path.expanduser()
+    launch_path = launch_path.expanduser()
+    manifest_path = manifest_path.expanduser()
+    for artifact, name, expected_name in (
+        (original_exit_path, "original exit receipt", "exit_receipt.json"),
+        (launch_path, "launch receipt", "launch_receipt.json"),
+    ):
+        if artifact.is_symlink() or not artifact.is_file():
+            raise RuntimeError(f"{name} is not a regular file: {artifact}")
+        if artifact.resolve().parent != root or artifact.name != expected_name:
+            raise RuntimeError(f"{name} is outside the salvaged run root")
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError(f"conveyor manifest is not a regular file: {manifest_path}")
+
+    original, original_sha256 = _read_json_snapshot(
+        original_exit_path,
+        label="original source exit receipt",
+    )
+    launch, launch_sha256 = _read_json_snapshot(
+        launch_path,
+        label="source launch receipt",
+    )
+    manifest_sha256, manifest = _load_json_object_streaming(
+        manifest_path,
+        where="source conveyor manifest",
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+    original_size = original_exit_path.stat().st_size
+    if _sha256_file(original_exit_path) != original_sha256:
+        raise RuntimeError("original source exit receipt changed during salvage")
+
+    if (
+        launch.get("schema") != TARGETED_LAUNCH_SCHEMA
+        or launch.get("status") != "running"
+    ):
+        raise RuntimeError("exit salvage requires an executed targeted launch")
+    code_revision = launch.get("code_revision")
+    if not isinstance(code_revision, str) or re.fullmatch(
+        r"[0-9a-f]{40}", code_revision
+    ) is None:
+        raise RuntimeError("salvaged launch code revision is invalid")
+    selected = launch.get("selected_repositories")
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(repository, str) or not repository for repository in selected)
+        or len(selected) != len(set(selected))
+        or launch.get("expected_selected_repository_count") != len(selected)
+    ):
+        raise RuntimeError("salvaged launch repository selection is invalid")
+    repair_base = launch.get("repair_base_code_run")
+    if not isinstance(repair_base, dict) or set(repair_base) != {
+        "launch_sha256",
+        "exit_sha256",
+        "manifest_sha256",
+    }:
+        raise RuntimeError("salvaged launch repair-base binding is invalid")
+    for name, value in repair_base.items():
+        _require_sha256(value, label=f"salvaged repair base {name}")
+
+    outputs = launch.get("outputs")
+    if not isinstance(outputs, dict):
+        raise RuntimeError("salvaged launch outputs are invalid")
+    raw_manifest_path = outputs.get("conveyor_manifest")
+    if (
+        not isinstance(raw_manifest_path, str)
+        or Path(raw_manifest_path).expanduser().resolve() != manifest_path.resolve()
+    ):
+        raise RuntimeError("salvaged launch manifest path drifted")
+
+    done = manifest.get("done")
+    failed = manifest.get("failed")
+    if not isinstance(done, dict) or not isinstance(failed, dict):
+        raise RuntimeError("salvaged conveyor manifest is invalid")
+    exit_code = original.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code <= 0:
+        raise RuntimeError("original source exit code is not a terminal failure")
+    finished_at = original.get("ts")
+    if not isinstance(finished_at, str) or not finished_at or len(finished_at) > 128:
+        raise RuntimeError("original source exit timestamp is invalid")
+    if not isinstance(reason, str) or not reason or len(reason) > 4096:
+        raise RuntimeError("source exit salvage reason is invalid")
+    for name, units in (("done", done), ("failed", failed)):
+        original_units = original.get(f"{name}_units")
+        original_count = original.get(f"{name}_count")
+        if (
+            not isinstance(original_units, list)
+            or any(not isinstance(unit, str) for unit in original_units)
+            or len(original_units) != len(set(original_units))
+            or sorted(original_units) != sorted(units)
+            or isinstance(original_count, bool)
+            or not isinstance(original_count, int)
+            or original_count != len(units)
+        ):
+            raise RuntimeError(f"original source exit {name} projection drifted")
+
+    receipt: dict[str, Any] = {
+        "schema": TARGETED_EXIT_SCHEMA,
+        "finished_at": finished_at,
+        "exit_code": exit_code,
+        "status": "failed",
+        "code_revision": code_revision,
+        "launch_receipt_sha256": launch_sha256,
+        "done_manifest": {
+            "path": str(manifest_path.resolve()),
+            "sha256": manifest_sha256,
+        },
+        "completion_receipt": None,
+        "terminal_coverage": None,
+        "code_revision_upgrade": launch.get("code_revision_upgrade"),
+        "selected_repositories": selected,
+        "repair_base_code_run": repair_base,
+        "salvage": {
+            "schema": EXIT_SALVAGE_SCHEMA,
+            "created_at": _utc_now(),
+            "reason": reason,
+            "original_exit_receipt": {
+                "path": str(original_exit_path.resolve()),
+                "sha256": original_sha256,
+                "size_bytes": original_size,
+            },
+        },
+    }
     _atomic_json(path, receipt)
     return receipt
 

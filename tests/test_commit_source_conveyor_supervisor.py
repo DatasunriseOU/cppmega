@@ -600,11 +600,196 @@ def test_commit_accepts_failed_base_plus_repair_and_plans_all_runs(
         selected_repositories=["project"],
         repair_base_code_run=repair_base["identity"],
     )
-    with pytest.raises(RuntimeError, match="code repair 1 exit code is non-zero"):
+    with pytest.raises(ValueError, match="contributed no code success"):
         commit_supervisor.load_terminal_code_run(
             base_root,
             repair_run_roots=(repair_root,),
         )
+
+
+def test_commit_waits_for_later_repair_after_partial_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial_root = tmp_path / "partial"
+    final_root = tmp_path / "final"
+    partial_root.mkdir()
+    final_root.mkdir()
+    _write_json(partial_root / "exit_receipt.json", {"exit_code": 130})
+    expected = {"status": "complete"}
+
+    def load_chain(*args: object, **kwargs: object) -> dict[str, str]:
+        if not (final_root / "exit_receipt.json").exists():
+            raise RuntimeError("later repair is still running")
+        return expected
+
+    def finish_later(_seconds: float) -> None:
+        _write_json(final_root / "exit_receipt.json", {"exit_code": 0})
+
+    monkeypatch.setattr(commit_supervisor, "load_terminal_code_run", load_chain)
+    result = commit_supervisor.wait_for_terminal_code_run(
+        tmp_path / "base",
+        (partial_root, final_root),
+        poll_seconds=0.01,
+        sleeper=finish_later,
+    )
+
+    assert result is expected
+
+
+def test_commit_chain_accepts_useful_partial_nonzero_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_root = tmp_path / "base"
+    partial_root = tmp_path / "partial"
+    final_root = tmp_path / "final"
+    for root in (base_root, partial_root, final_root):
+        (root / "conveyor").mkdir(parents=True)
+    _write_json(partial_root / "exit_receipt.json", {"exit_code": 130})
+    partial_salvaged_exit = partial_root / source_supervisor.SALVAGED_EXIT_FILENAME
+    _write_json(partial_salvaged_exit, {"schema": "salvaged fixture"})
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    code_root.mkdir()
+    commit_root.mkdir()
+    dedup_db = tmp_path / "dedup.sqlite"
+    dedup_db.write_bytes(b"dedup")
+    base_identity = {
+        "launch_sha256": "1" * 64,
+        "exit_sha256": "2" * 64,
+        "manifest_sha256": "3" * 64,
+    }
+    base = {
+        "root": base_root,
+        "launch_path": base_root / "launch_receipt.json",
+        "exit_path": base_root / "exit_receipt.json",
+        "manifest_path": base_root / "conveyor" / "_done.json",
+        "launch": {"repository_root": str(repo)},
+        "inputs": {},
+        "producer_root": repo,
+        "code_output_root": code_root,
+        "commit_output_root": commit_root,
+        "dedup_db": dedup_db,
+        "target_lengths": (1024,),
+        "repositories": ("alpha", "beta"),
+        "failed_repositories": {"alpha", "beta"},
+        "successful_repositories": set(),
+        "code_artifacts": set(),
+        "identity": base_identity,
+        "archive_identity": "archive",
+        "input_binding": "inputs",
+    }
+    monkeypatch.setattr(
+        source_supervisor,
+        "load_repair_base_code_run",
+        lambda _root: base,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "_revalidate_recorded_inputs",
+        lambda *args, **kwargs: ({}, object()),
+    )
+    monkeypatch.setattr(
+        source_supervisor,
+        "verify_completion_receipt",
+        lambda *args, **kwargs: {"successful_repository_count": 1},
+    )
+
+    launches: dict[Path, dict[str, object]] = {}
+    for root in (partial_root, final_root):
+        launch = {
+            "repository_root": str(repo),
+            "inputs": {},
+            "run_binding": {},
+            "run_binding_sha256": source_supervisor._canonical_sha256({}),
+        }
+        source_supervisor._atomic_json(root / "launch_receipt.json", launch)
+        launches[root] = launch
+    completion_path = final_root / "conveyor" / "completion_receipt.json"
+    source_supervisor._atomic_json(completion_path, {})
+    source_supervisor._atomic_json(
+        final_root / "exit_receipt.json",
+        {
+            "completion_receipt": {
+                "path": str(completion_path),
+                "sha256": _sha256(completion_path),
+            },
+            "terminal_coverage": {
+                "status": "complete",
+                "expected_repository_count": 1,
+                "successful_repository_count": 1,
+                "immutable_inputs_reverified_at_finish": True,
+            },
+        },
+    )
+
+    def loaded_run(raw: object, **_kwargs: object) -> tuple:
+        run_id = raw["run_id"]
+        is_partial = run_id == "code-repair-1"
+        root = partial_root if is_partial else final_root
+        expected_exit = (
+            partial_salvaged_exit if is_partial else final_root / "exit_receipt.json"
+        )
+        assert Path(raw["exit_receipt"]) == expected_exit
+        repository = "alpha" if is_partial else "beta"
+        selected = ["alpha", "beta"] if is_partial else ["beta"]
+        done = {
+            f"{repository}::code": {
+                "artifact_filename": f"{repository}.parquet",
+                "lengths": {"1024": {"rows": 1}},
+            }
+        }
+        portable = {
+            "launch": {
+                "schema": source_supervisor.TARGETED_LAUNCH_SCHEMA,
+                "sha256": _sha256(root / "launch_receipt.json"),
+            },
+            "exit": {
+                "exit_code": 130 if is_partial else 0,
+                "sha256": ("4" if is_partial else "5") * 64,
+            },
+            "manifest": {"sha256": ("6" if is_partial else "7") * 64},
+            "streams": "code",
+            "selected_repositories": selected,
+            "repair_base_code_run": base_identity,
+        }
+        allowlist = {
+            ("code", 1024): {f"{repository}.parquet": 1},
+            ("commits", 1024): {},
+        }
+        details = {
+            "done": done,
+            "dedup_path": str(dedup_db),
+        }
+        return (
+            portable,
+            allowlist,
+            {},
+            {repository},
+            set(),
+            set(),
+            set(),
+            "archive",
+            "inputs",
+            details,
+        )
+
+    monkeypatch.setattr(commit_supervisor, "_load_run", loaded_run)
+    with pytest.raises(RuntimeError, match="final code repair exit code is non-zero"):
+        commit_supervisor.load_terminal_code_run_chain(
+            base_root,
+            (partial_root,),
+        )
+    result = commit_supervisor.load_terminal_code_run_chain(
+        base_root,
+        (partial_root, final_root),
+    )
+
+    assert result["repositories"] == ("alpha", "beta")
+    assert len(result["identities"]) == 3
 
 
 def test_shared_child_stops_process_when_started_receipt_fails(
