@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import sys
@@ -9,10 +10,15 @@ import pytest
 
 from scripts.ci_stream_fetch import ExactTokenizer
 from scripts.distributed_data_prep import ci_case5_snapshot as snapshot_module
-from scripts.distributed_data_prep._common import ContractError, atomic_write_json, sha256_file
+from scripts.distributed_data_prep._common import (
+    ContractError,
+    atomic_write_json,
+    sha256_file,
+)
 from scripts.distributed_data_prep.ci_case5_snapshot import (
     ADAPTER_OUTPUT_SCHEMA,
     CASE5_PAYLOAD_SCHEMA,
+    CiCase5AdapterSession,
     FETCH_RECEIPT_NAME,
     MODE_PRODUCTION,
     MODE_THRESHOLD,
@@ -213,6 +219,95 @@ def test_adapter_emits_one_canonical_lossless_candidate_per_assigned_occurrence(
         payload["membership"]["sidecar"]["sidecar_sha256"]
         == payload["provenance"]["parser_sidecar_sha256"]
     )
+
+
+def test_persistent_session_verifies_store_and_fetch_state_once(
+    case5_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_verifications = 0
+    fetch_verifications = 0
+    original_store_verify = FrozenStore.verify
+    original_fetch_verify = FrozenFetchState.verify
+
+    def count_store_verify(store: FrozenStore) -> None:
+        nonlocal store_verifications
+        store_verifications += 1
+        original_store_verify(store)
+
+    def count_fetch_verify(fetch: FrozenFetchState) -> None:
+        nonlocal fetch_verifications
+        fetch_verifications += 1
+        original_fetch_verify(fetch)
+
+    monkeypatch.setattr(FrozenStore, "verify", count_store_verify)
+    monkeypatch.setattr(FrozenFetchState, "verify", count_fetch_verify)
+    tmp_path = case5_fixture["tmp_path"]
+    requests = []
+    for assignment_index in range(2):
+        request_path = tmp_path / f"session-request-{assignment_index}.json"
+        atomic_write_json(
+            request_path,
+            _request(case5_fixture, assignment_index=assignment_index),
+        )
+        requests.append(request_path)
+
+    with CiCase5AdapterSession(session_root=tmp_path / "session") as session:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    session.run,
+                    request_path=request_path,
+                    output_path=tmp_path / f"session-output-{index}.jsonl",
+                )
+                for index, request_path in enumerate(requests)
+            ]
+            results = [future.result() for future in futures]
+
+    assert [result["assignment_ordinal"] for result in results] == [0, 1]
+    assert store_verifications == 1
+    assert fetch_verifications == 1
+
+
+def test_persistent_session_rehashes_snapshots_before_close(case5_fixture) -> None:
+    tmp_path = case5_fixture["tmp_path"]
+    request = _request(case5_fixture, assignment_index=0)
+    request_path = tmp_path / "session-close-request.json"
+    output_path = tmp_path / "session-close-output.jsonl"
+    atomic_write_json(request_path, request)
+
+    session = CiCase5AdapterSession(session_root=tmp_path / "session-close")
+    session.run(request_path=request_path, output_path=output_path)
+    snapshots = request["snapshots"]
+    assert isinstance(snapshots, list)
+    pack = next(item for item in snapshots if str(item["name"]).endswith(".cicp"))
+    pack_path = Path(str(pack["local_path"]))
+    pack_path.write_bytes(pack_path.read_bytes() + b"tamper")
+
+    with pytest.raises(ContractError, match="(?:size|bytes) differ.*manifest"):
+        session.close()
+
+
+def test_persistent_session_rehashes_materialized_copy_before_close(
+    case5_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def force_copy(*_args, **_kwargs) -> None:
+        raise OSError("forced cross-filesystem snapshot copy")
+
+    monkeypatch.setattr(snapshot_module.os, "link", force_copy)
+    tmp_path = case5_fixture["tmp_path"]
+    request_path = tmp_path / "session-copy-request.json"
+    output_path = tmp_path / "session-copy-output.jsonl"
+    atomic_write_json(request_path, _request(case5_fixture, assignment_index=0))
+
+    session_root = tmp_path / "session-copy"
+    session = CiCase5AdapterSession(session_root=session_root)
+    session.run(request_path=request_path, output_path=output_path)
+    layout = next(session_root.glob("case5-layout-*"))
+    pack_path = next((layout / "content_store").glob("pack-*.cicp"))
+    pack_path.write_bytes(pack_path.read_bytes() + b"tamper")
+
+    with pytest.raises(ContractError, match="(?:size|bytes) differ.*manifest"):
+        session.close()
 
 
 @pytest.mark.parametrize("kind", ["fetch-receipt", "pack"])

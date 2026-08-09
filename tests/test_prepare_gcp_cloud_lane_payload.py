@@ -16,7 +16,6 @@ from scripts.distributed_data_prep._common import (
 from scripts.distributed_data_prep.cloud_lane import build_cloud_lane_manifest
 from scripts.prepare_gcp_cloud_lane_payload import prepare_cloud_lane_payload
 
-
 RUNNER_TEMPLATE = (
     Path(__file__).resolve().parents[1]
     / "infra/gcp_corpus_pool/pilot/cloud-lane-worker-runner.sh.tmpl"
@@ -161,9 +160,7 @@ def test_prepare_cloud_lane_payload_is_content_addressed_and_pool_bound(
     assert receipt["status"] == "ready_not_uploaded_not_applied"
     assert receipt["training_ready"] is False
     assert receipt["code_revision"] == revision
-    artifacts = {
-        item["path"]: item for item in receipt["artifacts"] if "uri" in item
-    }
+    artifacts = {item["path"]: item for item in receipt["artifacts"] if "uri" in item}
     assert len(artifacts) == 4
     for relative, descriptor in artifacts.items():
         artifact = output / relative
@@ -175,6 +172,15 @@ def test_prepare_cloud_lane_payload_is_content_addressed_and_pool_bound(
     assert "__CPPMEGA_" not in runner_text
     assert "cloud_lane_pool_worker.py" in runner_text
     assert "cloud_lane_worker.py" not in runner_text
+    assert "--persistent-case5-session" in runner_text
+    assert 'tee "$worker_stderr" >&2' in runner_text
+    assert 'worker_pipeline_status=("${PIPESTATUS[@]}")' in runner_text
+    assert "(( worker_exit == 75 )) && classified_exit=75" in runner_text
+    assert 'is_confirmed_429 "$worker_stderr"' not in runner_text
+    assert 'readonly HEARTBEAT_SECONDS=300' in runner_text
+    assert '"schema": "cppmega.cloud_lane_worker_heartbeat_v1"' in runner_text
+    assert "/control/cloud-lane-heartbeats/" in runner_text
+    assert '"training_ready": False' in runner_text
     assert 'readonly ASSIGNMENT_POOL_SIZE="4"' in runner_text
     subprocess.run(["bash", "-n", str(runner)], check=True)
 

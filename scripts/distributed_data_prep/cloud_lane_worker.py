@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
     _ROOT = Path(__file__).resolve().parents[2]
@@ -57,11 +56,19 @@ from scripts.distributed_data_prep.source_worker import (  # noqa: E402
     compress_zstd,
 )
 
-
 ADAPTER_REQUEST_SCHEMA = "cppmega.distributed_cloud_lane_adapter_request_v1"
 ADAPTER_OUTPUT_SCHEMA = "cppmega.distributed_cloud_lane_adapter_output_v1"
 WORKER_LEDGER_SCHEMA = "cppmega.distributed_cloud_lane_worker_ledger_v1"
 WORKER_COMPLETION_SCHEMA = "cppmega.distributed_cloud_lane_worker_completion_v1"
+WORKER_PREPARED_SCHEMA = "cppmega.distributed_cloud_lane_worker_prepared_v1"
+
+
+class AdapterSession(Protocol):
+    """In-process adapter session owned by one physical worker."""
+
+    def run(self, *, request_path: Path, output_path: Path) -> Mapping[str, object]: ...
+
+    def close(self) -> None: ...
 
 
 def _without_digest(value: Mapping[str, object], field: str) -> dict[str, object]:
@@ -179,6 +186,54 @@ def _download_snapshots(
                     stage.unlink(missing_ok=True)
             results.append({**snapshot, "local_path": str(destination)})
         return results
+
+
+def prepare_verified_snapshot_cache(
+    manifest: Mapping[str, object],
+    *,
+    object_store: ObjectStore,
+    input_root: Path,
+) -> list[dict[str, object]]:
+    """Download and hash one immutable snapshot cache for a physical worker."""
+
+    return _download_snapshots(
+        manifest, object_store=object_store, input_root=input_root
+    )
+
+
+def _preverified_snapshots(
+    manifest: Mapping[str, object],
+    snapshots: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    plan = validate_cloud_lane_manifest(manifest)
+    raw_expected = plan["input_snapshots"]
+    if not isinstance(raw_expected, list) or any(
+        not isinstance(item, Mapping) for item in raw_expected
+    ):
+        raise ContractError("validated cloud lane snapshots are malformed")
+    expected = [dict(item) for item in raw_expected if isinstance(item, Mapping)]
+    if len(snapshots) != len(expected):
+        raise ContractError("preverified cloud lane snapshot count drifted")
+    results: list[dict[str, object]] = []
+    for index, (raw, descriptor) in enumerate(zip(snapshots, expected, strict=True)):
+        snapshot = dict(raw)
+        if {
+            key: value for key, value in snapshot.items() if key != "local_path"
+        } != dict(descriptor):
+            raise ContractError(
+                f"preverified cloud lane snapshot {index} descriptor drifted"
+            )
+        local = Path(str(snapshot.get("local_path", "")))
+        if (
+            local.is_symlink()
+            or not local.is_file()
+            or local.stat().st_size != descriptor["size_bytes"]
+        ):
+            raise ContractError(
+                f"preverified cloud lane snapshot {index} became unsafe"
+            )
+        results.append(snapshot)
+    return results
 
 
 def _snapshot_identities(snapshots: Sequence[Mapping[str, object]]) -> dict[str, tuple[int, str]]:
@@ -461,6 +516,204 @@ def _revalidate_completed_entry(
         raise ContractError("resumed assignment publication descriptor drifted")
 
 
+def _worker_completion_from_ledger(
+    *,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    worker: str,
+    adapter_sha256: str,
+    ledger: Mapping[str, object],
+    receipt_root: Path,
+) -> dict[str, object]:
+    completed_entries = ledger["assignments"]
+    assert isinstance(completed_entries, list)
+    totals = {
+        "source_record_count": 0,
+        "candidate_document_count": 0,
+        "valid_tokens": 0,
+        "assignment_receipt_count": len(completed_entries),
+    }
+    summaries: list[dict[str, object]] = []
+    for entry in completed_entries:
+        assert isinstance(entry, Mapping)
+        receipt = entry["receipt"]
+        assert isinstance(receipt, Mapping)
+        receipt_totals = receipt["totals"]
+        assert isinstance(receipt_totals, Mapping)
+        for field in ("source_record_count", "candidate_document_count", "valid_tokens"):
+            totals[field] += int(receipt_totals[field])
+        summaries.append(
+            {
+                "assignment_sha256": entry["assignment_sha256"],
+                "receipt_sha256": receipt["receipt_sha256"],
+                "publication": entry["publication"],
+            }
+        )
+    completion: dict[str, object] = {
+        "schema": WORKER_COMPLETION_SCHEMA,
+        "status": "complete",
+        "kind": manifest["kind"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest_file_sha256": manifest_file_sha256,
+        "worker": worker,
+        "adapter_sha256": adapter_sha256,
+        "ledger_sha256": ledger["ledger_sha256"],
+        "assignment_receipts": summaries,
+        "totals": totals,
+        "training_ready": False,
+    }
+    completion["receipt_sha256"] = worker_completion_sha256(completion)
+    atomic_write_json(receipt_root / f"{worker}.complete.json", completion)
+    return completion
+
+
+def _prepared_worker_sha256(value: Mapping[str, object]) -> str:
+    return canonical_sha256(_without_digest(value, "prepared_sha256"))
+
+
+def publish_deferred_worker_completion(
+    prepared: Mapping[str, object],
+    *,
+    manifest_path: Path,
+    ledger_path: Path,
+    receipt_root: Path,
+    object_store: ObjectStore,
+    scratch_root: Path,
+) -> dict[str, object]:
+    """Publish assignment receipts only after a physical adapter session seals."""
+
+    manifest, manifest_file_sha256 = load_cloud_lane_manifest(manifest_path)
+    value = copy.deepcopy(dict(prepared))
+    require_exact_fields(
+        value,
+        {
+            "schema",
+            "status",
+            "kind",
+            "manifest_sha256",
+            "manifest_file_sha256",
+            "worker",
+            "adapter_sha256",
+            "resume_published_ledger",
+            "assignments",
+            "training_ready",
+            "prepared_sha256",
+        },
+        where="deferred cloud lane worker completion",
+    )
+    worker = require_nonempty(value["worker"], where="deferred worker")
+    adapter_sha256 = require_sha256(
+        value["adapter_sha256"], where="deferred adapter SHA-256"
+    )
+    pipeline = manifest["pipeline"]
+    if not isinstance(pipeline, Mapping):
+        raise ContractError("deferred cloud lane pipeline is malformed")
+    if (
+        value["schema"] != WORKER_PREPARED_SCHEMA
+        or value["status"] != "prepared"
+        or value["kind"] != manifest["kind"]
+        or value["manifest_sha256"] != manifest["manifest_sha256"]
+        or value["manifest_file_sha256"] != manifest_file_sha256
+        or adapter_sha256 != pipeline["runner_sha256"]
+        or value["training_ready"] is not False
+        or _prepared_worker_sha256(value)
+        != require_sha256(value["prepared_sha256"], where="prepared SHA-256")
+    ):
+        raise ContractError("deferred cloud lane worker binding drifted")
+    assignments = assignments_for_worker(manifest, worker)
+    raw_entries = value["assignments"]
+    if not isinstance(raw_entries, list):
+        raise ContractError("deferred worker assignments must be a list")
+    ledger_path = ledger_path.resolve()
+    receipt_root = receipt_root.resolve()
+    ledger = _load_or_create_ledger(
+        ledger_path,
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        worker=worker,
+    )
+    existing = ledger["assignments"]
+    assert isinstance(existing, list)
+    if value["resume_published_ledger"] is True:
+        if raw_entries or len(existing) != len(assignments):
+            raise ContractError("resumed deferred worker ledger is not complete")
+        return _worker_completion_from_ledger(
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            worker=worker,
+            adapter_sha256=adapter_sha256,
+            ledger=ledger,
+            receipt_root=receipt_root,
+        )
+    if value["resume_published_ledger"] is not False or existing:
+        raise ContractError("new deferred worker requires an empty publication ledger")
+    if len(raw_entries) != len(assignments):
+        raise ContractError("deferred worker does not cover every assignment")
+
+    completed_entries: list[dict[str, object]] = []
+    pending_root = (receipt_root / "pending" / worker).resolve()
+    for index, (raw_entry, assignment) in enumerate(
+        zip(raw_entries, assignments, strict=True)
+    ):
+        if not isinstance(raw_entry, Mapping):
+            raise ContractError(f"deferred worker assignment {index} is malformed")
+        require_exact_fields(
+            raw_entry,
+            {"assignment_sha256", "receipt_sha256", "receipt_path"},
+            where=f"deferred worker assignment {index}",
+        )
+        if raw_entry["assignment_sha256"] != assignment["assignment_sha256"]:
+            raise ContractError("deferred worker assignment order drifted")
+        receipt_path = Path(
+            require_nonempty(
+                raw_entry["receipt_path"], where=f"deferred receipt path {index}"
+            )
+        ).resolve()
+        if not receipt_path.is_relative_to(pending_root):
+            raise ContractError("deferred worker receipt escaped its pending root")
+        _raw, receipt_value = load_json_object(
+            receipt_path, where=f"deferred worker receipt {index}"
+        )
+        receipt = validate_completion_receipt(
+            receipt_value, manifest=manifest, assignment=assignment
+        )
+        if receipt["receipt_sha256"] != raw_entry["receipt_sha256"]:
+            raise ContractError("deferred worker receipt digest drifted")
+        publication = publish_completion_receipt(
+            receipt_path,
+            manifest=manifest,
+            assignment=assignment,
+            object_store=object_store,
+            scratch_root=scratch_root,
+        )
+        completed_entries.append(
+            {
+                "assignment_sha256": assignment["assignment_sha256"],
+                "receipt": receipt,
+                "publication": publication,
+            }
+        )
+    ledger = {**ledger, "status": "complete", "assignments": completed_entries}
+    _write_ledger(ledger_path, ledger)
+    _raw, ledger_value = load_json_object(
+        ledger_path, where="deferred cloud lane worker ledger"
+    )
+    ledger = _validate_ledger(
+        ledger_value,
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        worker=worker,
+    )
+    return _worker_completion_from_ledger(
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        worker=worker,
+        adapter_sha256=adapter_sha256,
+        ledger=ledger,
+        receipt_root=receipt_root,
+    )
+
+
 def run_cloud_lane_worker(
     *,
     manifest_path: Path,
@@ -472,6 +725,9 @@ def run_cloud_lane_worker(
     ledger_path: Path,
     object_store: ObjectStore,
     adapter_env: Mapping[str, str] | None = None,
+    adapter_session: AdapterSession | None = None,
+    verified_snapshots: Sequence[Mapping[str, object]] | None = None,
+    defer_completion_publication: bool = False,
 ) -> dict[str, object]:
     manifest, manifest_file_sha256 = load_cloud_lane_manifest(manifest_path)
     expected_adapter_sha = str(manifest["pipeline"]["runner_sha256"])
@@ -487,12 +743,21 @@ def run_cloud_lane_worker(
     receipt_root = receipt_root.resolve()
     scratch_root.mkdir(parents=True, exist_ok=True)
     receipt_root.mkdir(parents=True, exist_ok=True)
-    snapshots = _download_snapshots(
-        manifest,
-        object_store=object_store,
-        input_root=scratch_root / "inputs" / str(manifest["manifest_sha256"]),
+    if verified_snapshots is None:
+        snapshots = _download_snapshots(
+            manifest,
+            object_store=object_store,
+            input_root=scratch_root / "inputs" / str(manifest["manifest_sha256"]),
+        )
+    else:
+        if adapter_session is None:
+            raise ContractError(
+                "preverified snapshots require a physical adapter session"
+            )
+        snapshots = _preverified_snapshots(manifest, verified_snapshots)
+    snapshot_identities = (
+        None if verified_snapshots is not None else _snapshot_identities(snapshots)
     )
-    snapshot_identities = _snapshot_identities(snapshots)
     ledger = _load_or_create_ledger(
         ledger_path.resolve(),
         manifest=manifest,
@@ -511,8 +776,38 @@ def run_cloud_lane_worker(
             scratch_root=scratch_root,
         )
 
+    if defer_completion_publication and completed_entries:
+        if len(completed_entries) != len(assignments):
+            raise ContractError(
+                "deferred cloud lane worker cannot resume a partial published ledger"
+            )
+        prepared: dict[str, object] = {
+            "schema": WORKER_PREPARED_SCHEMA,
+            "status": "prepared",
+            "kind": manifest["kind"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": manifest_file_sha256,
+            "worker": worker,
+            "adapter_sha256": expected_adapter_sha,
+            "resume_published_ledger": True,
+            "assignments": [],
+            "training_ready": False,
+        }
+        prepared["prepared_sha256"] = _prepared_worker_sha256(prepared)
+        return prepared
+
+    prepared_entries: list[dict[str, object]] = []
+    pending_root = receipt_root / "pending" / worker
+    if defer_completion_publication:
+        pending_root.mkdir(parents=True, exist_ok=True)
+        if pending_root.is_symlink() or not pending_root.is_dir():
+            raise ContractError("deferred worker pending root is unsafe")
+
     for assignment in assignments[len(completed_entries) :]:
-        with tempfile.TemporaryDirectory(prefix="lane-assignment-", dir=scratch_root) as raw:
+        publication: dict[str, object] | None = None
+        with tempfile.TemporaryDirectory(
+            prefix="lane-assignment-", dir=scratch_root
+        ) as raw:
             attempt = Path(raw)
             request_path = attempt / "request.json"
             adapter_output = attempt / "adapter-output.jsonl"
@@ -524,16 +819,24 @@ def run_cloud_lane_worker(
                     manifest=manifest, assignment=assignment, snapshots=snapshots
                 ),
             )
-            _run_adapter(
-                command,
-                request_path=request_path,
-                output_path=adapter_output,
-                cwd=attempt,
-                env=adapter_env,
-            )
+            if adapter_session is None:
+                _run_adapter(
+                    command,
+                    request_path=request_path,
+                    output_path=adapter_output,
+                    cwd=attempt,
+                    env=adapter_env,
+                )
+            else:
+                adapter_session.run(
+                    request_path=request_path, output_path=adapter_output
+                )
             if sha256_file(adapter_entrypoint) != expected_adapter_sha:
                 raise ContractError("adapter entrypoint changed during execution")
-            if _snapshot_identities(snapshots) != snapshot_identities:
+            if (
+                snapshot_identities is not None
+                and _snapshot_identities(snapshots) != snapshot_identities
+            ):
                 raise ContractError("adapter modified an immutable input snapshot")
             document_count, valid_tokens = _canonicalize_adapter_output(
                 adapter_output,
@@ -578,13 +881,34 @@ def run_cloud_lane_worker(
             )
             receipt_path = attempt / "receipt.json"
             atomic_write_json(receipt_path, receipt)
-            publication = publish_completion_receipt(
-                receipt_path,
-                manifest=manifest,
-                assignment=assignment,
-                object_store=object_store,
-                scratch_root=scratch_root,
-            )
+            if defer_completion_publication:
+                assignment_ordinal = require_int(
+                    assignment["ordinal"], where="assignment.ordinal", minimum=0
+                )
+                pending_path = pending_root / (
+                    f"{assignment_ordinal:06d}-"
+                    f"{receipt['receipt_sha256']}.receipt.json"
+                )
+                atomic_write_json(pending_path, receipt)
+                prepared_entries.append(
+                    {
+                        "assignment_sha256": assignment["assignment_sha256"],
+                        "receipt_sha256": receipt["receipt_sha256"],
+                        "receipt_path": str(pending_path.resolve()),
+                    }
+                )
+            else:
+                publication = publish_completion_receipt(
+                    receipt_path,
+                    manifest=manifest,
+                    assignment=assignment,
+                    object_store=object_store,
+                    scratch_root=scratch_root,
+                )
+        if defer_completion_publication:
+            continue
+        if publication is None:
+            raise ContractError("cloud lane assignment receipt was not published")
         completed_entries.append(
             {
                 "assignment_sha256": assignment["assignment_sha256"],
@@ -612,44 +936,29 @@ def run_cloud_lane_worker(
         completed_entries = ledger["assignments"]
         assert isinstance(completed_entries, list)
 
-    totals = {
-        "source_record_count": 0,
-        "candidate_document_count": 0,
-        "valid_tokens": 0,
-        "assignment_receipt_count": len(completed_entries),
-    }
-    summaries: list[dict[str, object]] = []
-    for entry in completed_entries:
-        assert isinstance(entry, Mapping)
-        receipt = entry["receipt"]
-        assert isinstance(receipt, Mapping)
-        receipt_totals = receipt["totals"]
-        assert isinstance(receipt_totals, Mapping)
-        for field in ("source_record_count", "candidate_document_count", "valid_tokens"):
-            totals[field] += int(receipt_totals[field])
-        summaries.append(
-            {
-                "assignment_sha256": entry["assignment_sha256"],
-                "receipt_sha256": receipt["receipt_sha256"],
-                "publication": entry["publication"],
-            }
-        )
-    completion: dict[str, object] = {
-        "schema": WORKER_COMPLETION_SCHEMA,
-        "status": "complete",
-        "kind": manifest["kind"],
-        "manifest_sha256": manifest["manifest_sha256"],
-        "manifest_file_sha256": manifest_file_sha256,
-        "worker": worker,
-        "adapter_sha256": expected_adapter_sha,
-        "ledger_sha256": ledger["ledger_sha256"],
-        "assignment_receipts": summaries,
-        "totals": totals,
-        "training_ready": False,
-    }
-    completion["receipt_sha256"] = worker_completion_sha256(completion)
-    atomic_write_json(receipt_root / f"{worker}.complete.json", completion)
-    return completion
+    if defer_completion_publication:
+        prepared = {
+            "schema": WORKER_PREPARED_SCHEMA,
+            "status": "prepared",
+            "kind": manifest["kind"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": manifest_file_sha256,
+            "worker": worker,
+            "adapter_sha256": expected_adapter_sha,
+            "resume_published_ledger": False,
+            "assignments": prepared_entries,
+            "training_ready": False,
+        }
+        prepared["prepared_sha256"] = _prepared_worker_sha256(prepared)
+        return prepared
+    return _worker_completion_from_ledger(
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        worker=worker,
+        adapter_sha256=expected_adapter_sha,
+        ledger=ledger,
+        receipt_root=receipt_root,
+    )
 
 
 def _main(argv: Sequence[str] | None = None) -> int:

@@ -15,8 +15,10 @@ for global deduplication and declaring training readiness.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 import copy
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -25,6 +27,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 from typing import Any, Iterator, Mapping, Sequence
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
@@ -50,7 +53,6 @@ from scripts.distributed_data_prep._common import (  # noqa: E402
 from scripts.distributed_data_prep.cloud_lane import (  # noqa: E402
     build_cloud_lane_manifest,
 )
-
 
 SNAPSHOT_SET_SCHEMA = "cppmega.ci_case5_snapshot_set_v1"
 SNAPSHOT_RECEIPT_SCHEMA = SNAPSHOT_SET_SCHEMA
@@ -876,7 +878,9 @@ def build_ci_case5_manifest(
     )
 
 
-def _request_snapshots(value: object) -> tuple[list[dict[str, object]], str]:
+def _request_snapshots(
+    value: object, *, verify_bytes: bool = True
+) -> tuple[list[dict[str, object]], str]:
     if not isinstance(value, list) or not value:
         raise ContractError("adapter request snapshots must be a non-empty list")
     descriptors: list[dict[str, object]] = []
@@ -885,8 +889,17 @@ def _request_snapshots(value: object) -> tuple[list[dict[str, object]], str]:
         if not isinstance(raw, Mapping):
             raise ContractError(f"adapter snapshot {index} is malformed")
         expected = {
-            "name", "role", "uri", "generation", "size_bytes", "sha256",
-            "content_set_sha256", "schema_sha256", "format", "record_count", "local_path",
+            "name",
+            "role",
+            "uri",
+            "generation",
+            "size_bytes",
+            "sha256",
+            "content_set_sha256",
+            "schema_sha256",
+            "format",
+            "record_count",
+            "local_path",
         }
         require_exact_fields(raw, expected, where=f"adapter snapshot {index}")
         name = require_nonempty(raw["name"], where=f"adapter snapshot {index}.name")
@@ -897,23 +910,29 @@ def _request_snapshots(value: object) -> tuple[list[dict[str, object]], str]:
         expected_role = (
             "primary"
             if name == PRIMARY_SNAPSHOT_NAME
-            else "membership"
-            if name == MEMBERSHIP_SNAPSHOT_NAME
-            else "ancillary"
+            else "membership" if name == MEMBERSHIP_SNAPSHOT_NAME else "ancillary"
         )
         if raw["role"] != expected_role:
             raise ContractError(f"adapter snapshot role drifted: {name}")
-        local = Path(require_nonempty(raw["local_path"], where=f"adapter snapshot {index}.local_path")).expanduser()
+        local = Path(
+            require_nonempty(
+                raw["local_path"], where=f"adapter snapshot {index}.local_path"
+            )
+        ).expanduser()
         if local.is_symlink() or not local.is_file():
             raise ContractError(f"adapter snapshot local path is unsafe: {name}")
         descriptor = {key: raw[key] for key in expected if key != "local_path"}
         # The full receipt validator requires one primary and one membership;
         # validate request descriptors field-by-field here instead.
         validate_gcs_uri(raw["uri"], where=f"adapter snapshot {index}.uri")
-        generation = require_nonempty(raw["generation"], where=f"adapter snapshot {index}.generation")
+        generation = require_nonempty(
+            raw["generation"], where=f"adapter snapshot {index}.generation"
+        )
         if not generation.isdecimal() or int(generation) < 1:
             raise ContractError("adapter snapshot generation is invalid")
-        require_int(raw["size_bytes"], where=f"adapter snapshot {index}.size_bytes", minimum=1)
+        require_int(
+            raw["size_bytes"], where=f"adapter snapshot {index}.size_bytes", minimum=1
+        )
         record_count = require_int(
             raw["record_count"],
             where=f"adapter snapshot {index}.record_count",
@@ -922,19 +941,31 @@ def _request_snapshots(value: object) -> tuple[list[dict[str, object]], str]:
         if expected_role in {"primary", "membership"} and record_count < 1:
             raise ContractError(f"adapter snapshot has no {expected_role} records")
         _require_hex(raw["sha256"], where=f"adapter snapshot {index}.sha256")
-        _require_hex(raw["content_set_sha256"], where=f"adapter snapshot {index}.content_set_sha256")
-        _require_hex(raw["schema_sha256"], where=f"adapter snapshot {index}.schema_sha256")
-        if _stable_descriptor(local, where=f"adapter snapshot {name}") != {
-            "size_bytes": raw["size_bytes"],
-            "sha256": raw["sha256"],
-        }:
-            raise ContractError(f"adapter snapshot {name} bytes differ from manifest")
+        _require_hex(
+            raw["content_set_sha256"],
+            where=f"adapter snapshot {index}.content_set_sha256",
+        )
+        _require_hex(
+            raw["schema_sha256"], where=f"adapter snapshot {index}.schema_sha256"
+        )
+        if verify_bytes:
+            if _stable_descriptor(local, where=f"adapter snapshot {name}") != {
+                "size_bytes": raw["size_bytes"],
+                "sha256": raw["sha256"],
+            }:
+                raise ContractError(
+                    f"adapter snapshot {name} bytes differ from manifest"
+                )
+        elif local.stat().st_size != raw["size_bytes"]:
+            raise ContractError(f"adapter snapshot {name} size differs from manifest")
         descriptor["local_path"] = str(local)
         descriptors.append(descriptor)
         names.add(name)
     if descriptors != sorted(descriptors, key=lambda item: str(item["name"])):
         raise ContractError("adapter snapshots are not name-sorted")
-    plain = [{key: item[key] for key in item if key != "local_path"} for item in descriptors]
+    plain = [
+        {key: item[key] for key in item if key != "local_path"} for item in descriptors
+    ]
     return descriptors, canonical_sha256(plain)
 
 
@@ -1066,6 +1097,7 @@ def _validate_snapshot_semantics(
     mode: str,
     store_receipt: Mapping[str, object],
     fetch_receipt: Mapping[str, object],
+    verify_bytes: bool = True,
 ) -> None:
     """Bind lane descriptors back to the receipts reconstructed by the adapter."""
 
@@ -1073,7 +1105,9 @@ def _validate_snapshot_semantics(
     pack_hashes = store_receipt.get("pack_hashes")
     if not isinstance(pack_hashes, list):
         raise ContractError("CASE5 store receipt pack_hashes is missing")
-    pack_names = {str(item["filename"]) for item in pack_hashes if isinstance(item, Mapping)}
+    pack_names = {
+        str(item["filename"]) for item in pack_hashes if isinstance(item, Mapping)
+    }
     expected_names = {
         PRIMARY_SNAPSHOT_NAME,
         MEMBERSHIP_SNAPSHOT_NAME,
@@ -1105,9 +1139,13 @@ def _validate_snapshot_semantics(
             "size_bytes": snapshot["size_bytes"],
             "sha256": snapshot["sha256"],
         }
-        if _stable_descriptor(
-            Path(str(snapshot["local_path"])), where=f"adapter snapshot {name}"
-        ) != descriptor:
+        if (
+            verify_bytes
+            and _stable_descriptor(
+                Path(str(snapshot["local_path"])), where=f"adapter snapshot {name}"
+            )
+            != descriptor
+        ):
             raise ContractError(f"CASE5 adapter snapshot bytes drifted: {name}")
         expected_content_set = _content_set_for(
             name,
@@ -1121,45 +1159,94 @@ def _validate_snapshot_semantics(
         item = _require_mapping(item, where="CASE5 store receipt pack")
         name = str(item["filename"])
         snapshot = by_name[name]
-        if (
-            snapshot["sha256"] != item.get("sha256")
-            or snapshot["size_bytes"] != item.get("committed_end")
-        ):
+        if snapshot["sha256"] != item.get("sha256") or snapshot[
+            "size_bytes"
+        ] != item.get("committed_end"):
             raise ContractError(f"CASE5 adapter pack binding drifted: {name}")
 
 
-def run_ci_case5_adapter(*, request_path: Path, output_path: Path) -> dict[str, object]:
-    """Run the CASE5 adapter protocol used by ``cloud_lane_worker``."""
+@dataclass(frozen=True)
+class _Case5AdapterRequest:
+    manifest_sha256: str
+    input_snapshot_set_sha256: str
+    assignment: dict[str, object]
+    assignment_ordinal: int
+    record_start: int
+    record_count: int
+    snapshots: tuple[dict[str, object], ...]
+    output: Path
 
+
+def _load_case5_adapter_request(
+    *,
+    request_path: Path,
+    output_path: Path,
+    verify_snapshot_bytes: bool,
+) -> _Case5AdapterRequest:
     _raw, request = load_json_object(Path(request_path), where="CASE5 adapter request")
     require_exact_fields(
         request,
         {
-            "schema", "kind", "manifest_sha256", "input_snapshot_set_sha256",
-            "assignment", "snapshots", "output_schema", "training_ready",
+            "schema",
+            "kind",
+            "manifest_sha256",
+            "input_snapshot_set_sha256",
+            "assignment",
+            "snapshots",
+            "output_schema",
+            "training_ready",
         },
         where="CASE5 adapter request",
     )
-    if request["schema"] != ADAPTER_REQUEST_SCHEMA or request["kind"] != "ci" or request["output_schema"] != ADAPTER_OUTPUT_SCHEMA or request["training_ready"] is not False:
+    if (
+        request["schema"] != ADAPTER_REQUEST_SCHEMA
+        or request["kind"] != "ci"
+        or request["output_schema"] != ADAPTER_OUTPUT_SCHEMA
+        or request["training_ready"] is not False
+    ):
         raise ContractError("CASE5 adapter request contract is unsupported")
     manifest_sha = require_sha256(request["manifest_sha256"], where="manifest_sha256")
-    snapshot_set = require_sha256(request["input_snapshot_set_sha256"], where="input snapshot set SHA-256")
-    assignment = request["assignment"]
-    if not isinstance(assignment, Mapping):
+    snapshot_set = require_sha256(
+        request["input_snapshot_set_sha256"],
+        where="input snapshot set SHA-256",
+    )
+    raw_assignment = request["assignment"]
+    if not isinstance(raw_assignment, Mapping):
         raise ContractError("CASE5 adapter assignment is malformed")
+    assignment = dict(raw_assignment)
     require_exact_fields(
         assignment,
-        {"ordinal", "item_id", "record_start", "record_count", "partition_sha256", "worker", "assignment_sha256"},
+        {
+            "ordinal",
+            "item_id",
+            "record_start",
+            "record_count",
+            "partition_sha256",
+            "worker",
+            "assignment_sha256",
+        },
         where="CASE5 adapter assignment",
     )
-    start = require_int(assignment["record_start"], where="assignment.record_start", minimum=0)
-    count = require_int(assignment["record_count"], where="assignment.record_count", minimum=1)
-    partition_sha = require_sha256(assignment["partition_sha256"], where="assignment.partition_sha256")
-    require_sha256(assignment["assignment_sha256"], where="assignment.assignment_sha256")
-    ordinal = require_int(assignment["ordinal"], where="assignment.ordinal", minimum=0)
+    start = require_int(
+        assignment["record_start"], where="assignment.record_start", minimum=0
+    )
+    count = require_int(
+        assignment["record_count"], where="assignment.record_count", minimum=1
+    )
+    partition_sha = require_sha256(
+        assignment["partition_sha256"], where="assignment.partition_sha256"
+    )
+    require_sha256(
+        assignment["assignment_sha256"], where="assignment.assignment_sha256"
+    )
+    assignment_ordinal = require_int(
+        assignment["ordinal"], where="assignment.ordinal", minimum=0
+    )
     item_id = require_nonempty(assignment["item_id"], where="assignment.item_id")
     require_nonempty(assignment["worker"], where="assignment.worker")
-    snapshots, observed_set = _request_snapshots(request["snapshots"])
+    snapshots, observed_set = _request_snapshots(
+        request["snapshots"], verify_bytes=verify_snapshot_bytes
+    )
     if observed_set != snapshot_set:
         raise ContractError("adapter snapshot set digest differs from manifest")
     expected_partition = canonical_sha256(
@@ -1175,122 +1262,393 @@ def run_ci_case5_adapter(*, request_path: Path, output_path: Path) -> dict[str, 
         raise ContractError("CASE5 assignment partition binding drifted")
     output = Path(output_path).expanduser()
     if output.is_symlink() or output.exists():
-        raise ContractError(f"CASE5 adapter output must be a new regular file: {output}")
+        raise ContractError(
+            f"CASE5 adapter output must be a new regular file: {output}"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
-    with _snapshot_layout(snapshots, parent=output.parent) as layout:
-        store_receipt_value, store_receipt_sha = _load_object(layout[STORE_RECEIPT_NAME], where="CASE5 store receipt")
-        store_receipt_value = _validate_store_receipt(store_receipt_value)
-        fetch_receipt_value, fetch_receipt_sha = _load_object(layout[FETCH_RECEIPT_NAME], where="CASE5 fetch receipt")
-        mode = MODE_PRODUCTION if fetch_receipt_value.get("schema") == _FETCH_RECEIPT_PRODUCTION_SCHEMA else MODE_THRESHOLD
-        if mode == MODE_PRODUCTION and not {
-            INVENTORY_NAME,
-            INVENTORY_RECEIPT_NAME,
-            MERGE_RECEIPT_NAME,
-        }.issubset(layout):
-            raise ContractError("production adapter snapshot set lacks inventory/merge evidence")
-        fetch_receipt_value = _validate_fetch_receipt(
-            fetch_receipt_value,
-            mode=mode,
-            store_receipt=store_receipt_value,
-            fetch_state=layout[MEMBERSHIP_SNAPSHOT_NAME],
+    return _Case5AdapterRequest(
+        manifest_sha256=manifest_sha,
+        input_snapshot_set_sha256=snapshot_set,
+        assignment=assignment,
+        assignment_ordinal=assignment_ordinal,
+        record_start=start,
+        record_count=count,
+        snapshots=tuple(snapshots),
+        output=output,
+    )
+
+
+def _snapshot_stat_identities(
+    snapshots: Sequence[Mapping[str, object]],
+) -> dict[str, tuple[int, int, int, int]]:
+    identities: dict[str, tuple[int, int, int, int]] = {}
+    for snapshot in snapshots:
+        name = str(snapshot["name"])
+        path = Path(str(snapshot["local_path"]))
+        if path.is_symlink() or not path.is_file():
+            raise ContractError(f"CASE5 adapter snapshot became unsafe: {name}")
+        stat = path.stat()
+        identities[name] = (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
         )
-        token_contract = fetch_receipt_value.get("tokenizer_contract")
-        tokenizer_path = layout[TOKENIZER_NAME]
-        tokenizer_descriptor = _stable_descriptor(tokenizer_path, where="CASE5 tokenizer")
-        if not isinstance(token_contract, Mapping) or token_contract.get("artifact_sha256") != tokenizer_descriptor["sha256"]:
-            raise ContractError("CASE5 tokenizer snapshot differs from fetch receipt")
-        _validate_snapshot_semantics(
-            snapshots,
-            mode=mode,
-            store_receipt=store_receipt_value,
-            fetch_receipt=fetch_receipt_value,
-        )
-        # Imports are lazy so receipt-only tooling does not need the optional
-        # tokenizer/Parquet stack until an adapter actually executes.
-        try:
-            from scripts.ci_stream_fetch import ExactTokenizer
-            from scripts.export_ci_content_store_case5 import FrozenFetchState, FrozenStore
-        except (ImportError, ModuleNotFoundError) as exc:
-            raise ContractError("CASE5 exporter dependencies are unavailable") from exc
-        try:
-            tokenizer_adapter = ExactTokenizer(tokenizer_path)
-            with FrozenStore(layout["store_root"], layout[STORE_RECEIPT_NAME]) as store:
-                settings = sqlite3.connect(
-                    f"{layout[MEMBERSHIP_SNAPSHOT_NAME].as_uri()}?mode=ro&immutable=1",
-                    uri=True,
+    return identities
+
+
+def _materialized_snapshot_view(
+    snapshots: Sequence[Mapping[str, object]], layout: Mapping[str, Path]
+) -> tuple[dict[str, object], ...]:
+    materialized = tuple(
+        {**snapshot, "local_path": str(layout[str(snapshot["name"])])}
+        for snapshot in snapshots
+    )
+    originals = {str(snapshot["name"]): snapshot for snapshot in snapshots}
+    normalized, _observed = _request_snapshots(
+        list(materialized), verify_bytes=False
+    )
+    for snapshot in normalized:
+        name = str(snapshot["name"])
+        source = Path(str(originals[name]["local_path"]))
+        destination = Path(str(snapshot["local_path"]))
+        source_stat = source.stat()
+        destination_stat = destination.stat()
+        if (source_stat.st_dev, source_stat.st_ino) == (
+            destination_stat.st_dev,
+            destination_stat.st_ino,
+        ):
+            continue
+        if _stable_descriptor(
+            destination, where=f"materialized CASE5 snapshot {name}"
+        ) != {
+            "size_bytes": snapshot["size_bytes"],
+            "sha256": snapshot["sha256"],
+        }:
+            raise ContractError(
+                f"materialized CASE5 snapshot bytes differ from manifest: {name}"
+            )
+    return tuple(normalized)
+
+
+def _rehash_snapshot_views(
+    views: Sequence[Sequence[Mapping[str, object]]],
+    *,
+    expected_snapshot_set_sha256: str,
+) -> None:
+    verified_inodes: dict[tuple[int, int], tuple[int, str]] = {}
+    for view in views:
+        snapshots, observed = _request_snapshots(list(view), verify_bytes=False)
+        if observed != expected_snapshot_set_sha256:
+            raise ContractError("CASE5 snapshot view changed before session close")
+        for snapshot in snapshots:
+            name = str(snapshot["name"])
+            path = Path(str(snapshot["local_path"]))
+            stat = path.stat()
+            inode = (stat.st_dev, stat.st_ino)
+            descriptor = (
+                require_int(
+                    snapshot["size_bytes"],
+                    where=f"closing CASE5 snapshot {name}.size_bytes",
+                    minimum=1,
+                ),
+                str(snapshot["sha256"]),
+            )
+            previous = verified_inodes.get(inode)
+            if previous is not None:
+                if previous != descriptor:
+                    raise ContractError("CASE5 snapshot inode has conflicting bindings")
+                continue
+            if _stable_descriptor(
+                path, where=f"closing CASE5 snapshot {name}"
+            ) != {"size_bytes": descriptor[0], "sha256": descriptor[1]}:
+                raise ContractError(
+                    f"CASE5 snapshot bytes differ from manifest at close: {name}"
                 )
-                try:
-                    settings.row_factory = sqlite3.Row
-                    row = settings.execute("SELECT value FROM settings WHERE key='content_store_path'").fetchone()
-                    bound_path = Path(str(row[0])) if row is not None else layout["store_root"]
-                finally:
-                    settings.close()
-                with FrozenFetchState(
+            verified_inodes[inode] = descriptor
+
+
+class CiCase5AdapterSession:
+    """Reuse one fully verified CASE5 snapshot view for many assignments.
+
+    The first assignment performs every receipt, hash, SQLite, logical-set and
+    pack verification.  Later assignments are serialized through the same
+    immutable SQLite/pack view and use cheap inode/size/mtime checks.  Closing
+    the session re-hashes every original snapshot before a physical worker may
+    publish its terminal completion receipt.
+    """
+
+    def __init__(self, *, session_root: Path) -> None:
+        self._session_root = Path(session_root).resolve()
+        self._session_root.mkdir(parents=True, exist_ok=True)
+        if self._session_root.is_symlink() or not self._session_root.is_dir():
+            raise ContractError("CASE5 adapter session root must be a directory")
+        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="case5-adapter-session"
+        )
+        self._stack: ExitStack | None = None
+        self._closed = False
+        self._snapshots: tuple[dict[str, object], ...] | None = None
+        self._layout_snapshots: tuple[dict[str, object], ...] | None = None
+        self._snapshot_identities: dict[str, tuple[int, int, int, int]] = {}
+        self._layout_snapshot_identities: dict[str, tuple[int, int, int, int]] = {}
+        self._manifest_sha256 = ""
+        self._input_snapshot_set_sha256 = ""
+        self._store: Any = None
+        self._frozen_fetch: Any = None
+        self._store_receipt_sha256 = ""
+        self._fetch_receipt_sha256 = ""
+
+    def __enter__(self) -> "CiCase5AdapterSession":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def _initialize(self, request: _Case5AdapterRequest) -> None:
+        stack = ExitStack()
+        try:
+            layout = stack.enter_context(
+                _snapshot_layout(request.snapshots, parent=self._session_root)
+            )
+            layout_snapshots = _materialized_snapshot_view(request.snapshots, layout)
+            store_receipt_value, store_receipt_sha = _load_object(
+                layout[STORE_RECEIPT_NAME], where="CASE5 store receipt"
+            )
+            store_receipt_value = _validate_store_receipt(store_receipt_value)
+            fetch_receipt_value, fetch_receipt_sha = _load_object(
+                layout[FETCH_RECEIPT_NAME], where="CASE5 fetch receipt"
+            )
+            mode = (
+                MODE_PRODUCTION
+                if fetch_receipt_value.get("schema") == _FETCH_RECEIPT_PRODUCTION_SCHEMA
+                else MODE_THRESHOLD
+            )
+            if mode == MODE_PRODUCTION and not {
+                INVENTORY_NAME,
+                INVENTORY_RECEIPT_NAME,
+                MERGE_RECEIPT_NAME,
+            }.issubset(layout):
+                raise ContractError(
+                    "production adapter snapshot set lacks inventory/merge evidence"
+                )
+            fetch_receipt_value = _validate_fetch_receipt(
+                fetch_receipt_value,
+                mode=mode,
+                store_receipt=store_receipt_value,
+                fetch_state=layout[MEMBERSHIP_SNAPSHOT_NAME],
+            )
+            token_contract = fetch_receipt_value.get("tokenizer_contract")
+            tokenizer_path = layout[TOKENIZER_NAME]
+            tokenizer_descriptor = _stable_descriptor(
+                tokenizer_path, where="CASE5 tokenizer"
+            )
+            if (
+                not isinstance(token_contract, Mapping)
+                or token_contract.get("artifact_sha256")
+                != tokenizer_descriptor["sha256"]
+            ):
+                raise ContractError(
+                    "CASE5 tokenizer snapshot differs from fetch receipt"
+                )
+            _validate_snapshot_semantics(
+                request.snapshots,
+                mode=mode,
+                store_receipt=store_receipt_value,
+                fetch_receipt=fetch_receipt_value,
+                verify_bytes=False,
+            )
+            # Imports remain lazy so receipt-only tooling does not require the
+            # optional tokenizer/Parquet stack.
+            try:
+                from scripts.ci_stream_fetch import ExactTokenizer
+                from scripts.export_ci_content_store_case5 import (
+                    FrozenFetchState,
+                    FrozenStore,
+                )
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise ContractError(
+                    "CASE5 exporter dependencies are unavailable"
+                ) from exc
+            tokenizer_adapter = ExactTokenizer(tokenizer_path)
+            store = stack.enter_context(
+                FrozenStore(layout["store_root"], layout[STORE_RECEIPT_NAME])
+            )
+            settings = sqlite3.connect(
+                f"{layout[MEMBERSHIP_SNAPSHOT_NAME].as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            try:
+                settings.row_factory = sqlite3.Row
+                row = settings.execute(
+                    "SELECT value FROM settings WHERE key='content_store_path'"
+                ).fetchone()
+                bound_path = (
+                    Path(str(row[0])) if row is not None else layout["store_root"]
+                )
+            finally:
+                settings.close()
+            frozen_fetch = stack.enter_context(
+                FrozenFetchState(
                     layout[MEMBERSHIP_SNAPSHOT_NAME],
                     tokenizer=tokenizer_adapter,
                     store=store,
                     bound_store_path=bound_path,
-                ) as frozen_fetch:
-                    rows = _read_range(store.connection, start, count)
-                    if len(rows) != count:
-                        raise ContractError("CASE5 assignment range exceeds primary occurrence set")
-                    with output.open("xb") as stream:
-                        previous_key: tuple[str, str, str, str, int] | None = None
-                        for ordinal, row in enumerate(rows, start):
-                            occurrence = store._occurrence_record(row)
-                            if previous_key is not None and occurrence.key <= previous_key:
-                                raise ContractError("CASE5 occurrence order is not canonical")
-                            previous_key = occurrence.key
-                            member = frozen_fetch.validate_occurrence(occurrence)
-                            content = store.get_content_record(occurrence.content_sha256)
-                            content_bytes = store.read_content(content)
-                            payload = _candidate_payload(
-                                occurrence=occurrence,
-                                content=content,
-                                content_bytes=content_bytes,
-                                member=member,
-                                store_receipt_sha256=store_receipt_sha,
-                                fetch_receipt_sha256=fetch_receipt_sha,
-                            )
-                            envelope = {
-                                "schema": ADAPTER_OUTPUT_SCHEMA,
-                                "source_record_ordinal": ordinal,
-                                "document_ordinal": 0,
-                                "valid_tokens": content.token_count,
-                                "payload": payload,
-                            }
-                            stream.write(canonical_json_bytes(envelope) + b"\n")
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    store.require_unchanged()
-                    frozen_fetch.require_unchanged()
+                )
+            )
+        except BaseException:
+            stack.close()
+            raise
+        self._stack = stack
+        self._snapshots = request.snapshots
+        self._layout_snapshots = layout_snapshots
+        self._snapshot_identities = _snapshot_stat_identities(request.snapshots)
+        self._layout_snapshot_identities = _snapshot_stat_identities(layout_snapshots)
+        self._manifest_sha256 = request.manifest_sha256
+        self._input_snapshot_set_sha256 = request.input_snapshot_set_sha256
+        self._store = store
+        self._frozen_fetch = frozen_fetch
+        self._store_receipt_sha256 = store_receipt_sha
+        self._fetch_receipt_sha256 = fetch_receipt_sha
+
+    def _require_request_binding(self, request: _Case5AdapterRequest) -> None:
+        assert self._snapshots is not None
+        if (
+            request.manifest_sha256 != self._manifest_sha256
+            or request.input_snapshot_set_sha256 != self._input_snapshot_set_sha256
+            or request.snapshots != self._snapshots
+        ):
+            raise ContractError("CASE5 adapter session request binding drifted")
+        if _snapshot_stat_identities(request.snapshots) != self._snapshot_identities:
+            raise ContractError("CASE5 input snapshot changed during adapter session")
+        assert self._layout_snapshots is not None
+        if (
+            _snapshot_stat_identities(self._layout_snapshots)
+            != self._layout_snapshot_identities
+        ):
+            raise ContractError(
+                "CASE5 materialized snapshot changed during adapter session"
+            )
+
+    def _emit_assignment(self, request: _Case5AdapterRequest) -> None:
+        rows = _read_range(
+            self._store.connection, request.record_start, request.record_count
+        )
+        if len(rows) != request.record_count:
+            raise ContractError("CASE5 assignment range exceeds primary occurrence set")
+        with request.output.open("xb") as stream:
+            previous_key: tuple[str, str, str, str, int] | None = None
+            for source_ordinal, row in enumerate(rows, request.record_start):
+                occurrence = self._store._occurrence_record(row)
+                if previous_key is not None and occurrence.key <= previous_key:
+                    raise ContractError("CASE5 occurrence order is not canonical")
+                previous_key = occurrence.key
+                member = self._frozen_fetch.validate_occurrence(occurrence)
+                content = self._store.get_content_record(occurrence.content_sha256)
+                content_bytes = self._store.read_content(content)
+                payload = _candidate_payload(
+                    occurrence=occurrence,
+                    content=content,
+                    content_bytes=content_bytes,
+                    member=member,
+                    store_receipt_sha256=self._store_receipt_sha256,
+                    fetch_receipt_sha256=self._fetch_receipt_sha256,
+                )
+                envelope = {
+                    "schema": ADAPTER_OUTPUT_SCHEMA,
+                    "source_record_ordinal": source_ordinal,
+                    "document_ordinal": 0,
+                    "valid_tokens": content.token_count,
+                    "payload": payload,
+                }
+                stream.write(canonical_json_bytes(envelope) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _run_serial(
+        self, *, request_path: Path, output_path: Path
+    ) -> dict[str, object]:
+        request = _load_case5_adapter_request(
+            request_path=request_path,
+            output_path=output_path,
+            verify_snapshot_bytes=self._snapshots is None,
+        )
+        try:
+            if self._snapshots is None:
+                self._initialize(request)
+            self._require_request_binding(request)
+            self._emit_assignment(request)
+            self._require_request_binding(request)
         except ContractError:
             raise
         except Exception as exc:
-            # The exporter uses ExportError (a RuntimeError subclass).  Keep
-            # adapter failures on the lane's stable ContractError boundary and
-            # do not expose receipt contents or credentials in diagnostics.
+            # Keep adapter failures on the lane's stable ContractError
+            # boundary and never expose receipt contents or credentials.
             raise ContractError(
                 "CASE5 immutable adapter validation failed: "
                 f"{type(exc).__name__}: {str(exc)[:500]}"
             ) from exc
-    for snapshot in snapshots:
-        path = Path(str(snapshot["local_path"]))
-        if _stable_descriptor(path, where=f"adapter snapshot {snapshot['name']}") != {
-            "size_bytes": snapshot["size_bytes"],
-            "sha256": snapshot["sha256"],
-        }:
-            raise ContractError("CASE5 input snapshot changed during adapter execution")
-    return {
-        "schema": CASE5_ADAPTER_SCHEMA,
-        "manifest_sha256": manifest_sha,
-        "input_snapshot_set_sha256": snapshot_set,
-        "record_start": start,
-        "record_count": count,
-        "assignment_ordinal": ordinal,
-        "output": str(output),
-        "training_ready": False,
-    }
+        return {
+            "schema": CASE5_ADAPTER_SCHEMA,
+            "manifest_sha256": request.manifest_sha256,
+            "input_snapshot_set_sha256": request.input_snapshot_set_sha256,
+            "record_start": request.record_start,
+            "record_count": request.record_count,
+            "assignment_ordinal": request.assignment_ordinal,
+            "output": str(request.output),
+            "training_ready": False,
+        }
+
+    def run(self, *, request_path: Path, output_path: Path) -> dict[str, object]:
+        with self._lock:
+            if self._closed:
+                raise ContractError("CASE5 adapter session is closed")
+            future = self._executor.submit(
+                self._run_serial,
+                request_path=request_path,
+                output_path=output_path,
+            )
+        return future.result()
+
+    def _close_serial(self) -> None:
+        failure: BaseException | None = None
+        try:
+            if self._snapshots is not None:
+                assert self._layout_snapshots is not None
+                _rehash_snapshot_views(
+                    (self._snapshots, self._layout_snapshots),
+                    expected_snapshot_set_sha256=self._input_snapshot_set_sha256,
+                )
+        except BaseException as exc:
+            failure = exc
+        finally:
+            if self._stack is not None:
+                try:
+                    self._stack.close()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+        if failure is not None:
+            raise failure
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            future = self._executor.submit(self._close_serial)
+        try:
+            future.result()
+        finally:
+            self._executor.shutdown(wait=True)
+
+
+def run_ci_case5_adapter(*, request_path: Path, output_path: Path) -> dict[str, object]:
+    """Run one CASE5 assignment with the same persistent-session contract."""
+
+    with CiCase5AdapterSession(session_root=Path(output_path).parent) as session:
+        return session.run(request_path=request_path, output_path=output_path)
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
@@ -1453,6 +1811,7 @@ if __name__ == "__main__":  # pragma: no cover
 __all__ = [
     "ADAPTER_OUTPUT_SCHEMA",
     "CASE5_PAYLOAD_SCHEMA",
+    "CiCase5AdapterSession",
     "COMPLETION_MODE_INVENTORY_EXHAUSTIVE",
     "COMPLETION_MODE_THRESHOLD",
     "MEMBERSHIP_SNAPSHOT_NAME",
