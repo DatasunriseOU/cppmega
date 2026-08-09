@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from scripts.report_training_data_status import (
     collect_freshness,
     publish_status,
     scan_parquet_snapshot,
+    verify_runtime_checkout,
 )
 
 
@@ -47,6 +49,53 @@ def _write_parquet(path: Path) -> None:
         }
     )
     pq.write_table(table, path, compression="zstd")
+
+
+def _init_git_checkout(path: Path) -> str:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "status-test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Status Test"],
+        check=True,
+    )
+    (path / "tracked.txt").write_text("pinned\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "-m", "pinned runtime"],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_verify_runtime_checkout_requires_exact_clean_revision(tmp_path: Path) -> None:
+    revision = _init_git_checkout(tmp_path)
+
+    assert verify_runtime_checkout(tmp_path, revision) == {
+        "checkout": str(tmp_path.resolve()),
+        "code_revision": revision,
+    }
+
+    with pytest.raises(RuntimeError, match="revision mismatch"):
+        verify_runtime_checkout(tmp_path, "0" * 40)
+
+    (tmp_path / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="must be clean"):
+        verify_runtime_checkout(tmp_path, revision)
+
+
+def test_verify_runtime_checkout_rejects_noncanonical_revision(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="exact lowercase 40-character"):
+        verify_runtime_checkout(tmp_path, "ABC123")
 
 
 def _write_frozen_ci_receipts(
