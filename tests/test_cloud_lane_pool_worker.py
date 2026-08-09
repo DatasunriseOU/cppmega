@@ -95,6 +95,30 @@ class FailOneDeferredReceiptStore(CountingStore):
         return super().publish_if_absent(source, uri)
 
 
+class FailOneSnapshotDownloadStore(CountingStore):
+    def __init__(self, delegate: LocalObjectStore) -> None:
+        super().__init__(delegate)
+        self.failed = False
+
+    def download(self, uri: str, destination: Path, *, generation=None):
+        if uri.startswith("gs://inputs/") and not self.failed:
+            self.failed = True
+            raise RuntimeError("request failed with HTTP 429")
+        return super().download(uri, destination, generation=generation)
+
+
+class FailOnePhysicalCompletionStore(CountingStore):
+    def __init__(self, delegate: LocalObjectStore) -> None:
+        super().__init__(delegate)
+        self.failed = False
+
+    def publish_if_absent(self, source: Path, uri: str):
+        if "/cloud-lane-completed/" in uri and not self.failed:
+            self.failed = True
+            raise RuntimeError("HTTP 429 Too Many Requests")
+        return super().publish_if_absent(source, uri)
+
+
 @pytest.fixture
 def pool_fixture(tmp_path: Path):
     repo = tmp_path / "repo"
@@ -361,6 +385,108 @@ def test_pool_worker_retries_deferred_receipts_after_confirmed_429(
     assert len(sessions) == 2
     assert all(session.closes == 1 for session in sessions)
     assert [session.requests for session in sessions] == [2, 1]
+
+
+def test_pool_worker_retries_snapshot_download_after_confirmed_429(
+    pool_fixture,
+) -> None:
+    sessions: list[RecordingAdapterSession] = []
+
+    def factory(root: Path) -> RecordingAdapterSession:
+        session = RecordingAdapterSession(root)
+        sessions.append(session)
+        return session
+
+    store = FailOneSnapshotDownloadStore(pool_fixture["delegate"])
+    with pytest.raises(ConfirmedHttp429, match="confirmed HTTP 429 diagnostics"):
+        _run(pool_fixture, store=store, adapter_session_factory=factory)
+
+    failure = json.loads(
+        (pool_fixture["tmp_path"] / "stage/receipts/physical-0000.failed.json").read_text()
+    )
+    assert failure["retry_exit_code"] == 75
+    assert failure["diagnostics"][0]["worker"].endswith("-snapshot-cache")
+    failure_publication = (
+        pool_fixture["tmp_path"]
+        / "objects/control/lane-001/control/cloud-lane-failures"
+        / pool_fixture["manifest"]["manifest_sha256"]
+        / "physical-0000"
+        / f"{failure['receipt_sha256']}.failure.json"
+    )
+    assert json.loads(failure_publication.read_text()) == failure
+    assert sessions[0].requests == 0
+    assert sessions[0].closes == 1
+
+    result = _run(pool_fixture, store=store, adapter_session_factory=factory)
+    assert result["receipt"]["status"] == "complete"
+    assert len(sessions) == 2
+    assert sessions[1].requests == 2
+    assert sessions[1].closes == 1
+
+
+def test_pool_worker_retries_physical_completion_publication_after_confirmed_429(
+    pool_fixture,
+) -> None:
+    sessions: list[RecordingAdapterSession] = []
+
+    def factory(root: Path) -> RecordingAdapterSession:
+        session = RecordingAdapterSession(root)
+        sessions.append(session)
+        return session
+
+    store = FailOnePhysicalCompletionStore(pool_fixture["delegate"])
+    with pytest.raises(ConfirmedHttp429, match="confirmed HTTP 429 diagnostics"):
+        _run(pool_fixture, store=store, adapter_session_factory=factory)
+
+    failure = json.loads(
+        (pool_fixture["tmp_path"] / "stage/receipts/physical-0000.failed.json").read_text()
+    )
+    assert failure["retry_exit_code"] == 75
+    assert failure["diagnostics"][0]["worker"].endswith(
+        "-completion-publication"
+    )
+    failure_publication = (
+        pool_fixture["tmp_path"]
+        / "objects/control/lane-001/control/cloud-lane-failures"
+        / pool_fixture["manifest"]["manifest_sha256"]
+        / "physical-0000"
+        / f"{failure['receipt_sha256']}.failure.json"
+    )
+    assert json.loads(failure_publication.read_text()) == failure
+    local_completion = json.loads(
+        (pool_fixture["tmp_path"] / "stage/receipts/physical-0000.complete.json").read_text()
+    )
+
+    result = _run(pool_fixture, store=store, adapter_session_factory=factory)
+    assert result["receipt"] == local_completion
+    assert result["receipt"]["status"] == "complete"
+    assert len(sessions) == 2
+    assert sum(session.requests for session in sessions) == 2
+    assert all(session.closes == 1 for session in sessions)
+
+
+def test_pool_worker_does_not_retry_mixed_setup_diagnostics(pool_fixture) -> None:
+    class DeterministicCloseFailureSession(RecordingAdapterSession):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("snapshot close contract drifted")
+
+    store = FailOneSnapshotDownloadStore(pool_fixture["delegate"])
+    with pytest.raises(ContractError, match="deterministic diagnostics"):
+        _run(
+            pool_fixture,
+            store=store,
+            adapter_session_factory=DeterministicCloseFailureSession,
+        )
+
+    failure = json.loads(
+        (pool_fixture["tmp_path"] / "stage/receipts/physical-0000.failed.json").read_text()
+    )
+    assert failure["retry_exit_code"] == 2
+    assert [item["confirmed_http_429"] for item in failure["diagnostics"]] == [
+        False,
+        True,
+    ]
 
 
 def test_pool_worker_marks_only_explicit_429_as_retryable(

@@ -178,9 +178,12 @@ def test_prepare_cloud_lane_payload_is_content_addressed_and_pool_bound(
     assert "(( worker_exit == 75 )) && classified_exit=75" in runner_text
     assert 'is_confirmed_429 "$worker_stderr"' not in runner_text
     assert 'readonly HEARTBEAT_SECONDS=300' in runner_text
-    assert '"schema": "cppmega.cloud_lane_worker_heartbeat_v1"' in runner_text
-    assert "/control/cloud-lane-heartbeats/" in runner_text
-    assert '"training_ready": False' in runner_text
+    assert "cloud_lane_heartbeat.py\" run" in runner_text
+    assert '--control-prefix "$RUN_ROOT"' in runner_text
+    assert '--manifest-sha256 "$MANIFEST_LOGICAL_SHA256"' in runner_text
+    assert '--physical-worker "$physical_id"' in runner_text
+    assert 'kill -TERM "$heartbeat_pid"' in runner_text
+    assert 'kill -KILL "$heartbeat_pid"' in runner_text
     assert 'readonly ASSIGNMENT_POOL_SIZE="4"' in runner_text
     subprocess.run(["bash", "-n", str(runner)], check=True)
 
