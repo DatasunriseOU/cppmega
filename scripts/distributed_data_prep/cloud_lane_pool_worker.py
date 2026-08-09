@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, NoReturn, Sequence
 
 if __package__ in {None, ""}:  # pragma: no cover - direct CLI execution
     _ROOT = Path(__file__).resolve().parents[2]
@@ -113,7 +113,10 @@ def _publish_exact(
         metadata = object_store.download(uri, readback, generation=generation)
         if (
             str(metadata.get("generation")) != generation
-            or int(metadata.get("size_bytes", -1)) != source.stat().st_size
+            or require_int(
+                metadata.get("size_bytes"), where="publication.size_bytes"
+            )
+            != source.stat().st_size
             or sha256_file(readback) != sha256_file(source)
         ):
             raise ContractError("cloud lane publication exact-generation readback failed")
@@ -263,6 +266,64 @@ def _write_failure_receipt(
     return receipt
 
 
+def _raise_classified_pool_failures(
+    *,
+    stage_root: Path,
+    publication_scratch: Path,
+    control: str,
+    object_store: ObjectStore,
+    manifest: Mapping[str, object],
+    manifest_file_sha256: str,
+    physical_index: int,
+    physical_count: int,
+    failures: Sequence[_LogicalWorkerFailure],
+) -> NoReturn:
+    if not failures:
+        raise ContractError("cloud lane failure classification requires diagnostics")
+    failure_path = (
+        stage_root / "receipts" / f"physical-{physical_index:04d}.failed.json"
+    )
+    failure = _write_failure_receipt(
+        path=failure_path,
+        manifest=manifest,
+        manifest_file_sha256=manifest_file_sha256,
+        physical_index=physical_index,
+        physical_count=physical_count,
+        failures=failures,
+    )
+    failure_uri = gcs_join(
+        control,
+        "control",
+        "cloud-lane-failures",
+        str(manifest["manifest_sha256"]),
+        f"physical-{physical_index:04d}",
+        f"{failure['receipt_sha256']}.failure.json",
+    )
+    try:
+        _publish_exact(
+            failure_path,
+            failure_uri,
+            object_store=object_store,
+            scratch_root=publication_scratch / "failure",
+        )
+    except Exception:
+        # Preserve the original classified diagnostics.  A failure while
+        # publishing their immutable receipt must not turn a deterministic
+        # failure into a retryable one (or vice versa).
+        pass
+    if require_int(
+        failure["retry_exit_code"], where="failure.retry_exit_code"
+    ) == 75:
+        raise ConfirmedHttp429(
+            f"physical worker {physical_index} has confirmed HTTP 429 diagnostics "
+            f"{failure['receipt_sha256']}"
+        )
+    raise ContractError(
+        f"physical worker {physical_index} has deterministic diagnostics "
+        f"{failure['receipt_sha256']}"
+    )
+
+
 def run_cloud_lane_pool_worker(
     *,
     manifest_path: Path,
@@ -289,8 +350,13 @@ def run_cloud_lane_pool_worker(
     if adapter_path.is_symlink() or sha256_file(adapter_path) != adapter_sha256:
         raise ContractError("cloud lane adapter differs from manifest runner_sha256")
     control = validate_gcs_uri(control_prefix.rstrip("/"), where="control_prefix")
+    workers = manifest["workers"]
+    if not isinstance(workers, Sequence) or isinstance(
+        workers, (str, bytes, bytearray)
+    ):
+        raise ContractError("cloud lane manifest workers must be a sequence")
     assigned = _logical_workers(
-        manifest["workers"],
+        workers,
         physical_index=physical_index,
         physical_count=physical_count,
     )
@@ -310,27 +376,56 @@ def run_cloud_lane_pool_worker(
                 "cloud lane stage directories must be regular directories"
             )
 
-    session_root = scratch_root / "adapter-session"
-    if adapter_session_factory is not None:
-        adapter_session = adapter_session_factory(session_root)
-    elif enable_case5_session:
-        adapter_session = _case5_adapter_session(
-            adapter_path=adapter_path,
-            repo_root=repo_root.resolve(),
-            session_root=session_root,
-        )
-        if adapter_session is None:
-            raise ContractError(
-                "persistent CASE5 session requires the canonical CASE5 adapter"
-            )
-    else:
-        adapter_session = None
     verified_snapshots: list[dict[str, object]] | None = None
-    if adapter_session is not None:
-        verified_snapshots = prepare_verified_snapshot_cache(
-            manifest,
+    adapter_session: AdapterSession | None = None
+    setup_phase = "adapter-session-initialize"
+    try:
+        session_root = scratch_root / "adapter-session"
+        if adapter_session_factory is not None:
+            adapter_session = adapter_session_factory(session_root)
+        elif enable_case5_session:
+            adapter_session = _case5_adapter_session(
+                adapter_path=adapter_path,
+                repo_root=repo_root.resolve(),
+                session_root=session_root,
+            )
+            if adapter_session is None:
+                raise ContractError(
+                    "persistent CASE5 session requires the canonical CASE5 adapter"
+                )
+        if adapter_session is not None:
+            setup_phase = "snapshot-cache"
+            verified_snapshots = prepare_verified_snapshot_cache(
+                manifest,
+                object_store=object_store,
+                input_root=scratch_root / "inputs" / str(manifest["manifest_sha256"]),
+            )
+    except BaseException as error:
+        setup_failures = [
+            _LogicalWorkerFailure(
+                f"physical-{physical_index:04d}-{setup_phase}", error
+            )
+        ]
+        if adapter_session is not None:
+            try:
+                adapter_session.close()
+            except BaseException as close_error:
+                setup_failures.append(
+                    _LogicalWorkerFailure(
+                        f"physical-{physical_index:04d}-adapter-session-close",
+                        close_error,
+                    )
+                )
+        _raise_classified_pool_failures(
+            stage_root=stage_root,
+            publication_scratch=publication_scratch,
+            control=control,
             object_store=object_store,
-            input_root=scratch_root / "inputs" / str(manifest["manifest_sha256"]),
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            physical_index=physical_index,
+            physical_count=physical_count,
+            failures=setup_failures,
         )
 
     results: dict[str, dict[str, object]] = {}
@@ -400,42 +495,16 @@ def run_cloud_lane_pool_worker(
                 failures.append(_LogicalWorkerFailure(worker, error))
 
     if failures:
-        failure_path = (
-            stage_root / "receipts" / f"physical-{physical_index:04d}.failed.json"
-        )
-        failure = _write_failure_receipt(
-            path=failure_path,
+        _raise_classified_pool_failures(
+            stage_root=stage_root,
+            publication_scratch=publication_scratch,
+            control=control,
+            object_store=object_store,
             manifest=manifest,
             manifest_file_sha256=manifest_file_sha256,
             physical_index=physical_index,
             physical_count=physical_count,
             failures=failures,
-        )
-        failure_uri = gcs_join(
-            control,
-            "control",
-            "cloud-lane-failures",
-            str(manifest["manifest_sha256"]),
-            f"physical-{physical_index:04d}",
-            f"{failure['receipt_sha256']}.failure.json",
-        )
-        try:
-            _publish_exact(
-                failure_path,
-                failure_uri,
-                object_store=object_store,
-                scratch_root=publication_scratch / "failure",
-            )
-        except Exception:
-            pass
-        if int(failure["retry_exit_code"]) == 75:
-            raise ConfirmedHttp429(
-                f"physical worker {physical_index} has confirmed HTTP 429 diagnostics "
-                f"{failure['receipt_sha256']}"
-            )
-        raise ContractError(
-            f"physical worker {physical_index} has deterministic diagnostics "
-            f"{failure['receipt_sha256']}"
         )
 
     logical_receipts = []
@@ -485,18 +554,35 @@ def run_cloud_lane_pool_worker(
         stage_root / "receipts" / f"physical-{physical_index:04d}.complete.json"
     )
     atomic_write_json(completion_path, receipt)
-    publication = _publish_exact(
-        completion_path,
-        gcs_join(
-            control,
-            "control",
-            "cloud-lane-completed",
-            str(manifest["manifest_sha256"]),
-            f"physical-{physical_index:04d}.complete.json",
-        ),
-        object_store=object_store,
-        scratch_root=publication_scratch / "physical",
-    )
+    try:
+        publication = _publish_exact(
+            completion_path,
+            gcs_join(
+                control,
+                "control",
+                "cloud-lane-completed",
+                str(manifest["manifest_sha256"]),
+                f"physical-{physical_index:04d}.complete.json",
+            ),
+            object_store=object_store,
+            scratch_root=publication_scratch / "physical",
+        )
+    except BaseException as error:
+        _raise_classified_pool_failures(
+            stage_root=stage_root,
+            publication_scratch=publication_scratch,
+            control=control,
+            object_store=object_store,
+            manifest=manifest,
+            manifest_file_sha256=manifest_file_sha256,
+            physical_index=physical_index,
+            physical_count=physical_count,
+            failures=[
+                _LogicalWorkerFailure(
+                    f"physical-{physical_index:04d}-completion-publication", error
+                )
+            ],
+        )
     return {"receipt": receipt, "publication": publication}
 
 

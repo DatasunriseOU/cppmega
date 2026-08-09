@@ -173,65 +173,17 @@ publish_runner_failure() {
   return "$exit_code"
 }
 
-publish_worker_heartbeat() {
-  local sequence=$1
-  local heartbeat="$receipt_root/$physical_id.heartbeat.$(printf '%06d' "$sequence").json"
-  local receipt_sha publication_exit=0
-  receipt_sha="$("$venv/bin/python" - "$heartbeat" "$sequence" \
-      "$MANIFEST_LOGICAL_SHA256" "$MANIFEST_SHA256" "$CODE_REVISION" \
-      "$physical_id" "$physical_count" <<'PY'
-from datetime import datetime, timezone
-import hashlib
-import json
-import os
-from pathlib import Path
-import sys
-
-target, sequence, logical, raw, revision, worker, physical_count = sys.argv[1:]
-value = {
-    "schema": "cppmega.cloud_lane_worker_heartbeat_v1",
-    "status": "running",
-    "phase": "cloud-lane-pool-worker",
-    "sequence": int(sequence),
-    "manifest_sha256": logical,
-    "manifest_file_sha256": raw,
-    "code_revision": revision,
-    "physical_worker": worker,
-    "physical_worker_count": int(physical_count),
-    "emitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "training_ready": False,
-}
-encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
-value["receipt_sha256"] = hashlib.sha256(encoded).hexdigest()
-path = Path(target)
-temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-os.replace(temporary, path)
-print(value["receipt_sha256"])
-PY
-)"
-  publish_exact "$heartbeat" \
-    "$RUN_ROOT/control/cloud-lane-heartbeats/$MANIFEST_LOGICAL_SHA256/$physical_id/$(printf '%06d' "$sequence")-$receipt_sha.heartbeat.json" \
-    "$heartbeat.publication.json" || publication_exit=$?
-  return "$publication_exit"
-}
-
-worker_heartbeat_loop() {
-  local sequence=0 heartbeat_exit
-  while true; do
-    heartbeat_exit=0
-    publish_worker_heartbeat "$sequence" || heartbeat_exit=$?
-    if (( heartbeat_exit != 0 )); then
-      echo "cloud lane heartbeat publication failed with exit $heartbeat_exit" >&2
-    fi
-    sequence=$((sequence + 1))
-    sleep "$HEARTBEAT_SECONDS"
-  done
-}
-
 stop_worker_heartbeat() {
   if [[ -n "${heartbeat_pid:-}" ]]; then
-    kill "$heartbeat_pid" 2>/dev/null || true
+    kill -TERM "$heartbeat_pid" 2>/dev/null || true
+    for ((heartbeat_stop_wait=0; heartbeat_stop_wait<50; heartbeat_stop_wait++)); do
+      kill -0 "$heartbeat_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$heartbeat_pid" 2>/dev/null; then
+      echo "cloud lane heartbeat did not stop within 5 seconds; killing it" >&2
+      kill -KILL "$heartbeat_pid" 2>/dev/null || true
+    fi
     wait "$heartbeat_pid" 2>/dev/null || true
     heartbeat_pid=""
   fi
@@ -347,7 +299,17 @@ then
 fi
 
 heartbeat_pid=""
-worker_heartbeat_loop \
+PYTHONPATH="$repo_root" "$venv/bin/python" \
+  "$repo_root/scripts/distributed_data_prep/cloud_lane_heartbeat.py" run \
+  --control-prefix "$RUN_ROOT" \
+  --receipt-root "$receipt_root" \
+  --scratch-root "$work_root/heartbeat-readback" \
+  --manifest-sha256 "$MANIFEST_LOGICAL_SHA256" \
+  --manifest-file-sha256 "$MANIFEST_SHA256" \
+  --code-revision "$CODE_REVISION" \
+  --physical-worker "$physical_id" \
+  --physical-worker-count "$physical_count" \
+  --interval-seconds "$HEARTBEAT_SECONDS" \
   >>"$receipt_root/$physical_id.heartbeat.log" 2>&1 &
 heartbeat_pid=$!
 trap stop_worker_heartbeat EXIT
