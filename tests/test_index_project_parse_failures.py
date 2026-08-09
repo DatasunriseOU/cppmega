@@ -1496,6 +1496,63 @@ def test_valgrind_style_header_loads_with_sane_fallback_args(
     }
 
 
+def test_gnu_c_standard_header_keeps_consistent_language_family(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    header = tmp_path / "KeychainSyncAccountUpdater.h"
+    header.write_text(
+        "#import <UAUPlugin/UAUSession.h>\n\n"
+        "@interface KeychainSyncAccountUpdater : NSObject "
+        "<UserAccountUpdaterProtocol>\n\n"
+        "@end\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-std=gnu2x", "-fblocks", "-fsyntax-only", "-Wno-everything"],
+        str(header),
+    )
+
+    assert adapted[:3] == ["-x", "c-header", "-std=gnu2x"]
+    assert index_project._is_sane_compile_args(adapted)
+    translation_unit = index_project._load_translation_unit(
+        str(header),
+        index_project.Index.create(),
+        adapted,
+    )
+    assert translation_unit.spelling == str(header)
+
+
+@pytest.mark.parametrize(
+    ("standard_args", "expected_standard"),
+    [
+        (["--std=c11", "--std=gnu2x"], "--std=gnu2x"),
+        (["-cl-std=CL1.2", "-cl-std=CL3.0"], "-cl-std=CL3.0"),
+    ],
+)
+def test_header_adaptation_keeps_only_last_standard_alias(
+    tmp_path: Path,
+    standard_args: list[str],
+    expected_standard: str,
+) -> None:
+    index_project = _load_indexer()
+    header = tmp_path / "dialect.h"
+    header.write_text("int dialect_fixture;\n", encoding="utf-8")
+
+    adapted = index_project._adapt_args_for_file(
+        [*standard_args, "-fsyntax-only", "-Wno-everything"],
+        str(header),
+    )
+
+    standard_flags = [
+        arg
+        for arg in adapted
+        if arg.startswith(("-std=", "--std=", "-cl-std="))
+    ]
+    assert standard_flags == [expected_standard]
+
+
 def test_mixed_case_cpp_suffix_forces_cpp_language(
     tmp_path: Path,
 ) -> None:

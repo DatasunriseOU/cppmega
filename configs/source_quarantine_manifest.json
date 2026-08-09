@@ -92,6 +92,15 @@
       "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token"
     },
     {
+      "project_id": "intel/llvm",
+      "relative_path": "clang/test/Lexer/newline-nul.c",
+      "size_bytes": 332,
+      "sha256": "11548a466e2e5eb0a686cf422f7872ea94f616fe43f4bdb9311a0f1764391474",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_escaped_newline_nul_preprocessor_diagnostic",
+      "reason": "Clang lexer regression fixture intentionally places a NUL byte after an escaped newline inside a preprocessing directive"
+    },
+    {
       "project_id": "eclipse-threadx/threadx",
       "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
       "size_bytes": 60766,
