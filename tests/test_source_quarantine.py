@@ -1592,6 +1592,47 @@ def test_checked_in_cmake_truncated_bom_manifest_matches_archive_receipt() -> No
         assert entry["detected_format"] == detected_format
 
 
+def test_checked_in_windows_nul_ff_manifest_matches_pinned_archive() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "corpus.local/windows_10_shared_source_kit"
+        and item["detected_format"] == "nul_ff_binary_blob"
+    ]
+
+    expected = {
+        "windows_10_shared_source_kit/unknown_version_2/Source/drivers/spb/"
+        "spbcx/sys/driver.h": (
+            773,
+            "38f8873ec81398a0a0e025690b3e2baa55c5c1221441d68ca0144b0b557fcb4b",
+        ),
+        "windows_10_shared_source_kit/unknown_version_2/Source/drivers/wdm/usb/"
+        "usb3/usbxhci/sys/driver/driver.h": (
+            1552,
+            "1a165209c95259239d74a5db250ca275ff9356b8a40e6ec740d0e910e9eaabed",
+        ),
+    }
+    assert {
+        entry["relative_path"]: (entry["size_bytes"], entry["sha256"])
+        for entry in entries
+    } == expected
+    assert {
+        (entry["classification"], entry["detected_format"]) for entry in entries
+    } == {("mislabeled_non_cpp", "nul_ff_binary_blob")}
+
+    usb_payload = b"\0\0\xff\xff" * 388
+    assert len(usb_payload) == 1552
+    assert hashlib.sha256(usb_payload).hexdigest() == expected[
+        "windows_10_shared_source_kit/unknown_version_2/Source/drivers/wdm/usb/"
+        "usb3/usbxhci/sys/driver/driver.h"
+    ][1]
+
+
 def test_checked_in_xemu_certificate_pair_collection_matches_archive_receipt() -> None:
     manifest = json.loads(
         (

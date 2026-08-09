@@ -243,6 +243,15 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "nul_ff_binary_blob",
       "reason": "Pinned archive header that is a pure 0x00/0xff binary blob under a .h suffix"
+    },
+    {
+      "project_id": "corpus.local/windows_10_shared_source_kit",
+      "relative_path": "windows_10_shared_source_kit/unknown_version_2/Source/drivers/wdm/usb/usb3/usbxhci/sys/driver/driver.h",
+      "size_bytes": 1552,
+      "sha256": "1a165209c95259239d74a5db250ca275ff9356b8a40e6ec740d0e910e9eaabed",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "nul_ff_binary_blob",
+      "reason": "Pinned archive header that is a pure 0x00/0xff binary blob under a .h suffix"
     }
   ],
   "collections": [
