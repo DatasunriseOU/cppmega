@@ -5847,7 +5847,11 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 explicit_language = args[arg_index + 1].lower()
             elif arg.startswith('-x') and arg != '-x':
                 explicit_language = arg[2:].lower()
-        is_c_header = explicit_language in {'c', 'c-header'}
+        language_family = (
+            _CLANG_LANGUAGE_FAMILIES.get(explicit_language)
+            if explicit_language is not None
+            else None
+        )
         if explicit_language is None:
             standard_families = [
                 context[1]
@@ -5858,7 +5862,8 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 )
                 if (context := _standard_flag_context(arg)) is not None
             ]
-            is_c_header = bool(standard_families) and standard_families[-1] == 'c'
+            if standard_families:
+                language_family = standard_families[-1]
 
         # Change only the language form. The compile database or detected project
         # context owns the dialect flag, including C++20/C++23/C++26.
@@ -5891,7 +5896,12 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
             ):
                 continue
             adapted.append(arg)
-        header_language = 'c-header' if is_c_header else 'c++-header'
+        if language_family == 'c':
+            header_language = 'c-header'
+        elif language_family == 'opencl':
+            header_language = 'cl'
+        else:
+            header_language = 'c++-header'
         return ['-x', header_language] + adapted
     mixed_case_cpp_source = (
         raw_ext == '.C'
