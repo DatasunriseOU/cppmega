@@ -1045,7 +1045,9 @@ def build_child_environment(
 def _historical_input_cache_root() -> Path:
     """Return a private cache outside immutable source-run evidence."""
 
-    return Path(tempfile.gettempdir()) / "cppmega-source-supervisor-input-cache"
+    return Path(tempfile.gettempdir()) / (
+        f"cppmega-source-supervisor-input-cache-{os.geteuid()}"
+    )
 
 
 def revalidate_recorded_inputs(

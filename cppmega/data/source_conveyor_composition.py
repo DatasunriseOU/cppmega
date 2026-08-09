@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -567,25 +568,20 @@ def _resolve_recorded_repository_artifact(
         raise ValueError(f"{label} is not repository-owned") from exc
     if relative_path != Path("configs/source_quarantine_manifest.json"):
         raise ValueError(f"{label} is not the canonical quarantine manifest")
-    if recorded_path.is_file() and _sha256(recorded_path) == expected_sha256:
-        return recorded_path
+    if recorded_path.is_file():
+        recorded_size = recorded_path.stat().st_size
+        if recorded_size <= max_bytes and _sha256(recorded_path) == expected_sha256:
+            return recorded_path
 
-    cache_root = cache_root.expanduser()
-    if cache_root.is_symlink():
-        raise ValueError(f"{label} cache root must not be a symlink")
-    cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    cache_root = cache_root.resolve(strict=True)
-    if not cache_root.is_dir():
-        raise ValueError(f"{label} cache root must be a directory")
+    cache_root = _validate_private_cache_root(cache_root, label=label)
     target = cache_root / f"source_quarantine_manifest.{expected_sha256}.json"
-    if target.is_symlink():
-        raise ValueError(f"{label} historical cache artifact must not be a symlink")
-    if target.exists():
-        if not target.is_file():
-            raise ValueError(f"{label} historical cache artifact drifted")
-        if target.stat().st_size > max_bytes:
-            raise ValueError(f"{label} historical cache artifact exceeds the metadata bound")
-        if _sha256(target) != expected_sha256:
+    cached_sha256 = _sha256_private_cache_artifact(
+        target,
+        label=label,
+        max_bytes=max_bytes,
+    )
+    if cached_sha256 is not None:
+        if cached_sha256 != expected_sha256:
             raise ValueError(f"{label} historical cache artifact drifted")
         return target
 
@@ -662,15 +658,105 @@ def _resolve_recorded_repository_artifact(
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
-    if target.is_symlink() or _sha256(target) != expected_sha256:
+    if (
+        _sha256_private_cache_artifact(
+            target,
+            label=label,
+            max_bytes=max_bytes,
+        )
+        != expected_sha256
+    ):
         raise ValueError(f"{label} historical cache write drifted")
     return target
+
+
+def _validate_private_cache_root(cache_root: Path, *, label: str) -> Path:
+    """Create or validate one current-user-only historical input cache."""
+
+    cache_root = cache_root.expanduser()
+    try:
+        cache_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        pass
+    try:
+        metadata = os.lstat(cache_root)
+    except OSError as exc:
+        raise ValueError(f"{label} cache root is unavailable") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{label} cache root must be a directory")
+    if metadata.st_uid != os.geteuid():
+        raise ValueError(f"{label} cache root must be owned by the current user")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise ValueError(f"{label} cache root permissions must be 0700")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(cache_root, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} cache root is unavailable") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError(f"{label} cache root changed during validation")
+    finally:
+        os.close(descriptor)
+    return cache_root.resolve(strict=True)
+
+
+def _sha256_private_cache_artifact(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+) -> str | None:
+    """Hash a bounded regular cache file without following links."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"{label} historical cache artifact drifted") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} historical cache artifact drifted")
+        if metadata.st_uid != os.geteuid():
+            raise ValueError(
+                f"{label} historical cache artifact must be owned by the current user"
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise ValueError(
+                f"{label} historical cache artifact permissions must be 0600"
+            )
+        if metadata.st_size > max_bytes:
+            raise ValueError(
+                f"{label} historical cache artifact exceeds the metadata bound"
+            )
+        digest = hashlib.sha256()
+        hashed_bytes = 0
+        while payload := os.read(
+            descriptor,
+            min(1024 * 1024, max_bytes - hashed_bytes + 1),
+        ):
+            hashed_bytes += len(payload)
+            if hashed_bytes > max_bytes:
+                raise ValueError(
+                    f"{label} historical cache artifact exceeds the metadata bound"
+                )
+            digest.update(payload)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _historical_input_cache_root() -> Path:
     """Return a private cache outside immutable source-run evidence."""
 
-    return Path(tempfile.gettempdir()) / "cppmega-source-composition-input-cache"
+    return Path(tempfile.gettempdir()) / (
+        f"cppmega-source-composition-input-cache-{os.geteuid()}"
+    )
 
 
 def _validate_pr_provenance(

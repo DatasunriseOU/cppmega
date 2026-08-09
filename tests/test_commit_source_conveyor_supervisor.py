@@ -174,6 +174,135 @@ def test_commit_build_command_reuses_state_roots_and_emits_upgrade_flags(
     assert command[command.index("--allow-code-revision-upgrade-from") + 1] == "a" * 40
 
 
+def test_commit_run_waits_for_terminal_repair_before_starting_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code_root = tmp_path / "code-run"
+    repair_root = tmp_path / "repair-run"
+    run_root = tmp_path / "commit-run"
+    repository_root = tmp_path / "repo"
+    for path in (code_root, repair_root, repository_root):
+        path.mkdir()
+
+    args = commit_supervisor.parse_args(
+        [
+            "--code-run-root",
+            str(code_root),
+            "--code-repair-run-root",
+            str(repair_root),
+            "--run-root",
+            str(run_root),
+            "--pr-store",
+            str(tmp_path / "prs.sqlite"),
+            "--pr-repo-list",
+            str(tmp_path / "pr-repos.json"),
+            "--pr-completion-receipt",
+            str(tmp_path / "pr-completion.json"),
+            "--minimum-free-bytes",
+            "0",
+        ]
+    )
+    identity = {"run_root": str(code_root), "launch_sha256": "1" * 64}
+    initial_code_run = {
+        "repair_required": True,
+        "identity": identity,
+    }
+    terminal_code_run = {
+        "identity": identity,
+        "identities": [
+            identity,
+            {"run_root": str(repair_root), "launch_sha256": "2" * 64},
+        ],
+        "inputs": {"repo_list": {"path": str(tmp_path / "source-repos.json")}},
+        "producer_root": repository_root,
+        "code_output_root": tmp_path / "code-output",
+        "commit_output_root": tmp_path / "commit-output",
+        "dedup_db": tmp_path / "dedup.sqlite",
+        "target_lengths": (1024,),
+        "repositories": ("owner/project",),
+    }
+    pr_inputs = {
+        "completion_binding": {"receipt_sha256": "3" * 64},
+        "repo_list": {"path": str(tmp_path / "pr-repos.json")},
+        "store": {"path": str(tmp_path / "prs.sqlite")},
+        "completion": {"path": str(tmp_path / "pr-completion.json")},
+    }
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        commit_supervisor,
+        "_recorded_code_revision",
+        lambda *args, **kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "load_commit_source_run",
+        lambda *args, **kwargs: initial_code_run,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "_historical_code_revisions",
+        lambda *args, **kwargs: {"a" * 40},
+    )
+
+    def wait_for_terminal(*args: object, **kwargs: object) -> dict[str, object]:
+        events.append("terminal")
+        return terminal_code_run
+
+    monkeypatch.setattr(
+        commit_supervisor,
+        "wait_for_terminal_code_run",
+        wait_for_terminal,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "validate_pr_inputs",
+        lambda **kwargs: (
+            pr_inputs,
+            [],
+            (
+                Path(args.pr_store),
+                Path(args.pr_repo_list),
+                Path(args.pr_completion_receipt),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "build_command",
+        lambda *args, **kwargs: ["commit-child"],
+    )
+    monkeypatch.setattr(
+        source_supervisor,
+        "build_child_environment",
+        lambda *args, **kwargs: {},
+    )
+
+    def run_child(*args: object, **kwargs: object) -> int:
+        assert events == ["terminal"]
+        launch = json.loads(
+            (run_root / "launch_receipt.json").read_text(encoding="utf-8")
+        )
+        assert launch["source_code_runs"] == terminal_code_run["identities"]
+        assert (
+            launch["run_binding"]["source_code_runs"]
+            == terminal_code_run["identities"]
+        )
+        events.append("child")
+        return 17
+
+    monkeypatch.setattr(source_supervisor, "run_supervised_child", run_child)
+    monkeypatch.setattr(
+        source_supervisor,
+        "write_exit_receipt",
+        lambda *args, **kwargs: None,
+    )
+
+    assert commit_supervisor._run(args) == 17
+    assert events == ["terminal", "child"]
+
+
 def test_commit_upgrade_uses_live_quarantine_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
