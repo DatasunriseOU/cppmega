@@ -1,6 +1,6 @@
 # Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
 
-Дата среза evidence: `2026-08-09`; последний immutable GCP source audit: `2026-08-09T00:53:42Z`; factual refresh документа: `2026-08-09`
+Дата среза evidence: `2026-08-09`; последний immutable GCP source audit: `2026-08-09T00:53:42Z`; последний оперативный refresh: `2026-08-09T20:51:47Z`
 
 Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`
 
@@ -17,11 +17,11 @@
 ## Оперативный срез на момент factual refresh
 
 - Новый общий four-lane release ещё не готов к обучению: `training_ready=false`. Исторический source-only bundle 1K–16K не переносит свой legacy `release_ready` на новый scope.
-- `origin/main` на момент последней проверки — `a65db87ca4e95de7b8a3eb1949786dac813d8d83`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить.
-- Два локальных CI fetcher продолжают писать в физически отдельные stores. Их store-local token counters нельзя складывать как глобальный union; frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
-- CASE5 `ci-case5-smoke-20260808-003` остаётся полезной дорогой materialization, а `ci-case5-smoke-20260809-004` имеет sustained heartbeat/apply evidence (`sequence=40` на срезе `2026-08-09T18:45:46Z`). Ни один из них не объявляется completed без assignment completion, physical output, exact-generation readback и terminal receipt.
+- `origin/main` на момент последней проверки — `a87d2fe091ff9d2a7864b8d9adffc7720b5ff2f2`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить. Более новый `main` не даёт права менять revision уже активного writer.
+- Локальный source residual жив с одним writer: `5 done`, `3 failed`, `190,163,722` cumulative valid tokens; terminal completion/exit receipts отсутствуют. Два CI fetcher также физически продвигаются в раздельных stores; их свежий combined store-local upper bound `354,234,877,212` нельзя выдавать за global union или training tokens. Frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
+- CASE5 `ci-case5-smoke-20260808-003` остаётся полезной дорогой materialization: pool worker и `zstd` физически работают на Local SSD. `ci-case5-smoke-20260809-004` имеет sustained heartbeat/apply evidence (`sequence=65`, exact generation `1786308708553423`, emitted `2026-08-09T20:51:47Z`, self-digest verified). GCS пока содержит control evidence без outputs/completion/failure publication; ни один run не объявляется completed без assignment completion, physical output, exact-generation readback и terminal receipt.
 - CASE5 heartbeat/429 hardening уже landed в `main`: implementation commit `306179407570f97d4d7a571a447e95e0e9d05aed`, merge PR `#133` — `a65db87ca4e95de7b8a3eb1949786dac813d8d83`. Focused suite `25 passed`, related CASE5/cloud suite `116 passed`, Pyright `0 errors`; `py_compile`, `bash -n`, `shellcheck`, Terraform fmt/validate/tests, CodeQL и GitHub CI прошли. Следующий runtime обязан pin exact landed revision; merge сам по себе не завершает текущие `.003/.004`.
-- Source-worker taxonomy «retry только при подтверждённом HTTP 429» начата отдельно в `/Volumes/external/cppmega_data/worktrees/cppmega-source-confirmed-429-only-20260809`: пока изменён только `source_worker.py`, tests/commit/push ещё не выполнены, поэтому это состояние относится к N007, а не к подтверждённым D-пунктам.
+- Source-worker taxonomy «retry только при чисто подтверждённом HTTP 429» завершена: implementation `9d8a2a78168987d42d5c658e3a02bdc013c51616`, PR `#135`, merge `52472d831a6a2191f36b6f363f7d4057e844c4aa`, входит в текущий `origin/main`. Focused suite `27 passed`, related source/scheduler/cloud suite `189 passed`, changed-test Pyright `0 errors`; production `source_worker.py` всё ещё имеет `17` ранее существовавших Pyright errors и не объявляется полностью Pyright-clean. Pure 429 может дать bounded retry/exit `75`; mixed 429+deterministic, 401/403, 408/5xx, parser/contract/network defects дают exit `2` без automatic retry.
 - GCP source runs дают полезные assignment completions, но terminal slot/run receipts всё ещё отсутствуют. Широкий Terraform destroy запрещён: сначала worker-by-worker Local SSD diagnostics, exact backend lineage/serial и instance-only plan.
 
 ## Авторитетные контуры и идентичности
@@ -669,7 +669,7 @@
 ### D001 — Source/GCP repair stack интегрирован в основную историю
 
 - **Сделано:** ветка integration landed через commit `ac41718b` и последующие merges; `origin/main` на evidence-срезе содержит source repair/runtime stack.
-- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547`; commits `ac41718b`, `10066e88`, `b045e547`, прежний срез `88f4d8e7` и CASE5 merge `a65db87c` находятся в текущей основной истории.
+- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547`; commits `ac41718b`, `10066e88`, `b045e547`, прежний срез `88f4d8e7`, CASE5 merge `a65db87c`, source retry merge `52472d83` и source recovery merge `a87d2fe0` находятся в текущей основной истории.
 - **Честная граница:** наличие кода в main не означает, что все source assignments завершены.
 
 ### D002 — Terraform foundation оформлен отдельным модулем
@@ -734,9 +734,9 @@
 
 ### D012 — Source failure receipts сделаны attempt-unique
 
-- **Сделано:** разные attempts deterministic failure больше не конфликтуют по одному object key.
-- **Доказательство:** commit `b3e15f9c` в `origin/main`; отдельная repair branch также сохранила fix lineage.
-- **Честная граница:** уникальность receipt не исправляет первопричину failure.
+- **Сделано:** разные attempts deterministic failure больше не конфликтуют по одному object key; source transport retry дополнительно сужен до pure confirmed HTTP 429.
+- **Доказательство:** attempt-unique commit `b3e15f9c`; retry implementation `9d8a2a78168987d42d5c658e3a02bdc013c51616`, PR `#135`, merge `52472d831a6a2191f36b6f363f7d4057e844c4aa`; focused `27 passed`, related `189 passed`, changed-test Pyright `0 errors`.
+- **Честная граница:** уникальность receipt и корректная taxonomy не исправляют первопричину deterministic failure. Production module сохраняет `17` pre-existing Pyright errors и не считается полностью type-clean.
 
 ### D013 — CASE5 contract допускает корректный prefix ladder
 
@@ -950,13 +950,13 @@
 
 ### D047 — 30-минутный pipeline watchdog установлен и исполняется
 
-- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 267 runs и last exit `0`; loop выполняет все четыре GCP scans и считает cadence от начала цикла.
+- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 275 runs и last exit `0`; loop выполняет все четыре GCP source scans и считает cadence от начала цикла.
 - **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, `launchctl print`, live loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`; лог содержит последовательные полные cycles, в том числе `358s` и `411s`.
 - **Честная граница:** launchd `state=not running` между interval invocations нормален; mutable run count не является immutable pipeline completion receipt.
 
 ### D048 — Codex 429 watchdog установлен
 
-- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 34 runs и last exit `0`.
+- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 43 runs и last exit `0`; последний подтверждённый scan нашёл `0` pure-429 candidates.
 - **Доказательство:** `com.codex.multi-429-watchdog.plist`, `launchctl print`, script SHA-256 `6a6f03a2621283b95ba59a19d755512324d49993aa03efd569e7c3f7a4ae5c2d`.
 - **Честная граница:** watchdog повторяет controller session; он не даёт права retry deterministic parser assignment.
 
@@ -1022,10 +1022,10 @@
 
 ### N007 — Пересобрать exact local failure inventory
 
-- **Действие:** для каждого unresolved attempt сохранить exit, bounded stderr, repo/commit, failing file и classification; сузить source-worker retry taxonomy до подтверждённого HTTP 429.
+- **Действие:** для каждого unresolved attempt сохранить exit, bounded stderr, repo/commit, failing file и classification; применять уже landed source-worker taxonomy из `52472d83`, не расширяя её обратно на generic transient failures.
 - **Код/инфра/аккаунт:** supervisor logs, parser diagnostics, quarantine receipts, `scripts/distributed_data_prep/source_worker.py` и его tests.
 - **Проверка:** только `confirmed_http_429=true` может дать exit `75`; generic 408/5xx/network error, OOM, deterministic parser, corrupt input и operator interruption дают bounded exit `2`/terminal diagnostics; `unknown=0` до authorization.
-- **Готово когда:** inventory SHA связан с N006, finite repair contract построен, а regression tests запрещают automatic retry для всего, кроме confirmed 429.
+- **Готово когда:** inventory SHA связан с N006, finite repair contract построен, production residual run pin является descendant `52472d83`, а immutable outcomes подтверждают отсутствие automatic retry для всего, кроме pure confirmed 429.
 
 ### N008 — Довести KeyDB repair до production receipt
 
@@ -1462,7 +1462,7 @@
 
 ### N069 — Привязать landed CASE5 hardening к следующему runtime attempt
 
-- **Действие:** использовать уже landed merge `a65db87c` или более новый descendant при формировании следующего CASE5 payload; не перезапускать `.003/.004` только ради подмены revision и не смешивать их evidence с новым attempt.
+- **Действие:** использовать landed CASE5 merge `a65db87c` и source retry merge `52472d83` либо их clean descendant при формировании следующего CASE5 payload; не перезапускать `.003/.004` только ради подмены revision и не смешивать их evidence с новым attempt.
 - **Код/инфра/аккаунт:** `cloud_lane_pool_worker.py`, `cloud_lane_heartbeat.py`, runner template, payload manifest, run-specific GCS prefix и isolated Terraform backend.
 - **Проверка:** payload/code revision/tree SHA совпадают с apply/claim/heartbeat/completion receipts; immutable heartbeat проходит self-digest и exact-generation readback; mixed 429+deterministic остаётся exit `2`, только pure confirmed 429 может дать `75`.
 - **Готово когда:** clean landed commit/tree SHA входит в новый payload/apply receipt, regression receipt сохранён immutable, а новый worker публикует heartbeat и terminal evidence по hardened contract.
