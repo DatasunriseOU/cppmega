@@ -1,0 +1,222 @@
+===== VM 01 us-central1-a =====
+CPPMEGA_IAP_DIAG_VM=cppmega-corpus-01-source-prod-20260804-005
+CPPMEGA_IAP_DIAG_ZONE=us-central1-a
+CPPMEGA_IAP_DIAG_STARTED_AT=2026-08-09T09:27:51Z
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/dave/.ssh/config
+debug1: Reading configuration data /Users/dave/.colima/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config.d/100-macos.conf
+debug1: /etc/ssh/ssh_config.d/100-macos.conf line 1: Applying options for *
+debug1: Reading configuration data /etc/ssh/crypto.conf
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Executing proxy command: exec /Users/dave/.config/gcloud/virtenv/bin/python3.14 /opt/homebrew/Caskroom/gcloud-cli/565.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel cppmega-corpus-01-source-prod-20260804-005 22 --listen-on-stdin --project=natural-bison-491019-t9 --zone=us-central1-a --verbosity=warning
+debug1: loaded pubkey from /Users/dave/.ssh/google_compute_engine: RSA SHA256:BCX3eMSYdSznEZOyHaLFuMzPCRanJUQPcyPGl898wFY
+debug1: identity file /Users/dave/.ssh/google_compute_engine type 0
+debug1: no identity pubkey loaded from /Users/dave/.ssh/google_compute_engine
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Connection timed out during banner exchange
+Connection to UNKNOWN port 65535 timed out
+
+Recommendation: To check for possible causes of SSH connectivity issues and get
+recommendations, rerun the ssh command with the --troubleshoot option.
+
+gcloud compute ssh cppmega-corpus-01-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-a --troubleshoot
+
+Or, to investigate an IAP tunneling issue:
+
+gcloud compute ssh cppmega-corpus-01-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-a --troubleshoot --tunnel-through-iap
+
+ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code [255].
+CPPMEGA_IAP_DIAG_FINISHED_AT=2026-08-09T09:28:08Z
+CPPMEGA_IAP_DIAG_LOCAL_EXIT=255
+===== VM 03 us-central1-b =====
+CPPMEGA_IAP_DIAG_VM=cppmega-corpus-03-source-prod-20260804-005
+CPPMEGA_IAP_DIAG_ZONE=us-central1-b
+CPPMEGA_IAP_DIAG_STARTED_AT=2026-08-09T09:27:51Z
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/dave/.ssh/config
+debug1: Reading configuration data /Users/dave/.colima/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config.d/100-macos.conf
+debug1: /etc/ssh/ssh_config.d/100-macos.conf line 1: Applying options for *
+debug1: Reading configuration data /etc/ssh/crypto.conf
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Executing proxy command: exec /Users/dave/.config/gcloud/virtenv/bin/python3.14 /opt/homebrew/Caskroom/gcloud-cli/565.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel cppmega-corpus-03-source-prod-20260804-005 22 --listen-on-stdin --project=natural-bison-491019-t9 --zone=us-central1-b --verbosity=warning
+debug1: loaded pubkey from /Users/dave/.ssh/google_compute_engine: RSA SHA256:BCX3eMSYdSznEZOyHaLFuMzPCRanJUQPcyPGl898wFY
+debug1: identity file /Users/dave/.ssh/google_compute_engine type 0
+debug1: no identity pubkey loaded from /Users/dave/.ssh/google_compute_engine
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Connection timed out during banner exchange
+Connection to UNKNOWN port 65535 timed out
+
+Recommendation: To check for possible causes of SSH connectivity issues and get
+recommendations, rerun the ssh command with the --troubleshoot option.
+
+gcloud compute ssh cppmega-corpus-03-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot
+
+Or, to investigate an IAP tunneling issue:
+
+gcloud compute ssh cppmega-corpus-03-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot --tunnel-through-iap
+
+ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code [255].
+CPPMEGA_IAP_DIAG_FINISHED_AT=2026-08-09T09:28:09Z
+CPPMEGA_IAP_DIAG_LOCAL_EXIT=255
+===== VM 05 us-central1-b =====
+CPPMEGA_IAP_DIAG_VM=cppmega-corpus-05-source-prod-20260804-005
+CPPMEGA_IAP_DIAG_ZONE=us-central1-b
+CPPMEGA_IAP_DIAG_STARTED_AT=2026-08-09T09:27:51Z
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/dave/.ssh/config
+debug1: Reading configuration data /Users/dave/.colima/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config.d/100-macos.conf
+debug1: /etc/ssh/ssh_config.d/100-macos.conf line 1: Applying options for *
+debug1: Reading configuration data /etc/ssh/crypto.conf
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Executing proxy command: exec /Users/dave/.config/gcloud/virtenv/bin/python3.14 /opt/homebrew/Caskroom/gcloud-cli/565.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel cppmega-corpus-05-source-prod-20260804-005 22 --listen-on-stdin --project=natural-bison-491019-t9 --zone=us-central1-b --verbosity=warning
+debug1: loaded pubkey from /Users/dave/.ssh/google_compute_engine: RSA SHA256:BCX3eMSYdSznEZOyHaLFuMzPCRanJUQPcyPGl898wFY
+debug1: identity file /Users/dave/.ssh/google_compute_engine type 0
+debug1: no identity pubkey loaded from /Users/dave/.ssh/google_compute_engine
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Connection timed out during banner exchange
+Connection to UNKNOWN port 65535 timed out
+
+Recommendation: To check for possible causes of SSH connectivity issues and get
+recommendations, rerun the ssh command with the --troubleshoot option.
+
+gcloud compute ssh cppmega-corpus-05-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot
+
+Or, to investigate an IAP tunneling issue:
+
+gcloud compute ssh cppmega-corpus-05-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot --tunnel-through-iap
+
+ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code [255].
+CPPMEGA_IAP_DIAG_FINISHED_AT=2026-08-09T09:28:08Z
+CPPMEGA_IAP_DIAG_LOCAL_EXIT=255
+===== VM 11 us-central1-b =====
+CPPMEGA_IAP_DIAG_VM=cppmega-corpus-11-source-prod-20260804-005
+CPPMEGA_IAP_DIAG_ZONE=us-central1-b
+CPPMEGA_IAP_DIAG_STARTED_AT=2026-08-09T09:27:51Z
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/dave/.ssh/config
+debug1: Reading configuration data /Users/dave/.colima/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config.d/100-macos.conf
+debug1: /etc/ssh/ssh_config.d/100-macos.conf line 1: Applying options for *
+debug1: Reading configuration data /etc/ssh/crypto.conf
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Executing proxy command: exec /Users/dave/.config/gcloud/virtenv/bin/python3.14 /opt/homebrew/Caskroom/gcloud-cli/565.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel cppmega-corpus-11-source-prod-20260804-005 22 --listen-on-stdin --project=natural-bison-491019-t9 --zone=us-central1-b --verbosity=warning
+debug1: loaded pubkey from /Users/dave/.ssh/google_compute_engine: RSA SHA256:BCX3eMSYdSznEZOyHaLFuMzPCRanJUQPcyPGl898wFY
+debug1: identity file /Users/dave/.ssh/google_compute_engine type 0
+debug1: no identity pubkey loaded from /Users/dave/.ssh/google_compute_engine
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Connection timed out during banner exchange
+Connection to UNKNOWN port 65535 timed out
+
+Recommendation: To check for possible causes of SSH connectivity issues and get
+recommendations, rerun the ssh command with the --troubleshoot option.
+
+gcloud compute ssh cppmega-corpus-11-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot
+
+Or, to investigate an IAP tunneling issue:
+
+gcloud compute ssh cppmega-corpus-11-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot --tunnel-through-iap
+
+ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code [255].
+CPPMEGA_IAP_DIAG_FINISHED_AT=2026-08-09T09:28:09Z
+CPPMEGA_IAP_DIAG_LOCAL_EXIT=255
+===== VM 12 us-central1-b =====
+CPPMEGA_IAP_DIAG_VM=cppmega-corpus-12-source-prod-20260804-005
+CPPMEGA_IAP_DIAG_ZONE=us-central1-b
+CPPMEGA_IAP_DIAG_STARTED_AT=2026-08-09T09:27:51Z
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/dave/.ssh/config
+debug1: Reading configuration data /Users/dave/.colima/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config.d/100-macos.conf
+debug1: /etc/ssh/ssh_config.d/100-macos.conf line 1: Applying options for *
+debug1: Reading configuration data /etc/ssh/crypto.conf
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Executing proxy command: exec /Users/dave/.config/gcloud/virtenv/bin/python3.14 /opt/homebrew/Caskroom/gcloud-cli/565.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel cppmega-corpus-12-source-prod-20260804-005 22 --listen-on-stdin --project=natural-bison-491019-t9 --zone=us-central1-b --verbosity=warning
+debug1: loaded pubkey from /Users/dave/.ssh/google_compute_engine: RSA SHA256:BCX3eMSYdSznEZOyHaLFuMzPCRanJUQPcyPGl898wFY
+debug1: identity file /Users/dave/.ssh/google_compute_engine type 0
+debug1: no identity pubkey loaded from /Users/dave/.ssh/google_compute_engine
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Connection timed out during banner exchange
+Connection to UNKNOWN port 65535 timed out
+
+Recommendation: To check for possible causes of SSH connectivity issues and get
+recommendations, rerun the ssh command with the --troubleshoot option.
+
+gcloud compute ssh cppmega-corpus-12-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot
+
+Or, to investigate an IAP tunneling issue:
+
+gcloud compute ssh cppmega-corpus-12-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-b --troubleshoot --tunnel-through-iap
+
+ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code [255].
+CPPMEGA_IAP_DIAG_FINISHED_AT=2026-08-09T09:28:08Z
+CPPMEGA_IAP_DIAG_LOCAL_EXIT=255
+===== VM 15 us-central1-f =====
+CPPMEGA_IAP_DIAG_VM=cppmega-corpus-15-source-prod-20260804-005
+CPPMEGA_IAP_DIAG_ZONE=us-central1-f
+CPPMEGA_IAP_DIAG_STARTED_AT=2026-08-09T09:27:51Z
+debug1: OpenSSH_10.3p1, LibreSSL 3.3.6
+debug1: Reading configuration data /Users/dave/.ssh/config
+debug1: Reading configuration data /Users/dave/.colima/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Reading configuration data /etc/ssh/ssh_config.d/100-macos.conf
+debug1: /etc/ssh/ssh_config.d/100-macos.conf line 1: Applying options for *
+debug1: Reading configuration data /etc/ssh/crypto.conf
+debug1: Authenticator provider $SSH_SK_PROVIDER did not resolve; disabling
+debug1: Executing proxy command: exec /Users/dave/.config/gcloud/virtenv/bin/python3.14 /opt/homebrew/Caskroom/gcloud-cli/565.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel cppmega-corpus-15-source-prod-20260804-005 22 --listen-on-stdin --project=natural-bison-491019-t9 --zone=us-central1-f --verbosity=warning
+debug1: loaded pubkey from /Users/dave/.ssh/google_compute_engine: RSA SHA256:BCX3eMSYdSznEZOyHaLFuMzPCRanJUQPcyPGl898wFY
+debug1: identity file /Users/dave/.ssh/google_compute_engine type 0
+debug1: no identity pubkey loaded from /Users/dave/.ssh/google_compute_engine
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+Connection timed out during banner exchange
+Connection to UNKNOWN port 65535 timed out
+
+Recommendation: To check for possible causes of SSH connectivity issues and get
+recommendations, rerun the ssh command with the --troubleshoot option.
+
+gcloud compute ssh cppmega-corpus-15-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-f --troubleshoot
+
+Or, to investigate an IAP tunneling issue:
+
+gcloud compute ssh cppmega-corpus-15-source-prod-20260804-005 --project=natural-bison-491019-t9 --zone=us-central1-f --troubleshoot --tunnel-through-iap
+
+ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited with return code [255].
+CPPMEGA_IAP_DIAG_FINISHED_AT=2026-08-09T09:28:09Z
+CPPMEGA_IAP_DIAG_LOCAL_EXIT=255

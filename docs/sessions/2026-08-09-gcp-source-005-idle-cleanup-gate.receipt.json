@@ -1,0 +1,336 @@
+{
+  "schema": "cppmega.gcp_source_idle_cleanup_gate_receipt_v1",
+  "created_at": "2026-08-09T09:41:42Z",
+  "project_id": "natural-bison-491019-t9",
+  "run_id": "source-prod-20260804-005",
+  "target_worker_indexes": [
+    1,
+    3,
+    5,
+    11,
+    12,
+    15
+  ],
+  "protected_worker_indexes_not_probed_or_targeted": [
+    10,
+    13,
+    14
+  ],
+  "authorization_scope": {
+    "compute_and_gcs_account": "nanochat-automation@natural-bison-491019-t9.iam.gserviceaccount.com",
+    "iap_account": "david@jewelmusic.art",
+    "iap_account_override": "CLOUDSDK_CORE_ACCOUNT process environment plus explicit --account",
+    "global_gcloud_account_expected": "cloud-love-ci-observer@gen-lang-client-0223744829.iam.gserviceaccount.com",
+    "global_gcloud_account_final": "cloud-love-ci-observer@gen-lang-client-0223744829.iam.gserviceaccount.com",
+    "global_account_drift_detected_and_restored": true
+  },
+  "iap_diagnostics": {
+    "started_at": "2026-08-09T09:27:51Z",
+    "finished_at_latest": "2026-08-09T09:28:09Z",
+    "operation": "gcloud compute ssh --tunnel-through-iap with a remote marker and OpenSSH ConnectTimeout=15",
+    "remote_marker": "CPPMEGA_IAP_DIAG_REMOTE_REACHED",
+    "remote_marker_reached_count": 0,
+    "common_result": "SSH banner exchange timed out",
+    "local_exit_code_by_worker": {
+      "01": 255,
+      "03": 255,
+      "05": 255,
+      "11": 255,
+      "12": 255,
+      "15": 255
+    },
+    "raw_output": {
+      "path": "/Volumes/external/cppmega_data/worktrees/cppmega-distributed-prep-150-runbook/docs/sessions/2026-08-09-gcp-source-005-idle-cleanup-gate-iap.raw.txt",
+      "size_bytes": 13500,
+      "sha256": "4457d5abfb2408dfadf83a01931da146283847f5211de0ebdea35afb9606c0f1",
+      "line_endings": "LF-normalized combined stdout/stderr"
+    }
+  },
+  "compute_inventory": {
+    "checked_read_only": true,
+    "all_targets_running": true,
+    "local_ssd_contents_verified": false,
+    "local_ssd_gate": "blocked_by_unreachable_guest",
+    "workers": [
+      {
+        "index": 1,
+        "name": "cppmega-corpus-01-source-prod-20260804-005",
+        "zone": "us-central1-a",
+        "machine_type": "n2d-standard-16",
+        "status": "RUNNING",
+        "local_ssd_count": 2,
+        "local_ssd_gb_each": 375,
+        "local_ssd_type": "SCRATCH",
+        "local_ssd_auto_delete": true,
+        "describe_sha256": "0b2bc3617c826f8a64fe8b844f29a7dc571ba2933673126019658f918f0a495f"
+      },
+      {
+        "index": 3,
+        "name": "cppmega-corpus-03-source-prod-20260804-005",
+        "zone": "us-central1-b",
+        "machine_type": "n2d-standard-16",
+        "status": "RUNNING",
+        "local_ssd_count": 2,
+        "local_ssd_gb_each": 375,
+        "local_ssd_type": "SCRATCH",
+        "local_ssd_auto_delete": true,
+        "describe_sha256": "82ffac5abacb6eb96d66f1cd9096f86ea0e39e4a88519b203b2c6545d9d6d376"
+      },
+      {
+        "index": 5,
+        "name": "cppmega-corpus-05-source-prod-20260804-005",
+        "zone": "us-central1-b",
+        "machine_type": "n2d-standard-16",
+        "status": "RUNNING",
+        "local_ssd_count": 2,
+        "local_ssd_gb_each": 375,
+        "local_ssd_type": "SCRATCH",
+        "local_ssd_auto_delete": true,
+        "describe_sha256": "9c7309bfdf63fda7167d2afb6a499366e84754b64aaddec2e5b71581ee7cd990"
+      },
+      {
+        "index": 11,
+        "name": "cppmega-corpus-11-source-prod-20260804-005",
+        "zone": "us-central1-b",
+        "machine_type": "n2d-standard-16",
+        "status": "RUNNING",
+        "local_ssd_count": 2,
+        "local_ssd_gb_each": 375,
+        "local_ssd_type": "SCRATCH",
+        "local_ssd_auto_delete": true,
+        "describe_sha256": "d5ae5c7349c8284c62534dabc86078f1fb55cc3b826688522b1367afcd480016"
+      },
+      {
+        "index": 12,
+        "name": "cppmega-corpus-12-source-prod-20260804-005",
+        "zone": "us-central1-b",
+        "machine_type": "n2d-standard-16",
+        "status": "RUNNING",
+        "local_ssd_count": 2,
+        "local_ssd_gb_each": 375,
+        "local_ssd_type": "SCRATCH",
+        "local_ssd_auto_delete": true,
+        "describe_sha256": "3d10b13cbc7992ba9d03e1d66bc1d3a4ddba8f956e1ae7f3db58daff6332c7bd"
+      },
+      {
+        "index": 15,
+        "name": "cppmega-corpus-15-source-prod-20260804-005",
+        "zone": "us-central1-f",
+        "machine_type": "n2-standard-16",
+        "status": "RUNNING",
+        "local_ssd_count": 2,
+        "local_ssd_gb_each": 375,
+        "local_ssd_type": "SCRATCH",
+        "local_ssd_auto_delete": true,
+        "describe_sha256": "d8e64f6f376bb9fcfdd78859314f69a7f44fc5b92bc50f374870043c0d3a1c76"
+      }
+    ],
+    "addresses": {
+      "count": 6,
+      "all_status": "IN_USE",
+      "normalized_inventory_sha256": "da4330b6f483c0d0f4eeff80db4813e37b887ea51edee5d12edb0656fac8b536"
+    }
+  },
+  "serial_console_evidence": {
+    "operation": "read-only get-serial-port-output port 1 start 0",
+    "account": "nanochat-automation@natural-bison-491019-t9.iam.gserviceaccount.com",
+    "captures": [
+      {
+        "index": 1,
+        "size_bytes": 1048695,
+        "sha256": "4f883023a8e30e9cd2f013ad74843b12379df3267f90971c5099014bc204b4dc",
+        "next_start": 65897047,
+        "finding": "continuous guest-agent failures: metadata server network is unreachable, including OS Login initialization"
+      },
+      {
+        "index": 3,
+        "size_bytes": 469645,
+        "sha256": "95efad7e40b96eca0f4108182887c1a23354d760c10b331489d2161bbc605946",
+        "next_start": 469528,
+        "finding": "metadata-server I/O timeout is the latest network evidence"
+      },
+      {
+        "index": 5,
+        "size_bytes": 285699,
+        "sha256": "6e480e9a6392efd9ae011bc40bd2bbdc4dfb903110e8a35d08fd5bab69e02ec2",
+        "next_start": 285582,
+        "finding": "source worker previously restarted; later metadata and identity calls report network unreachable"
+      },
+      {
+        "index": 11,
+        "size_bytes": 269734,
+        "sha256": "d4f458ebd7ad12d3c829a376b0314c417d4dba46891d3e765de5fa25e982de4a",
+        "next_start": 269617,
+        "finding": "source worker logged a GCS metadata retry; later guest metadata is network unreachable"
+      },
+      {
+        "index": 12,
+        "size_bytes": 295107,
+        "sha256": "7b3cad36b743d3e6f12853b626b8bff6d409d0261aec0cd4038cf0d84182953e",
+        "next_start": 294990,
+        "finding": "metadata-server I/O timeouts are present"
+      },
+      {
+        "index": 15,
+        "size_bytes": 282665,
+        "sha256": "7d4089f2f9cab8cb295bff8eacec00cffbca1805e9b65e181faa4762ed66931d",
+        "next_start": 282548,
+        "finding": "metadata-server I/O timeouts are present"
+      }
+    ]
+  },
+  "claims_and_completions_snapshot": {
+    "source_path": "/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/gcp-source-prod-20260804-005.current.json",
+    "source_file_sha256": "dea1f4992608f76e17482d5ae57d953cf9ac23035a5a80ba6f3a2523bf118d8c",
+    "schema": "cppmega.gcp_source_run_monitor_report_v1",
+    "checked_at": "2026-08-09T09:32:58Z",
+    "checked_at_unix": 1786267978,
+    "state": "blocked_deterministic",
+    "claim_inventory_sha256": "212edbd553d9a51f7698ea0671888746c71a6b2bc17f8ac8acaa67d0cfcc3c76",
+    "heartbeat_inventory_sha256": "5801fdbb381cc7812755aed3a45214b5b18feb5cf1db4e9e4cdb6e57301a0835",
+    "outcome_inventory_sha256": "57e0bfbbd22684179ce2b052dfcf2d0c6925502a4eb5419e4cce7c384c5a6a24",
+    "receipt_inventory_sha256": "65312416123a60ab74721496b5ebca1a82763a4f771966c18d4516fa636340e5",
+    "manifest_assignments": 482,
+    "claimed_assignments": 482,
+    "completion_receipts": 410,
+    "deterministic_outcomes": 54,
+    "transient_outcomes": 0,
+    "current_claimed_assignments": 18,
+    "fresh_heartbeat_assignments": 4,
+    "slot_completion_receipts": 0,
+    "completed_workers": 0,
+    "idle_target_current_claims": {
+      "01": 0,
+      "03": 0,
+      "05": 0,
+      "11": 0,
+      "12": 0,
+      "15": 0
+    },
+    "protected_by_instruction_not_targeted": {
+      "10": {
+        "current_claims": 2,
+        "fresh_heartbeats": 0
+      },
+      "13": {
+        "current_claims": 2,
+        "fresh_heartbeats": 2
+      },
+      "14": {
+        "current_claims": 2,
+        "fresh_heartbeats": 2
+      }
+    },
+    "training_ready": false
+  },
+  "terraform_state": {
+    "backend": {
+      "bucket": "natural-bison-491019-t9-cppmega-corpus",
+      "prefix": "terraform/source-runs/source-prod-20260804-005"
+    },
+    "backend_config_path": "/Volumes/external/cppmega_data/gcp_source_prod_20260804_005/n2d-ab-missing5/isolated-terraform/source-prod-20260804-005.backend.hcl",
+    "backend_config_sha256": "afed8b3642907458d42a963171e0813a8f2249e413b752adc162be7cf829df5d",
+    "tf_data_dir": "/Volumes/external/cppmega_data/gcp_source_prod_20260804_005/n2d-ab-missing5/isolated-terraform/terraform-data-source-prod-20260804-005",
+    "local_backend_metadata_sha256_after_reconfigure": "430890f70b245109caba8366da091347bc4278ddb1c0f2d09c9ed564d1716845",
+    "local_backend_metadata_contains_access_token": false,
+    "remote_state_serial": 11,
+    "remote_state_lineage": "0a0be625-4587-a098-79ad-bb67fb79dc89",
+    "remote_state_managed_instance_count": 33,
+    "remote_state_identity_projection_sha256": "9abdd3d8991b3ecd07dd23e60a69090bd6aa6a11ed31d2f203245651c96e3545",
+    "remote_state_identity_projection_repeat_count": 2,
+    "terraform_version": "1.15.4",
+    "provider": "hashicorp/google v7.42.0",
+    "terraform_module_worktree_head": "00373dfc1e7f83d7cd188b7dbdaa238d807048f6",
+    "terraform_module_origin_main_at_plan_time": "43aa2aecb7016a3c6c5266bbf7422175da902d99",
+    "terraform_workers_tree_sha1_both_revisions": "81ec23d31b53aaaa33fe5618d7a3cab9fe604eb3",
+    "var_file_path": "/Volumes/external/cppmega_data/gcp_source_prod_20260804_005/source-prod-005-us-central1-ab-missing5.tfvars",
+    "var_file_sha256": "b91dccf67d896885ab50425531f0f6f1c94c31b9202db7a2a3f44bc1ad129737"
+  },
+  "terraform_plans": {
+    "vm_and_address_preview": {
+      "path": "/Volumes/external/cppmega_data/gcp_source_prod_20260804_005/n2d-ab-missing5/isolated-terraform/source-prod-20260804-005.idle-010305111215.destroy-preview-20260809T0928Z.tfplan",
+      "size_bytes": 54699,
+      "binary_sha256": "064f05725d04f205f53507f69c8e91951fff7f8e50907401abd9522e740aa823",
+      "plan_json_sha256": "5ac066bba102c652547e2c5c38736d20ade86992aa80dd7eeac3ee4bc08bd0be",
+      "plan_stdout_sha256": "38d90b107dc9d5de5d2b50e0fb9cbb7130045d204933904eff7d311f8d74dc14",
+      "exit_code": 0,
+      "summary": {
+        "add": 0,
+        "change": 0,
+        "destroy": 22
+      },
+      "delete_actions": {
+        "target_addresses": [
+          1,
+          3,
+          5,
+          11,
+          12,
+          15
+        ],
+        "instances": "all indexes 0 through 15"
+      },
+      "status": "UNSAFE_DO_NOT_APPLY",
+      "reason": "address targets pull every instance through the Terraform dependency graph, including protected workers"
+    },
+    "instances_only_preview": {
+      "path": "/Volumes/external/cppmega_data/gcp_source_prod_20260804_005/n2d-ab-missing5/isolated-terraform/source-prod-20260804-005.idle-010305111215.instances-only.destroy-preview-20260809T0928Z.tfplan",
+      "size_bytes": 51123,
+      "binary_sha256": "d24f436bd5567cc9823aa80ca5a60553238681fdaa4b997bfa617785c00d80b2",
+      "plan_json_sha256": "f8e8654333c206d6157ae575669995460565cafa614332bf073c1ccc37b900c1",
+      "plan_stdout_sha256": "9c31a7944b1eca09b8ee77260b4d70925939e5cbfd81db2284a161c1a76a0b8e",
+      "exit_code": 0,
+      "summary": {
+        "add": 0,
+        "change": 0,
+        "destroy": 6
+      },
+      "delete_actions": [
+        "google_compute_instance.worker[\"cppmega-corpus-01\"]",
+        "google_compute_instance.worker[\"cppmega-corpus-03\"]",
+        "google_compute_instance.worker[\"cppmega-corpus-05\"]",
+        "google_compute_instance.worker[\"cppmega-corpus-11\"]",
+        "google_compute_instance.worker[\"cppmega-corpus-12\"]",
+        "google_compute_instance.worker[\"cppmega-corpus-15\"]"
+      ],
+      "status": "TOPOLOGY_EXACT_BUT_BLOCKED_DO_NOT_APPLY",
+      "reason": "the plan isolates the intended instances, but guest reachability failed and Local SSD contents remain unverified"
+    }
+  },
+  "operations_performed": [
+    "Compute GET/LIST",
+    "Address LIST",
+    "serial-port GET",
+    "IAP TCP/SSH connection attempt with remote read-only marker",
+    "GCS-backed Terraform state pull",
+    "Terraform refresh and targeted destroy preview with -lock=false",
+    "Terraform show of local binary plans"
+  ],
+  "cloud_mutations_performed": [],
+  "local_writes_performed": [
+    "Terraform backend metadata reconfigure in the pre-existing isolated TF_DATA_DIR",
+    "two local binary plan previews",
+    "this evidence receipt and its IAP raw-output companion",
+    "restored the global gcloud account after detected drift"
+  ],
+  "apply_performed": false,
+  "destroy_performed": false,
+  "delete_performed": false,
+  "safe_to_delete_idle_workers": false,
+  "safe_to_apply_any_saved_plan": false,
+  "verdict": "UNSAFE_TO_DELETE",
+  "blocking_reasons": [
+    "all six IAP probes failed before executing the remote marker",
+    "each VM still has two 375 GB auto-deleting SCRATCH Local SSDs whose contents could not be inspected or read back",
+    "serial evidence includes guest metadata/GCS connectivity failures, so unuploaded Local SSD state cannot be excluded",
+    "the VM+address Terraform preview expands to all sixteen instances",
+    "there are no slot completion receipts and no completed worker receipts"
+  ],
+  "next_safe_gate": [
+    "restore read-only guest access or obtain an equivalent immutable inventory of /mnt/cppmega-stage",
+    "prove every useful candidate/receipt/checkpoint has generation-pinned GCS readback",
+    "only then regenerate an instance-only plan against the same state serial and verify its six exact actions",
+    "release the six addresses in a later Terraform stage after those instances are absent; never apply the combined 22-delete preview"
+  ],
+  "training_ready": false
+}
