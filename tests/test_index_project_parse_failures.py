@@ -1525,15 +1525,16 @@ def test_gnu_c_standard_header_keeps_consistent_language_family(
 
 
 @pytest.mark.parametrize(
-    ("standard_args", "expected_standard"),
+    ("standard_args", "expected_language", "expected_standard"),
     [
-        (["--std=c11", "--std=gnu2x"], "--std=gnu2x"),
-        (["-cl-std=CL1.2", "-cl-std=CL3.0"], "-cl-std=CL3.0"),
+        (["--std=c11", "--std=gnu2x"], "c-header", "--std=gnu2x"),
+        (["-cl-std=CL1.2", "-cl-std=CL3.0"], "cl", "-cl-std=CL3.0"),
     ],
 )
 def test_header_adaptation_keeps_only_last_standard_alias(
     tmp_path: Path,
     standard_args: list[str],
+    expected_language: str,
     expected_standard: str,
 ) -> None:
     index_project = _load_indexer()
@@ -1550,7 +1551,9 @@ def test_header_adaptation_keeps_only_last_standard_alias(
         for arg in adapted
         if arg.startswith(("-std=", "--std=", "-cl-std="))
     ]
+    assert adapted[:2] == ["-x", expected_language]
     assert standard_flags == [expected_standard]
+    assert index_project._is_sane_compile_args(adapted)
 
 
 def test_mixed_case_cpp_suffix_forces_cpp_language(
