@@ -5865,7 +5865,12 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
         adapted = []
         skip_next = False
         standard_indexes = [
-            index for index, arg in enumerate(args) if arg.startswith('-std=')
+            index
+            for index, arg in enumerate(args)
+            if any(
+                arg.startswith(prefix)
+                for prefix in _STANDARD_FLAG_PREFIXES
+            )
         ]
         last_standard_index = standard_indexes[-1] if standard_indexes else None
         for arg_index, arg in enumerate(args):
@@ -5877,7 +5882,13 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 continue
             if arg.startswith('-x') and arg != '-x':
                 continue
-            if arg.startswith('-std=') and arg_index != last_standard_index:
+            if (
+                any(
+                    arg.startswith(prefix)
+                    for prefix in _STANDARD_FLAG_PREFIXES
+                )
+                and arg_index != last_standard_index
+            ):
                 continue
             adapted.append(arg)
         header_language = 'c-header' if is_c_header else 'c++-header'
