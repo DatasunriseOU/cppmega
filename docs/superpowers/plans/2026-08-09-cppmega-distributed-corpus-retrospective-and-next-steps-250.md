@@ -1,6 +1,6 @@
 # Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
 
-Дата среза evidence: `2026-08-09`
+Дата среза evidence: `2026-08-09`; последний сведённый GCP audit: `2026-08-09T00:53:42Z`
 
 Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`
 
@@ -659,7 +659,7 @@
 ### D001 — Source/GCP repair stack интегрирован в основную историю
 
 - **Сделано:** ветка integration landed через commit `ac41718b` и последующие merges; `origin/main` на evidence-срезе содержит source repair/runtime stack.
-- **Доказательство:** `git log --all`, merge `10066e88` и текущий `origin/main` `b045e547`.
+- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547` и текущий `origin/main` `88f4d8e7`.
 - **Честная граница:** наличие кода в main не означает, что все source assignments завершены.
 
 ### D002 — Terraform foundation оформлен отдельным модулем
@@ -676,9 +676,9 @@
 
 ### D004 — Receipt-bound GCP source monitor реализован
 
-- **Сделано:** monitor умеет считать claims, heartbeats, outcomes, assignment receipts и recovery policy по immutable objects.
-- **Доказательство:** commit `f9b59646` и live report schema `cppmega.gcp_source_run_monitor_report_v1`.
-- **Честная граница:** monitor может показать `blocked_deterministic`; он не исправляет parser defect автоматически.
+- **Сделано:** monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts.
+- **Доказательство:** pushed branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`, monitor SHA-256 `4d1e8b141e5ecd854c6f41574e688ba05b7bfc8c901f3bfdc0391f6e8e5aa046`, focused suite `56 passed`.
+- **Честная граница:** live loop на этом срезе всё ещё pinned к старому SHA `08759b…`; N014 обязан обновить pin и доказать два свежих цикла. Сам monitor не исправляет parser defect автоматически.
 
 ### D005 — Dynamic source work stealing реализован
 
@@ -940,13 +940,13 @@
 
 ### D047 — 30-минутный pipeline watchdog установлен и исполняется
 
-- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 235 runs и last exit `0` на evidence-срезе.
-- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist` и `launchctl print`.
-- **Честная граница:** launchd `state=not running` между interval invocations нормален; freshness проверяется timestamps reports.
+- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 239 runs и last exit `0`; loop считает cadence как 1800 секунд от начала цикла, а не `scan + 1800`.
+- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, `launchctl print` и live loop SHA-256 `46a540199f9e399156573d2961425a99a6c001f0fbda34b3c0f5946cf5a7a9d3`.
+- **Честная граница:** launchd `state=not running` между interval invocations нормален, но GCP subscan до N014 fail-closed пропускается из-за намеренно не обновлённого monitor SHA pin.
 
 ### D048 — Codex 429 watchdog установлен
 
-- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 2 runs и last exit `0`.
+- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 6 runs и last exit `0`.
 - **Доказательство:** `com.codex.multi-429-watchdog.plist` и `launchctl print`.
 - **Честная граница:** watchdog повторяет controller session; он не даёт права retry deterministic parser assignment.
 
@@ -956,11 +956,11 @@
 - **Доказательство:** `ci-case5-smoke-20260808-002.destroy-receipt.json`, status `destroyed_verified`, plan `0/0/3`.
 - **Честная граница:** сохранённые GCS evidence содержат ready receipt, но assignment/output `0/0`; это cleanup, не data completion.
 
-### D050 — GCP source repair `.001` имеет immutable operational snapshot
+### D050 — Четыре GCP source run сведены immutable read-only audit
 
-- **Сделано:** свежий monitor зафиксировал 4 physical/ready workers, 47 claims, 14 successful assignment receipts, 25 deterministic outcomes, 8 fresh active assignments и 0 transient outcomes.
-- **Доказательство:** `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/gcp-source-repair-20260808-001.current.json`, inventory SHA-256 fields.
-- **Честная граница:** state `blocked_deterministic`, completed workers/slot receipts `0`; snapshot доказывает работу/диагностику, не завершение run.
+- **Сделано:** audit связал `.004=111 success/371 unclaimed/0 VM`, `.005=409 success/54 deterministic/19 current/6 fresh/16 VM`, новый `.001=46 success/2 deterministic/32 current/32 fresh/16 VM`, repair `.001=14 success/26 deterministic/8 current/8 fresh/4 VM`; any-run union покрывает 423 проекта, 59 пока не покрыты ни одним run.
+- **Доказательство:** `/Volumes/external/cppmega_data/gcp_source_multi_run_audit_20260809/evidence/read-only-audit-20260809T005342Z/audit.md`, SHA-256 `76f157c7a625560bdcbc4141a5b13b57f27e57b4e0955bb1caeaa2e537babc5a`, и соседний immutable evidence receipt.
+- **Честная граница:** audit read-only и ни один run не имеет terminal slot/run receipts или reducer seal; 36 перечисленных source VM нельзя считать завершёнными, а шесть `.005` idle candidates можно удалять только после Local SSD diagnostics и state-aware Terraform plan.
 
 ---
 
@@ -1061,14 +1061,14 @@
 
 ### N014 — Повторно проверить оба 30-минутных watchdog
 
-- **Действие:** проверить launchd labels, actual report timestamps, exit history и duplicate legacy schedulers.
-- **Код/инфра/аккаунт:** два plists, dispatcher scripts и Application Support report roots.
-- **Проверка:** два consecutive reports ≤35 минут; secret scan logs; recovery не запускает deterministic assignment.
-- **Готово когда:** watchdog health receipt содержит plist/script hashes и test transient 429 dry-run.
+- **Действие:** заменить в live loop старый `gcp_monitor_sha256=08759b…` на SHA исправленного monitor `4d1e8b…`, проверить shell и перезапустить terminal/launchd controller без второго writer.
+- **Код/инфра/аккаунт:** `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/pipeline-watchdog-loop.sh`, pinned worktree `cppmega-gcp-source-assignment-heartbeat-monitor-live-20260806`, два plists и report roots.
+- **Проверка:** `sh -n`, exact file hash, один controller PID; два consecutive reports ≤35 минут; recovery не запускает exit `1/2`, а controlled transient `75/429` создаёт новый attempt.
+- **Готово когда:** watchdog health receipt связывает plist/script/config hashes и два новых полных cycle timestamps.
 
 ### N015 — Снять свежий GCP repair `.001` inventory scoped identity
 
-- **Действие:** использовать credential override operator SA, потому что текущий global gcloud account не имеет `compute.instances.list`.
+- **Действие:** использовать только command-scoped credential override operator SA; global human account `david@jewelmusic.art` не переключать.
 - **Код/инфра/аккаунт:** project `natural-bison-491019-t9`, `nanochat-automation@…`, GCE/GCS read-only commands.
 - **Проверка:** account/project printed без token value; instances, addresses, policies и GCS receipts inventory связаны timestamp/digest.
 - **Готово когда:** current report не старше 35 минут и reconciles с Compute API inventory.
@@ -1408,19 +1408,19 @@
 - **Проверка:** create-only upload, chunk/archive hash, exact-generation readback, no local 500 GiB requirement.
 - **Готово когда:** cloud workers могут стартовать только с GCS inputs + manifest.
 
-### N063 — Диагностировать stalled smoke `.003`
+### N063 — Запечатать диагностику долгой CASE5 smoke `.003`
 
-- **Действие:** прочитать bootstrap serial logs, systemd/process state, GCS control prefix и Terraform apply receipt.
+- **Действие:** сохранить systemd/process/fd/cgroup/Local SSD/SQLite evidence уже подтверждённой expensive validation и добавить bounded phase visibility, не называя процесс stalled.
 - **Код/инфра/аккаунт:** `ci-case5-smoke-20260808-003`, scoped Compute/GCS identity.
-- **Проверка:** определить, почему за прежний срез не было assignment/output/failure receipts и использовалось эффективно одно CPU.
-- **Готово когда:** immutable diagnostic receipt классифицирует bootstrap, scheduling, resource или code failure.
+- **Проверка:** bind adapter PID, открытый `67,177,742,336`-byte `index.sqlite3`, read counters, CPU affinity `0-15`, memory и текущую validation phase; подтвердить отсутствие 429/stall/output receipt.
+- **Готово когда:** immutable diagnostic receipt объясняет однопоточную фазу и задаёт безопасное решение: дождаться terminal readback либо supersede новым revision.
 
 ### N064 — Исправить effective single-core execution
 
-- **Действие:** передать реальный pool size/cgroup affinity и проверить, что worker видит 16 vCPU.
-- **Код/инфра/аккаунт:** Terraform startup template, cloud-lane runner, Python process pool settings.
-- **Проверка:** smoke benchmark CPU utilization/process count, deterministic output hashes против serial fixture.
-- **Готово когда:** pool использует ожидаемые cores без oversubscription/OOM и topology receipt отражает факт.
+- **Действие:** профилировать повторные SHA/SQLite/logical verification passes, распараллелить только доказанно независимые read-only partitions и оставить single-writer finalize; передать реальный pool size/cgroup affinity.
+- **Код/инфра/аккаунт:** CASE5 adapter/exporter, Terraform startup template, cloud-lane runner и Python process-pool settings.
+- **Проверка:** serial-vs-parallel fixture даёт byte-identical hashes/counts; benchmark фиксирует wall time, CPU utilization, peak RSS/I/O и не создаёт competing SQLite writers.
+- **Готово когда:** fixed smoke использует ожидаемые cores на parallel-safe phases без oversubscription/OOM, а topology/phase receipt отражает фактическую степень параллелизма.
 
 ### N065 — Закрепить CASE5 bootstrap тестами
 
@@ -1431,10 +1431,10 @@
 
 ### N066 — Пересоздать smoke новым run ID при deterministic fix
 
-- **Действие:** сохранить `.003` evidence, destroy его resources после diagnosis и запустить `.004`, не mutate `.003`.
+- **Действие:** дать `.003` закончить текущую expensive validation, если heartbeat/read counters продолжают расти; после terminal GCS readback выполнить teardown. Только при доказанном deterministic defect сохранить evidence, destroy через его backend и запустить `.004`, не mutate `.003`.
 - **Код/инфра/аккаунт:** isolated Terraform backends and GCS prefixes.
-- **Проверка:** `.003` destroy plan scoped; `.004` plan binds fixed revision; foundation untouched.
-- **Готово когда:** old run `destroyed_verified`, new run ready with exact topology.
+- **Проверка:** `.003` output/diagnostic generation pinned; destroy plan scoped; при необходимости `.004` plan binds fixed revision; foundation untouched.
+- **Готово когда:** `.003` либо terminal+readback+`destroyed_verified`, либо superseded с immutable diagnostic, а `.004` ready with exact topology.
 
 ### N067 — Получить terminal CASE5 smoke output
 
