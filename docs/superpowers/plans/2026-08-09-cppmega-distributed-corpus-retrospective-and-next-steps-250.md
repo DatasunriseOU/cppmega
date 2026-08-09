@@ -1,7 +1,9 @@
 # Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
 
-Дата среза evidence: `2026-08-09`  
-Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`  
+Дата среза evidence: `2026-08-09`
+
+Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`
+
 Целевой результат: lossless Parquet и Megatron для `code`, GitHub PR, GitLab MR и CI на длинах `1024, 2048, 4096, 8192, 16384, 32768, 65536`, с immutable receipts, независимым GCS/Nebius readback и без оставленных дорогих transient VM.
 
 ## Как читать отчёт
@@ -956,7 +958,7 @@
 
 ### D050 — GCP source repair `.001` имеет immutable operational snapshot
 
-- **Сделано:** monitor зафиксировал 4 physical/ready workers, 34 claims, 8 assignment receipts, 18 deterministic outcomes, 8 fresh heartbeats и 0 transient outcomes.
+- **Сделано:** свежий monitor зафиксировал 4 physical/ready workers, 47 claims, 14 successful assignment receipts, 25 deterministic outcomes, 8 fresh active assignments и 0 transient outcomes.
 - **Доказательство:** `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/gcp-source-repair-20260808-001.current.json`, inventory SHA-256 fields.
 - **Честная граница:** state `blocked_deterministic`, completed workers/slot receipts `0`; snapshot доказывает работу/диагностику, не завершение run.
 
