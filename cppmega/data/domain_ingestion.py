@@ -361,21 +361,30 @@ def _trailing_nul_bytes(
 _MULE_INTERNAL_SIGNATURE = b"-- MULE \x92"
 
 
-def _path_declared_codec(
-    path: Path,
-    *,
-    source_prefix: bytes = b"",
-) -> tuple[str, str] | None:
-    if tuple(part.casefold() for part in path.parts[-5:]) == (
+def _is_postgres_mule_internal_path(path: Path) -> bool:
+    """True for the pinned postgres multibyte mule_internal SQL fixture path."""
+    return tuple(part.casefold() for part in path.parts[-5:]) == (
         "src",
         "test",
         "mb",
         "sql",
         "mule_internal.sql",
-    ):
-        if source_prefix.startswith(_MULE_INTERNAL_SIGNATURE):
-            return "latin-1", "mule-internal"
-        return None
+    )
+
+
+def _path_declared_codec(
+    path: Path,
+    *,
+    source_prefix: bytes = b"",
+) -> tuple[str, str] | None:
+    # The path is the contract. Archive-pinned mule_internal.sql is raw
+    # mule-internal SQL (0x92 at offset 11; 0x81 later) and does not carry the
+    # modern "-- MULE \x92" banner. Falling through to cp1252 fails closed on
+    # 0x81. latin-1 preserves every byte and round-trips exactly. The optional
+    # signature is retained only as a documented tip-marker for fixtures/tests.
+    del source_prefix  # path contract; prefix is not authoritative for this pin
+    if _is_postgres_mule_internal_path(path):
+        return "latin-1", "mule-internal"
     declared = _FILENAME_DECLARED_CODECS.get(path.name.casefold())
     if declared is not None:
         return declared

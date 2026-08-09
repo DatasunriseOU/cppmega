@@ -234,6 +234,15 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "utf16le_source_text",
       "reason": "UTF-16LE C/C++ header mislabeled as source; contains embedded NULs (github tip hash; rebind if archive pin differs)"
+    },
+    {
+      "project_id": "corpus.local/windows_10_shared_source_kit",
+      "relative_path": "windows_10_shared_source_kit/unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h",
+      "size_bytes": 773,
+      "sha256": "38f8873ec81398a0a0e025690b3e2baa55c5c1221441d68ca0144b0b557fcb4b",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "nul_ff_binary_blob",
+      "reason": "Pinned archive header that is a pure 0x00/0xff binary blob under a .h suffix"
     }
   ],
   "collections": [
@@ -246,6 +255,16 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "asn1_der_x509_certificate_pair",
       "reason": "Pinned pyca-cryptography PKITS DER X.509 CertificatePair vector set stored under .cp suffixes"
+    },
+    {
+      "project_id": "xemu-project/xemu",
+      "relative_path_prefix": "roms/edk2/SecurityPkg/DeviceSecurity/SpdmLib/libspdm/os_stub/openssllib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/",
+      "relative_path_suffix": ".cp",
+      "expected_file_count": 348,
+      "content_set_sha256": "f109a9ffd7ad27256039925e3222ccd21fba5c6e734b2a12f0b243122e36701e",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "asn1_der_x509_certificate_pair",
+      "reason": "Pinned SecurityPkg duplicate of pyca-cryptography PKITS DER X.509 CertificatePair vectors under .cp suffixes"
     }
   ]
 }

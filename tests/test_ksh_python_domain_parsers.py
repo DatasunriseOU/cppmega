@@ -655,13 +655,21 @@ def test_postgres_mule_internal_fixture_round_trips_byte_exactly(
     assert all(chunk.byte_end - chunk.byte_start <= 17 for chunk in chunks)
 
 
-def test_postgres_mule_internal_contract_requires_signature(tmp_path: Path) -> None:
+def test_postgres_mule_internal_path_is_contract_without_banner(
+    tmp_path: Path,
+) -> None:
+    """Archive pin has no '-- MULE \\x92' banner; path alone selects latin-1."""
     from cppmega.data.domain_ingestion import (
         decode_domain_prefix,
         iter_domain_file_chunks,
     )
 
-    encoded = b"-- unrelated \x92 fixture\nSELECT 1;\n"
+    # Mirrors the archive pin: ASCII SQL with 0x92 early and 0x81 later.
+    # 0x81 is undefined in cp1252; path-declared latin-1 must win.
+    encoded = (
+        b"drop table \x92name;\n"
+        b"create table t (\x81col int);\n"
+    )
     path = tmp_path / "src/test/mb/sql/mule_internal.sql"
     path.parent.mkdir(parents=True)
     path.write_bytes(encoded)
@@ -669,9 +677,9 @@ def test_postgres_mule_internal_contract_requires_signature(tmp_path: Path) -> N
     decoded_prefix = decode_domain_prefix(encoded, path=path)
     chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=17))
 
-    assert decoded_prefix.encode("cp1252") == encoded
-    assert {chunk.source_encoding for chunk in chunks} == {"windows-1252"}
-    assert b"".join(chunk.text.encode("cp1252") for chunk in chunks) == encoded
+    assert decoded_prefix.encode("latin-1") == encoded
+    assert {chunk.source_encoding for chunk in chunks} == {"mule-internal"}
+    assert b"".join(chunk.text.encode("latin-1") for chunk in chunks) == encoded
 
 
 @pytest.mark.parametrize(
