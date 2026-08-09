@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +21,8 @@ _FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 _FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
 _TARGETED_LAUNCH_SCHEMA = "cppmega.canonical_source_targeted_retry_launch_v1"
 _TARGETED_EXIT_SCHEMA = "cppmega.canonical_source_targeted_retry_exit_v1"
+_EXIT_SALVAGE_SCHEMA = "cppmega.source_exit_salvage_attestation_v1"
+_SALVAGED_EXIT_FILENAME = "exit_receipt.salvaged.json"
 _PR_COMPLETION_SCHEMA = "cppmega_pr_completion_v2"
 _PR_COMPLETION_BINDING_FIELDS = {
     "schema",
@@ -210,6 +215,111 @@ def _resolve_bound_path(raw: object, *, where: str) -> Path:
     return _resolve_regular_file(Path(raw), where=where)
 
 
+def _validate_exit_salvage(
+    *,
+    exit_path: Path,
+    exit_receipt: Mapping[str, object],
+    exit_code: int,
+    done: Mapping[str, object],
+    failed: Mapping[str, object],
+    run_id: str,
+) -> tuple[dict[str, object] | None, Path | None]:
+    raw_salvage = exit_receipt.get("salvage")
+    if raw_salvage is None:
+        if exit_path.name == _SALVAGED_EXIT_FILENAME:
+            raise ValueError(f"{run_id} salvaged exit has no attestation")
+        return None, None
+    if exit_path.name != _SALVAGED_EXIT_FILENAME:
+        raise ValueError(f"{run_id} exit salvage must use {_SALVAGED_EXIT_FILENAME}")
+    if exit_code == 0:
+        raise ValueError(f"{run_id} successful exit must not be salvaged")
+
+    salvage = _require_mapping(raw_salvage, where=f"{run_id} exit salvage")
+    _require_exact_fields(
+        salvage,
+        {"schema", "created_at", "reason", "original_exit_receipt"},
+        where=f"{run_id} exit salvage",
+    )
+    if salvage.get("schema") != _EXIT_SALVAGE_SCHEMA:
+        raise ValueError(f"{run_id} exit salvage schema is unsupported")
+    created_at = salvage.get("created_at")
+    reason = salvage.get("reason")
+    if not isinstance(created_at, str) or not created_at or len(created_at) > 128:
+        raise ValueError(f"{run_id} exit salvage created_at is invalid")
+    if not isinstance(reason, str) or not reason or len(reason) > 4096:
+        raise ValueError(f"{run_id} exit salvage reason is invalid")
+
+    binding = _require_mapping(
+        salvage.get("original_exit_receipt"),
+        where=f"{run_id} original exit receipt binding",
+    )
+    _require_exact_fields(
+        binding,
+        {"path", "sha256", "size_bytes"},
+        where=f"{run_id} original exit receipt binding",
+    )
+    original_path = _resolve_bound_path(
+        binding.get("path"), where=f"{run_id} original exit receipt"
+    )
+    if (
+        original_path.parent != exit_path.parent.resolve()
+        or original_path.name != "exit_receipt.json"
+    ):
+        raise ValueError(f"{run_id} exit salvage binds a noncanonical original path")
+    original_raw, original = _load_json_object(
+        original_path,
+        where=f"{run_id} original exit receipt",
+        max_bytes=_MAX_RECEIPT_BYTES,
+    )
+    original_size = _require_positive_int(
+        binding.get("size_bytes"),
+        where=f"{run_id} original exit receipt size_bytes",
+    )
+    original_sha256 = _require_sha256(
+        binding.get("sha256"),
+        where=f"{run_id} original exit receipt sha256",
+    )
+    if (
+        len(original_raw) != original_size
+        or hashlib.sha256(original_raw).hexdigest() != original_sha256
+    ):
+        raise ValueError(f"{run_id} original exit receipt binding drifted")
+    if (
+        _require_nonnegative_int(
+            original.get("exit_code"), where=f"{run_id} original exit_code"
+        )
+        != exit_code
+        or original.get("ts") != exit_receipt.get("finished_at")
+    ):
+        raise ValueError(f"{run_id} salvaged exit projection drifted")
+
+    for name, units in (("done", done), ("failed", failed)):
+        raw_units = original.get(f"{name}_units")
+        if (
+            not isinstance(raw_units, list)
+            or any(not isinstance(unit, str) for unit in raw_units)
+            or len(raw_units) != len(set(raw_units))
+            or sorted(raw_units) != sorted(units)
+            or _require_nonnegative_int(
+                original.get(f"{name}_count"),
+                where=f"{run_id} original {name}_count",
+            )
+            != len(units)
+        ):
+            raise ValueError(f"{run_id} original {name} projection drifted")
+
+    return (
+        {
+            "schema": _EXIT_SALVAGE_SCHEMA,
+            "created_at": created_at,
+            "reason": reason,
+            "original_exit_receipt_sha256": original_sha256,
+            "original_exit_receipt_size_bytes": original_size,
+        },
+        original_path,
+    )
+
+
 def _single_option(command: Sequence[object], name: str) -> str:
     indexes = [index for index, value in enumerate(command) if value == name]
     if len(indexes) != 1:
@@ -373,17 +483,146 @@ def _validate_input_artifact(
     *,
     run_id: str,
     max_bytes: int | None = None,
+    repository_root: Path | None = None,
+    recorded_revision: str | None = None,
+    cache_root: Path | None = None,
 ) -> tuple[dict[str, Any], Path]:
     binding = _require_mapping(inputs.get(name), where=f"{run_id} {name}")
-    path = _resolve_bound_path(binding.get("path"), where=f"{run_id} {name}")
     expected_sha256 = _require_sha256(
         binding.get("sha256"), where=f"{run_id} {name}.sha256"
     )
+    raw_path = binding.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"{run_id} {name} path must be a non-empty string")
+    try:
+        path = _resolve_bound_path(raw_path, where=f"{run_id} {name}")
+    except FileNotFoundError:
+        path = None
+    if path is not None:
+        if max_bytes is not None and path.stat().st_size > max_bytes:
+            raise ValueError(f"{run_id} {name} exceeds the metadata size bound")
+        if _sha256(path) == expected_sha256:
+            return binding, path
+    if name == "source_quarantine_manifest" and all(
+        value is not None
+        for value in (repository_root, recorded_revision, cache_root)
+    ):
+        assert repository_root is not None
+        assert recorded_revision is not None
+        assert cache_root is not None
+        path = _resolve_recorded_repository_artifact(
+            recorded_path=Path(raw_path),
+            expected_sha256=expected_sha256,
+            repository_root=repository_root,
+            recorded_revision=recorded_revision,
+            cache_root=cache_root,
+            label=f"{run_id} {name}",
+            max_bytes=max_bytes,
+        )
+    else:
+        raise ValueError(f"{run_id} {name} artifact binding drifted")
     if max_bytes is not None and path.stat().st_size > max_bytes:
         raise ValueError(f"{run_id} {name} exceeds the metadata size bound")
     if _sha256(path) != expected_sha256:
         raise ValueError(f"{run_id} {name} artifact binding drifted")
     return binding, path
+
+
+def _resolve_recorded_repository_artifact(
+    *,
+    recorded_path: Path,
+    expected_sha256: str,
+    repository_root: Path,
+    recorded_revision: str,
+    cache_root: Path,
+    label: str,
+    max_bytes: int | None,
+) -> Path:
+    """Resolve a drifted tracked input from its recorded Git revision."""
+
+    expected_sha256 = _require_sha256(expected_sha256, where=f"{label}.sha256")
+    if _COMMIT_RE.fullmatch(recorded_revision) is None:
+        raise ValueError(f"{label} recorded revision is not an exact Git commit")
+    repository_root = repository_root.expanduser()
+    if repository_root.is_symlink():
+        raise ValueError(f"{label} repository root must not be a symlink")
+    repository_root = repository_root.resolve(strict=True)
+    recorded_path = recorded_path.expanduser()
+    if recorded_path.is_symlink():
+        raise ValueError(f"{label} recorded path must not be a symlink")
+    recorded_path = recorded_path.resolve(strict=False)
+    try:
+        relative_path = recorded_path.relative_to(repository_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not repository-owned") from exc
+    if relative_path != Path("configs/source_quarantine_manifest.json"):
+        raise ValueError(f"{label} is not the canonical quarantine manifest")
+    if recorded_path.is_file() and _sha256(recorded_path) == expected_sha256:
+        return recorded_path
+
+    cache_root = cache_root.expanduser()
+    if cache_root.is_symlink():
+        raise ValueError(f"{label} cache root must not be a symlink")
+    cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cache_root = cache_root.resolve(strict=True)
+    if not cache_root.is_dir():
+        raise ValueError(f"{label} cache root must be a directory")
+    target = cache_root / f"source_quarantine_manifest.{expected_sha256}.json"
+    if target.is_symlink():
+        raise ValueError(f"{label} historical cache artifact must not be a symlink")
+    if target.exists():
+        if not target.is_file() or _sha256(target) != expected_sha256:
+            raise ValueError(f"{label} historical cache artifact drifted")
+        if max_bytes is not None and target.stat().st_size > max_bytes:
+            raise ValueError(f"{label} historical cache artifact exceeds the metadata bound")
+        return target
+
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository_root),
+            "show",
+            f"{recorded_revision}:{relative_path.as_posix()}",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"{label} historical Git blob is unavailable")
+    payload = completed.stdout
+    if max_bytes is not None and len(payload) > max_bytes:
+        raise ValueError(f"{label} historical Git blob exceeds the metadata bound")
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError(f"{label} historical Git blob does not match its binding")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=cache_root,
+        prefix=f".{expected_sha256}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        directory_descriptor = os.open(cache_root, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    if target.is_symlink() or _sha256(target) != expected_sha256:
+        raise ValueError(f"{label} historical cache write drifted")
+    return target
 
 
 def _validate_pr_provenance(
@@ -909,12 +1148,21 @@ def _load_run(
         ).expanduser().resolve()
         if command_archive != receipt_archive:
             raise ValueError(f"{run_id} source archive command path drifted")
+    raw_repository_root = launch.get("repository_root")
+    repository_root = (
+        Path(raw_repository_root)
+        if isinstance(raw_repository_root, str) and raw_repository_root
+        else None
+    )
     input_artifacts: dict[str, tuple[dict[str, Any], Path]] = {
         name: _validate_input_artifact(
             inputs,
             name,
             run_id=run_id,
             max_bytes=_MAX_RECEIPT_BYTES if name.endswith("_receipt") else None,
+            repository_root=repository_root,
+            recorded_revision=expected_revision,
+            cache_root=launch_path.parent / "frozen_inputs",
         )
         for name in (
             "archive_sha256_receipt",
@@ -940,10 +1188,12 @@ def _load_run(
     if (
         Path(_single_option(command, "--repo-list")).expanduser().resolve()
         != input_artifacts["repo_list"][1]
-        or Path(
-            _single_option(command, "--source-quarantine-manifest")
-        ).expanduser().resolve()
-        != input_artifacts["source_quarantine_manifest"][1]
+        or Path(_single_option(command, "--source-quarantine-manifest"))
+        .expanduser()
+        .resolve()
+        != Path(str(input_artifacts["source_quarantine_manifest"][0]["path"]))
+        .expanduser()
+        .resolve()
     ):
         raise ValueError(f"{run_id} launch command input paths drifted")
 
@@ -1016,6 +1266,14 @@ def _load_run(
 
     done = _require_mapping(manifest.get("done"), where=f"{run_id} done")
     failed = _require_mapping(manifest.get("failed"), where=f"{run_id} failed")
+    exit_salvage, original_exit_path = _validate_exit_salvage(
+        exit_path=exit_path,
+        exit_receipt=exit_receipt,
+        exit_code=exit_code,
+        done=done,
+        failed=failed,
+        run_id=run_id,
+    )
     pr_provenance: dict[str, object] | None = None
     pr_files: dict[str, Path] = {}
     if streams in {"commits", "both"}:
@@ -1081,8 +1339,17 @@ def _load_run(
         else set()
     )
     terminal = code_terminal | commit_terminal
-    if selected and terminal != selected:
+    if selected and (
+        (exit_code == 0 and terminal != selected)
+        or (exit_code != 0 and (not terminal or not terminal <= selected))
+    ):
         raise ValueError(f"{run_id} targeted terminal repository set drifted")
+    if selected and exit_code != 0 and not any(
+        str(unit).endswith("::code") for unit in done
+    ):
+        raise ValueError(
+            f"{run_id} interrupted targeted repair contributed no code success"
+        )
     if selected and any(_unit_repo(str(unit)) not in selected for unit in (*done, *failed)):
         raise ValueError(f"{run_id} contains units outside its targeted selection")
 
@@ -1120,6 +1387,8 @@ def _load_run(
     }
     if pr_provenance is not None:
         portable["pr_completion"] = pr_provenance
+    if exit_salvage is not None:
+        portable["exit"]["salvage"] = exit_salvage
     if repair_base_code_run is not None:
         portable["repair_base_code_run"] = repair_base_code_run
     if source_code_runs is not None:
@@ -1137,6 +1406,8 @@ def _load_run(
         "tokenizer": input_artifacts["tokenizer"][1],
     }
     files.update(pr_files)
+    if original_exit_path is not None:
+        files["original_exit"] = original_exit_path
     return (
         portable,
         allowed,
@@ -1267,17 +1538,17 @@ def load_source_composition(
         if details["launch_schema"] == _FULL_LAUNCH_SCHEMA
         and details["streams"] in {"code", "both"}
     }
+    repairs_by_base: dict[tuple[str, str, str], list[dict[str, object]]] = {}
     for portable, details in zip(run_receipts, run_details, strict=True):
         repair_base = details["repair_base_code_run"]
         if repair_base is None:
             continue
-        base_details = full_code_runs.get(
-            (
-                str(repair_base["launch_sha256"]),
-                str(repair_base["exit_sha256"]),
-                str(repair_base["manifest_sha256"]),
-            )
+        base_identity = (
+            str(repair_base["launch_sha256"]),
+            str(repair_base["exit_sha256"]),
+            str(repair_base["manifest_sha256"]),
         )
+        base_details = full_code_runs.get(base_identity)
         if base_details is None:
             raise ValueError(
                 f"{portable['run_id']} repair base code run is absent from the plan"
@@ -1291,6 +1562,13 @@ def load_source_composition(
             raise ValueError(
                 f"{portable['run_id']} targets repositories not failed by its base run"
             )
+        repairs_by_base.setdefault(base_identity, []).append(portable)
+    for repairs in repairs_by_base.values():
+        final_exit = _require_mapping(
+            repairs[-1].get("exit"), where="final targeted repair exit"
+        )
+        if final_exit.get("exit_code") != 0:
+            raise ValueError("final targeted code repair exit code is non-zero")
     if any(details["repair_base_code_run"] is not None for details in run_details):
         code_run_identities = [
             {

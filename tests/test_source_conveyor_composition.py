@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pyarrow as pa
@@ -17,6 +18,7 @@ from cppmega.data.source_conveyor_composition import (
     _load_json_object_streaming,
     _manifest_allowlist,
     _MAX_MANIFEST_BYTES,
+    _resolve_recorded_repository_artifact,
     build_packed_source_inventory_receipt,
     load_source_composition,
 )
@@ -84,6 +86,16 @@ def _write_json(path: Path, value: object) -> None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
 
 
 def _revision(digit: str) -> dict[str, object]:
@@ -741,6 +753,255 @@ def test_source_composition_resolves_revision_bound_code_repair(
     )
     assert commit_run["pr_completion"]["status"] == "verified"
     assert commit_run["pr_completion"]["stored_pr_count"] == 2
+
+
+def test_source_composition_resolves_interrupted_partial_repair_chain(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    base, partial, commit = plan["runs"]
+
+    base_manifest_path = Path(base["manifest"])
+    base_exit_path = Path(base["exit_receipt"])
+    base_manifest = json.loads(base_manifest_path.read_text(encoding="utf-8"))
+    base_manifest["done"] = {}
+    base_manifest["failed"] = {
+        "alpha::repo": {"stage": "index_project"},
+        "beta::repo": {"stage": "index_project"},
+    }
+    _write_json(base_manifest_path, base_manifest)
+    base_exit = json.loads(base_exit_path.read_text(encoding="utf-8"))
+    base_exit["done_manifest"]["sha256"] = _sha256(base_manifest_path)
+    _write_json(base_exit_path, base_exit)
+    base_identity = {
+        "launch_sha256": _sha256(Path(base["launch_receipt"])),
+        "exit_sha256": _sha256(base_exit_path),
+        "manifest_sha256": _sha256(base_manifest_path),
+    }
+
+    partial_manifest_path = Path(partial["manifest"])
+    partial_launch_path = Path(partial["launch_receipt"])
+    partial_exit_path = Path(partial["exit_receipt"])
+    partial_manifest = json.loads(
+        partial_manifest_path.read_text(encoding="utf-8")
+    )
+    partial_manifest["done"] = {
+        "alpha::code": {
+            "artifact_filename": "alpha.parquet",
+            "lengths": _lengths(),
+        }
+    }
+    partial_manifest["failed"] = {
+        "beta::code": {"stage": "index_project"},
+    }
+    _write_json(partial_manifest_path, partial_manifest)
+    partial_launch = json.loads(partial_launch_path.read_text(encoding="utf-8"))
+    partial_launch["selected_repositories"] = ["alpha", "beta"]
+    partial_launch["expected_selected_repository_count"] = 2
+    partial_launch["repair_base_code_run"] = base_identity
+    command = partial_launch["command"]
+    command[command.index("--only-repo") :] = [
+        "--only-repo",
+        "alpha",
+        "--only-repo",
+        "beta",
+        "--max-repos",
+        "2",
+    ]
+    _write_json(partial_launch_path, partial_launch)
+    partial_exit = json.loads(partial_exit_path.read_text(encoding="utf-8"))
+    partial_exit.update(
+        status="failed",
+        exit_code=130,
+        finished_at="2026-08-09T07:34:59Z",
+        selected_repositories=["alpha", "beta"],
+        repair_base_code_run=base_identity,
+        launch_receipt_sha256=_sha256(partial_launch_path),
+    )
+    partial_exit["done_manifest"]["sha256"] = _sha256(partial_manifest_path)
+    _write_json(
+        partial_exit_path,
+        {
+            "status": "operator_abort",
+            "exit_code": 130,
+            "reason": "archive decompressor exited",
+            "ts": "2026-08-09T07:34:59Z",
+            "done_count": 1,
+            "failed_count": 1,
+            "done_units": ["alpha::code"],
+            "failed_units": ["beta::code"],
+        },
+    )
+    partial_exit["salvage"] = {
+        "schema": "cppmega.source_exit_salvage_attestation_v1",
+        "created_at": "2026-08-09T08:13:30Z",
+        "reason": "bind the legacy abort to its immutable launch and manifest",
+        "original_exit_receipt": {
+            "path": str(partial_exit_path),
+            "sha256": _sha256(partial_exit_path),
+            "size_bytes": partial_exit_path.stat().st_size,
+        },
+    }
+    partial_salvaged_exit_path = partial_exit_path.with_name(
+        "exit_receipt.salvaged.json"
+    )
+    _write_json(partial_salvaged_exit_path, partial_exit)
+    partial["exit_receipt"] = str(partial_salvaged_exit_path)
+    partial_identity = {
+        "launch_sha256": _sha256(partial_launch_path),
+        "exit_sha256": _sha256(partial_salvaged_exit_path),
+        "manifest_sha256": _sha256(partial_manifest_path),
+    }
+
+    base_launch = json.loads(Path(base["launch_receipt"]).read_text(encoding="utf-8"))
+    inputs = base_launch["inputs"]
+    outputs = base_launch["outputs"]
+    final = _write_run(
+        tmp_path,
+        run_id="repair-code-final",
+        digit="5",
+        streams="code",
+        done={
+            "beta::code": {
+                "artifact_filename": "beta.parquet",
+                "lengths": _lengths(),
+            }
+        },
+        failed={},
+        code_root=code_root,
+        commit_root=commit_root,
+        dedup_db=Path(outputs["dedup_db"]),
+        inventory=Path(inputs["archive_inventory_receipt"]["path"]),
+        archive_receipt=Path(inputs["archive_sha256_receipt"]["path"]),
+        repo_list=Path(inputs["repo_list"]["path"]),
+        quarantine=Path(inputs["source_quarantine_manifest"]["path"]),
+        tokenizer=Path(inputs["tokenizer"]["path"]),
+        targeted=("beta",),
+        repair_base=base_identity,
+    )
+    final_identity = {
+        "launch_sha256": _sha256(Path(final["launch_receipt"])),
+        "exit_sha256": _sha256(Path(final["exit_receipt"])),
+        "manifest_sha256": _sha256(Path(final["manifest"])),
+    }
+
+    commit_launch_path = Path(commit["launch_receipt"])
+    commit_exit_path = Path(commit["exit_receipt"])
+    commit_launch = json.loads(commit_launch_path.read_text(encoding="utf-8"))
+    commit_launch["source_code_run"] = base_identity
+    commit_launch["source_code_runs"] = [
+        base_identity,
+        partial_identity,
+        final_identity,
+    ]
+    _write_json(commit_launch_path, commit_launch)
+    commit_exit = json.loads(commit_exit_path.read_text(encoding="utf-8"))
+    commit_exit["launch_receipt_sha256"] = _sha256(commit_launch_path)
+    _write_json(commit_exit_path, commit_exit)
+
+    plan["runs"] = [base, partial, final, commit]
+    _write_json(plan_path, plan)
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+
+    assert composition.receipt["status"] == "complete"
+    assert composition.receipt["coverage"]["code_success_repositories"] == 2
+    assert [run["run_id"] for run in composition.receipt["runs"]] == [
+        "base-code",
+        "repair-code",
+        "repair-code-final",
+        "full-commits",
+    ]
+
+    final_exit_path = Path(final["exit_receipt"])
+    final_exit_bytes = final_exit_path.read_bytes()
+    final_exit = json.loads(final_exit_bytes)
+    final_exit["exit_code"] = 1
+    final_exit["status"] = "failed"
+    _write_json(final_exit_path, final_exit)
+    with pytest.raises(ValueError, match="final targeted code repair exit code"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+    final_exit_path.write_bytes(final_exit_bytes)
+
+    original_abort = json.loads(partial_exit_path.read_text(encoding="utf-8"))
+    original_abort["reason"] = "tampered after salvage"
+    _write_json(partial_exit_path, original_abort)
+    with pytest.raises(ValueError, match="original exit receipt binding drifted"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
+def test_historical_repository_artifact_is_materialized_from_git_blob(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    manifest = repo / "configs" / "source_quarantine_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Composition Test")
+    _git(repo, "config", "user.email", "composition@example.test")
+    _write_json(manifest, {"schema": "fixture", "entries": ["old"]})
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "old")
+    historical_revision = _git(repo, "rev-parse", "HEAD")
+    historical_sha256 = _sha256(manifest)
+    historical_bytes = manifest.read_bytes()
+    _write_json(manifest, {"schema": "fixture", "entries": ["new"]})
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "new")
+
+    resolved = _resolve_recorded_repository_artifact(
+        recorded_path=manifest,
+        expected_sha256=historical_sha256,
+        repository_root=repo,
+        recorded_revision=historical_revision,
+        cache_root=tmp_path / "run" / "frozen_inputs",
+        label="historical quarantine",
+        max_bytes=4 * 1024 * 1024,
+    )
+
+    assert resolved != manifest
+    assert resolved.read_bytes() == historical_bytes
+    assert _sha256(resolved) == historical_sha256
+
+    manifest.unlink()
+    (repo / ".git").rename(repo / "git-hidden")
+    cached = _resolve_recorded_repository_artifact(
+        recorded_path=manifest,
+        expected_sha256=historical_sha256,
+        repository_root=repo,
+        recorded_revision=historical_revision,
+        cache_root=tmp_path / "run" / "frozen_inputs",
+        label="historical quarantine",
+        max_bytes=4 * 1024 * 1024,
+    )
+    assert cached == resolved
+
+    cached.write_text('{"mutated":true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="historical cache artifact drifted"):
+        _resolve_recorded_repository_artifact(
+            recorded_path=manifest,
+            expected_sha256=historical_sha256,
+            repository_root=repo,
+            recorded_revision=historical_revision,
+            cache_root=tmp_path / "run" / "frozen_inputs",
+            label="historical quarantine",
+            max_bytes=4 * 1024 * 1024,
+        )
 
 
 def test_source_composition_allows_repair_quarantine_but_not_tokenizer_drift(

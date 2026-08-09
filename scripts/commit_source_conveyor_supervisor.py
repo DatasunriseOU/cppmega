@@ -630,6 +630,24 @@ def _repair_exit_code(root: Path) -> int | None:
     return value
 
 
+def _repair_exit_receipt_path(root: Path) -> Path:
+    """Select an attested salvage only for a noncanonical original receipt."""
+
+    original = root / "exit_receipt.json"
+    salvaged = root / source_supervisor.SALVAGED_EXIT_FILENAME
+    if not salvaged.exists():
+        return original
+    if salvaged.is_symlink() or not salvaged.is_file():
+        raise RuntimeError(f"code repair salvaged exit is not a regular file: {salvaged}")
+    original_receipt = source_supervisor._read_json(
+        original,
+        label="code repair original exit receipt",
+    )
+    if original_receipt.get("schema") == source_supervisor.TARGETED_EXIT_SCHEMA:
+        raise RuntimeError("code repair has both canonical and salvaged exit receipts")
+    return salvaged
+
+
 def _validate_repair_run_roots(
     repair_run_roots: Sequence[Path],
 ) -> tuple[Path, ...]:
@@ -684,14 +702,7 @@ def wait_for_terminal_code_run(
             exit_codes = [
                 _repair_exit_code(Path(root)) for root in repair_run_roots
             ]
-            terminal_failures = [
-                root
-                for root, exit_code in zip(repair_run_roots, exit_codes, strict=True)
-                if exit_code is not None and exit_code != 0
-            ]
-            if terminal_failures:
-                raise
-            if all(exit_code == 0 for exit_code in exit_codes):
+            if all(exit_code is not None for exit_code in exit_codes):
                 raise
             sleeper(poll_seconds)
 
@@ -739,7 +750,7 @@ def load_terminal_code_run_chain(
         if not root.is_dir():
             raise RuntimeError(f"code repair run root is not a directory: {root}")
         launch_path = root / "launch_receipt.json"
-        exit_path = root / "exit_receipt.json"
+        exit_path = _repair_exit_receipt_path(root)
         manifest_path = root / "conveyor" / "_done.json"
         completion_path = root / "conveyor" / "completion_receipt.json"
         launch, launch_sha256 = source_supervisor._read_json_snapshot(
@@ -787,8 +798,9 @@ def load_terminal_code_run_chain(
             code_root=base["code_output_root"],
             commit_root=base["commit_output_root"],
         )
-        if portable["exit"]["exit_code"] != 0:
-            raise RuntimeError(f"code repair {index} exit code is non-zero")
+        exit_code = int(portable["exit"]["exit_code"])
+        if exit_code != 0 and index == len(repair_run_roots):
+            raise RuntimeError("final code repair exit code is non-zero")
         selected = set(portable["selected_repositories"])
         if (
             portable["launch"]["sha256"] != launch_sha256
@@ -796,7 +808,9 @@ def load_terminal_code_run_chain(
             != source_supervisor.TARGETED_LAUNCH_SCHEMA
             or portable["streams"] != "code"
             or commit_terminal
-            or code_terminal != selected
+            or not code_terminal
+            or not code_terminal <= selected
+            or (exit_code == 0 and code_terminal != selected)
             or not selected <= base_failed
             or portable.get("repair_base_code_run") != base["identity"]
             or archive_identity != base["archive_identity"]
@@ -814,6 +828,11 @@ def load_terminal_code_run_chain(
             for unit in done
             if unit.endswith("::code")
         }
+        if exit_code != 0 and not repair_success:
+            raise RuntimeError(
+                f"code repair {index} exit code is non-zero and contributed "
+                "no successful repositories"
+            )
         duplicate_success = successful & repair_success
         if duplicate_success:
             raise RuntimeError(
