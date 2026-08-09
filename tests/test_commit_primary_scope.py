@@ -224,6 +224,100 @@ def test_extractor_keeps_added_deleted_renamed_large_and_shebang_changes(
     assert "README" not in {item["filepath"] for item in root_diffs}
 
 
+def test_extractor_ignores_gitlink_changes_without_reading_submodule_blob(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Scope Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "scope@example.invalid"],
+        check=True,
+    )
+    (repo / "main.cpp").write_text(
+        "int before_value() { return 123456; }\n" * 3,
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "main.cpp"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+
+    (repo / "main.cpp").write_text(
+        "int after_value() { return 654321; }\n" * 3,
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "main.cpp"], check=True)
+    submodule_cacheinfo = (
+        "160000,"
+        + "a" * 40
+        + ",tests/cbmc/aws-templates-for-cbmc-proofs"
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            submodule_cacheinfo,
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "add submodule"],
+        check=True,
+    )
+    commit_hash = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    changes = get_commit_file_changes(str(repo), commit_hash) or []
+    assert "tests/cbmc/aws-templates-for-cbmc-proofs" not in {
+        change["new_filepath"] or change["old_filepath"] for change in changes
+    }
+    assert {change["new_filepath"] for change in changes} == {"main.cpp"}
+
+    (repo / "main.cpp").write_text(
+        "int final_value() { return 111222; }\n" * 3,
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-index",
+            "--force-remove",
+            "tests/cbmc/aws-templates-for-cbmc-proofs",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "main.cpp"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "remove submodule"],
+        check=True,
+    )
+    delete_commit_hash = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    delete_changes = get_commit_file_changes(str(repo), delete_commit_hash) or []
+    assert "tests/cbmc/aws-templates-for-cbmc-proofs" not in {
+        change["new_filepath"] or change["old_filepath"]
+        for change in delete_changes
+    }
+    assert {change["new_filepath"] for change in delete_changes} == {"main.cpp"}
+
+
 @pytest.mark.native_toolchain
 def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> None:
     from tools.clang_indexer.process_commits import process_record
