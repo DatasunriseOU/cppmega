@@ -140,7 +140,13 @@ def worker_fixture(tmp_path: Path):
     }
 
 
-def _run(fixture, *, env=None):
+def _run(
+    fixture,
+    *,
+    env=None,
+    adapter_session=None,
+    verified_snapshots=None,
+):
     return run_cloud_lane_worker(
         manifest_path=fixture["manifest_path"],
         worker="worker-0000",
@@ -151,6 +157,8 @@ def _run(fixture, *, env=None):
         ledger_path=fixture["ledger"],
         object_store=fixture["store"],
         adapter_env=env,
+        adapter_session=adapter_session,
+        verified_snapshots=verified_snapshots,
     )
 
 
@@ -203,6 +211,43 @@ def test_snapshot_cache_reuses_verified_bytes_and_repairs_tampering(
     )
     assert store.downloads == len(worker_fixture["manifest"]["input_snapshots"]) + 1
     assert repaired == first
+
+
+def test_adapter_session_guards_freshly_downloaded_snapshots(worker_fixture) -> None:
+    class TamperingSession:
+        def run(self, *, request_path: Path, output_path: Path) -> dict[str, object]:
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            assignment = request["assignment"]
+            assert isinstance(assignment, dict)
+            with output_path.open("x", encoding="utf-8") as stream:
+                for ordinal in range(
+                    assignment["record_start"],
+                    assignment["record_start"] + assignment["record_count"],
+                ):
+                    stream.write(
+                        json.dumps(
+                            {
+                                "schema": request["output_schema"],
+                                "source_record_ordinal": ordinal,
+                                "document_ordinal": 0,
+                                "valid_tokens": ordinal + 1,
+                                "payload": {"ordinal": ordinal},
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+            snapshots = request["snapshots"]
+            assert isinstance(snapshots, list)
+            Path(str(snapshots[0]["local_path"])).write_bytes(b"tampered\n")
+            return {"status": "complete"}
+
+        def close(self) -> None:
+            pass
+
+    with pytest.raises(ContractError, match="adapter modified an immutable input snapshot"):
+        _run(worker_fixture, adapter_session=TamperingSession())
 
 
 def test_worker_rejects_adapter_output_outside_assignment(worker_fixture) -> None:

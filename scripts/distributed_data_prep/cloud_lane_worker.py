@@ -756,7 +756,7 @@ def run_cloud_lane_worker(
             )
         snapshots = _preverified_snapshots(manifest, verified_snapshots)
     snapshot_identities = (
-        None if adapter_session is not None else _snapshot_identities(snapshots)
+        None if verified_snapshots is not None else _snapshot_identities(snapshots)
     )
     ledger = _load_or_create_ledger(
         ledger_path.resolve(),
