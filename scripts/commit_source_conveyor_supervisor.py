@@ -513,7 +513,11 @@ def load_terminal_code_run(
         "exit_path": exit_path,
         "manifest_path": manifest_path,
         "launch": launch,
-        "inputs": stored_inputs,
+        "inputs": (
+            live_inputs
+            if execution_code_revision is not None
+            else stored_inputs
+        ),
         "producer_root": producer_root,
         "code_output_root": code_root,
         "commit_output_root": commit_root,
@@ -545,7 +549,7 @@ def _load_failed_base_commit_metadata(
     if producer_root.is_symlink():
         raise RuntimeError(f"base repository root must not be a symlink: {producer_root}")
     producer_root = producer_root.resolve(strict=True)
-    _revalidate_recorded_inputs(
+    live_inputs, _validation_args = _revalidate_recorded_inputs(
         base["launch"],
         run_root=base["root"],
         repo_root=producer_root,
@@ -559,7 +563,11 @@ def _load_failed_base_commit_metadata(
         "exit_path": base["exit_path"],
         "manifest_path": base["manifest_path"],
         "launch": base["launch"],
-        "inputs": base["inputs"],
+        "inputs": (
+            live_inputs
+            if execution_code_revision is not None
+            else base["inputs"]
+        ),
         "producer_root": producer_root,
         "code_output_root": base["code_output_root"],
         "commit_output_root": base["commit_output_root"],
@@ -725,13 +733,15 @@ def load_terminal_code_run_chain(
             f"base repository root must not be a symlink: {base_producer_root}"
         )
     base_producer_root = base_producer_root.resolve(strict=True)
-    _revalidate_recorded_inputs(
+    base_live_inputs, _base_validation_args = _revalidate_recorded_inputs(
         base["launch"],
         run_root=base["root"],
         repo_root=base_producer_root,
         execution_code_revision=execution_code_revision,
         allowed_historical_code_revisions=allowed_historical_code_revisions,
     )
+    if execution_code_revision is not None:
+        base["inputs"] = base_live_inputs
     expected_repositories = set(base["repositories"])
     base_failed = set(base["failed_repositories"])
     successful = set(base["successful_repositories"])
@@ -920,7 +930,11 @@ def load_terminal_code_run_chain(
                 "exit_path": exit_path,
                 "manifest_path": manifest_path,
                 "launch": launch,
-                "inputs": stored_inputs,
+                "inputs": (
+                    live_inputs
+                    if execution_code_revision is not None
+                    else stored_inputs
+                ),
                 "producer_root": producer_root,
                 "identity": identity,
             }

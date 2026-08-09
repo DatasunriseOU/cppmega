@@ -2930,3 +2930,100 @@ def test_artifact_records_include_nested_source_run_manifest(tmp_path: Path) -> 
 
     assert "manifest.json" not in paths
     assert "provenance/source_composition/runs/full/manifest.json" in paths
+
+
+def test_stage_source_composition_binds_salvage_and_pr_artifacts(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+
+    def write(name: str, payload: bytes) -> Path:
+        path = source_root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return path
+
+    def binding(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    plan_path = write("plan.json", b'{"schema":"fixture"}\n')
+    dedup_path = write("dedup.json", b'{"schema":"fixture"}\n')
+    input_artifacts = {
+        name: write(f"inputs/{name}.json", name.encode("ascii"))
+        for name in (
+            "archive_sha256_receipt",
+            "archive_inventory_receipt",
+            "repo_list",
+            "source_quarantine_manifest",
+            "tokenizer",
+        )
+    }
+    artifacts = {
+        "launch": write("run/launch.json", b"launch"),
+        "exit": write("run/exit.json", b"salvaged-exit"),
+        "manifest": write("run/manifest.json", b"manifest"),
+        "archive_sha256_receipt": input_artifacts["archive_sha256_receipt"],
+        "archive_inventory": input_artifacts["archive_inventory_receipt"],
+        "repo_list": input_artifacts["repo_list"],
+        "source_quarantine_manifest": input_artifacts[
+            "source_quarantine_manifest"
+        ],
+        "tokenizer": input_artifacts["tokenizer"],
+        "original_exit": write("run/original_exit.json", b"original-exit"),
+        "pr_completion": write("run/pr_completion.json", b"pr-completion"),
+        "pr_repo_list": write("run/pr_repo_list.json", b"pr-repos"),
+    }
+    verifier = builder.REPO_ROOT / "scripts/data/verify_global_dedup_store.py"
+    assert verifier.is_file()
+    run_receipt = {
+        "run_id": "repair",
+        "launch": {"sha256": binding(artifacts["launch"])},
+        "exit": {
+            "sha256": binding(artifacts["exit"]),
+            "salvage": {
+                "original_exit_receipt_sha256": binding(artifacts["original_exit"]),
+                "original_exit_receipt_size_bytes": artifacts["original_exit"].stat().st_size,
+            },
+        },
+        "manifest": {"sha256": binding(artifacts["manifest"])},
+        "input_artifacts": {
+            name: binding(path) for name, path in input_artifacts.items()
+        },
+        "pr_completion": {
+            "receipt_sha256": binding(artifacts["pr_completion"]),
+            "repo_list_sha256": binding(artifacts["pr_repo_list"]),
+        },
+    }
+    composition = SourceComposition(
+        allowlist={},
+        receipt={
+            "schema": "cppmega_source_conveyor_composition_v1",
+            "plan_sha256": binding(plan_path),
+            "dedup": {
+                "receipt_sha256": binding(dedup_path),
+                "verifier": {
+                    "script": "scripts/data/verify_global_dedup_store.py",
+                    "script_sha256": binding(verifier),
+                },
+            },
+            "runs": [run_receipt],
+        },
+        plan_path=plan_path,
+        dedup_receipt_path=dedup_path,
+        run_files=(artifacts,),
+    )
+
+    staged = builder._stage_source_composition(
+        composition,
+        partial_dir=tmp_path / "partial",
+        provenance_root=tmp_path / "partial" / "provenance",
+    )
+
+    staged_artifacts = staged["runs"][0]["artifacts"]
+    assert set(staged_artifacts) == set(artifacts)
+    assert staged_artifacts["original_exit"]["sha256"] == binding(
+        artifacts["original_exit"]
+    )
+    assert staged_artifacts["pr_completion"]["sha256"] == binding(
+        artifacts["pr_completion"]
+    )

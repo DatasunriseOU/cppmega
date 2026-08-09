@@ -2241,6 +2241,11 @@ def _validate_logical_manifest_contract(manifest: object) -> None:
         "source_quarantine_manifest",
         "tokenizer",
     }
+    optional_run_artifacts = {
+        "original_exit",
+        "pr_completion",
+        "pr_repo_list",
+    }
     for raw_run in raw_runs:
         if not isinstance(raw_run, dict) or set(raw_run) != {"run_id", "artifacts"}:
             raise ValueError("bundle source composition run is malformed")
@@ -2255,7 +2260,10 @@ def _validate_logical_manifest_contract(manifest: object) -> None:
         run_artifacts = raw_run.get("artifacts")
         if (
             not isinstance(run_artifacts, dict)
-            or set(run_artifacts) != required_run_artifacts
+            or not required_run_artifacts <= set(run_artifacts)
+            or not set(run_artifacts) <= required_run_artifacts | optional_run_artifacts
+            or ("pr_completion" in run_artifacts)
+            != ("pr_repo_list" in run_artifacts)
         ):
             raise ValueError(f"bundle source composition run {run_id} artifacts drifted")
         for name, binding in run_artifacts.items():
@@ -2735,12 +2743,50 @@ def _validate_source_composition_payloads(
                 for file_key, binding_key in input_file_keys.items()
             }
         )
-        if any(
-            staged[name]["sha256"] != expected_sha256
-            for name, expected_sha256 in expected_hashes.items()
-        ):
+        salvage = exit_receipt.get("salvage")
+        original_exit_size: int | None = None
+        if salvage is not None:
+            if not isinstance(salvage, dict):
+                raise ValueError("source composition exit salvage is malformed")
+            original_exit_sha256 = salvage.get("original_exit_receipt_sha256")
+            original_exit_size = salvage.get("original_exit_receipt_size_bytes")
+            if (
+                not isinstance(original_exit_sha256, str)
+                or SHA256_RE.fullmatch(original_exit_sha256) is None
+                or not isinstance(original_exit_size, int)
+                or isinstance(original_exit_size, bool)
+                or original_exit_size < 1
+            ):
+                raise ValueError("source composition exit salvage binding is malformed")
+            expected_hashes["original_exit"] = original_exit_sha256
+        pr_completion = run.get("pr_completion")
+        if pr_completion is not None:
+            if not isinstance(pr_completion, dict):
+                raise ValueError("source composition PR provenance is malformed")
+            for artifact_name, field in (
+                ("pr_completion", "receipt_sha256"),
+                ("pr_repo_list", "repo_list_sha256"),
+            ):
+                digest = pr_completion.get(field)
+                if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+                    raise ValueError("source composition PR provenance is malformed")
+                expected_hashes[artifact_name] = digest
+        if set(staged) != set(expected_hashes):
             raise ValueError(
                 f"source composition run artifact binding drifted: {run['run_id']}"
+            )
+        for name, expected_sha256 in expected_hashes.items():
+            binding = staged.get(name)
+            if not isinstance(binding, dict) or binding.get("sha256") != expected_sha256:
+                raise ValueError(
+                    f"source composition run artifact binding drifted: {run['run_id']}"
+                )
+        if (
+            original_exit_size is not None
+            and staged["original_exit"].get("size_bytes") != original_exit_size
+        ):
+            raise ValueError(
+                f"source composition original exit binding drifted: {run['run_id']}"
             )
 
 

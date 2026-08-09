@@ -597,6 +597,7 @@ def test_supervisor_historical_revalidation_changes_only_code_revision(
 
 def test_supervisor_historical_revalidation_accepts_git_bound_quarantine(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, argv = _input_fixture(tmp_path)
     quarantine = repo / "configs" / "source_quarantine_manifest.json"
@@ -617,6 +618,12 @@ def test_supervisor_historical_revalidation_accepts_git_bound_quarantine(
     _git(repo, "add", str(quarantine.relative_to(repo)))
     _git(repo, "commit", "-q", "-m", "new quarantine")
     execution_revision = _git(repo, "rev-parse", "HEAD")
+    cache_root = tmp_path / "private-cache"
+    monkeypatch.setattr(
+        supervisor,
+        "_historical_input_cache_root",
+        lambda: cache_root,
+    )
 
     live, revalidation_args = supervisor.revalidate_recorded_inputs(
         {
@@ -634,13 +641,15 @@ def test_supervisor_historical_revalidation_accepts_git_bound_quarantine(
         historical_inputs["source_quarantine_manifest"]["sha256"]
         != live["source_quarantine_manifest"]["sha256"]
     )
+    assert live["source_quarantine_manifest"]["path"] == str(quarantine.resolve())
+    assert revalidation_args.source_quarantine_manifest == str(quarantine.resolve())
     historical_sha256 = historical_inputs["source_quarantine_manifest"]["sha256"]
     frozen_manifest = (
-        Path(historical_args.run_root)
-        / "frozen_inputs"
+        cache_root
         / f"source_quarantine_manifest.{historical_sha256}.json"
     )
     assert _sha256(frozen_manifest) == historical_sha256
+    assert not (Path(historical_args.run_root) / "frozen_inputs").exists()
     assert revalidation_args.expected_code_revision == execution_revision
 
 

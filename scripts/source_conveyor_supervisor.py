@@ -1042,6 +1042,12 @@ def build_child_environment(
     return environment
 
 
+def _historical_input_cache_root() -> Path:
+    """Return a private cache outside immutable source-run evidence."""
+
+    return Path(tempfile.gettempdir()) / "cppmega-source-supervisor-input-cache"
+
+
 def revalidate_recorded_inputs(
     launch: dict[str, Any],
     *,
@@ -1168,7 +1174,7 @@ def revalidate_recorded_inputs(
                 expected_sha256=raw_sha256,
                 repository_root=repo_root,
                 recorded_revision=recorded_code_revision,
-                cache_root=run_root / "frozen_inputs",
+                cache_root=_historical_input_cache_root(),
                 label="historical source quarantine manifest",
                 max_bytes=MAX_METADATA_BYTES,
             )

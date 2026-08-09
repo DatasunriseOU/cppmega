@@ -3270,6 +3270,24 @@ def _stage_source_composition(
                 for file_key, binding_key in input_file_keys.items()
             },
         }
+        exit_receipt = run.get("exit")
+        if not isinstance(exit_receipt, dict):
+            raise RuntimeError(f"source composition run {run_id} has malformed exit")
+        salvage = exit_receipt.get("salvage")
+        if salvage is not None:
+            if not isinstance(salvage, dict):
+                raise RuntimeError(
+                    f"source composition run {run_id} has malformed exit salvage"
+                )
+            original_sha256 = salvage.get("original_exit_receipt_sha256")
+            if (
+                not isinstance(original_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", original_sha256) is None
+            ):
+                raise RuntimeError(
+                    f"source composition run {run_id} has malformed original exit binding"
+                )
+            expected_hashes["original_exit"] = original_sha256
         pr_completion = run.get("pr_completion")
         if pr_completion is not None:
             if not isinstance(pr_completion, dict):

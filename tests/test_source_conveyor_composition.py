@@ -1033,6 +1033,44 @@ def test_historical_repository_artifact_timeout_is_structured(
         )
 
 
+def test_historical_repository_artifact_is_size_checked_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    manifest = repo / "configs" / "source_quarantine_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"entries":["current"]}\n', encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def oversized_blob(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        if command[-2:] != ["-s", f"{'a' * 40}:configs/source_quarantine_manifest.json"]:
+            raise AssertionError("historical blob content was read before size validation")
+        return subprocess.CompletedProcess(command, 0, stdout=b"4194305\n", stderr=b"")
+
+    monkeypatch.setattr(
+        "cppmega.data.source_conveyor_composition.subprocess.run",
+        oversized_blob,
+    )
+
+    with pytest.raises(ValueError, match="historical Git blob exceeds"):
+        _resolve_recorded_repository_artifact(
+            recorded_path=manifest,
+            expected_sha256=hashlib.sha256(b'{"entries":["old"]}\n').hexdigest(),
+            repository_root=repo,
+            recorded_revision="a" * 40,
+            cache_root=tmp_path / "private-cache",
+            label="historical quarantine",
+            max_bytes=4 * 1024 * 1024,
+        )
+
+    assert len(commands) == 1
+
+
 def test_source_composition_allows_repair_quarantine_but_not_tokenizer_drift(
     tmp_path: Path,
 ) -> None:
