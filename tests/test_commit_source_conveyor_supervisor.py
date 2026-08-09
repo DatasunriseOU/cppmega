@@ -12,7 +12,7 @@ from scripts import commit_source_conveyor_supervisor as commit_supervisor
 from scripts import source_conveyor_supervisor as source_supervisor
 from scripts import streaming_conveyor as conveyor
 from scripts.pr_ingest import pr_store
-from tests.test_source_conveyor_supervisor import _input_fixture
+from tests.test_source_conveyor_supervisor import _git, _input_fixture
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -172,6 +172,121 @@ def test_commit_build_command_reuses_state_roots_and_emits_upgrade_flags(
         state_root / "work-parent"
     )
     assert command[command.index("--allow-code-revision-upgrade-from") + 1] == "a" * 40
+
+
+def test_commit_upgrade_uses_live_quarantine_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, argv = _input_fixture(tmp_path)
+    quarantine = repo / "configs" / "source_quarantine_manifest.json"
+    quarantine.parent.mkdir()
+    _write_json(quarantine, {"schema": "fixture", "entries": ["old"]})
+    _git(repo, "add", str(quarantine.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "old quarantine")
+    historical_revision = _git(repo, "rev-parse", "HEAD")
+    argv[argv.index("--source-quarantine-manifest") + 1] = str(quarantine)
+    argv[argv.index("--expected-code-revision") + 1] = historical_revision
+
+    base_args = source_supervisor.parse_args(argv)
+    base_inputs = source_supervisor.validate_inputs(base_args, repo_root=repo)
+    base_root = Path(base_args.run_root)
+    (base_root / "reindexed").mkdir()
+    (base_root / "reindexed-commits").mkdir()
+    (base_root / "dedup.sqlite").write_bytes(b"dedup")
+    base_command = source_supervisor.build_command(base_args, base_inputs)
+    base_binding = source_supervisor.build_run_binding(base_args, base_inputs)
+    base_launch = source_supervisor.build_launch_receipt(
+        base_args,
+        inputs=base_inputs,
+        command=base_command,
+        run_binding=base_binding,
+        attempt=1,
+    )
+    base_launch["status"] = "running"
+    base_launch["repository_root"] = str(repo)
+    base_launch_path = base_root / "launch_receipt.json"
+    source_supervisor._atomic_json(base_launch_path, base_launch)
+    base_manifest = base_root / "conveyor" / "_done.json"
+    source_supervisor._atomic_json(
+        base_manifest,
+        {
+            "code_revision": base_inputs["code_revision"],
+            "done": {},
+            "failed": {"project::code": {"stage": "index_project"}},
+        },
+    )
+    source_supervisor.write_exit_receipt(
+        base_root / "exit_receipt.json",
+        launch_path=base_launch_path,
+        code_revision=historical_revision,
+        return_code=1,
+        manifest_path=base_manifest,
+        completion_path=base_root / "conveyor" / "completion_receipt.json",
+    )
+
+    _write_json(quarantine, {"schema": "fixture", "entries": ["new"]})
+    _git(repo, "add", str(quarantine.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "new quarantine")
+    execution_revision = _git(repo, "rev-parse", "HEAD")
+    cache_root = tmp_path / "private-cache"
+    monkeypatch.setattr(
+        source_supervisor,
+        "_historical_input_cache_root",
+        lambda: cache_root,
+    )
+
+    code_run = commit_supervisor.load_commit_source_run(
+        base_root,
+        execution_code_revision=execution_revision,
+        allowed_historical_code_revisions={historical_revision},
+    )
+
+    assert code_run["repair_required"] is True
+    assert code_run["inputs"]["source_quarantine_manifest"] == {
+        "path": str(quarantine.resolve()),
+        "sha256": _sha256(quarantine),
+    }
+    historical_sha256 = base_inputs["source_quarantine_manifest"]["sha256"]
+    assert _sha256(
+        cache_root / f"source_quarantine_manifest.{historical_sha256}.json"
+    ) == historical_sha256
+    assert not (base_root / "frozen_inputs").exists()
+
+    args = commit_supervisor.parse_args(
+        [
+            "--code-run-root",
+            str(base_root),
+            "--run-root",
+            str(tmp_path / "commit-run"),
+            "--pr-store",
+            str(tmp_path / "prs.sqlite"),
+            "--pr-repo-list",
+            str(tmp_path / "pr-repos.json"),
+            "--pr-completion-receipt",
+            str(tmp_path / "pr-completion.json"),
+            "--expected-code-revision",
+            execution_revision,
+            "--allow-code-revision-upgrade-from",
+            historical_revision,
+            "--code-revision-upgrade-reason",
+            "use current quarantine binding after source revision upgrade",
+            "--code-revision-upgrade-authorized-at",
+            "2026-08-09T12:00:00Z",
+        ]
+    )
+    command = commit_supervisor.build_command(
+        args,
+        code_run,
+        {
+            "repo_list": {"path": str(tmp_path / "pr-repos.json")},
+            "store": {"path": str(tmp_path / "prs.sqlite")},
+            "completion": {"path": str(tmp_path / "pr-completion.json")},
+        },
+    )
+    assert command[command.index("--source-quarantine-manifest") + 1] == str(
+        quarantine.resolve()
+    )
 
 
 def test_resume_state_root_binds_old_manifest_and_rejects_wrong_source(
@@ -662,13 +777,25 @@ def test_commit_chain_accepts_useful_partial_nonzero_repair(
         "exit_sha256": "2" * 64,
         "manifest_sha256": "3" * 64,
     }
+    stored_inputs = {
+        "source_quarantine_manifest": {
+            "path": "/historical/quarantine.json",
+            "sha256": "8" * 64,
+        }
+    }
+    live_inputs = {
+        "source_quarantine_manifest": {
+            "path": "/current/quarantine.json",
+            "sha256": "9" * 64,
+        }
+    }
     base = {
         "root": base_root,
         "launch_path": base_root / "launch_receipt.json",
         "exit_path": base_root / "exit_receipt.json",
         "manifest_path": base_root / "conveyor" / "_done.json",
         "launch": {"repository_root": str(repo)},
-        "inputs": {},
+        "inputs": stored_inputs,
         "producer_root": repo,
         "code_output_root": code_root,
         "commit_output_root": commit_root,
@@ -690,19 +817,26 @@ def test_commit_chain_accepts_useful_partial_nonzero_repair(
     monkeypatch.setattr(
         commit_supervisor,
         "_revalidate_recorded_inputs",
-        lambda *args, **kwargs: ({}, object()),
+        lambda *args, **kwargs: (live_inputs, object()),
     )
+
+    verified_inputs: list[dict[str, object]] = []
+
+    def verify_completion(*args: object, **kwargs: object) -> dict[str, int]:
+        verified_inputs.append(kwargs["inputs"])
+        return {"successful_repository_count": 1}
+
     monkeypatch.setattr(
         source_supervisor,
         "verify_completion_receipt",
-        lambda *args, **kwargs: {"successful_repository_count": 1},
+        verify_completion,
     )
 
     launches: dict[Path, dict[str, object]] = {}
     for root in (partial_root, final_root):
         launch = {
             "repository_root": str(repo),
-            "inputs": {},
+            "inputs": stored_inputs,
             "run_binding": {},
             "run_binding_sha256": source_supervisor._canonical_sha256({}),
         }
@@ -786,10 +920,14 @@ def test_commit_chain_accepts_useful_partial_nonzero_repair(
     result = commit_supervisor.load_terminal_code_run_chain(
         base_root,
         (partial_root, final_root),
+        execution_code_revision="b" * 40,
+        allowed_historical_code_revisions={"a" * 40},
     )
 
     assert result["repositories"] == ("alpha", "beta")
     assert len(result["identities"]) == 3
+    assert result["inputs"] == live_inputs
+    assert verified_inputs == [stored_inputs]
 
 
 def test_shared_child_stops_process_when_started_receipt_fails(

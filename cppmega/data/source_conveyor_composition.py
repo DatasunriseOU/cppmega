@@ -507,6 +507,10 @@ def _validate_input_artifact(
         value is not None
         for value in (repository_root, recorded_revision, cache_root)
     ):
+        if max_bytes is None:
+            raise ValueError(
+                f"{run_id} {name} historical recovery requires a metadata size bound"
+            )
         assert repository_root is not None
         assert recorded_revision is not None
         assert cache_root is not None
@@ -536,11 +540,17 @@ def _resolve_recorded_repository_artifact(
     recorded_revision: str,
     cache_root: Path,
     label: str,
-    max_bytes: int | None,
+    max_bytes: int,
 ) -> Path:
     """Resolve a drifted tracked input from its recorded Git revision."""
 
     expected_sha256 = _require_sha256(expected_sha256, where=f"{label}.sha256")
+    if (
+        not isinstance(max_bytes, int)
+        or isinstance(max_bytes, bool)
+        or max_bytes < 1
+    ):
+        raise ValueError(f"{label} metadata bound is invalid")
     if _COMMIT_RE.fullmatch(recorded_revision) is None:
         raise ValueError(f"{label} recorded revision is not an exact Git commit")
     repository_root = repository_root.expanduser()
@@ -571,11 +581,39 @@ def _resolve_recorded_repository_artifact(
     if target.is_symlink():
         raise ValueError(f"{label} historical cache artifact must not be a symlink")
     if target.exists():
-        if not target.is_file() or _sha256(target) != expected_sha256:
+        if not target.is_file():
             raise ValueError(f"{label} historical cache artifact drifted")
-        if max_bytes is not None and target.stat().st_size > max_bytes:
+        if target.stat().st_size > max_bytes:
             raise ValueError(f"{label} historical cache artifact exceeds the metadata bound")
+        if _sha256(target) != expected_sha256:
+            raise ValueError(f"{label} historical cache artifact drifted")
         return target
+
+    object_spec = f"{recorded_revision}:{relative_path.as_posix()}"
+    try:
+        size_result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository_root),
+                "cat-file",
+                "-s",
+                object_spec,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"{label} historical Git blob lookup timed out") from exc
+    if size_result.returncode != 0:
+        raise ValueError(f"{label} historical Git blob is unavailable")
+    try:
+        blob_size = int(size_result.stdout.strip())
+    except ValueError as exc:
+        raise ValueError(f"{label} historical Git blob size is invalid") from exc
+    if blob_size < 0 or blob_size > max_bytes:
+        raise ValueError(f"{label} historical Git blob exceeds the metadata bound")
 
     try:
         completed = subprocess.run(
@@ -583,8 +621,9 @@ def _resolve_recorded_repository_artifact(
                 "git",
                 "-C",
                 str(repository_root),
-                "show",
-                f"{recorded_revision}:{relative_path.as_posix()}",
+                "cat-file",
+                "blob",
+                object_spec,
             ],
             check=False,
             capture_output=True,
@@ -595,7 +634,7 @@ def _resolve_recorded_repository_artifact(
     if completed.returncode != 0:
         raise ValueError(f"{label} historical Git blob is unavailable")
     payload = completed.stdout
-    if max_bytes is not None and len(payload) > max_bytes:
+    if len(payload) > max_bytes:
         raise ValueError(f"{label} historical Git blob exceeds the metadata bound")
     if hashlib.sha256(payload).hexdigest() != expected_sha256:
         raise ValueError(f"{label} historical Git blob does not match its binding")
@@ -626,6 +665,12 @@ def _resolve_recorded_repository_artifact(
     if target.is_symlink() or _sha256(target) != expected_sha256:
         raise ValueError(f"{label} historical cache write drifted")
     return target
+
+
+def _historical_input_cache_root() -> Path:
+    """Return a private cache outside immutable source-run evidence."""
+
+    return Path(tempfile.gettempdir()) / "cppmega-source-composition-input-cache"
 
 
 def _validate_pr_provenance(
@@ -1162,10 +1207,15 @@ def _load_run(
             inputs,
             name,
             run_id=run_id,
-            max_bytes=_MAX_RECEIPT_BYTES if name.endswith("_receipt") else None,
+            max_bytes=(
+                _MAX_RECEIPT_BYTES
+                if name.endswith("_receipt")
+                or name == "source_quarantine_manifest"
+                else None
+            ),
             repository_root=repository_root,
             recorded_revision=expected_revision,
-            cache_root=launch_path.parent / "frozen_inputs",
+            cache_root=_historical_input_cache_root(),
         )
         for name in (
             "archive_sha256_receipt",

@@ -1029,6 +1029,85 @@ def test_validate_bundle_rehashes_every_manifest_artifact(tmp_path):
     assert artifact_record["sha256"] == digest
 
 
+def test_validate_bundle_accepts_hash_bound_salvage_and_pr_artifacts(tmp_path):
+    _bundle(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    descriptor = manifest["source_snapshot"]["source_composition"]
+    receipt_path = tmp_path / descriptor["receipt"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    run = receipt["runs"][0]
+    staged_artifacts = descriptor["runs"][0]["artifacts"]
+
+    def add_artifact(name: str, payload: bytes) -> dict[str, object]:
+        path = receipt_path.parent / "runs" / "full" / f"{name}.json"
+        path.write_bytes(payload)
+        binding = {
+            "path": path.relative_to(tmp_path).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        staged_artifacts[name] = binding
+        manifest["artifacts"].append(
+            {
+                "path": binding["path"],
+                "size": binding["size_bytes"],
+                "sha256": binding["sha256"],
+            }
+        )
+        return binding
+
+    original_exit = add_artifact("original_exit", b'{"exit_code":130}\n')
+    pr_completion = add_artifact("pr_completion", b'{"status":"verified"}\n')
+    pr_repo_list = add_artifact("pr_repo_list", b'{"repos":[]}\n')
+    run["exit"]["salvage"] = {
+        "original_exit_receipt_sha256": original_exit["sha256"],
+        "original_exit_receipt_size_bytes": original_exit["size_bytes"],
+    }
+    run["pr_completion"] = {
+        "receipt_sha256": pr_completion["sha256"],
+        "repo_list_sha256": pr_repo_list["sha256"],
+    }
+
+    def write_manifest() -> None:
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    descriptor["receipt"]["sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    write_manifest()
+    _rehash_bundle_manifest(tmp_path)
+
+    _validate_bundle(tmp_path, hash_jobs=1)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    staged_artifacts = manifest["source_snapshot"]["source_composition"]["runs"][0][
+        "artifacts"
+    ]
+    missing_pr_repo_list = staged_artifacts.pop("pr_repo_list")
+    write_manifest()
+    with pytest.raises(ValueError, match="artifacts drifted"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+    staged_artifacts["pr_repo_list"] = missing_pr_repo_list
+
+    staged_artifacts["unexpected"] = dict(original_exit)
+    write_manifest()
+    with pytest.raises(ValueError, match="artifacts drifted"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+    staged_artifacts.pop("unexpected")
+    write_manifest()
+
+    original_path = tmp_path / original_exit["path"]
+    original_path.write_bytes(b'{"exit_code":131}\n')
+    _rehash_bundle_manifest(tmp_path)
+    with pytest.raises(ValueError, match="not bundle-artifact-bound"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+
+
 def test_validate_bundle_requires_source_composition_descriptor(tmp_path) -> None:
     _bundle(tmp_path)
     manifest_path = tmp_path / "manifest.json"
