@@ -117,6 +117,26 @@ def test_commit_upgrade_flags_require_fixed_audit_timestamp(tmp_path: Path) -> N
     assert args.code_revision_upgrade_authorized_at == "2026-08-09T10:00:00Z"
 
 
+@pytest.mark.parametrize(
+    ("execution_code_revision", "execution_repository_root"),
+    [
+        ("b" * 40, None),
+        (None, Path("execution-repo")),
+    ],
+)
+def test_execution_root_requires_revision_and_root_together(
+    tmp_path: Path,
+    execution_code_revision: str | None,
+    execution_repository_root: Path | None,
+) -> None:
+    with pytest.raises(RuntimeError, match="must be provided together"):
+        commit_supervisor._execution_root(
+            tmp_path / "recorded-repo",
+            execution_code_revision=execution_code_revision,
+            execution_repository_root=execution_repository_root,
+        )
+
+
 def test_commit_build_command_reuses_state_roots_and_emits_upgrade_flags(
     tmp_path: Path,
 ) -> None:
@@ -248,6 +268,8 @@ def test_commit_run_waits_for_terminal_repair_before_starting_child(
 
     def wait_for_terminal(*args: object, **kwargs: object) -> dict[str, object]:
         events.append("terminal")
+        assert kwargs["execution_repository_root"] is None
+        assert kwargs["execution_code_revision"] is None
         return terminal_code_run
 
     monkeypatch.setattr(
@@ -358,6 +380,21 @@ def test_commit_upgrade_uses_live_quarantine_binding(
     _git(repo, "add", str(quarantine.relative_to(repo)))
     _git(repo, "commit", "-q", "-m", "new quarantine")
     execution_revision = _git(repo, "rev-parse", "HEAD")
+    execution_repo = tmp_path / "execution-repo"
+    _git(
+        repo,
+        "worktree",
+        "add",
+        "--detach",
+        str(execution_repo),
+        execution_revision,
+    )
+    execution_quarantine = (
+        execution_repo / "configs" / "source_quarantine_manifest.json"
+    )
+    _write_json(quarantine, {"schema": "fixture", "entries": ["drifted"]})
+    _git(repo, "add", str(quarantine.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "drift recorded worktree")
     cache_root = tmp_path / "private-cache"
     monkeypatch.setattr(
         source_supervisor,
@@ -367,15 +404,22 @@ def test_commit_upgrade_uses_live_quarantine_binding(
 
     code_run = commit_supervisor.load_commit_source_run(
         base_root,
+        execution_repository_root=execution_repo,
         execution_code_revision=execution_revision,
         allowed_historical_code_revisions={historical_revision},
     )
 
     assert code_run["repair_required"] is True
     assert code_run["inputs"]["source_quarantine_manifest"] == {
-        "path": str(quarantine.resolve()),
-        "sha256": _sha256(quarantine),
+        "path": str(execution_quarantine.resolve()),
+        "sha256": _sha256(execution_quarantine),
     }
+    execution_tokenizer = execution_repo / "cppmega" / "tokenizer" / "tokenizer.json"
+    assert code_run["inputs"]["tokenizer"] == {
+        "path": str(execution_tokenizer.resolve()),
+        "sha256": _sha256(execution_tokenizer),
+    }
+    assert code_run["producer_root"] == execution_repo.resolve()
     historical_sha256 = base_inputs["source_quarantine_manifest"]["sha256"]
     assert _sha256(
         cache_root / f"source_quarantine_manifest.{historical_sha256}.json"
@@ -414,7 +458,7 @@ def test_commit_upgrade_uses_live_quarantine_binding(
         },
     )
     assert command[command.index("--source-quarantine-manifest") + 1] == str(
-        quarantine.resolve()
+        execution_quarantine.resolve()
     )
 
 
@@ -1049,6 +1093,7 @@ def test_commit_chain_accepts_useful_partial_nonzero_repair(
     result = commit_supervisor.load_terminal_code_run_chain(
         base_root,
         (partial_root, final_root),
+        execution_repository_root=repo,
         execution_code_revision="b" * 40,
         allowed_historical_code_revisions={"a" * 40},
     )

@@ -228,21 +228,51 @@ def _revalidate_recorded_inputs(
     *,
     run_root: Path,
     repo_root: Path,
+    execution_repository_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> tuple[dict[str, Any], argparse.Namespace]:
     """Call the shared validator without widening legacy monkeypatch contracts."""
 
+    validation_root = (
+        execution_repository_root
+        if execution_code_revision is not None
+        and execution_repository_root is not None
+        else repo_root
+    )
     kwargs: dict[str, Any] = {
         "run_root": run_root,
-        "repo_root": repo_root,
+        "repo_root": validation_root,
     }
     if execution_code_revision is not None:
+        kwargs["recorded_repo_root"] = repo_root
         kwargs["execution_code_revision"] = execution_code_revision
         kwargs["allowed_historical_code_revisions"] = (
             allowed_historical_code_revisions or set()
         )
     return source_supervisor.revalidate_recorded_inputs(launch, **kwargs)
+
+
+def _execution_root(
+    recorded_root: Path,
+    *,
+    execution_code_revision: str | None,
+    execution_repository_root: Path | None,
+) -> Path:
+    if (execution_code_revision is None) != (execution_repository_root is None):
+        raise RuntimeError(
+            "execution code revision and repository root must be provided together"
+        )
+    if execution_code_revision is None:
+        return recorded_root
+    assert execution_repository_root is not None
+    root = execution_repository_root.expanduser()
+    if root.is_symlink():
+        raise RuntimeError(f"execution repository root must not be a symlink: {root}")
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise RuntimeError(f"execution repository root is not a directory: {root}")
+    return root
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -391,6 +421,7 @@ def load_terminal_code_run(
     code_run_root: Path,
     *,
     repair_run_roots: Sequence[Path] = (),
+    execution_repository_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -400,6 +431,7 @@ def load_terminal_code_run(
         return load_terminal_code_run_chain(
             code_run_root,
             repair_run_roots,
+            execution_repository_root=execution_repository_root,
             execution_code_revision=execution_code_revision,
             allowed_historical_code_revisions=allowed_historical_code_revisions,
         )
@@ -476,11 +508,17 @@ def load_terminal_code_run(
             f"code repository root must not be a symlink: {producer_root}"
         )
     producer_root = producer_root.resolve(strict=True)
+    execution_root = _execution_root(
+        producer_root,
+        execution_code_revision=execution_code_revision,
+        execution_repository_root=execution_repository_root,
+    )
     stored_inputs = _object(launch.get("inputs"), label="code inputs")
     live_inputs, validation_args = _revalidate_recorded_inputs(
         launch,
         run_root=root,
         repo_root=producer_root,
+        execution_repository_root=execution_root,
         execution_code_revision=execution_code_revision,
         allowed_historical_code_revisions=allowed_historical_code_revisions,
     )
@@ -518,7 +556,7 @@ def load_terminal_code_run(
             if execution_code_revision is not None
             else stored_inputs
         ),
-        "producer_root": producer_root,
+        "producer_root": execution_root,
         "code_output_root": code_root,
         "commit_output_root": commit_root,
         "dedup_db": dedup_db,
@@ -537,6 +575,7 @@ def load_terminal_code_run(
 def _load_failed_base_commit_metadata(
     code_run_root: Path,
     *,
+    execution_repository_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -549,10 +588,16 @@ def _load_failed_base_commit_metadata(
     if producer_root.is_symlink():
         raise RuntimeError(f"base repository root must not be a symlink: {producer_root}")
     producer_root = producer_root.resolve(strict=True)
+    execution_root = _execution_root(
+        producer_root,
+        execution_code_revision=execution_code_revision,
+        execution_repository_root=execution_repository_root,
+    )
     live_inputs, _validation_args = _revalidate_recorded_inputs(
         base["launch"],
         run_root=base["root"],
         repo_root=producer_root,
+        execution_repository_root=execution_root,
         execution_code_revision=execution_code_revision,
         allowed_historical_code_revisions=allowed_historical_code_revisions,
     )
@@ -568,7 +613,7 @@ def _load_failed_base_commit_metadata(
             if execution_code_revision is not None
             else base["inputs"]
         ),
-        "producer_root": producer_root,
+        "producer_root": execution_root,
         "code_output_root": base["code_output_root"],
         "commit_output_root": base["commit_output_root"],
         "dedup_db": base["dedup_db"],
@@ -584,6 +629,7 @@ def _load_failed_base_commit_metadata(
 def load_commit_source_run(
     code_run_root: Path,
     *,
+    execution_repository_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -602,6 +648,7 @@ def load_commit_source_run(
     if exit_code == 0:
         result = load_terminal_code_run(
             root,
+            execution_repository_root=execution_repository_root,
             execution_code_revision=execution_code_revision,
             allowed_historical_code_revisions=allowed_historical_code_revisions,
         )
@@ -611,6 +658,7 @@ def load_commit_source_run(
         raise RuntimeError("code exit receipt has an invalid exit code")
     return _load_failed_base_commit_metadata(
         root,
+        execution_repository_root=execution_repository_root,
         execution_code_revision=execution_code_revision,
         allowed_historical_code_revisions=allowed_historical_code_revisions,
     )
@@ -688,6 +736,7 @@ def wait_for_terminal_code_run(
     *,
     poll_seconds: float = DEFAULT_REPAIR_POLL_SECONDS,
     sleeper: Any = time.sleep,
+    execution_repository_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -703,6 +752,7 @@ def wait_for_terminal_code_run(
             return load_terminal_code_run(
                 code_run_root,
                 repair_run_roots=repair_run_roots,
+                execution_repository_root=execution_repository_root,
                 execution_code_revision=execution_code_revision,
                 allowed_historical_code_revisions=allowed_historical_code_revisions,
             )
@@ -719,6 +769,7 @@ def load_terminal_code_run_chain(
     code_run_root: Path,
     repair_run_roots: Sequence[Path],
     *,
+    execution_repository_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -733,10 +784,16 @@ def load_terminal_code_run_chain(
             f"base repository root must not be a symlink: {base_producer_root}"
         )
     base_producer_root = base_producer_root.resolve(strict=True)
+    base_execution_root = _execution_root(
+        base_producer_root,
+        execution_code_revision=execution_code_revision,
+        execution_repository_root=execution_repository_root,
+    )
     base_live_inputs, _base_validation_args = _revalidate_recorded_inputs(
         base["launch"],
         run_root=base["root"],
         repo_root=base_producer_root,
+        execution_repository_root=base_execution_root,
         execution_code_revision=execution_code_revision,
         allowed_historical_code_revisions=allowed_historical_code_revisions,
     )
@@ -779,10 +836,16 @@ def load_terminal_code_run_chain(
                 f"{producer_root}"
             )
         producer_root = producer_root.resolve(strict=True)
+        execution_root = _execution_root(
+            producer_root,
+            execution_code_revision=execution_code_revision,
+            execution_repository_root=execution_repository_root,
+        )
         live_inputs, validation_args = _revalidate_recorded_inputs(
             launch,
             run_root=root,
             repo_root=producer_root,
+            execution_repository_root=execution_root,
             execution_code_revision=execution_code_revision,
             allowed_historical_code_revisions=allowed_historical_code_revisions,
         )
@@ -935,7 +998,7 @@ def load_terminal_code_run_chain(
                     if execution_code_revision is not None
                     else stored_inputs
                 ),
-                "producer_root": producer_root,
+                "producer_root": execution_root,
                 "identity": identity,
             }
         )
@@ -1178,6 +1241,14 @@ def _run(args: argparse.Namespace) -> int:
             label="base code run",
         )
         execution_code_revision = args.expected_code_revision or base_code_revision
+        execution_repository_root = (
+            _REPO_ROOT if args.expected_code_revision is not None else None
+        )
+        execution_validation_revision = (
+            execution_code_revision
+            if execution_repository_root is not None
+            else None
+        )
         if args.allow_code_revision_upgrade_from is not None and (
             args.resume_from_run_root is None
         ):
@@ -1202,6 +1273,7 @@ def _run(args: argparse.Namespace) -> int:
             )
         code_run = load_commit_source_run(
             code_run_root,
+            execution_repository_root=execution_repository_root,
             execution_code_revision=(
                 execution_code_revision
                 if args.expected_code_revision is not None
@@ -1225,12 +1297,14 @@ def _run(args: argparse.Namespace) -> int:
                 code_run_root,
                 repair_run_roots,
                 poll_seconds=args.repair_poll_seconds,
-                execution_code_revision=execution_code_revision,
+                execution_repository_root=execution_repository_root,
+                execution_code_revision=execution_validation_revision,
                 allowed_historical_code_revisions=historical_revisions,
             )
         else:
             current_code_run = load_terminal_code_run(
                 code_run_root,
+                execution_repository_root=execution_repository_root,
                 execution_code_revision=(
                     execution_code_revision
                     if args.expected_code_revision is not None
@@ -1371,12 +1445,14 @@ def _run(args: argparse.Namespace) -> int:
                     code_run_root,
                     repair_run_roots,
                     poll_seconds=args.repair_poll_seconds,
-                    execution_code_revision=execution_code_revision,
+                    execution_repository_root=execution_repository_root,
+                    execution_code_revision=execution_validation_revision,
                     allowed_historical_code_revisions=historical_revisions,
                 )
             else:
                 current_code_run = load_terminal_code_run(
                     code_run_root,
+                    execution_repository_root=execution_repository_root,
                     execution_code_revision=execution_code_revision
                     if args.expected_code_revision is not None
                     else None,
