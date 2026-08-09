@@ -83,6 +83,11 @@ run "content_addressed_v4_bootstrap" {
   }
 
   assert {
+    condition     = strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "python3-venv")
+    error_message = "Startup must install Python venv support required by every content-addressed runner."
+  }
+
+  assert {
     condition     = strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcs_read_exact \"$BOOTSTRAP_URI\"") && !strcontains(google_compute_instance.worker["cppmega-corpus-00"].metadata_startup_script, "gcloud storage cp \"$BOOTSTRAP_URI\"")
     error_message = "Startup must use the v4-proven exact-object download path."
   }
