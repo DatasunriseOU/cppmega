@@ -1055,6 +1055,7 @@ def revalidate_recorded_inputs(
     *,
     run_root: Path,
     repo_root: Path,
+    recorded_repo_root: Path | None = None,
     execution_code_revision: str | None = None,
     allowed_historical_code_revisions: set[str] | None = None,
 ) -> tuple[dict[str, Any], argparse.Namespace]:
@@ -1062,8 +1063,9 @@ def revalidate_recorded_inputs(
 
     A controlled downstream resume may execute with a newer clean checkout
     while preserving an older source-run receipt. The historical commit must
-    be explicitly allow-listed. A changed quarantine manifest is accepted only
-    when its recorded bytes are still provable from that historical Git tree.
+    be explicitly allow-listed. Repository-owned runtime inputs are rebased to
+    the execution checkout, while ``recorded_repo_root`` remains the sole root
+    used to prove a changed quarantine manifest from its historical Git tree.
     """
 
     stored = launch.get("inputs")
@@ -1122,8 +1124,16 @@ def revalidate_recorded_inputs(
         archive_sha256_receipt=field("archive_sha256_receipt", "path"),
         archive_inventory_receipt=field("archive_inventory_receipt", "path"),
         repo_list=field("repo_list", "path"),
-        source_quarantine_manifest=field("source_quarantine_manifest", "path"),
-        tokenizer=field("tokenizer", "path"),
+        source_quarantine_manifest=(
+            str(repo_root / "configs" / "source_quarantine_manifest.json")
+            if execution_code_revision is not None
+            else field("source_quarantine_manifest", "path")
+        ),
+        tokenizer=(
+            str(repo_root / "cppmega" / "tokenizer" / "tokenizer.json")
+            if execution_code_revision is not None
+            else field("tokenizer", "path")
+        ),
         python=field("python", "path"),
         libclang=field("libclang", "path"),
         macos_sdk=macos_sdk_path,
@@ -1155,6 +1165,16 @@ def revalidate_recorded_inputs(
     if execution_code_revision is not None:
         live_identity.pop("code_revision", None)
         stored_identity.pop("code_revision", None)
+        live_tokenizer = live_identity.get("tokenizer")
+        stored_tokenizer = stored_identity.get("tokenizer")
+        if (
+            isinstance(live_tokenizer, dict)
+            and isinstance(stored_tokenizer, dict)
+            and set(live_tokenizer) == {"path", "sha256"}
+            and set(stored_tokenizer) == {"path", "sha256"}
+            and live_tokenizer["sha256"] == stored_tokenizer["sha256"]
+        ):
+            stored_identity["tokenizer"] = live_tokenizer
         if live_identity.get("source_quarantine_manifest") != stored_identity.get(
             "source_quarantine_manifest"
         ):
@@ -1174,7 +1194,7 @@ def revalidate_recorded_inputs(
             _resolve_recorded_repository_artifact(
                 recorded_path=Path(raw_path),
                 expected_sha256=raw_sha256,
-                repository_root=repo_root,
+                repository_root=recorded_repo_root or repo_root,
                 recorded_revision=recorded_code_revision,
                 cache_root=_historical_input_cache_root(),
                 label="historical source quarantine manifest",

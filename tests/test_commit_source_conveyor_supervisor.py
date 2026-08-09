@@ -358,6 +358,21 @@ def test_commit_upgrade_uses_live_quarantine_binding(
     _git(repo, "add", str(quarantine.relative_to(repo)))
     _git(repo, "commit", "-q", "-m", "new quarantine")
     execution_revision = _git(repo, "rev-parse", "HEAD")
+    execution_repo = tmp_path / "execution-repo"
+    _git(
+        repo,
+        "worktree",
+        "add",
+        "--detach",
+        str(execution_repo),
+        execution_revision,
+    )
+    execution_quarantine = (
+        execution_repo / "configs" / "source_quarantine_manifest.json"
+    )
+    _write_json(quarantine, {"schema": "fixture", "entries": ["drifted"]})
+    _git(repo, "add", str(quarantine.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "drift recorded worktree")
     cache_root = tmp_path / "private-cache"
     monkeypatch.setattr(
         source_supervisor,
@@ -367,15 +382,22 @@ def test_commit_upgrade_uses_live_quarantine_binding(
 
     code_run = commit_supervisor.load_commit_source_run(
         base_root,
+        execution_repository_root=execution_repo,
         execution_code_revision=execution_revision,
         allowed_historical_code_revisions={historical_revision},
     )
 
     assert code_run["repair_required"] is True
     assert code_run["inputs"]["source_quarantine_manifest"] == {
-        "path": str(quarantine.resolve()),
-        "sha256": _sha256(quarantine),
+        "path": str(execution_quarantine.resolve()),
+        "sha256": _sha256(execution_quarantine),
     }
+    execution_tokenizer = execution_repo / "cppmega" / "tokenizer" / "tokenizer.json"
+    assert code_run["inputs"]["tokenizer"] == {
+        "path": str(execution_tokenizer.resolve()),
+        "sha256": _sha256(execution_tokenizer),
+    }
+    assert code_run["producer_root"] == execution_repo.resolve()
     historical_sha256 = base_inputs["source_quarantine_manifest"]["sha256"]
     assert _sha256(
         cache_root / f"source_quarantine_manifest.{historical_sha256}.json"
@@ -414,7 +436,7 @@ def test_commit_upgrade_uses_live_quarantine_binding(
         },
     )
     assert command[command.index("--source-quarantine-manifest") + 1] == str(
-        quarantine.resolve()
+        execution_quarantine.resolve()
     )
 
 

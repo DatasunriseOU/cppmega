@@ -582,6 +582,20 @@ def test_supervisor_historical_revalidation_changes_only_code_revision(
     )
     assert live == live_inputs
     assert revalidation_args.expected_code_revision == "b" * 40
+
+    live_inputs["tokenizer"]["sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="source launch inputs drifted"):
+        supervisor.revalidate_recorded_inputs(
+            {
+                "code_revision": "a" * 40,
+                "inputs": historical_inputs,
+            },
+            run_root=Path(args.run_root),
+            repo_root=repo,
+            execution_code_revision="b" * 40,
+            allowed_historical_code_revisions={"a" * 40},
+        )
+
     with pytest.raises(RuntimeError, match="allow-listed"):
         supervisor.revalidate_recorded_inputs(
             {
