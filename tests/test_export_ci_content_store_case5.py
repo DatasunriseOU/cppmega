@@ -42,6 +42,10 @@ from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
     MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    REVIEWED_FROZEN_PARSER_LINEAGE,
+    REVIEWED_FROZEN_PARSER_SINK_SHA256,
+    REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
     REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
     REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
     SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
@@ -2265,6 +2269,130 @@ def test_reviewed_primary_equivalent_parser_transition_is_receipt_bound(
         "mixed_lineage_projection"
     )
     assert receipt["source_binding_projection"]["selection_counts"] == {}
+
+
+def test_reviewed_frozen_parser_transition_is_exact_and_receipt_bound(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "clang++ -c src/current.cpp"
+    provenance = _provenance(text)
+    provenance["repository"] = "owner/base"
+    provenance["repository_requested"] = "owner/base"
+    provenance["repository_scope_key"] = "owner/base"
+    provenance["source_repository"] = "fork/base"
+    provenance["source_repository_id"] = 2
+    provenance["workflow"]["event"] = "pull_request"
+    provenance["chunk"]["training_sidecars"]["build_actions"] = [
+        {
+            "normalization_schema": "cppmega_ci_build_action_normalization_v1",
+            "tool": "clang++",
+            "kind": "compile",
+            "cwd": "/home/runner/work/base/base/build",
+            "source_inputs": ["src/main.cpp"],
+            "source_input_count": 1,
+            "outputs": [],
+            "output_count": 0,
+            "flags": ["-c"],
+            "repository_source_bindings": [
+                {
+                    "repository": "owner/base",
+                    "head_sha": "a" * 40,
+                    "source_path": "build/src/main.cpp",
+                    "confidence": {
+                        "score": 0.95,
+                        "level": "high",
+                        "source": "relative_source_path_v1",
+                    },
+                }
+            ],
+            "repository_source_binding_count": 1,
+            "command_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "action_shape_sha256": hashlib.sha256(
+                f"shape:{text}".encode()
+            ).hexdigest(),
+            "start_char": 0,
+            "end_char": len(text),
+            "line_index": 0,
+            "section_ordinal": 0,
+            "step_ordinal": None,
+            "confidence": {
+                "score": 0.98,
+                "level": "high",
+                "source": "fixture",
+            },
+        }
+    ]
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, provenance)],
+        parser_script_sha256=REVIEWED_FROZEN_PARSER_SINK_SHA256,
+    )
+    upgrade = {
+        "binding_key": "parser_script_sha256",
+        "from_sha256": REVIEWED_FROZEN_PARSER_FROM_SHA256,
+        "to_sha256": REVIEWED_FROZEN_PARSER_SINK_SHA256,
+        "reason": REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
+        "upgraded_at": "2026-07-31T13:01:16Z",
+    }
+    with sqlite3.connect(fetch_state) as connection:
+        connection.execute(
+            """
+            INSERT INTO binding_upgrades(
+              binding_key,from_sha256,to_sha256,reason,upgraded_at
+            ) VALUES (:binding_key,:from_sha256,:to_sha256,:reason,:upgraded_at)
+            """,
+            upgrade,
+        )
+        connection.commit()
+
+    refused = tmp_path / "reviewed-frozen-refused"
+    with pytest.raises(ExportError, match="must terminate at the current parser"):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=refused,
+            target_lengths=(1024,),
+        )
+    assert not refused.exists()
+
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=tmp_path / "reviewed-frozen",
+        source_binding_projection_from_parser_sha256=(
+            REVIEWED_FROZEN_PARSER_FROM_SHA256
+        ),
+        target_lengths=(1024,),
+    )
+
+    assert receipt["parser_generation_policy"] == {
+        "mode": "reviewed-frozen-parser-transition",
+        "expected_current_parser_script_sha256": target_parser_script_sha256(),
+        "observed_parser_lineage": list(REVIEWED_FROZEN_PARSER_LINEAGE),
+        "current_singleton": False,
+        "authorized_projection_from_parser_script_sha256": (
+            REVIEWED_FROZEN_PARSER_FROM_SHA256
+        ),
+    }
+    assert receipt["input_fetch_state"]["summary"]["binding_upgrades"] == [
+        upgrade
+    ]
+    projection = receipt["source_binding_projection"]
+    assert projection["mode"] == "mixed_lineage_projection"
+    assert projection["parser_lineage"] == list(REVIEWED_FROZEN_PARSER_LINEAGE)
+    assert projection["input_parser_script_sha256"] == (
+        target_parser_script_sha256()
+    )
+    assert projection["target_parser_script_sha256"] == (
+        target_parser_script_sha256()
+    )
+    assert projection["selection_counts"] == {"current_audit": 1}
 
 
 def test_parser_binding_history_disconnected_from_current_fails_closed(

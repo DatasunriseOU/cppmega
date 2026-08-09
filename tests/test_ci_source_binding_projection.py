@@ -8,11 +8,17 @@ import pytest
 from scripts.ci_log_sidecars import _repo_source_binding
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
+    REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    REVIEWED_FROZEN_PARSER_LINEAGE,
+    REVIEWED_FROZEN_PARSER_SINK_SHA256,
+    REVIEWED_FROZEN_PARSER_TARGET_SHA256,
+    REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
     SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
     SOURCE_BINDING_PROJECTION_SCHEMA,
     SourceBindingProjectionError,
     SourceBindingProjector,
     SourceBindingProjectionRouter,
+    is_reviewed_frozen_parser_transition,
     projection_record_key,
     projection_script_sha256,
     summarize_projection_records,
@@ -248,6 +254,101 @@ def test_current_parser_is_audit_only_and_deterministic() -> None:
     assert first.records[1]["old_binding"] is None
     assert first.records[1]["projected_binding"] is None
     assert first.records[0]["cwd_sha256"] is None
+
+
+def test_reviewed_frozen_parser_lineage_uses_current_binding_semantics() -> None:
+    upgrade = {
+        "binding_key": "parser_script_sha256",
+        "from_sha256": REVIEWED_FROZEN_PARSER_FROM_SHA256,
+        "to_sha256": REVIEWED_FROZEN_PARSER_SINK_SHA256,
+        "reason": REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
+        "upgraded_at": "2026-07-31T13:01:16Z",
+    }
+    assert is_reviewed_frozen_parser_transition(
+        REVIEWED_FROZEN_PARSER_LINEAGE,
+        [upgrade],
+        authorized_parser_sha256=REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    )
+    assert not is_reviewed_frozen_parser_transition(
+        REVIEWED_FROZEN_PARSER_LINEAGE,
+        [{**upgrade, "reason": "unreviewed transition"}],
+        authorized_parser_sha256=REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    )
+    assert not is_reviewed_frozen_parser_transition(
+        REVIEWED_FROZEN_PARSER_LINEAGE,
+        [upgrade],
+        authorized_parser_sha256=None,
+    )
+
+    with pytest.raises(
+        SourceBindingProjectionError,
+        match="reviewed frozen parser transition evidence is invalid",
+    ):
+        SourceBindingProjectionRouter(
+            REVIEWED_FROZEN_PARSER_LINEAGE,
+            reviewed_frozen_parser_transition=True,
+        )
+
+    router = SourceBindingProjectionRouter(
+        REVIEWED_FROZEN_PARSER_LINEAGE,
+        authorized_legacy_sha256=REVIEWED_FROZEN_PARSER_FROM_SHA256,
+        reviewed_frozen_parser_transition=True,
+    )
+    source_inputs = ["src/main.cpp"]
+    cwd = "/home/runner/work/base/base/build"
+    action = _action(
+        source_inputs,
+        _current_bindings(source_inputs, cwd=cwd),
+        cwd=cwd,
+    )
+    selected = router.project_action(
+        _OCCURRENCE_KEY,
+        _PROVENANCE_SHA256,
+        _PROVENANCE,
+        action,
+        0,
+    )
+
+    assert router.mode == SourceBindingProjectionRouter.MIXED_MODE
+    assert router.parser_lineage == REVIEWED_FROZEN_PARSER_LINEAGE
+    assert router.input_parser_sha256 == target_parser_script_sha256()
+    assert router.reviewed_frozen_parser_transition is True
+    assert selected.selected_mode == "current_audit"
+    assert selected.selected_input_parser_sha256 == target_parser_script_sha256()
+    assert selected.projected_bindings == tuple(
+        action["repository_source_bindings"]
+    )
+
+
+def test_reviewed_frozen_parser_lineage_is_bound_to_reviewed_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upgrade = {
+        "binding_key": "parser_script_sha256",
+        "from_sha256": REVIEWED_FROZEN_PARSER_FROM_SHA256,
+        "to_sha256": REVIEWED_FROZEN_PARSER_SINK_SHA256,
+        "reason": REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
+        "upgraded_at": "2026-07-31T13:01:16Z",
+    }
+    assert target_parser_script_sha256() == REVIEWED_FROZEN_PARSER_TARGET_SHA256
+    monkeypatch.setattr(
+        "scripts.ci_source_binding_projection.target_parser_script_sha256",
+        lambda: "f" * 64,
+    )
+    assert not is_reviewed_frozen_parser_transition(
+        REVIEWED_FROZEN_PARSER_LINEAGE,
+        [upgrade],
+        authorized_parser_sha256=REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    )
+    with pytest.raises(
+        SourceBindingProjectionError,
+        match="reviewed frozen parser transition evidence is invalid",
+    ):
+        SourceBindingProjectionRouter(
+            REVIEWED_FROZEN_PARSER_LINEAGE,
+            authorized_legacy_sha256=REVIEWED_FROZEN_PARSER_FROM_SHA256,
+            reviewed_frozen_parser_transition=True,
+        )
 
 
 def test_mixed_parser_lineage_routes_each_stored_action_fail_closed() -> None:

@@ -26,6 +26,10 @@ from cppmega.data.pr_primary_membership import (
 )
 from cppmega.data.source_conveyor_composition import SourceComposition
 from scripts.ci_source_binding_projection import (
+    REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    REVIEWED_FROZEN_PARSER_LINEAGE,
+    REVIEWED_FROZEN_PARSER_SINK_SHA256,
+    REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
     REVIEWED_PRIMARY_EQUIVALENT_PARSER_SHA256,
     REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON,
 )
@@ -1148,6 +1152,79 @@ def test_content_store_export_accepts_only_reviewed_primary_equivalent_transitio
     }
 
     upgrade["reason"] = "unreviewed parser transition"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="parser generation is not reviewed"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_content_store_export_accepts_exact_reviewed_frozen_parser_transition(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    current = builder.target_parser_script_sha256()
+    upgrade = {
+        "binding_key": "parser_script_sha256",
+        "from_sha256": REVIEWED_FROZEN_PARSER_FROM_SHA256,
+        "to_sha256": REVIEWED_FROZEN_PARSER_SINK_SHA256,
+        "reason": REVIEWED_FROZEN_PARSER_UPGRADE_REASON,
+        "upgraded_at": "2026-07-31T13:01:16Z",
+    }
+    manifest["input_fetch_state"]["settings"]["parser_script_sha256"] = (
+        REVIEWED_FROZEN_PARSER_SINK_SHA256
+    )
+    manifest["input_fetch_state"]["summary"] = {
+        "binding_upgrades": [upgrade]
+    }
+    manifest["parser_generation_policy"] = {
+        "mode": "reviewed-frozen-parser-transition",
+        "expected_current_parser_script_sha256": current,
+        "observed_parser_lineage": list(REVIEWED_FROZEN_PARSER_LINEAGE),
+        "current_singleton": False,
+        "authorized_projection_from_parser_script_sha256": (
+            REVIEWED_FROZEN_PARSER_FROM_SHA256
+        ),
+    }
+    manifest["source_binding_projection"].update(
+        {
+            "mode": "mixed_lineage_projection",
+            "parser_lineage": list(REVIEWED_FROZEN_PARSER_LINEAGE),
+            "selection_policy": "stored-binding-semantics-current-first-v1",
+            "selection_counts": {},
+        }
+    )
+    manifest["source_binding_projection"]["coverage"][
+        "source_input_count"
+    ] = 0
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    allowed, _metadata = _load_ci_manifest_allowlist(
+        manifest_path,
+        ci_root,
+        builder.DEFAULT_BUCKETS,
+        cppmega_mlx_commit="unused",
+        cppmega_mlx_tree_sha256="unused",
+    )
+    assert set(allowed) == {
+        ("ci", bucket) for bucket in builder.DEFAULT_BUCKETS
+    }
+
+    manifest["parser_generation_policy"][
+        "authorized_projection_from_parser_script_sha256"
+    ] = "0" * 64
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
