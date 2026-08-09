@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.distributed_data_prep import source_worker
 from scripts.distributed_data_prep.source_worker import (
     GcloudObjectStore,
     TransientTransportError,
@@ -139,6 +140,101 @@ def test_gcs_metadata_retries_429_without_retrying_terminal_401(tmp_path: Path) 
     assert terminal_calls == 1
 
 
+def test_gcs_download_streams_to_target_filesystem_without_second_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"large immutable snapshot"
+    destination = tmp_path / "local-ssd" / "content-store-index.sqlite3"
+    download_outputs: list[Path] = []
+
+    def runner(command, **kwargs):
+        command = list(command)
+        if command[0] == "gcloud":
+            return _completed(command, 0, stdout="token")
+        output = Path(command[command.index("--output") + 1])
+        if "/download/storage/" in command[-1]:
+            download_outputs.append(output)
+            output.write_bytes(payload)
+        else:
+            output.write_text(
+                '{"name":"snapshot","generation":"7","size":"'
+                + str(len(payload))
+                + '"}',
+                encoding="utf-8",
+            )
+        return _completed(command, 0, stdout="200")
+
+    monkeypatch.setattr(
+        source_worker.shutil,
+        "copyfile",
+        lambda *_args, **_kwargs: pytest.fail("download performed a second full copy"),
+    )
+    store = GcloudObjectStore(runner=runner)
+
+    metadata = store.download(
+        "gs://bucket/snapshot", destination, generation="7"
+    )
+
+    assert metadata["size_bytes"] == len(payload)
+    assert destination.read_bytes() == payload
+    assert len(download_outputs) == 1
+    assert download_outputs[0].parent == destination.parent
+    assert download_outputs[0].name.startswith(f".{destination.name}.")
+    assert not download_outputs[0].exists()
+
+
+def test_gcs_download_failure_preserves_destination_and_omits_binary_body(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "local-ssd" / "snapshot"
+    destination.parent.mkdir()
+    destination.write_bytes(b"existing snapshot")
+    staged: list[Path] = []
+
+    def runner(command, **kwargs):
+        command = list(command)
+        if command[0] == "gcloud":
+            return _completed(command, 0, stdout="token")
+        output = Path(command[command.index("--output") + 1])
+        staged.append(output)
+        output.write_bytes(b"binary-response-must-not-reach-the-diagnostic")
+        return _completed(
+            command,
+            23,
+            stdout="200",
+            stderr="curl: (23) failure writing output",
+        )
+
+    store = GcloudObjectStore(runner=runner, max_retries=0)
+    with pytest.raises(RuntimeError) as raised:
+        store.download("gs://bucket/snapshot", destination, generation="7")
+
+    assert "curl: (23) failure writing output" in str(raised.value)
+    assert "binary-response-must-not-reach" not in str(raised.value)
+    assert destination.read_bytes() == b"existing snapshot"
+    assert len(staged) == 1
+    assert not staged[0].exists()
+
+
+def test_gcs_download_failure_preserves_small_json_error_body(tmp_path: Path) -> None:
+    destination = tmp_path / "local-ssd" / "snapshot"
+
+    def runner(command, **kwargs):
+        command = list(command)
+        if command[0] == "gcloud":
+            return _completed(command, 0, stdout="token")
+        output = Path(command[command.index("--output") + 1])
+        output.write_text('{"error":{"message":"object denied"}}', encoding="utf-8")
+        return _completed(command, 0, stdout="403")
+
+    store = GcloudObjectStore(runner=runner, max_retries=0)
+    with pytest.raises(RuntimeError, match="object denied"):
+        store.download("gs://bucket/snapshot", destination, generation="7")
+
+    assert not destination.exists()
+    assert not list(destination.parent.glob(f".{destination.name}.*.tmp"))
+
+
 class _PublishFixtureStore(GcloudObjectStore):
     def __init__(self, source_bytes: bytes, statuses: list[int]):
         super().__init__(runner=lambda *_args, **_kwargs: _completed([], 0, stdout="token"))
@@ -147,6 +243,7 @@ class _PublishFixtureStore(GcloudObjectStore):
         self.existing = False
         self.existing_bytes = source_bytes
         self.post_calls = 0
+        self.download_destinations: list[Path] = []
 
     def _access_token(self) -> str:
         return "token"
@@ -167,6 +264,7 @@ class _PublishFixtureStore(GcloudObjectStore):
         return {"uri": uri, "generation": "7", "size_bytes": len(self.source_bytes)}
 
     def download(self, uri: str, destination: Path, *, generation: str | None = None):
+        self.download_destinations.append(destination)
         destination.write_bytes(self.existing_bytes)
         return {"uri": uri, "generation": "7", "size_bytes": len(self.existing_bytes)}
 
@@ -181,12 +279,18 @@ def test_immutable_upload_reconciles_lost_success_and_rejects_different_bytes(
     metadata = store.publish_if_absent(source, "gs://bucket/object")
     assert metadata["generation"] == "7"
     assert store.post_calls == 1
+    assert len(store.download_destinations) == 1
+    assert store.download_destinations[0].parent.parent == source.parent
 
     different = _PublishFixtureStore(source.read_bytes(), [412])
     different.existing = True
     different.existing_bytes = b"different"
     with pytest.raises(ContractError, match="different bytes"):
         different.publish_if_absent(source, "gs://bucket/object")
+
+    absent = _PublishFixtureStore(source.read_bytes(), [412])
+    with pytest.raises(ContractError, match="existing object was not readable"):
+        absent.publish_if_absent(source, "gs://bucket/object")
 
 
 def test_exhausted_git_transport_is_resumable_exit_class() -> None:
