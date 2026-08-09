@@ -34,6 +34,7 @@ RELATIVE_PARSER_CRASH_FIXTURE = (
     "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c"
 )
 RELATIVE_NUL_DIAGNOSTIC_FIXTURE = "clang/test/Misc/diag-null-bytes-in-line.cpp"
+RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE = "clang/test/Lexer/newline-nul.c"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
@@ -175,6 +176,22 @@ def _clang_embedded_nul_diagnostic_bytes() -> bytes:
         b"// CHECK-NEXT: int x[sizeof<U+0000>int];\n"
         b"// CHECK-NEXT:             ^\n"
         b"// CHECK-NEXT:             (          )\n"
+    )
+
+
+def _clang_newline_nul_diagnostic_bytes() -> bytes:
+    return (
+        b"// RUN: %clang_cc1 -E %s -verify\n"
+        b"\n"
+        b"// We used to crash if a line continuation was followed by a nul byte "
+        b"within a\n"
+        b"// preprocessing directive.\n"
+        b"# if 1 \\\n"
+        b"\0#if something_else // expected-warning {{null character ignored}} "
+        b"expected-error {{not a valid binary operator}}\n"
+        b"#error error\n"
+        b"#endif\n"
+        b"#endif // expected-error {{#endif without #if}}\n"
     )
 
 
@@ -1131,6 +1148,61 @@ def test_exact_quarantine_filters_clang_embedded_nul_diagnostic(
     )
 
 
+def test_exact_quarantine_filters_clang_newline_nul_diagnostic(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_newline_nul_diagnostic_bytes()
+    candidate = tmp_path / RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_escaped_newline_nul_preprocessor_diagnostic",
+        relative_path=RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="fixture intentionally embeds a NUL after an escaped newline",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == (
+        "deliberate_compiler_diagnostic_fixture"
+    )
+    assert receipt["entries"][0]["detected_format"] == (
+        "clang_escaped_newline_nul_preprocessor_diagnostic"
+    )
+
+
+def test_clang_newline_nul_quarantine_requires_preprocessor_signature(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_newline_nul_diagnostic_bytes().replace(
+        b"expected-error {{not a valid binary operator}}",
+        b"expected-error {{unrelated diagnostic}}",
+    )
+    candidate = tmp_path / RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="clang_escaped_newline_nul_preprocessor_diagnostic",
+        relative_path=RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE,
+        reason="forged newline/NUL diagnostic fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="contract is incomplete"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
 def test_exact_quarantine_filters_der_x509_certificate_pair(
     tmp_path: Path,
 ) -> None:
@@ -1559,6 +1631,32 @@ def test_checked_in_intel_nul_diagnostic_manifest_matches_reference_fixture() ->
     assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
     assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
     assert entry["detected_format"] == "clang_embedded_nul_diagnostic"
+
+
+def test_checked_in_intel_newline_nul_manifest_matches_reference_fixture() -> None:
+    payload = _clang_newline_nul_diagnostic_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "intel/llvm"
+        and item["relative_path"] == RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE
+    )
+
+    assert len(payload) == 332
+    assert hashlib.sha256(payload).hexdigest() == (
+        "11548a466e2e5eb0a686cf422f7872ea94f616fe43f4bdb9311a0f1764391474"
+    )
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
+    assert entry["detected_format"] == (
+        "clang_escaped_newline_nul_preprocessor_diagnostic"
+    )
 
 
 def test_checked_in_cmake_truncated_bom_manifest_matches_archive_receipt() -> None:
@@ -2018,6 +2116,10 @@ def test_process_project_quarantines_clang_embedded_nul_diagnostic(
     candidate = tmp_path / RELATIVE_NUL_DIAGNOSTIC_FIXTURE
     candidate.parent.mkdir(parents=True)
     candidate.write_bytes(payload)
+    newline_payload = _clang_newline_nul_diagnostic_bytes()
+    newline_candidate = tmp_path / RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE
+    newline_candidate.parent.mkdir(parents=True)
+    newline_candidate.write_bytes(newline_payload)
     manifest = Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
     receipt_path = tmp_path / "receipts/source.json"
 
@@ -2033,10 +2135,11 @@ def test_process_project_quarantines_clang_embedded_nul_diagnostic(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["project_id"] == "intel/llvm"
     assert receipt["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
-    assert receipt["quarantined_count"] == 1
-    assert receipt["entries"][0]["relative_path"] == (
-        RELATIVE_NUL_DIAGNOSTIC_FIXTURE
-    )
+    assert receipt["quarantined_count"] == 2
+    assert {entry["relative_path"] for entry in receipt["entries"]} == {
+        RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
+        RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE,
+    }
 
 
 def test_process_project_quarantines_non_cpp_executable_archive(

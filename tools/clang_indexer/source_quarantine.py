@@ -66,6 +66,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_diagnostic_fixture",
         "clang_embedded_nul_diagnostic",
     ),
+    (
+        "deliberate_compiler_diagnostic_fixture",
+        "clang_escaped_newline_nul_preprocessor_diagnostic",
+    ),
     ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
@@ -432,6 +436,50 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared clang_embedded_nul_diagnostic "
                 "but the embedded-NUL diagnostic contract is incomplete or ambiguous"
+            )
+        return
+
+    if (
+        entry.detected_format
+        == "clang_escaped_newline_nul_preprocessor_diagnostic"
+    ):
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "clang_escaped_newline_nul_preprocessor_diagnostic but the "
+                f"fixture is not ASCII: {exc}"
+            ) from exc
+        lines = decoded.splitlines()
+        run_line = "// RUN: %clang_cc1 -E %s -verify"
+        continuation_line = "# if 1 \\"
+        nul_directive_line = (
+            "\0#if something_else // expected-warning {{null character ignored}} "
+            "expected-error {{not a valid binary operator}}"
+        )
+        trailing_error_line = (
+            "#endif // expected-error {{#endif without #if}}"
+        )
+        required_lines = {
+            run_line,
+            continuation_line,
+            nul_directive_line,
+            "#error error",
+            "#endif",
+            trailing_error_line,
+        }
+        if (
+            payload.count(b"\0") != 1
+            or not required_lines.issubset(lines)
+            or any(lines.count(line) != 1 for line in required_lines)
+            or not nul_directive_line.startswith("\0#if")
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "clang_escaped_newline_nul_preprocessor_diagnostic but the "
+                "escaped-newline/NUL diagnostic contract is incomplete or ambiguous"
             )
         return
 

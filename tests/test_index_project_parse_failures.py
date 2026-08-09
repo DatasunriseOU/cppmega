@@ -1496,6 +1496,34 @@ def test_valgrind_style_header_loads_with_sane_fallback_args(
     }
 
 
+def test_gnu_c_standard_header_keeps_consistent_language_family(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    header = tmp_path / "KeychainSyncAccountUpdater.h"
+    header.write_text(
+        "#import <UAUPlugin/UAUSession.h>\n\n"
+        "@interface KeychainSyncAccountUpdater : NSObject "
+        "<UserAccountUpdaterProtocol>\n\n"
+        "@end\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-std=gnu2x", "-fblocks", "-fsyntax-only", "-Wno-everything"],
+        str(header),
+    )
+
+    assert adapted[:3] == ["-x", "c-header", "-std=gnu2x"]
+    assert index_project._is_sane_compile_args(adapted)
+    translation_unit = index_project._load_translation_unit(
+        str(header),
+        index_project.Index.create(),
+        adapted,
+    )
+    assert translation_unit.spelling == str(header)
+
+
 def test_mixed_case_cpp_suffix_forces_cpp_language(
     tmp_path: Path,
 ) -> None:

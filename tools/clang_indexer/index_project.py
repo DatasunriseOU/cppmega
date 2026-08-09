@@ -5849,10 +5849,16 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 explicit_language = arg[2:].lower()
         is_c_header = explicit_language in {'c', 'c-header'}
         if explicit_language is None:
-            is_c_header = any(
-                arg.startswith('-std=c') and not arg.startswith('-std=c++')
+            standard_families = [
+                context[1]
                 for arg in args
-            )
+                if any(
+                    arg.startswith(prefix)
+                    for prefix in _STANDARD_FLAG_PREFIXES
+                )
+                if (context := _standard_flag_context(arg)) is not None
+            ]
+            is_c_header = bool(standard_families) and standard_families[-1] == 'c'
 
         # Change only the language form. The compile database or detected project
         # context owns the dialect flag, including C++20/C++23/C++26.
