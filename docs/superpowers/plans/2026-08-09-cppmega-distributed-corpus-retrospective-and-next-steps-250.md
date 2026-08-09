@@ -676,9 +676,9 @@
 
 ### D004 — Receipt-bound GCP source monitor реализован
 
-- **Сделано:** monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts.
-- **Доказательство:** pushed branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`, monitor SHA-256 `4d1e8b141e5ecd854c6f41574e688ba05b7bfc8c901f3bfdc0391f6e8e5aa046`, focused suite `56 passed`.
-- **Честная граница:** live loop на этом срезе всё ещё pinned к старому SHA `08759b…`; N014 обязан обновить pin и доказать два свежих цикла. Сам monitor не исправляет parser defect автоматически.
+- **Сделано:** monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts, а live loop уже обновлён на этот monitor.
+- **Доказательство:** pushed branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`, monitor SHA-256 `4d1e8b141e5ecd854c6f41574e688ba05b7bfc8c901f3bfdc0391f6e8e5aa046`, loop SHA-256 `2bf0bd31f047bca2bddf3453e2218cb875bb9f3119582cf96dd0fee61acd3cb5`, focused suite `56 passed`, `sh -n` и один полный цикл четырёх GCP scans за `452` секунды с рассчитанным остатком сна `1348` секунд.
+- **Честная граница:** доказан только один полный последовательный цикл после обновления pin; N014 всё ещё обязан получить второй последовательный цикл. Сам monitor не исправляет parser defect автоматически.
 
 ### D005 — Dynamic source work stealing реализован
 
@@ -698,11 +698,11 @@
 - **Доказательство:** commit `259f793f`, `scripts/distributed_data_prep/ci_case5_snapshot.py`.
 - **Честная граница:** adapter не равен завершённому CASE5 Parquet export.
 
-### D008 — GitHub PR cloud lane добавлен
+### D008 — GitHub PR cloud lane существует только как локальный prototype
 
-- **Сделано:** код умеет представить membership-bound PR materialization как receipt-bound cloud lane.
-- **Доказательство:** commit `3a5f7309` и связанные distributed scripts/tests.
-- **Честная граница:** текущий training status всё ещё показывает GitHub PR Parquet `0`.
+- **Сделано:** локальный prototype умеет представить membership-bound PR materialization как receipt-bound cloud lane.
+- **Доказательство:** локальный commit object `3a5f7309` содержит связанные distributed scripts/tests; `git merge-base --is-ancestor 3a5f7309 origin/main` возвращает `1`, а refs, содержащие commit, отсутствуют.
+- **Честная граница:** prototype не pushed и не landed, поэтому не считается доступной production-возможностью; текущий training status по-прежнему показывает GitHub PR Parquet `0`.
 
 ### D009 — Pool execution для CASE5 workers реализован
 
@@ -751,49 +751,49 @@
 ### D016 — Честный machine-readable training status выпускается
 
 - **Сделано:** status раздельно показывает live source, sealed Megatron, GitHub PR, GitLab MR и CI.
-- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md` с собственным SHA-256.
+- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`; SHA-256 физического файла `ba53cc59027be172f97d86e3e950f9ac39a558eb2cbb798f283ba2c1f8321999`, а записанный внутри status digest — `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`. Эти два digest относятся к разным уровням и не подменяют друг друга.
 - **Честная граница:** status прямо сохраняет `release ready=false` для новых live/PR/MR/CI lanes.
 
 ### D017 — Live source Parquet 1K физически существует
 
-- **Сделано:** учтено 440 файлов, 3,085,794 rows, 3,054,269,011 valid и 3,038,224,353 trained tokens.
-- **Доказательство:** таблица `Live source Parquet`, root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`.
+- **Сделано:** учтено 436 файлов, 3,085,378 rows, 3,053,857,239 valid и 3,037,814,601 trained tokens.
+- **Доказательство:** physical inventory root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`, inventory SHA-256 `dd540b7e…f32a`.
 - **Честная граница:** bucket `packed_unsealed`, а completion totals расходятся с physical Parquet.
 
 ### D018 — Live source Parquet 2K физически существует
 
-- **Сделано:** учтено 438 файлов, 449,658 rows, 640,701,360 valid и 640,251,702 trained tokens.
-- **Доказательство:** тот же status/root.
+- **Сделано:** учтено 435 файлов, 449,588 rows, 640,599,729 valid и 640,150,141 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
 - **Честная граница:** данные входят в незавершённый overlapping live snapshot.
 
 ### D019 — Live source Parquet 4K физически существует
 
-- **Сделано:** учтено 435 файлов, 221,983 rows, 627,003,170 valid и 626,781,187 trained tokens.
-- **Доказательство:** physical status inventory.
+- **Сделано:** учтено 432 файла, 221,946 rows, 626,886,677 valid и 626,664,731 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
 - **Честная граница:** global composition/dedup/seal ещё не закрыты.
 
 ### D020 — Live source Parquet 8K физически существует
 
-- **Сделано:** учтено 437 файлов, 97,963 rows, 552,562,497 valid и 552,464,534 trained tokens.
-- **Доказательство:** physical status inventory.
+- **Сделано:** учтено 433 файла, 97,899 rows, 552,169,300 valid и 552,071,401 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
 - **Честная граница:** наличие rows не доказывает terminal repository coverage.
 
 ### D021 — Live source Parquet 16K физически существует
 
-- **Сделано:** учтено 428 файлов, 100,016 rows, 1,415,781,331 valid и 1,415,681,315 trained tokens.
-- **Доказательство:** physical status inventory.
+- **Сделано:** учтено 425 файлов, 99,984 rows, 1,415,363,453 valid и 1,415,263,469 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
 - **Честная граница:** 32K/64K в этом live root ещё не материализованы.
 
 ### D022 — Live source token accounting посчитан
 
-- **Сделано:** status фиксирует 6,290,317,369 valid и 6,273,403,091 trained tokens без сложения с overlapping sealed snapshot.
-- **Доказательство:** summary и sum пяти physical bucket tables.
+- **Сделано:** physical inventory фиксирует 2,161 файл, 3,954,795 rows, 6,288,876,398 valid и 6,271,964,343 trained tokens без сложения с overlapping sealed snapshot.
+- **Доказательство:** сумма пяти physical bucket tables; inventory SHA-256 `dd540b7e…f32a`.
 - **Честная граница:** totals относятся к `packed_unsealed`, не к release-ready corpus.
 
 ### D023 — Source documents разложены по восьми категориям
 
 - **Сделано:** посчитаны bash, build, headers, C/C++ source, diagnostics, Python auxiliary, shell other и SQL.
-- **Доказательство:** category table, включая 13,073,135 header documents и 3,570,482 source documents.
+- **Доказательство:** physical category inventory: bash `14,376`, build `116,363`, headers `13,071,160`, C/C++ source `3,570,481`, diagnostics `10,123`, Python auxiliary `102,770`, shell other `17,189`, SQL `9,593`.
 - **Честная граница:** status отмечает, что Python auxiliary пока смешан с main rows.
 
 ### D024 — Source blockers не скрыты
@@ -922,8 +922,8 @@
 
 ### D044 — CI live CAS имеет измеренный store-local upper bound
 
-- **Сделано:** current status считает 295,701,087,270 exact unique payload tokens внутри live stores.
-- **Доказательство:** секция `CI` current status.
+- **Сделано:** historical audit slice двух live progress receipts считает 302,564,372,278 exact unique payload tokens внутри live stores.
+- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260422_20260721/fetch.progress.json` при `generated_at=2026-08-09T01:48:56Z` фиксировал `104,741,255,435`, а `/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260721_20260730/fetch.progress.json` при `generated_at=2026-08-09T01:57:32Z` фиксировал `197,823,116,843`; их сумма — `302,564,372,278`. Mutable current receipts уже выросли, поэтому число действительно только для этих двух timestamps.
 - **Честная граница:** это store-local upper bound, не global union/dedup и не training tokens.
 
 ### D045 — Frozen CASE5 threshold snapshot сохранён
@@ -940,9 +940,9 @@
 
 ### D047 — 30-минутный pipeline watchdog установлен и исполняется
 
-- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 239 runs и last exit `0`; loop считает cadence как 1800 секунд от начала цикла, а не `scan + 1800`.
-- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, `launchctl print` и live loop SHA-256 `46a540199f9e399156573d2961425a99a6c001f0fbda34b3c0f5946cf5a7a9d3`.
-- **Честная граница:** launchd `state=not running` между interval invocations нормален, но GCP subscan до N014 fail-closed пропускается из-за намеренно не обновлённого monitor SHA pin.
+- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 240 runs и last exit `0`; loop считает cadence как 1800 секунд от начала цикла, а не `scan + 1800`, и GCP subscans больше не пропускаются из-за monitor SHA pin.
+- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, frozen `launchctl print`, live loop SHA-256 `2bf0bd31f047bca2bddf3453e2218cb875bb9f3119582cf96dd0fee61acd3cb5`, `sh -n` и полный четырёх-run GCP scan cycle за `452` секунды.
+- **Честная граница:** launchd `state=not running` между interval invocations нормален; один полный цикл доказан, но N014 всё ещё требует второй последовательный цикл для cadence gate.
 
 ### D048 — Codex 429 watchdog установлен
 
