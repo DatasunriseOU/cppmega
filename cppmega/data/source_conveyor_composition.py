@@ -507,6 +507,10 @@ def _validate_input_artifact(
         value is not None
         for value in (repository_root, recorded_revision, cache_root)
     ):
+        if max_bytes is None:
+            raise ValueError(
+                f"{run_id} {name} historical recovery requires a metadata size bound"
+            )
         assert repository_root is not None
         assert recorded_revision is not None
         assert cache_root is not None

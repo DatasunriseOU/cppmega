@@ -3270,6 +3270,7 @@ def _stage_source_composition(
                 for file_key, binding_key in input_file_keys.items()
             },
         }
+        expected_sizes: dict[str, int] = {}
         exit_receipt = run.get("exit")
         if not isinstance(exit_receipt, dict):
             raise RuntimeError(f"source composition run {run_id} has malformed exit")
@@ -3280,14 +3281,19 @@ def _stage_source_composition(
                     f"source composition run {run_id} has malformed exit salvage"
                 )
             original_sha256 = salvage.get("original_exit_receipt_sha256")
+            original_size = salvage.get("original_exit_receipt_size_bytes")
             if (
                 not isinstance(original_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", original_sha256) is None
+                or not isinstance(original_size, int)
+                or isinstance(original_size, bool)
+                or original_size < 1
             ):
                 raise RuntimeError(
                     f"source composition run {run_id} has malformed original exit binding"
                 )
             expected_hashes["original_exit"] = original_sha256
+            expected_sizes["original_exit"] = original_size
         pr_completion = run.get("pr_completion")
         if pr_completion is not None:
             if not isinstance(pr_completion, dict):
@@ -3300,15 +3306,21 @@ def _stage_source_composition(
                     "pr_repo_list": str(pr_completion["repo_list_sha256"]),
                 }
             )
+        if set(files) != set(expected_hashes):
+            raise RuntimeError(
+                f"source composition run {run_id} artifact set drifted"
+            )
         artifacts: dict[str, dict[str, object]] = {}
         for name, source in sorted(files.items()):
-            expected_sha256 = expected_hashes.get(name)
-            if expected_sha256 is None:
-                raise RuntimeError(
-                    f"source composition run {run_id} has an unknown artifact {name}"
-                )
+            expected_sha256 = expected_hashes[name]
             target = run_root / f"{name}{source.suffix}"
             shutil.copy2(source, target)
+            actual_size = target.stat().st_size
+            if name in expected_sizes and actual_size != expected_sizes[name]:
+                raise RuntimeError(
+                    "staged source composition original exit size drifted: "
+                    f"{run_id}/{name}"
+                )
             actual_sha256 = _sha256(target)
             if actual_sha256 != expected_sha256:
                 raise RuntimeError(
@@ -3316,7 +3328,7 @@ def _stage_source_composition(
                 )
             artifacts[name] = {
                 "path": target.relative_to(partial_dir).as_posix(),
-                "size_bytes": target.stat().st_size,
+                "size_bytes": actual_size,
                 "sha256": actual_sha256,
             }
         run_descriptors.append({"run_id": run_id, "artifacts": artifacts})

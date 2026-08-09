@@ -3027,3 +3027,25 @@ def test_stage_source_composition_binds_salvage_and_pr_artifacts(
     assert staged_artifacts["pr_completion"]["sha256"] == binding(
         artifacts["pr_completion"]
     )
+
+    original_exit = artifacts.pop("original_exit")
+    missing_partial = tmp_path / "missing.partial"
+    with pytest.raises(RuntimeError, match="artifact set drifted"):
+        builder._stage_source_composition(
+            composition,
+            partial_dir=missing_partial,
+            provenance_root=missing_partial / "provenance",
+        )
+    artifacts["original_exit"] = original_exit
+
+    salvage = run_receipt["exit"]["salvage"]
+    original_size = salvage["original_exit_receipt_size_bytes"]
+    salvage["original_exit_receipt_size_bytes"] = original_size + 1
+    wrong_size_partial = tmp_path / "wrong-size.partial"
+    with pytest.raises(RuntimeError, match="original exit size drifted"):
+        builder._stage_source_composition(
+            composition,
+            partial_dir=wrong_size_partial,
+            provenance_root=wrong_size_partial / "provenance",
+        )
+    salvage["original_exit_receipt_size_bytes"] = original_size
