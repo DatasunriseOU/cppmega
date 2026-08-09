@@ -470,6 +470,53 @@ def test_supervisor_revalidates_recorded_inputs_through_shared_seam(
     assert revalidation_args.expected_code_revision == args.expected_code_revision
 
 
+def test_supervisor_historical_revalidation_changes_only_code_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, argv = _input_fixture(tmp_path)
+    args = supervisor.parse_args(argv)
+    inputs = supervisor.validate_inputs(args, repo_root=repo)
+    historical_inputs = json.loads(json.dumps(inputs))
+    historical_inputs["code_revision"] = {"git_commit": "a" * 40}
+    live_inputs = json.loads(json.dumps(inputs))
+    live_inputs["code_revision"] = {"git_commit": "b" * 40}
+
+    def fake_validate(
+        live_args: object,
+        *,
+        repo_root: Path,
+        enforce_minimum_free_disk: bool,
+    ) -> dict:
+        assert getattr(live_args, "expected_code_revision") == "b" * 40
+        return live_inputs
+
+    monkeypatch.setattr(supervisor, "validate_inputs", fake_validate)
+    live, revalidation_args = supervisor.revalidate_recorded_inputs(
+        {
+            "code_revision": "a" * 40,
+            "inputs": historical_inputs,
+        },
+        run_root=Path(args.run_root),
+        repo_root=repo,
+        execution_code_revision="b" * 40,
+        allowed_historical_code_revisions={"a" * 40},
+    )
+    assert live == live_inputs
+    assert revalidation_args.expected_code_revision == "b" * 40
+    with pytest.raises(RuntimeError, match="allow-listed"):
+        supervisor.revalidate_recorded_inputs(
+            {
+                "code_revision": "a" * 40,
+                "inputs": historical_inputs,
+            },
+            run_root=Path(args.run_root),
+            repo_root=repo,
+            execution_code_revision="b" * 40,
+            allowed_historical_code_revisions={"c" * 40},
+        )
+
+
 def test_supervisor_rejects_incompatible_resume_binding(
     tmp_path: Path,
 ) -> None:

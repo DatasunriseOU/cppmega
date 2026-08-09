@@ -1040,8 +1040,16 @@ def revalidate_recorded_inputs(
     *,
     run_root: Path,
     repo_root: Path,
+    execution_code_revision: str | None = None,
+    allowed_historical_code_revisions: set[str] | None = None,
 ) -> tuple[dict[str, Any], argparse.Namespace]:
-    """Re-run production input validation for an existing launch receipt."""
+    """Re-run production input validation for an existing launch receipt.
+
+    A controlled downstream resume may execute with a newer clean checkout
+    while preserving an older source-run receipt. In that mode every recorded
+    input except the historical code-revision binding must remain identical,
+    and the historical commit must be explicitly allow-listed by the caller.
+    """
 
     stored = launch.get("inputs")
     if not isinstance(stored, dict):
@@ -1063,6 +1071,37 @@ def revalidate_recorded_inputs(
     else:
         raise RuntimeError("source launch macos_sdk binding is invalid")
 
+    recorded_code_revision = launch.get("code_revision")
+    expected_code_revision = (
+        recorded_code_revision
+        if execution_code_revision is None
+        else execution_code_revision
+    )
+    if not isinstance(expected_code_revision, str) or re.fullmatch(
+        r"[0-9a-f]{40}", expected_code_revision
+    ) is None:
+        raise RuntimeError("source launch code revision is not an exact Git commit")
+    if execution_code_revision is not None:
+        if not isinstance(recorded_code_revision, str) or re.fullmatch(
+            r"[0-9a-f]{40}", recorded_code_revision
+        ) is None:
+            raise RuntimeError("historical source launch code revision is invalid")
+        allowed = allowed_historical_code_revisions or set()
+        if recorded_code_revision not in allowed:
+            raise RuntimeError(
+                "historical source launch code revision is not explicitly "
+                f"allow-listed: {recorded_code_revision}"
+            )
+        stored_revision = stored.get("code_revision")
+        if (
+            not isinstance(stored_revision, dict)
+            or stored_revision.get("git_commit") != recorded_code_revision
+        ):
+            raise RuntimeError(
+                "historical source launch code revision does not match its "
+                "recorded input binding"
+            )
+
     args = argparse.Namespace(
         archive=field("archive", "resolved_path"),
         archive_sha256_receipt=field("archive_sha256_receipt", "path"),
@@ -1073,7 +1112,7 @@ def revalidate_recorded_inputs(
         python=field("python", "path"),
         libclang=field("libclang", "path"),
         macos_sdk=macos_sdk_path,
-        expected_code_revision=launch.get("code_revision"),
+        expected_code_revision=expected_code_revision,
         run_root=str(run_root),
         minimum_free_bytes=0,
         only_repo=list(launch.get("selected_repositories", [])),
@@ -1096,7 +1135,12 @@ def revalidate_recorded_inputs(
         result["archive"].pop("requested_path", None)
         return result
 
-    if _canonical_sha256(identity(live)) != _canonical_sha256(identity(stored)):
+    live_identity = identity(live)
+    stored_identity = identity(stored)
+    if execution_code_revision is not None:
+        live_identity.pop("code_revision", None)
+        stored_identity.pop("code_revision", None)
+    if _canonical_sha256(live_identity) != _canonical_sha256(stored_identity):
         raise RuntimeError("source launch inputs drifted")
     return live, args
 
@@ -1211,6 +1255,7 @@ def write_exit_receipt(
     schema: str = EXIT_SCHEMA,
     selected_repositories: list[str] | None = None,
     repair_base_code_run: dict[str, str] | None = None,
+    code_revision_upgrade: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the canonical exit binding shared by source supervisors."""
 
@@ -1224,6 +1269,7 @@ def write_exit_receipt(
         "done_manifest": None,
         "completion_receipt": None,
         "terminal_coverage": terminal_coverage,
+        "code_revision_upgrade": code_revision_upgrade,
     }
     if schema == TARGETED_EXIT_SCHEMA:
         if not selected_repositories or repair_base_code_run is None:
@@ -1346,6 +1392,16 @@ def verify_completion_receipt(
         != conveyor._code_revision_identity(inputs["code_revision"])
     ):
         raise RuntimeError("completion manifest code revision binding drifted")
+    upgrade = receipt.get("code_revision_upgrade")
+    if upgrade is not None:
+        try:
+            validated_upgrade = conveyor._validate_code_revision_upgrade_record(upgrade)
+        except (conveyor.CodeRevisionError, ValueError) as exc:
+            raise RuntimeError("completion code revision upgrade binding is invalid") from exc
+        if conveyor._code_revision_identity(validated_upgrade["to"]) != conveyor._code_revision_identity(
+            manifest_revision
+        ):
+            raise RuntimeError("completion code revision upgrade destination drifted")
     manifest_repo_list = receipt.get("source_repo_list")
     expected_repo_list = inputs["repo_list"]
     if (
