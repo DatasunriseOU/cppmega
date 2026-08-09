@@ -125,6 +125,7 @@ from scripts.ci_source_binding_projection import (  # noqa: E402
     SourceBindingProjectionError,
     SourceBindingProjector,
     SourceBindingProjectionRouter,
+    is_reviewed_frozen_parser_transition,
     is_reviewed_primary_equivalent_parser_transition,
     projection_record_key,
     projection_script_sha256,
@@ -5239,14 +5240,24 @@ def export_store(
                     frozen_fetch_state.summary["binding_upgrades"],
                 )
             )
+            reviewed_frozen_parser_transition = (
+                is_reviewed_frozen_parser_transition(
+                    parser_lineage,
+                    frozen_fetch_state.summary["binding_upgrades"],
+                    authorized_parser_sha256=(
+                        source_binding_projection_from_parser_sha256
+                    ),
+                )
+            )
             if (
                 completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
                 and parser_lineage != (current_parser_sha256,)
                 and not reviewed_primary_equivalent_transition
+                and not reviewed_frozen_parser_transition
             ):
                 raise ExportError(
                     "production export requires current-parser singleton data "
-                    "or the exact reviewed primary-equivalent parser transition; "
+                    "or an exact reviewed parser transition; "
                     f"observed lineage {list(parser_lineage)}"
                 )
             parser_generation_mode = (
@@ -5259,12 +5270,17 @@ def export_store(
                 )
                 else "reviewed-primary-equivalent-transition"
                 if reviewed_primary_equivalent_transition
+                else "reviewed-frozen-parser-transition"
+                if reviewed_frozen_parser_transition
                 else "audited-lineage"
             )
             source_binding_projector = SourceBindingProjectionRouter(
                 parser_lineage,
                 authorized_legacy_sha256=(
                     source_binding_projection_from_parser_sha256
+                ),
+                reviewed_frozen_parser_transition=(
+                    reviewed_frozen_parser_transition
                 ),
             )
             source_binding_projection_writer = _source_binding_projection_writer(
@@ -6575,6 +6591,15 @@ def export_store(
                     "observed_parser_lineage": list(parser_lineage),
                     "current_singleton": parser_lineage
                     == (current_parser_sha256,),
+                    **(
+                        {
+                            "authorized_projection_from_parser_script_sha256": (
+                                source_binding_projection_from_parser_sha256
+                            )
+                        }
+                        if reviewed_frozen_parser_transition
+                        else {}
+                    ),
                 },
                 "source_binding_projection": {
                     "schema": SOURCE_BINDING_PROJECTION_SCHEMA,

@@ -73,6 +73,8 @@ from cppmega.data.ci_training_scope import (  # noqa: E402
     training_scope_policy,
 )
 from scripts.ci_source_binding_projection import (  # noqa: E402
+    REVIEWED_FROZEN_PARSER_SINK_SHA256,
+    is_reviewed_frozen_parser_transition,
     is_reviewed_primary_equivalent_parser_transition,
     projection_script_sha256,
     target_parser_script_sha256,
@@ -711,13 +713,37 @@ def _load_content_store_ci_export_allowlist(
             binding_upgrades,
         )
     )
+    reviewed_frozen_transition = (
+        isinstance(parser_generation, dict)
+        and parser_generation.get("mode")
+        == "reviewed-frozen-parser-transition"
+        and isinstance(observed_parser_lineage, list)
+        and isinstance(binding_upgrades, list)
+        and parser_generation.get("current_singleton") is False
+        and is_reviewed_frozen_parser_transition(
+            observed_parser_lineage,
+            binding_upgrades,
+            authorized_parser_sha256=parser_generation.get(
+                "authorized_projection_from_parser_script_sha256"
+            ),
+        )
+    )
+    expected_fetch_parser_sha256 = (
+        REVIEWED_FROZEN_PARSER_SINK_SHA256
+        if reviewed_frozen_transition
+        else current_parser_sha256
+    )
     if (
         not isinstance(parser_generation, dict)
         or parser_generation.get("expected_current_parser_script_sha256")
         != current_parser_sha256
         or fetch_settings.get("parser_script_sha256")
-        != current_parser_sha256
-        or not (current_singleton or reviewed_transition)
+        != expected_fetch_parser_sha256
+        or not (
+            current_singleton
+            or reviewed_transition
+            or reviewed_frozen_transition
+        )
     ):
         raise RuntimeError(
             f"{manifest_path}: CI export parser generation is not reviewed"
@@ -862,7 +888,7 @@ def _load_content_store_ci_export_allowlist(
         ),
         where="source-binding projection occurrence count",
     )
-    if reviewed_transition:
+    if reviewed_transition or reviewed_frozen_transition:
         selection_counts = source_binding_projection["selection_counts"]
         source_input_count = nonnegative_int(
             (

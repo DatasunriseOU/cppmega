@@ -45,6 +45,23 @@ REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON = (
     "linear giant-line path and pytest-summary scans validated on "
     "clickhouse/clickhouse run 24857659503 attempt 3"
 )
+REVIEWED_FROZEN_PARSER_FROM_SHA256 = (
+    "37211386eb04a64d3be0d093487a3e699b996c608d1c534a99d92c68f0eb2f08"
+)
+REVIEWED_FROZEN_PARSER_SINK_SHA256 = (
+    "9cb1f2a8202411880b599eb57ad48bcdea2c97f1a5430b4ed68bf6a5d6c0651d"
+)
+REVIEWED_FROZEN_PARSER_TARGET_SHA256 = (
+    "183ccdf53f2b11c00dd9ba530de1b6e6cdece2fabf2730da2b416321fe210847"
+)
+REVIEWED_FROZEN_PARSER_LINEAGE = (
+    REVIEWED_FROZEN_PARSER_FROM_SHA256,
+    REVIEWED_FROZEN_PARSER_SINK_SHA256,
+)
+REVIEWED_FROZEN_PARSER_UPGRADE_REASON = (
+    "token-boundary path regex makes 475282-character ncnn progress lines "
+    "linear; validated on Tencent/ncnn run 24951670168 attempt 2"
+)
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _OCCURRENCE_KEY_FIELDS = (
@@ -126,6 +143,69 @@ def is_reviewed_primary_equivalent_parser_transition(
         and upgrade.get("reason")
         == REVIEWED_PRIMARY_EQUIVALENT_PARSER_UPGRADE_REASON
     )
+
+
+def is_reviewed_frozen_parser_transition(
+    parser_lineage: Iterable[str],
+    binding_upgrades: Iterable[Mapping[str, object]],
+    *,
+    authorized_parser_sha256: str | None,
+) -> bool:
+    """Recognize the reviewed frozen CASE5 parser lineage.
+
+    The frozen threshold store was written by the 9cb parser after the
+    explicitly reviewed 372 -> 9cb upgrade.  Its source-binding implementation
+    is the current implementation, but the frozen state cannot be rewritten to
+    the newer parser SHA without invalidating its receipt.  Keep this exception
+    exact, receipt-bound, and authorization-bound; all other non-current sinks
+    remain rejected by the projection router.
+    """
+
+    current = target_parser_script_sha256()
+    if current != REVIEWED_FROZEN_PARSER_TARGET_SHA256:
+        return False
+    fields = {
+        "binding_key",
+        "from_sha256",
+        "to_sha256",
+        "reason",
+        "upgraded_at",
+    }
+    records = tuple(binding_upgrades)
+    if any(
+        not isinstance(upgrade, Mapping)
+        or set(upgrade) != fields
+        or _HEX64_RE.fullmatch(str(upgrade.get("from_sha256"))) is None
+        or _HEX64_RE.fullmatch(str(upgrade.get("to_sha256"))) is None
+        or not isinstance(upgrade.get("reason"), str)
+        or not upgrade["reason"]
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            str(upgrade.get("upgraded_at")),
+        )
+        is None
+        for upgrade in records
+    ):
+        return False
+    upgrades = [
+        upgrade
+        for upgrade in records
+        if upgrade.get("binding_key") == "parser_script_sha256"
+    ]
+    if (
+        tuple(parser_lineage) != REVIEWED_FROZEN_PARSER_LINEAGE
+        or authorized_parser_sha256 != REVIEWED_FROZEN_PARSER_FROM_SHA256
+        or len(upgrades) != 1
+    ):
+        return False
+    upgrade = upgrades[0]
+    return (
+        upgrade.get("from_sha256") == REVIEWED_FROZEN_PARSER_FROM_SHA256
+        and upgrade.get("to_sha256") == REVIEWED_FROZEN_PARSER_SINK_SHA256
+        and upgrade.get("reason") == REVIEWED_FROZEN_PARSER_UPGRADE_REASON
+    )
+
+
 _CHANGE_REASONS = {
     "unchanged": {
         "current_binding_verified",
@@ -563,6 +643,7 @@ class SourceBindingProjectionRouter:
         parser_lineage: Iterable[str],
         *,
         authorized_legacy_sha256: str | None = None,
+        reviewed_frozen_parser_transition: bool = False,
     ) -> None:
         lineage = tuple(
             _require_hex64(value, where="parser_lineage entry")
@@ -580,8 +661,18 @@ class SourceBindingProjectionRouter:
                 authorized_legacy_sha256,
                 where="authorized_legacy_sha256",
             )
+        reviewed_frozen = (
+            reviewed_frozen_parser_transition
+            and lineage == REVIEWED_FROZEN_PARSER_LINEAGE
+            and authorized_legacy_sha256 == REVIEWED_FROZEN_PARSER_FROM_SHA256
+            and target == REVIEWED_FROZEN_PARSER_TARGET_SHA256
+        )
+        if reviewed_frozen_parser_transition and not reviewed_frozen:
+            raise SourceBindingProjectionError(
+                "reviewed frozen parser transition evidence is invalid"
+            )
         legacy_singleton = lineage == (LEGACY_PARSER_SHA256,)
-        if not legacy_singleton and lineage[-1] != target:
+        if not legacy_singleton and lineage[-1] != target and not reviewed_frozen:
             raise SourceBindingProjectionError(
                 "parser_lineage must terminate at the current parser; only "
                 "the exact authorized legacy singleton may have a legacy sink"
@@ -595,14 +686,17 @@ class SourceBindingProjectionRouter:
             )
         if (
             authorized_legacy_sha256 is not None
-            and LEGACY_PARSER_SHA256 not in lineage
+            and not (
+                LEGACY_PARSER_SHA256 in lineage
+                or reviewed_frozen
+            )
         ):
             raise SourceBindingProjectionError(
                 "legacy parser authorization is outside parser_lineage"
             )
 
         projectors: list[SourceBindingProjector] = []
-        if lineage[-1] == target:
+        if lineage[-1] == target or reviewed_frozen:
             projectors.append(SourceBindingProjector(target))
         if LEGACY_PARSER_SHA256 in lineage:
             projectors.append(
@@ -617,10 +711,11 @@ class SourceBindingProjectionRouter:
                 "semantics"
             )
         self.parser_lineage = lineage
-        self.input_parser_sha256 = lineage[-1]
+        self.input_parser_sha256 = target if reviewed_frozen else lineage[-1]
         self.target_parser_sha256 = target
         self.implementation_sha256 = projection_script_sha256()
         self._projectors = tuple(projectors)
+        self.reviewed_frozen_parser_transition = reviewed_frozen
         self.mode = (
             self.MIXED_MODE
             if len(self.parser_lineage) > 1
