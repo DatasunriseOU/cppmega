@@ -186,6 +186,7 @@ class DedupStore:
         self.stage_id = str(stage_id) if stage_id is not None else None
         self._pending = 0
         self._local_stage = self.stage_db_path is not None
+        self._closed = False
 
         # FAIL LOUD: sqlite open failure raises (no in-memory fallback). In
         # local-stage mode the child process must not acquire a global writer
@@ -1019,6 +1020,12 @@ class DedupStore:
     def discard_current_stage(self) -> None:
         if self.stage_id is None:
             raise ValueError("discard_current_stage requires a staged DedupStore")
+        if self._closed:
+            return
+        # A local stage is disposable. Close its owned connection before
+        # unlinking the stage family so a caller cannot keep writing an
+        # unlinked SQLite inode after discard.
+        self._close_connections()
         self.discard_stage(
             self.db_path,
             self.stage_id,
@@ -1060,13 +1067,23 @@ class DedupStore:
             self.conn.commit()
         self._pending = 0
 
+    def _close_connections(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self.stage_conn is not self.conn:
+                self.stage_conn.close()
+        finally:
+            self.conn.close()
+            self._closed = True
+
     def close(self) -> None:
+        if self._closed:
+            return
         try:
             self.commit()
         finally:
-            if self.stage_conn is not self.conn:
-                self.stage_conn.close()
-            self.conn.close()
+            self._close_connections()
 
     def __enter__(self):
         return self
