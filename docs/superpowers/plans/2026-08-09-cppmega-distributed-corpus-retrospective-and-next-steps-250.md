@@ -1,6 +1,6 @@
 # Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
 
-Дата среза evidence: `2026-08-09`; последний сведённый GCP audit: `2026-08-09T00:53:42Z`
+Дата среза evidence: `2026-08-09`; последний immutable GCP source audit: `2026-08-09T00:53:42Z`; factual refresh документа: `2026-08-09`
 
 Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`
 
@@ -13,6 +13,15 @@
 - `N001–N100` — исполнимый дальнейший план. Каждый пункт называет код или инфраструктурный объект, способ проверки и критерий завершения.
 - `training_ready=true` запрещён для нового общего корпуса до финального `N099`; staged CAS, verified SQLite, partial Parquet, работающий worker и отправленное assignment не считаются training-ready.
 - Автоматический retry допустим только для immutable attempt с подтверждённым HTTP 429/exit `75`. Exit `2`, drift contract, 401/403 и parser defect требуют нового revision/run, а не повтора in-place.
+
+## Оперативный срез на момент factual refresh
+
+- Новый общий four-lane release ещё не готов к обучению: `training_ready=false`. Исторический source-only bundle 1K–16K не переносит свой legacy `release_ready` на новый scope.
+- `origin/main` на момент проверки — `a13fb7332e3e21f0e6791bf6a80967ec9519e478`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить.
+- Два локальных CI fetcher продолжают писать в физически отдельные stores. Их store-local token counters нельзя складывать как глобальный union; frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
+- CASE5 `ci-case5-smoke-20260808-003` остаётся полезной дорогой materialization, а `ci-case5-smoke-20260809-004` имеет только sustained heartbeat/apply evidence. Ни один из них не объявляется completed без assignment completion, physical output, exact-generation readback и terminal receipt.
+- CASE5 heartbeat/429 hardening подготовлен в `/Volumes/external/cppmega_data/worktrees/cppmega-case5-persistent-session-20260809`: related suite `128 passed`, focused suite `25 passed`, Pyright `0 errors`, `py_compile`, `bash -n`, `shellcheck`, Terraform validate/tests и `git diff --check` прошли; шесть файлов ещё должны быть зафиксированы и pushed отдельным commit.
+- GCP source runs дают полезные assignment completions, но terminal slot/run receipts всё ещё отсутствуют. Широкий Terraform destroy запрещён: сначала worker-by-worker Local SSD diagnostics, exact backend lineage/serial и instance-only plan.
 
 ## Авторитетные контуры и идентичности
 
@@ -80,9 +89,9 @@
 
 ### W008 — Развести transient и deterministic failures
 
-- **Замысел:** повторять только подтверждённые сетевые/rate-limit сбои и не зацикливать parser defects.
-- **Где/чем:** exit taxonomy `75/2`, assignment diagnostics, watchdog recovery policy.
-- **Изначальный критерий:** transient retry создаёт новый attempt; deterministic repair требует нового pinned code revision и residual run.
+- **Замысел:** автоматически повторять только подтверждённый HTTP 429 и не зацикливать parser defects, auth failures, contract drift, generic 408/5xx или необъяснённые network exceptions.
+- **Где/чем:** exit taxonomy `75/2`, immutable assignment diagnostics, `scripts/distributed_data_prep/source_worker.py`, `scripts/distributed_data_prep/cloud_lane_pool_worker.py` и watchdog recovery policy.
+- **Изначальный критерий:** exit `75` разрешён только при `confirmed_http_429=true`; retry создаёт новый attempt, а любой deterministic/неподтверждённый сбой требует нового pinned revision/residual run. Текущую более широкую source-worker transient classification нужно сузить и закрепить regression tests.
 
 ### W009 — Наблюдать pipeline каждые 30 минут
 
@@ -143,8 +152,8 @@
 ### W018 — Материализовать commit lane отдельно от code lane
 
 - **Замысел:** не смешивать history/diff documents с snapshot code при dedup и packing.
-- **Где/чем:** commit conveyor, `cppmega/data/source_conveyor_composition.py`, separate route roots; final sealer по-прежнему принимает один kind `source/code`, внутри которого обязателен route submanifest.
-- **Изначальный критерий:** code и commit routes имеют distinct IDs, totals и по семь Megatron states; source/code lane manifest агрегирует обе routes без превращения общей матрицы `4×7` в неявную `5×7`.
+- **Где/чем:** commit conveyor, `cppmega/data/source_conveyor_composition.py`, separate route roots; `scripts/distributed_data_prep/seal_outputs.py` принимает top-level kind `source`, внутри которого обязательны route submanifests `code` и `commits`.
+- **Изначальный критерий:** code и commit routes имеют distinct IDs, totals и по семь Megatron states; top-level `source` manifest агрегирует обе routes без превращения общей матрицы `4×7` в неявную `5×7`.
 
 ### W019 — Сохранить compiler/linker/sanitizer diagnostics
 
@@ -176,11 +185,11 @@
 - **Где/чем:** `configs/source_quarantine_manifest.json`, `tools/clang_indexer/source_quarantine.py`.
 - **Изначальный критерий:** one-byte drift ломает quarantine match; negative fixtures не отбрасываются.
 
-### W024 — Выполнить worker-local exact dedup безопасно
+### W024 — Считать worker-local hashes без удаления candidates
 
-- **Замысел:** экономить повторную обработку внутри assignment, не объявляя локальную SQLite глобальным dedup.
-- **Где/чем:** per-worker dedup DB, content hashes, candidate receipts.
-- **Изначальный критерий:** DB проходит integrity check, но final membership определяется только single-writer reducer.
+- **Замысел:** экономить повторное хеширование/cache lookup внутри assignment, но сохранять все candidate documents и occurrences до глобального выбора winner.
+- **Где/чем:** per-worker cache/content hashes и candidate receipts; `scripts/distributed_data_prep/source_manifest.py` фиксирует `dedup_applied_on_worker=false`, а `scripts/distributed_data_prep/source_reducer.py` выполняет exact/near dedup единственным writer.
+- **Изначальный критерий:** worker не отбрасывает candidates; reducer доказывает winner/duplicate/occurrence conservation. Любой будущий worker-side removal требует новой schema и отдельного occurrence-conservation receipt.
 
 ### W025 — Реализовать crash-resume локального conveyor
 
@@ -229,7 +238,7 @@
 ### W032 — Создать run-scoped Terraform workers module
 
 - **Замысел:** разворачивать несколько одинаковых workers с изолированным backend prefix.
-- **Где/чем:** `infra/gcp_corpus_pool/workers`, `backend.tf`, generated per-run backend HCL и `workers.tftest.hcl`; общий example prefix `terraform/lane-workers` не годится для concurrent production runs.
+- **Где/чем:** `infra/gcp_corpus_pool/workers/backend.tf.example`, `infra/gcp_corpus_pool/workers/lane-workers.backend.hcl.example`, `infra/gcp_corpus_pool/workers/workers.tftest.hcl`; реальный run-scoped backend HCL генерирует `scripts/gcp_isolated_worker_rollout.py`. Общий example prefix `terraform/lane-workers` не годится для concurrent production runs.
 - **Изначальный критерий:** backend prefix включает validated run ID, а два run IDs не могут адресовать одинаковые VM/IP/state objects.
 
 ### W033 — Обеспечить быстрый сетевой путь
@@ -253,7 +262,7 @@
 ### W036 — Использовать transient Local SSD как scratch
 
 - **Замысел:** быстро клонировать/распаковывать/indexировать без накопления долговечных локальных сотен гигабайт.
-- **Где/чем:** Local SSD/NVMe mounts в `startup.sh.tftpl`.
+- **Где/чем:** Local SSD/NVMe mounts в `infra/gcp_corpus_pool/workers/startup.sh.tftpl`.
 - **Изначальный критерий:** mount/read-write benchmark проходит; accepted artifacts загружены до destroy VM.
 
 ### W037 — Сделать boot disk воспроизводимым
@@ -277,13 +286,13 @@
 ### W040 — Раздать source assignments детерминированно
 
 - **Замысел:** каждый repo получает assignment digest, home shard и явный resource class; текущая source manifest schema имеет identity/shard, но ещё не resource envelope.
-- **Где/чем:** `scripts/distributed_data_prep/source_manifest.py`, `source_work_queue.py` и schema migration для heavy/resource class.
+- **Где/чем:** `scripts/distributed_data_prep/source_manifest.py`, `scripts/distributed_data_prep/source_work_queue.py` и schema migration для heavy/resource class.
 - **Изначальный критерий:** assignment set digest равен manifest; unknown/duplicate assignment и heavy class без matching worker envelope отвергаются.
 
 ### W041 — Добавить dynamic work stealing
 
 - **Замысел:** не держать VM пустой, если её home shard закончен, пока в очереди есть runnable work.
-- **Где/чем:** `source_slot_scheduler.py`, claims и leases в GCS.
+- **Где/чем:** `scripts/distributed_data_prep/source_slot_scheduler.py`, claims и leases в GCS.
 - **Изначальный критерий:** lease исключает двойного winner; stale claim может быть заменён только по contract.
 
 ### W042 — Публиковать heartbeat на active assignment
@@ -384,9 +393,9 @@
 - **Где/чем:** distinct `primary.sqlite`, `ancillary.sqlite` и sidecar root.
 - **Изначальный критерий:** store files имеют разные paths/hashes; route conservation и store counts проверены.
 
-### W058 — Выполнить authenticated smoke до production GitLab scan
+### W058 — Выполнить authenticated smoke до authoritative detail fetch
 
-- **Замысел:** доказать доступ к candidate details на каждом host ограниченным run.
+- **Замысел:** доказать доступ к candidate details на каждом host ограниченным run до authoritative production detail fetch. Уже выполненный public production-labelled inventory на 46,978 MR этого gate не закрывает.
 - **Где/чем:** отдельные smoke roots и host-scoped tokens.
 - **Изначальный критерий:** smoke completion восстанавливается из store/manifest; 401/403/429 классифицированы правильно.
 
@@ -474,7 +483,7 @@
 
 - **Замысел:** получить immutable срез достаточно большого CI corpus для воспроизводимого export.
 - **Где/чем:** `scripts/distributed_data_prep/ci_case5_snapshot.py`, frozen receipt.
-- **Изначальный критерий:** snapshot закрывает writers, hashes stores и не складывается с overlapping live upper bound.
+- **Изначальный критерий:** отдельная frozen SQLite/CAS copy не содержит WAL/SHM, её hashes стабильны и она не складывается с overlapping live upper bound; live fetchers могут продолжать работу в других stores.
 
 ### W073 — Перенести CASE5 inputs в GCS
 
@@ -485,7 +494,7 @@
 ### W074 — Материализовать CASE5 на GCP
 
 - **Замысел:** использовать CPU/Local SSD workers для reducer/export/packing рядом с GCS.
-- **Где/чем:** cloud lane manifests, `cloud_lane_pool_worker.py`, isolated Terraform run.
+- **Где/чем:** cloud lane manifests, `scripts/distributed_data_prep/cloud_lane_pool_worker.py`, isolated Terraform run.
 - **Изначальный критерий:** smoke создаёт assignment, output и terminal receipts; production масштабируется только после smoke.
 
 ### W075 — Выдать CI lane seal
@@ -499,8 +508,8 @@
 ### W076 — Зафиксировать canonical Parquet schema
 
 - **Замысел:** унифицировать tokens, labels, document IDs, provenance и objective columns между lanes.
-- **Где/чем:** отдельная versioned training-Parquet schema для tokens/labels/provenance/objectives и exporter receipts; `scripts/canonical_parquet_ledger.py` описывает ledger (`sequence_index`, `record_json`, `record_sha256`), а не training rows.
-- **Изначальный критерий:** schema/version/dtypes одинаково интерпретируются auditor и Megatron converter.
+- **Где/чем:** консолидировать training-row schema из `cppmega/data/nanochat_pipeline/packed_rows_schema.py` и `scripts/nanochat_data/pack_enriched_rows.py` в один versioned contract с schema digest; `scripts/canonical_parquet_ledger.py` остаётся отдельной ledger schema (`sequence_index`, `record_json`, `record_sha256`).
+- **Изначальный критерий:** exporter, auditor и Megatron converter проверяют один schema version/digest и одинаковые dtypes/semantics; training rows нельзя принять по digest ledger schema.
 
 ### W077 — Использовать ZSTD и атомарную публикацию Parquet
 
@@ -582,9 +591,9 @@
 
 ### W090 — Зафиксировать batch geometry
 
-- **Замысел:** считать full batches/remainder для каждой длины без изменения training tokens.
-- **Где/чем:** training status и batch size contract.
-- **Изначальный критерий:** rows=full_batches×batch_size+remainder; padding не считается valid/trained.
+- **Замысел:** считать full batches/remainder для каждой длины без изменения training tokens и без выдачи одного исторического `batch_size=192` за универсальный training contract 1K–64K.
+- **Где/чем:** per-length/configurable training geometry manifest и training status; исторический status batch size используется только как информационный расчёт.
+- **Изначальный критерий:** для каждого выбранного `(lane, length, batch_size)` выполняется `rows=full_batches×batch_size+remainder`; padding не считается valid/trained, а sealing не зависит от незафиксированного default batch size.
 
 ### Publication, release и эксплуатация
 
@@ -659,7 +668,7 @@
 ### D001 — Source/GCP repair stack интегрирован в основную историю
 
 - **Сделано:** ветка integration landed через commit `ac41718b` и последующие merges; `origin/main` на evidence-срезе содержит source repair/runtime stack.
-- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547` и текущий `origin/main` `88f4d8e7`.
+- **Доказательство:** `git log --all`, merge `10066e88`, parser/tokenizer repair `b045e547`; commits `ac41718b`, `10066e88`, `b045e547` и прежний срез `88f4d8e7` являются ancestors текущего `origin/main` `a13fb733`.
 - **Честная граница:** наличие кода в main не означает, что все source assignments завершены.
 
 ### D002 — Terraform foundation оформлен отдельным модулем
@@ -676,9 +685,9 @@
 
 ### D004 — Receipt-bound GCP source monitor реализован
 
-- **Сделано:** monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts, а live loop уже обновлён на этот monitor.
-- **Доказательство:** pushed branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`, monitor SHA-256 `4d1e8b141e5ecd854c6f41574e688ba05b7bfc8c901f3bfdc0391f6e8e5aa046`, loop SHA-256 `2bf0bd31f047bca2bddf3453e2218cb875bb9f3119582cf96dd0fee61acd3cb5`, focused suite `56 passed`, `sh -n` и один полный цикл четырёх GCP scans за `452` секунды с рассчитанным остатком сна `1348` секунд.
-- **Честная граница:** доказан только один полный последовательный цикл после обновления pin; N014 всё ещё обязан получить второй последовательный цикл. Сам monitor не исправляет parser defect автоматически.
+- **Сделано:** monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts.
+- **Доказательство:** pushed branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`; live monitor SHA-256 `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064`, loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`, а pushed monitor-stack branch заканчивается `24a43b46`.
+- **Честная граница:** `ba417173` pushed, но ещё не landed в `origin/main`; исторические `56 passed` и `452` секунды не имеют отдельного immutable test/log receipt и не используются здесь как доказательство. Сам monitor parser defects не исправляет.
 
 ### D005 — Dynamic source work stealing реализован
 
@@ -708,7 +717,7 @@
 
 - **Сделано:** добавлен pooled worker path для распределения lane assignments.
 - **Доказательство:** commit `8ba86ec5`, `cloud_lane_pool_worker.py`.
-- **Честная граница:** smoke `.003` обязан доказать, что assignments реально claim/complete в текущем bootstrap.
+- **Честная граница:** `ci-case5-smoke-20260809-002` опубликовал heartbeats, но завершился deterministic exit `2` без assignment/output completion; активные `ci-case5-smoke-20260808-003` и `ci-case5-smoke-20260809-004` ещё обязаны доказать claim/completion/output/readback в текущем bootstrap.
 
 ### D010 — CASE5 smoke topology изолирована от production
 
@@ -752,48 +761,48 @@
 
 - **Сделано:** status раздельно показывает live source, sealed Megatron, GitHub PR, GitLab MR и CI.
 - **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`; SHA-256 физического файла `ba53cc59027be172f97d86e3e950f9ac39a558eb2cbb798f283ba2c1f8321999`, а записанный внутри status digest — `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`. Эти два digest относятся к разным уровням и не подменяют друг друга.
-- **Честная граница:** status прямо сохраняет `release ready=false` для новых live/PR/MR/CI lanes.
+- **Честная граница:** это immutable срез `2026-08-08T23:11:36Z`, а не live dashboard; его heartbeat позднее был `stale=true`. Срез прямо сохраняет `release ready=false` для новых live/PR/MR/CI lanes.
 
 ### D017 — Live source Parquet 1K физически существует
 
-- **Сделано:** учтено 436 файлов, 3,085,378 rows, 3,053,857,239 valid и 3,037,814,601 trained tokens.
-- **Доказательство:** physical inventory root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`, inventory SHA-256 `dd540b7e…f32a`.
+- **Сделано:** учтено 440 файлов, 3,085,794 rows, 3,054,269,011 valid и 3,038,224,353 trained tokens.
+- **Доказательство:** physical inventory root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`, inventory SHA-256 `bddee557f4ffd6070f70d4e95fc32087f68d94b71e1bb4e48d69c1e3890f3802`.
 - **Честная граница:** bucket `packed_unsealed`, а completion totals расходятся с physical Parquet.
 
 ### D018 — Live source Parquet 2K физически существует
 
-- **Сделано:** учтено 435 файлов, 449,588 rows, 640,599,729 valid и 640,150,141 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
+- **Сделано:** учтено 438 файлов, 449,658 rows, 640,701,360 valid и 640,251,702 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
 - **Честная граница:** данные входят в незавершённый overlapping live snapshot.
 
 ### D019 — Live source Parquet 4K физически существует
 
-- **Сделано:** учтено 432 файла, 221,946 rows, 626,886,677 valid и 626,664,731 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
+- **Сделано:** учтено 435 файлов, 221,983 rows, 627,003,170 valid и 626,781,187 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
 - **Честная граница:** global composition/dedup/seal ещё не закрыты.
 
 ### D020 — Live source Parquet 8K физически существует
 
-- **Сделано:** учтено 433 файла, 97,899 rows, 552,169,300 valid и 552,071,401 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
+- **Сделано:** учтено 437 файлов, 97,963 rows, 552,562,497 valid и 552,464,534 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
 - **Честная граница:** наличие rows не доказывает terminal repository coverage.
 
 ### D021 — Live source Parquet 16K физически существует
 
-- **Сделано:** учтено 425 файлов, 99,984 rows, 1,415,363,453 valid и 1,415,263,469 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `dd540b7e…f32a`.
+- **Сделано:** учтено 428 файлов, 100,016 rows, 1,415,781,331 valid и 1,415,681,315 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
 - **Честная граница:** 32K/64K в этом live root ещё не материализованы.
 
 ### D022 — Live source token accounting посчитан
 
-- **Сделано:** physical inventory фиксирует 2,161 файл, 3,954,795 rows, 6,288,876,398 valid и 6,271,964,343 trained tokens без сложения с overlapping sealed snapshot.
-- **Доказательство:** сумма пяти physical bucket tables; inventory SHA-256 `dd540b7e…f32a`.
+- **Сделано:** physical inventory фиксирует 2,178 файлов, 3,955,414 rows, 6,290,317,369 valid и 6,273,403,091 trained tokens без сложения с overlapping sealed snapshot.
+- **Доказательство:** сумма пяти physical bucket tables; inventory SHA-256 `bddee557f4ffd6070f70d4e95fc32087f68d94b71e1bb4e48d69c1e3890f3802`.
 - **Честная граница:** totals относятся к `packed_unsealed`, не к release-ready corpus.
 
 ### D023 — Source documents разложены по восьми категориям
 
 - **Сделано:** посчитаны bash, build, headers, C/C++ source, diagnostics, Python auxiliary, shell other и SQL.
-- **Доказательство:** physical category inventory: bash `14,376`, build `116,363`, headers `13,071,160`, C/C++ source `3,570,481`, diagnostics `10,123`, Python auxiliary `102,770`, shell other `17,189`, SQL `9,593`.
+- **Доказательство:** physical category inventory: bash `14,377`, build `116,555`, headers `13,073,135`, C/C++ source `3,570,482`, diagnostics `10,126`, Python auxiliary `102,813`, shell other `17,197`, SQL `9,593`.
 - **Честная граница:** status отмечает, что Python auxiliary пока смешан с main rows.
 
 ### D024 — Source blockers не скрыты
@@ -802,41 +811,41 @@
 - **Доказательство:** секция `Blockers` live source.
 - **Честная граница:** это завершённая диагностика/прозрачность, а не устранение blockers.
 
-### D025 — Существующий sealed Megatron manifest сохранён
+### D025 — Существующий sealed Megatron manifest и remote archive receipt сохранены
 
-- **Сделано:** manifest `/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/manifest.json` остаётся отдельным sealed snapshot.
-- **Доказательство:** status классифицирует его `sealed_megatron`, release-ready для его исторического scope.
-- **Честная граница:** snapshot overlaps live source и покрывает только 1K–16K, поэтому не является новым four-lane release.
+- **Сделано:** manifest `/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/manifest.json` и долговременный Nebius archive receipt сохраняют отдельный historical snapshot.
+- **Доказательство:** manifest SHA `1e44fcd8ff9192a15e25b62c18ac71569ca7627e3f2221b29d249d5c2fb93391`, artifact-set SHA `8c550514dd52ddc99ecad91cfd5e4b0355c194c5d3e38d6686550cf4fd2d088b`, archive SHA `5ac3e095289b28d4924c3547ebae62ee79f002c4ad0c81467fda59b03a1c93a7`, size `2,823,467,371`, status `uploaded_verified`.
+- **Честная граница:** локально отсутствуют 230 из 236 manifest artifacts (`local_snapshot_retained=false`). Legacy `release_ready=true` относится только к historical source-only 1K–16K bundle: manifest не имеет современного `training_ready` gate/loader-smoke receipt и не является новым four-lane release.
 
-### D026 — Sealed Megatron 1K физически учтён
+### D026 — Sealed Megatron 1K зафиксирован manifest/audit
 
 - **Сделано:** manifest связывает 2,366 files, 1,804,082 rows, 1,712,299,227 valid и 1,704,343,213 trained tokens.
-- **Доказательство:** `Sealed Megatron bundle` table в current status.
-- **Честная граница:** этот bucket относится к историческому source-only bundle.
+- **Доказательство:** `Sealed Megatron bundle` table в current status и remote archive binding D025.
+- **Честная граница:** это manifest/audit total исторического source-only bundle, а не утверждение о локальном наличии каждого файла.
 
-### D027 — Sealed Megatron 2K физически учтён
+### D027 — Sealed Megatron 2K зафиксирован manifest/audit
 
 - **Сделано:** manifest связывает 2,367 files, 441,140 rows, 629,504,765 valid и 629,063,625 trained tokens.
-- **Доказательство:** sealed bundle table.
-- **Честная граница:** он не содержит новые PR/MR/CI lanes.
+- **Доказательство:** sealed bundle table и remote archive binding D025.
+- **Честная граница:** локальное наличие всех artifacts не доказано; bundle не содержит новые PR/MR/CI lanes.
 
-### D028 — Sealed Megatron 4K физически учтён
+### D028 — Sealed Megatron 4K зафиксирован manifest/audit
 
 - **Сделано:** manifest связывает 2,363 files, 230,004 rows, 653,341,457 valid и 653,111,453 trained tokens.
-- **Доказательство:** sealed bundle table.
-- **Честная граница:** это не доказательство 32K/64K поддержки.
+- **Доказательство:** sealed bundle table и remote archive binding D025.
+- **Честная граница:** это не доказательство локального physical set или 32K/64K поддержки.
 
-### D029 — Sealed Megatron 8K физически учтён
+### D029 — Sealed Megatron 8K зафиксирован manifest/audit
 
 - **Сделано:** manifest связывает 2,358 files, 110,040 rows, 621,715,449 valid и 621,605,409 trained tokens.
-- **Доказательство:** sealed bundle table.
-- **Честная граница:** bucket нельзя складывать с live 8K из-за overlap.
+- **Доказательство:** sealed bundle table и remote archive binding D025.
+- **Честная граница:** локальное наличие всех artifacts не доказано; bucket нельзя складывать с live 8K из-за overlap.
 
-### D030 — Sealed Megatron 16K физически учтён
+### D030 — Sealed Megatron 16K зафиксирован manifest/audit
 
 - **Сделано:** manifest связывает 2,317 files, 46,197 rows, 515,886,337 valid и 515,840,140 trained tokens.
-- **Доказательство:** sealed bundle table.
-- **Честная граница:** исторический manifest не содержит 32K/64K physical artifacts.
+- **Доказательство:** sealed bundle table и remote archive binding D025.
+- **Честная граница:** локальное наличие всех artifacts не доказано; historical manifest не содержит 32K/64K states.
 
 ### D031 — Totals sealed bundle посчитаны без overlap
 
@@ -914,16 +923,16 @@
 
 ### D043 — Focused bridge regression suite воспроизводимо проходит
 
-- **Сделано:** `tests/test_gitlab_primary_membership_bridge.py` повторно запущен из detached clean worktree commit `4ec96cf5` в project venv с explicit portable profile; результат `5 passed in 3.33s`.
+- **Сделано:** `tests/test_gitlab_primary_membership_bridge.py` повторно запущен из detached clean worktree commit `4ec96cf5` в project venv с explicit portable profile; результат `5 passed`.
 - **Доказательство:** команда использовала `/Volumes/external/sources/cppmega.mlx/.venv/bin/python`, `CPPMEGA_TEST_PROFILE=portable-data` и временный worktree, удалённый после проверки.
-- **Честная граница:** это focused bridge suite; current GitLab scanner/exporter и production bytes требуют собственных N047–N056 тестов/receipts.
+- **Честная граница:** точное historical duration не запечатано отдельным receipt; независимый rerun дал `5 passed in 1.46s`. Это focused bridge suite; current GitLab scanner/exporter и production bytes требуют собственных N047–N056 тестов/receipts.
 
 ### CI, watchdog и GCP operational evidence
 
 ### D044 — CI live CAS имеет измеренный store-local upper bound
 
-- **Сделано:** historical audit slice двух live progress receipts считает 302,564,372,278 exact unique payload tokens внутри live stores.
-- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260422_20260721/fetch.progress.json` при `generated_at=2026-08-09T01:48:56Z` фиксировал `104,741,255,435`, а `/Volumes/external/sources/cppmega.mlx/outputs/ci_stream_prod_v4_20260721_20260730/fetch.progress.json` при `generated_at=2026-08-09T01:57:32Z` фиксировал `197,823,116,843`; их сумма — `302,564,372,278`. Mutable current receipts уже выросли, поэтому число действительно только для этих двух timestamps.
+- **Сделано:** immutable training-status slice фиксирует `295,701,087,270` exact unique payload tokens как сумму store-local counters двух live stores.
+- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, generated `2026-08-08T23:11:36Z`, internal status SHA-256 `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`.
 - **Честная граница:** это store-local upper bound, не global union/dedup и не training tokens.
 
 ### D045 — Frozen CASE5 threshold snapshot сохранён
@@ -940,33 +949,33 @@
 
 ### D047 — 30-минутный pipeline watchdog установлен и исполняется
 
-- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 240 runs и last exit `0`; loop считает cadence как 1800 секунд от начала цикла, а не `scan + 1800`, и GCP subscans больше не пропускаются из-за monitor SHA pin.
-- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, frozen `launchctl print`, live loop SHA-256 `2bf0bd31f047bca2bddf3453e2218cb875bb9f3119582cf96dd0fee61acd3cb5`, `sh -n` и полный четырёх-run GCP scan cycle за `452` секунды.
-- **Честная граница:** launchd `state=not running` между interval invocations нормален; один полный цикл доказан, но N014 всё ещё требует второй последовательный цикл для cadence gate.
+- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 267 runs и last exit `0`; loop выполняет все четыре GCP scans и считает cadence от начала цикла.
+- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, `launchctl print`, live loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`; лог содержит последовательные полные cycles, в том числе `358s` и `411s`.
+- **Честная граница:** launchd `state=not running` между interval invocations нормален; mutable run count не является immutable pipeline completion receipt.
 
 ### D048 — Codex 429 watchdog установлен
 
-- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 6 runs и last exit `0`.
-- **Доказательство:** `com.codex.multi-429-watchdog.plist` и `launchctl print`.
+- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 34 runs и last exit `0`.
+- **Доказательство:** `com.codex.multi-429-watchdog.plist`, `launchctl print`, script SHA-256 `6a6f03a2621283b95ba59a19d755512324d49993aa03efd569e7c3f7a4ae5c2d`.
 - **Честная граница:** watchdog повторяет controller session; он не даёт права retry deterministic parser assignment.
 
-### D049 — Obsolete CASE5 smoke `.002` уничтожен и readback-verified
+### D049 — CASE5 runs `ci-case5-smoke-20260808-002` и `ci-case5-smoke-20260809-002` уничтожены scoped и evidence сохранено
 
-- **Сделано:** Terraform destroy удалил VM, static address и compact placement policy; managed state пуст.
-- **Доказательство:** `/Volumes/external/cppmega_data/ci_case5_cloud_materialize_20260808_002/isolated-terraform/ci-case5-smoke-20260808-002.destroy-receipt.json`, status `destroyed_verified`, plan `0/0/3`.
-- **Честная граница:** сохранённые GCS evidence содержат ready receipt, но assignment/output `0/0`; это cleanup, не data completion.
+- **Сделано:** для обоих разных `.002` run exact isolated Terraform destroy удалил только run VM/static address/placement policy; managed states пусты.
+- **Доказательство:** historical destroy receipt `/Volumes/external/cppmega_data/ci_case5_cloud_materialize_20260808_002/isolated-terraform/ci-case5-smoke-20260808-002.destroy-receipt.json`; новый evidence root `/Volumes/external/cppmega_data/ci_case5_cloud_materialize_20260809_002/terminal-evidence`, bundle SHA/generation `47db8f7ac3c0bb399845d0ab2fe3c116fdd7be209f8c34f2790d7991c64cefae`/`1786289496842413`, terminal receipt SHA/generation `ae5c7fe30c36474962e10912d0492c6bba5339d3d3f4b9e5e45a627d6b06ea5a`/`1786289614633242`, destroy receipt SHA/generation `64fda071550b184f9f579cf29ddd582a5de118f904f93267f258acae8679e392`/`1786290047242620`, plan `0 add / 0 change / 3 destroy`.
+- **Честная граница:** новый run на code revision `b05e0bd0` доказал HTTP `200`, `curl_exit=23` при записи большого `content-store-index.sqlite3`, diagnostic SHA `d7023d35dc95e6369998d9fe1194e95d5d9bf333d10dd969cff39b08a494a704`, deterministic exit `2`, `confirmed_http_429=false`, без assignment/output completion. Это diagnostic+cleanup, не data completion и не основание для retry.
 
-### D050 — Четыре GCP source run сведены immutable read-only audit
+### D050 — Четыре GCP source run сведены immutable historical read-only audit
 
 - **Сделано:** audit связал `.004=111 success/371 unclaimed/0 VM`, `.005=409 success/54 deterministic/19 current/6 fresh/16 VM`, новый `.001=46 success/2 deterministic/32 current/32 fresh/16 VM`, repair `.001=14 success/26 deterministic/8 current/8 fresh/4 VM`; any-run union покрывает 423 проекта, 59 пока не покрыты ни одним run.
 - **Доказательство:** `/Volumes/external/cppmega_data/gcp_source_multi_run_audit_20260809/evidence/read-only-audit-20260809T005342Z/audit.md`, SHA-256 `76f157c7a625560bdcbc4141a5b13b57f27e57b4e0955bb1caeaa2e537babc5a`, и соседний immutable evidence receipt.
-- **Честная граница:** audit read-only и ни один run не имеет terminal slot/run receipts или reducer seal; 36 перечисленных source VM нельзя считать завершёнными, а шесть `.005` idle candidates можно удалять только после Local SSD diagnostics и state-aware Terraform plan.
+- **Честная граница:** это точный historical срез `2026-08-09T00:53:42Z`, а не live count. Ни один run на этом срезе не имеет terminal slot/run receipts или reducer seal; перечисленные VM нельзя считать завершёнными, а любой cleanup допустим только после worker-local SSD diagnostics и state-aware Terraform plan.
 
 ---
 
 ## Часть III. Детальный дальнейший план — 100 пунктов
 
-### Немедленное восстановление и завершение source/code lane
+### Немедленное восстановление и завершение source lane (`code` + `commits` routes)
 
 ### N001 — Заморозить новый общий runtime checkpoint
 
@@ -975,33 +984,33 @@
 - **Проверка:** stat-before/hash/stat-after; mutable file получает отдельную observed-version запись, а не ложный stable hash.
 - **Готово когда:** `N001-runtime-checkpoint.json` перечисляет local/GCP/PR/MR/CI evidence и везде сохраняет `training_ready=false`.
 
-### N002 — Восстановить durable pinned worktree локального conveyor
+### N002 — Зафиксировать уже восстановленный durable runtime pin
 
-- **Действие:** создать новый worktree из сохранённого pushed repair commit вместо исчезнувшего `/Volumes/external/cppmega_data/worktrees/cppmega-gcp-deterministic-repair-20260806`.
-- **Код/инфра/аккаунт:** `git worktree`, branch/commit lineage repair stack; output root не перемещать.
-- **Проверка:** `git rev-parse HEAD`, clean status, все scripts/tokenizer/config paths существуют и hashes совпадают launch contract либо явно superseded новым receipt.
-- **Готово когда:** durable path записан в новый launch receipt, а старый missing cwd помечен причиной остановки, не success.
+- **Действие:** проверить, что активный local residual run продолжает использовать pin `00373dfc` и durable paths; не создавать второй supervisor и не переключать detached writer worktree.
+- **Код/инфра/аккаунт:** `/Volumes/external/cppmega_data/source_full501_repair_main_00373dfc_20260809T073953Z`, process/launch receipts и `git worktree list`.
+- **Проверка:** PID/cwd/code revision/tokenizer/config paths совпадают launch contract; output root не перемещён и не имеет второго writer.
+- **Готово когда:** свежий runtime-binding receipt подтверждает единственный живой supervisor и помечает старый missing cwd только как historical cause.
 
-### N003 — Убрать lifetime-зависимость child processes от удаляемого worktree
+### N003 — Проверить landed durable-cwd fix на active generation
 
-- **Действие:** изменить supervisor так, чтобы child cwd был durable run workspace или проверялся/восстанавливался до spawn.
+- **Действие:** подтвердить, что supervisor выбирает durable run workspace, проверяет cwd до spawn и fail-closed обрабатывает исчезновение checkout; новый fix в active writer не подмешивать.
 - **Код/инфра/аккаунт:** `scripts/source_conveyor_supervisor.py`, `scripts/streaming_conveyor.py`, worktree lifecycle helper.
 - **Проверка:** regression удаляет исходный checkout после staging; resume обязан либо продолжить из durable cwd, либо fail deterministic до writer mutation.
-- **Готово когда:** focused tests проходят, а `FileNotFoundError: cwd` больше не создаёт каскад ложных repo failures.
+- **Готово когда:** landed revision/fixture tests и свежие active-run records подтверждают отсутствие нового `FileNotFoundError: cwd`; при расхождении — отдельный новый revision/run после завершения current writer.
 
-### N004 — Закрепить restart/lock semantics тестами
+### N004 — Повторно подтвердить restart/lock semantics
 
-- **Действие:** покрыть единственного supervisor, shared-base repair lock, stale PID и restart после crash.
+- **Действие:** прогнать уже существующие regression tests единственного supervisor/shared-base repair lock/stale PID/restart и сохранить immutable test receipt exact revision.
 - **Код/инфра/аккаунт:** `tests/test_source_conveyor_supervisor.py`, `tests/test_streaming_conveyor_revision.py`.
 - **Проверка:** два concurrent writers отвергаются; stale lock снимается только с bound evidence; accepted shard hash не меняется.
 - **Готово когда:** clean pinned worktree выдаёт pytest exit `0` и test receipt с source tree SHA.
 
-### N005 — Безопасно возобновить локальный conveyor
+### N005 — Дать активному локальному conveyor продолжить без перезапуска
 
-- **Действие:** остановить только сломанный controller generation, сохранить long-running accepted child outcome и запустить resume по N001/N002 binding.
-- **Код/инфра/аккаунт:** supervisor CLI, existing run root, local operator; не использовать broad kill pattern.
-- **Проверка:** process identity/lock/output generation совпадают; первые новые progress records ссылаются на resume receipt.
-- **Готово когда:** два 30-минутных watchdog среза показывают forward progress без новых cwd failures или duplicate writers.
+- **Действие:** не останавливать живой writer; наблюдать forward progress и запускать новый resume generation только после terminal exit либо доказанного controller failure.
+- **Код/инфра/аккаунт:** существующий supervisor CLI/run root, local operator; broad kill pattern запрещён.
+- **Проверка:** process identity/lock/output generation стабильны; два 30-минутных watchdog среза показывают новые parser/materialization counters без duplicate writer.
+- **Готово когда:** active generation получает terminal receipt или возникает immutable deterministic blocker, авторизующий новый pinned run.
 
 ### N006 — Нормализовать 501 scope против progress attempts
 
@@ -1012,10 +1021,10 @@
 
 ### N007 — Пересобрать exact local failure inventory
 
-- **Действие:** для каждого unresolved attempt сохранить exit, bounded stderr, repo/commit, failing file и classification.
-- **Код/инфра/аккаунт:** supervisor logs, parser diagnostics, quarantine receipts.
-- **Проверка:** transport/429, OOM, deterministic parser, corrupt input и operator interruption различаются; `unknown=0` до authorization.
-- **Готово когда:** inventory SHA связан с N006 и может породить finite repair contract.
+- **Действие:** для каждого unresolved attempt сохранить exit, bounded stderr, repo/commit, failing file и classification; сузить source-worker retry taxonomy до подтверждённого HTTP 429.
+- **Код/инфра/аккаунт:** supervisor logs, parser diagnostics, quarantine receipts, `scripts/distributed_data_prep/source_worker.py` и его tests.
+- **Проверка:** только `confirmed_http_429=true` может дать exit `75`; generic 408/5xx/network error, OOM, deterministic parser, corrupt input и operator interruption дают bounded exit `2`/terminal diagnostics; `unknown=0` до authorization.
+- **Готово когда:** inventory SHA связан с N006, finite repair contract построен, а regression tests запрещают automatic retry для всего, кроме confirmed 429.
 
 ### N008 — Довести KeyDB repair до production receipt
 
@@ -1061,7 +1070,7 @@
 
 ### N014 — Повторно проверить оба 30-минутных watchdog
 
-- **Действие:** заменить в live loop старый `gcp_monitor_sha256=08759b…` на SHA исправленного monitor `4d1e8b…`, проверить shell и перезапустить terminal/launchd controller без второго writer.
+- **Действие:** проверить live monitor SHA `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064` и loop SHA `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`; перезапускать launchd controller только при drift/failure и без второго writer.
 - **Код/инфра/аккаунт:** `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/pipeline-watchdog-loop.sh`, pinned worktree `cppmega-gcp-source-assignment-heartbeat-monitor-live-20260806`, два plists и report roots.
 - **Проверка:** `sh -n`, exact file hash, один controller PID; два consecutive reports ≤35 минут; recovery не запускает exit `1/2`, а controlled transient `75/429` создаёт новый attempt.
 - **Готово когда:** watchdog health receipt связывает plist/script/config hashes и два новых полных cycle timestamps.
@@ -1075,7 +1084,7 @@
 
 ### N016 — Дать `.001` завершить только уже активную полезную работу
 
-- **Действие:** не retry 18 exit-2 outcomes in-place; сохранить outputs текущих eight fresh assignments и новых runnable claims.
+- **Действие:** не retry ни один deterministic exit-2 outcome in-place; сохранить outputs всех fresh/runnable assignments, взяв их количество из нового immutable inventory, а не из устаревающего числа в runbook.
 - **Код/инфра/аккаунт:** GCS run `source-repair-20260808-001`, dynamic claim queue.
 - **Проверка:** heartbeat freshness, assignment digest, terminal candidate/hash; no automatic replacement flag.
 - **Готово когда:** все не-deterministic runnable assignments имеют terminal accepted/outcome receipt, а active=0.
@@ -1110,10 +1119,10 @@
 
 ### N021 — Собрать canonical local+GCP source composition
 
-- **Действие:** логически объединить local base/repair, `.001` accepted и `.002` residual outputs, сохраняя distinct code/commit route manifests внутри одного source/code lane.
+- **Действие:** логически объединить local base/repair и все полезные accepted generations `.001`–`.005`, включая поздние `.004/.005` outputs; superseded/duplicate producers оставить evidence, но не winners. Сохранить distinct `code`/`commits` route manifests внутри top-level `source` lane.
 - **Код/инфра/аккаунт:** `cppmega/data/source_conveyor_composition.py` и composition tests.
 - **Проверка:** один primary producer на repo/artifact; tokenizer/repo-list/revision drift и duplicate winners отвергаются.
-- **Готово когда:** receipt покрывает exact scope и выдаёт route submanifests, которые final four-kind sealer принимает как один source/code lane без потери code/commit totals.
+- **Готово когда:** receipt покрывает exact scope и выдаёт route submanifests, которые final four-kind sealer принимает как один top-level `source` lane без потери `code`/`commits` totals.
 
 ### N022 — Выполнить single-writer global source dedup/reducer
 
@@ -1166,10 +1175,10 @@
 
 ### N029 — Удалить все source transient resources
 
-- **Действие:** после N027/N028 построить/apply destroy для `.001`, `.002` и других retained source worker runs.
-- **Код/инфра/аккаунт:** каждый isolated Terraform backend; foundation/bucket вне destroy scope.
-- **Проверка:** plan addresses only run VM/IP/policy/disks; Compute readback absent; remote data всё ещё verifiable.
-- **Готово когда:** per-run `destroyed_verified` receipts и zero source worker cost inventory.
+- **Действие:** после N027/N028 удалять source workers по одному run/worker только после Local SSD diagnostics и exact-generation artifact readback; broad combined destroy запрещён.
+- **Код/инфра/аккаунт:** exact isolated Terraform backend lineage/serial каждого run; foundation/bucket и соседние runs вне destroy scope.
+- **Проверка:** новый instance-only plan адресует только проверенные VM/attached Local SSD; addresses/policies удаляются отдельным поздним plan после inventory reconciliation. Известный combined plan на `22 destroy`, расширяющий scope до всех 16 VM, применять нельзя.
+- **Готово когда:** каждый worker/run имеет собственный `destroyed_verified` receipt, Compute readback absent, remote data всё ещё verifiable и source transient cost inventory равен нулю.
 
 ### N030 — Выдать immutable source A→B/C handoff
 
@@ -1222,19 +1231,19 @@
 - **Проверка:** schema, unique/sorted key set, file SHA/size и revalidation после close.
 - **Готово когда:** membership receipt проходит portable verifier и не ссылается на mutable temp path.
 
-### N037 — Запустить bounded GitHub export canary
-
-- **Действие:** materialize 100 membership-bound PR во всех семи target lengths в отдельный canary root.
-- **Код/инфра/аккаунт:** `scripts/pr_ingest/export_pr_parquet.py --limit 100`.
-- **Проверка:** only members read, rendered discussion deterministic, provenance/sidecars align, 32K/64K contract exercised.
-- **Готово когда:** canary conservation/audit receipt green; canary artifacts не копируются в production root.
-
-### N038 — Закрыть exporter long-context/zero semantics
+### N037 — Закрыть exporter long-context/zero semantics
 
 - **Действие:** расширить `export_pr_parquet.py` с текущих default 1K–16K до 1K–64K и реализовать PR sidecar producer для actors/reviews/files/links; true empty выдаёт verified-zero.
 - **Код/инфра/аккаунт:** exporter, packer, новый sidecar producer, `tests/test_pr_export_batches.py`.
 - **Проверка:** positive 32K/64K, true/forged zero, oversized doc, split-conservation и sidecar foreign-key/shape fixtures.
 - **Готово когда:** producer, а не только auditor, выпускает seven-length Parquet+sidecars; tests green и revision pinned.
+
+### N038 — Запустить bounded GitHub export canary
+
+- **Действие:** materialize 100 membership-bound PR во всех семи target lengths в отдельный canary root, явно передав `1024,2048,4096,8192,16384,32768,65536`.
+- **Код/инфра/аккаунт:** revision N037, `scripts/pr_ingest/export_pr_parquet.py --limit 100 --target-lengths ...`.
+- **Проверка:** only members read, rendered discussion deterministic, provenance/sidecars align, 32K/64K и verified-zero contract реально exercised.
+- **Готово когда:** canary conservation/audit receipt green; canary artifacts не копируются в production root.
 
 ### N039 — Выполнить полный resumable GitHub export
 
@@ -1296,8 +1305,8 @@
 
 ### N047 — Pin current GitLab scanner/exporter revision
 
-- **Действие:** создать clean worktree `/Volumes/external/sources/cppmega.mlx` на hardened checkpoint с `GITLAB_CONTRACT_VERSION=3`; scanner не искать в cppmega worktree.
-- **Код/инфра/аккаунт:** `/Volumes/external/sources/cppmega.mlx/scripts/pr_ingest/gitlab_mr_stream.py`, exporter/store code.
+- **Действие:** создать отдельный новый detached clean worktree из hardened `cppmega.mlx` checkpoint с `GITLAB_CONTRACT_VERSION=3`; существующий `/Volumes/external/sources/cppmega.mlx` является live runtime tree и не объявляется новым worktree.
+- **Код/инфра/аккаунт:** новый path под `/Volumes/external/cppmega_data/worktrees/`, runtime source `/Volumes/external/sources/cppmega.mlx/scripts/pr_ingest/gitlab_mr_stream.py`, exporter/store code.
 - **Проверка:** source subtree clean, commit/tree/script hashes recorded.
 - **Готово когда:** code-binding receipt становится input всех новых smoke/production runs.
 
@@ -1401,138 +1410,138 @@
 - **Проверка:** checkpoint after writer flush/close либо explicitly live upper-bound; repo partitions identified.
 - **Готово когда:** exact input ledger отделяет frozen threshold, live shards и legacy sample.
 
-### N062 — Перенести CASE5 materialization input в GCS вместо локальной копии
-
-- **Действие:** publish manifest-bound frozen stores/archives chunks directly to cloud.
-- **Код/инфра/аккаунт:** `prepare_gcp_cloud_lane_payload.py`, GCS inputs prefix.
-- **Проверка:** create-only upload, chunk/archive hash, exact-generation readback, no local 500 GiB requirement.
-- **Готово когда:** cloud workers могут стартовать только с GCS inputs + manifest.
-
-### N063 — Запечатать диагностику долгой CASE5 smoke `.003`
-
-- **Действие:** сохранить systemd/process/fd/cgroup/Local SSD/SQLite evidence уже подтверждённой expensive validation и добавить bounded phase visibility, не называя процесс stalled.
-- **Код/инфра/аккаунт:** `ci-case5-smoke-20260808-003`, scoped Compute/GCS identity.
-- **Проверка:** bind adapter PID, открытый `67,177,742,336`-byte `index.sqlite3`, read counters, CPU affinity `0-15`, memory и текущую validation phase; подтвердить отсутствие 429/stall/output receipt.
-- **Готово когда:** immutable diagnostic receipt объясняет однопоточную фазу и задаёт безопасное решение: дождаться terminal readback либо supersede новым revision.
-
-### N064 — Исправить effective single-core execution
-
-- **Действие:** профилировать повторные SHA/SQLite/logical verification passes, распараллелить только доказанно независимые read-only partitions и оставить single-writer finalize; передать реальный pool size/cgroup affinity.
-- **Код/инфра/аккаунт:** CASE5 adapter/exporter, Terraform startup template, cloud-lane runner и Python process-pool settings.
-- **Проверка:** serial-vs-parallel fixture даёт byte-identical hashes/counts; benchmark фиксирует wall time, CPU utilization, peak RSS/I/O и не создаёт competing SQLite writers.
-- **Готово когда:** fixed smoke использует ожидаемые cores на parallel-safe phases без oversubscription/OOM, а topology/phase receipt отражает фактическую степень параллелизма.
-
-### N065 — Закрепить CASE5 bootstrap тестами
-
-- **Действие:** тестировать payload download/readback, venv/dependency setup, Local SSD mounts, worker invocation и failure receipt.
-- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/pilot/cloud-lane-worker-runner.sh.tmpl`, startup tests.
-- **Проверка:** corrupted payload, missing assignment, wrong manifest, no SSD и permission denied возвращают terminal diagnostics.
-- **Готово когда:** bootstrap focused suite green и payload receipt связан с code commit.
-
-### N066 — Пересоздать smoke новым run ID при deterministic fix
-
-- **Действие:** дать `.003` закончить текущую expensive validation, если heartbeat/read counters продолжают расти; после terminal GCS readback выполнить teardown. Только при доказанном deterministic defect сохранить evidence, destroy через его backend и запустить `.004`, не mutate `.003`.
-- **Код/инфра/аккаунт:** isolated Terraform backends and GCS prefixes.
-- **Проверка:** `.003` output/diagnostic generation pinned; destroy plan scoped; при необходимости `.004` plan binds fixed revision; foundation untouched.
-- **Готово когда:** `.003` либо terminal+readback+`destroyed_verified`, либо superseded с immutable diagnostic, а `.004` ready with exact topology.
-
-### N067 — Получить terminal CASE5 smoke output
-
-- **Действие:** обработать bounded frozen subset через assignment→materializer→auditor.
-- **Код/инфра/аккаунт:** cloud lane pool worker, CASE5 exporter, Local SSD scratch.
-- **Проверка:** assignment claim/completion, output artifact, failure taxonomy, Parquet footer и sidecar conservation.
-- **Готово когда:** terminal smoke receipt имеет nonzero output и independently readback GCS artifact.
-
-### N068 — Повторно верифицировать frozen threshold snapshot
-
-- **Действие:** проверить 61,311,228,208-token input receipt, stores/archives и occurrence bindings до production.
-- **Код/инфра/аккаунт:** `ci_case5_snapshot.py`, GCS threshold inputs.
-- **Проверка:** no writer, hashes stable, exact unique calculation reproducible, no overlap addition.
-- **Готово когда:** production input receipt принят CASE5 materializer.
-
-### N069 — Спланировать production CASE5 pool по benchmark
-
-- **Действие:** из N067 оценить machines/shards/Local SSD/runtime/cost, включая прямо запрошенный сценарий `4 × 16 vCPU / 64 GB`, а не theoretical 10 Gbit.
-- **Код/инфра/аккаунт:** `scripts/estimate_distributed_data_prep.py`, workers tfvars.
-- **Проверка:** минимум три trials фиксируют CPU, memory, Local SSD/GCS p50/p95 throughput и reducer bottleneck; estimator даёт confidence interval/scaling efficiency; quotas confirmed.
-- **Готово когда:** plan receipt содержит measured baseline, ETA interval/cost для 1/4/16 workers, assignments и teardown policy.
-
-### N070 — Развернуть production CASE5 workers
-
-- **Действие:** apply generated run-ID backend с run-scoped VM/IP/policies, exact resolved image self-link и worker IAM, ограниченным exact run prefix.
-- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/workers`, operator SA credential override.
-- **Проверка:** Terraform plan/backend/image digests, ready receipts, no unexpected instances; negative IAM probe не читает sibling run/state/foundation.
-- **Готово когда:** expected slots готовы и GCS control plane read/write smoke green.
-
-### N071 — Довести local CI fetch shards до terminal freeze
+### N062 — Довести local CI fetch shards до terminal freeze
 
 - **Действие:** продолжать существующие fetchers, retry только confirmed 429, затем закрыть cursors/WAL и publish terminal receipts.
-- **Код/инфра/аккаунт:** `ci_stream_fetch.py`, token ledger, shard states.
+- **Код/инфра/аккаунт:** `scripts/ci_stream_fetch.py`, token ledger, shard states.
 - **Проверка:** exact repo coverage, page/run boundary, no duplicate active writer, no secret logs.
 - **Готово когда:** каждый shard terminal verified или finite residual inventory создан.
 
-### N072 — Обработать CI fetch residuals
+### N063 — Обработать CI fetch residuals
 
 - **Действие:** новый residual run для missing repos/pages/jobs, не broad refetch successful shards.
 - **Код/инфра/аккаунт:** fetch state migration/resume scripts, immutable authorization.
 - **Проверка:** residual set digest, 75/2 taxonomy, existing shard hashes unchanged.
 - **Готово когда:** repo/run/workflow/job inventory scope закрыт без unresolved records.
 
-### N073 — Слить CI shards логически
+### N064 — Слить CI shards логически
 
 - **Действие:** построить canonical union manifests/CAS occurrence ledger и deterministic winner across local/GCP producers без копирования mutable SQLite trees.
-- **Код/инфра/аккаунт:** `scripts/merge_ci_stream_shards.py`, `clone_ci_stream_union_for_resume.py` только по contract.
+- **Код/инфра/аккаунт:** `scripts/merge_ci_stream_shards.py`, `scripts/clone_ci_stream_union_for_resume.py` только по contract.
 - **Проверка:** key uniqueness, shard coverage, duplicate payload/occurrence distinction, input hashes.
 - **Готово когда:** terminal union receipt воспроизводим и read-only.
 
-### N074 — Проверить CI CAS и preserved archives
+### N065 — Проверить CI CAS и preserved archives
 
 - **Действие:** hash blobs, validate zlib/gzip, recover only receipt-authorized preserved archives.
-- **Код/инфра/аккаунт:** `ci_content_store.py`, `ci_zlib_evidence.py`, `recover_ci_preserved_archives.py`.
+- **Код/инфра/аккаунт:** `scripts/ci_content_store.py`, `scripts/ci_zlib_evidence.py`, `scripts/recover_ci_preserved_archives.py`.
 - **Проверка:** CAS blob hash, decompression bounds, orphan/set-based receipt checks.
 - **Готово когда:** corrupt/missing/quarantined sets explicit, unexplained missing payload=0.
 
-### N075 — Выполнить global CI payload/occurrence dedup
+### N066 — Выполнить global CI payload/occurrence dedup
 
 - **Действие:** вычислить exact global union, сохранив все repo/run/job/step occurrence bindings.
 - **Код/инфра/аккаунт:** CI reducer, canonical manifest order, portable dedup store.
 - **Проверка:** store-local 295.7B upper bound заменён exact global totals; payload dedup не теряет occurrences.
 - **Готово когда:** deterministic dedup receipt имеет winner/duplicate/conservation equations.
 
-### N076 — Материализовать production CASE5 Parquet
+### N067 — Опубликовать exact CASE5 input в GCS
 
-- **Действие:** запустить `export_ci_content_store_case5.py` поверх N068/N075 inputs в cloud workers N070.
+- **Действие:** создать manifest-bound frozen SQLite/CAS/occurrence inputs из N064–N066 и publish chunks напрямую в GCS, не требуя локальных 500 GiB.
+- **Код/инфра/аккаунт:** `scripts/prepare_gcp_cloud_lane_payload.py`, `scripts/distributed_data_prep/ci_case5_snapshot.py`, GCS inputs prefix.
+- **Проверка:** frozen copy без WAL/SHM, create-only upload, chunk/archive SHA, exact-generation readback; historical `61,311,228,208` threshold отдельно верифицируется и не складывается с union.
+- **Готово когда:** production workers могут стартовать только с immutable GCS inputs + manifest, accepted exact global total N066 и explicit threshold lineage.
+
+### N068 — Довести CASE5 smokes `.003` и `.004` до terminal evidence
+
+- **Действие:** не уничтожать `.003`, пока process/CPU/read counters показывают полезную materialization; для `.004` дождаться assignment completion/physical output либо immutable deterministic failure. Не считать sustained heartbeat completion.
+- **Код/инфра/аккаунт:** `ci-case5-smoke-20260808-003`, `ci-case5-smoke-20260809-004`, scoped Compute/GCS identities и isolated backends.
+- **Проверка:** systemd/PID/cgroup/Local SSD/SQLite phase evidence; claim/completion/output receipt; exact-generation GCS readback. Retry только при `confirmed_http_429=true`/exit `75`.
+- **Готово когда:** каждый smoke имеет terminal+readback+scoped destroy receipt либо immutable supersession diagnostic; минимум один fixed-revision smoke имеет nonzero audited Parquet output.
+
+### N069 — Commit/push CASE5 heartbeat/429/bootstrap hardening
+
+- **Действие:** зафиксировать шесть подготовленных файлов после rebase на `a13fb733`, не смешивая другие worktrees; push с `--force-with-lease` только rebase-ветки.
+- **Код/инфра/аккаунт:** `/Volumes/external/cppmega_data/worktrees/cppmega-case5-persistent-session-20260809`, `cloud_lane_pool_worker.py`, новый `cloud_lane_heartbeat.py`, runner template и три test files.
+- **Проверка:** related `128 passed`, focused `25 passed`, Pyright `0 errors`, `py_compile`, `bash -n`, `shellcheck`, `git diff --check`, Terraform fmt/validate/tests; mixed 429+deterministic остаётся exit `2`.
+- **Готово когда:** clean pushed commit/tree SHA входит в следующий payload/apply receipt и regression receipt сохранён immutable.
+
+### N070 — Спланировать production CASE5 pool по measured smoke
+
+- **Действие:** по N068 оценить machines/shards/Local SSD/runtime/cost, включая сценарий `4 × 16 vCPU / 64 GB`; theoretical «10 Gbit» не использовать как измерение.
+- **Код/инфра/аккаунт:** CASE5-specific estimator/benchmark receipt, workers tfvars и Compute quotas; source-only estimator не считать CI network/SSD/cost model без расширения.
+- **Проверка:** минимум три trials фиксируют CPU, RSS, Local SSD/GCS p50/p95 throughput, reducer bottleneck и scaling efficiency; quotas confirmed.
+- **Готово когда:** plan receipt содержит measured baseline, ETA interval/cost для 1/4/16 workers, assignment geometry и teardown policy.
+
+### N071 — Выполнить pre-apply Terraform/bootstrap gate
+
+- **Действие:** до production apply прогнать fmt/init-backend=false/validate/test foundation/workers/pilot, generated backend collision tests и exact image resolution.
+- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/foundation`, `infra/gcp_corpus_pool/workers`, `infra/gcp_corpus_pool/pilot`, pinned Terraform/providers.
+- **Проверка:** no startup drift, no secrets in plans, distinct concurrent backend prefixes, Local SSD mount/download-on-target-filesystem и heartbeat service tests.
+- **Готово когда:** immutable pre-apply test receipt exit `0` связан N069 commit и exact production plan inputs.
+
+### N072 — Выполнить pre-apply IAM/network/cost gate
+
+- **Действие:** до VM apply сузить worker access до exact run prefix и проверить operator/worker identities, firewall/gVNIC/network tier/static-IP necessity/quotas/budget.
+- **Код/инфра/аккаунт:** scoped operator SA override, exact-run worker IAM condition, Cloud Billing/Compute read-only views.
+- **Проверка:** sibling-run/state/foundation read/write denied; no secret metadata; measured network/SSD receipt и maximum-cost bound приложены.
+- **Готово когда:** security/network/cost gate green и production apply не требует интерактивной human reauth.
+
+### N073 — Развернуть production CASE5 workers
+
+- **Действие:** только после N061–N072 apply generated run-ID backend с run-scoped VM/IP/policies, exact image и Local SSD topology.
+- **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/workers`, operator SA credential override.
+- **Проверка:** plan/backend/state-serial/image/payload digests, ready heartbeats, expected instances only; GCS control-plane smoke and negative IAM probe.
+- **Готово когда:** expected slots готовы, exact N067 input принят и assignment claims начались без unexpected resources.
+
+### N074 — Материализовать production CASE5 Parquet
+
+- **Действие:** запустить `scripts/export_ci_content_store_case5.py` поверх N067 exact union/dedup input в workers N073.
 - **Код/инфра/аккаунт:** CASE5 exporter, GCS input/output prefixes, Local SSD scratch.
-- **Проверка:** resumable done receipts, no mutable store reads after freeze, document/token conservation.
-- **Готово когда:** terminal export receipt покрывает весь exact CASE5 membership, а partial generations не authoritative.
+- **Проверка:** resumable immutable done receipts, no mutable store reads, exact membership/document/token conservation; partial generations не authoritative.
+- **Готово когда:** terminal export receipt покрывает весь exact CASE5 membership и output прошёл independent footer/schema/hash readback.
 
-### N077 — Материализовать полный CI sidecar set
+### N075 — Материализовать полный CI sidecar set
 
 - **Действие:** выпустить repo/run/workflow/job/step/actor/runner, language/platform/toolchain/build, commands/targets, tests, diagnostics, entities/edges и chunks.
-- **Код/инфра/аккаунт:** `ci_log_sidecars.py` для classification/tests, `ci_source_sidecars.py` и `ci_source_binding_projection.py` для source bindings; `fetch_ci_diagnostics.py` только bounded evidence.
-- **Проверка:** shape/foreign-key/offset/hash audits и secret redaction; nullable fields explicit.
+- **Код/инфра/аккаунт:** `scripts/ci_log_sidecars.py` для classification/tests, `scripts/ci_source_sidecars.py` и `scripts/ci_source_binding_projection.py` для source bindings; `scripts/fetch_ci_diagnostics.py` только bounded evidence.
+- **Проверка:** shape/foreign-key/offset/hash audits, occurrence conservation и secret redaction; nullable fields explicit.
 - **Готово когда:** каждый Parquet document имеет согласованный sidecar binding либо schema-authorized absence.
 
-### N078 — Закрыть CI seven-length ladder
+### N076 — Закрыть CI seven-length ladder
 
-- **Действие:** route/pack CASE5 documents по единому disjoint route-by-fit contract на 1K–64K; 32K/64K physical либо exact verified-zero.
-- **Код/инфра/аккаунт:** canonical packer и distributed sealing contract.
+- **Действие:** route/pack N074 documents по disjoint route-by-fit contract на 1K–64K; 32K/64K physical либо exact verified-zero.
+- **Код/инфра/аккаунт:** canonical packer, versioned training schema и distributed sealing contract.
 - **Проверка:** disjoint routed IDs, lossless oversized split, capacity/token range, no forged empty.
 - **Готово когда:** CI Parquet inventory содержит семь audited states и exact totals.
 
-### N079 — Построить CI Megatron 1K–64K
+### N077 — Построить CI Megatron 1K–64K
 
-- **Действие:** конвертировать N078 с полными objective/graph/provenance sidecars.
-- **Код/инфра/аккаунт:** `data_prep_parquet_to_megatron.py`, CI-specific prefixes.
+- **Действие:** конвертировать N076 с полными objective/graph/provenance sidecars.
+- **Код/инфра/аккаунт:** `scripts/data_prep_parquet_to_megatron.py`, CI-specific prefixes.
 - **Проверка:** MMIDIDX reread, `.bin/.idx` counts/bytes, document isolation, long-context receipts.
-- **Готово когда:** seven physical/verified-zero prefixes связаны с CI export/dedup receipts.
+- **Готово когда:** seven physical/verified-zero prefixes связаны с N066/N074–N076 receipts.
 
-### N080 — Запечатать CI lane, прочитать из GCS и удалить CI pool
+### N078 — Запечатать и опубликовать CI lane
 
-- **Действие:** create-only publish N076–N079, exact-generation readback, затем scoped Terraform destroy N070.
-- **Код/инфра/аккаунт:** CI lane manifest, GCS, isolated backend.
-- **Проверка:** artifact-set hash remote=local; VM/IP/policy absent after destroy; foundation/input/output preserved.
-- **Готово когда:** CI C-lane handoff portable, `lane_ready=true`, global training false, transient CI cost zero.
+- **Действие:** собрать immutable lane manifest, create-only publish N074–N077 и выполнить exact-generation GCS readback.
+- **Код/инфра/аккаунт:** CI lane manifest builder, GCS, scoped operator identity.
+- **Проверка:** artifact-set hash remote=local; frozen input/dedup/Parquet/Megatron/sidecar lineage complete; `training_ready=false`.
+- **Готово когда:** portable CI lane handoff принят independent verifier без local SQLite path.
+
+### N079 — Удалить CI pool безопасно
+
+- **Действие:** после N078 удалять run-scoped instances worker-by-worker; Local SSD diagnostics/output generations проверять до destroy, addresses/policy — отдельным поздним plan.
+- **Код/инфра/аккаунт:** exact N073 backend lineage/serial и Compute readback.
+- **Проверка:** instance-only plan не затрагивает sibling runs/foundation; broad expanded destroy запрещён; post-destroy GCS artifacts остаются green.
+- **Готово когда:** VM/Local SSD/IP/policy отсутствуют, retained non-expensive foundation explicit и destroy receipts immutable.
+
+### N080 — Выдать CI C-lane handoff
+
+- **Действие:** связать N061–N079 inventory/freeze/dedup/export/sidecar/Megatron/readback/destroy receipts в один content-addressed handoff.
+- **Код/инфра/аккаунт:** CI lane handoff schema и final GCS pointer.
+- **Проверка:** consumer восстанавливает artifact-set SHA только по exact generations; store-local upper bounds/legacy sample не принимаются как production total.
+- **Готово когда:** CI handoff portable, `lane_ready=true`, global `training_ready=false`, transient CI compute cost zero.
 
 ### Общий four-lane seal и публикация
 
@@ -1566,7 +1575,7 @@
 
 ### N085 — Собрать полную матрицу 4×7
 
-- **Действие:** перечислить `code`, `github_pr`, `gitlab_mr`, `ci` × семь lengths; `code` cells агрегируют отдельно проверенные code/commit route submanifests N021/N026.
+- **Действие:** перечислить sealer kinds `source`, `github_pr`, `gitlab_mr`, `ci` × семь lengths; пользовательская code lane представлена top-level `source`, чьи cells агрегируют отдельно проверенные `code`/`commits` route submanifests N021/N026.
 - **Код/инфра/аккаунт:** `scripts/distributed_data_prep/seal_outputs.py`.
 - **Проверка:** exactly 28 unique top-level cells; source route totals/code+commit lineage сохраняются; missing, duplicate, manifest-only, forged-zero fail.
 - **Готово когда:** matrix coverage receipt green и связан N081–N084.
@@ -1643,51 +1652,53 @@
 
 ### Финальная эксплуатационная приёмка
 
-### N096 — Прогнать полный Terraform/bootstrap verification
+### N096 — Повторить Terraform/bootstrap verification после всех cloud runs
 
-- **Действие:** `terraform fmt -check`, init `-backend=false`, validate/test foundation/workers/bootstrap; добавить tests generated run-ID backend и exact image resolution.
+- **Действие:** повторить pre-apply gate N071 на финальном release code, сверить actual apply payloads и destroy backends, чтобы исключить drift между тестом и production.
 - **Код/инфра/аккаунт:** `infra/gcp_corpus_pool/foundation`, `infra/gcp_corpus_pool/workers`, `infra/gcp_corpus_pool/pilot`.
 - **Проверка:** pinned Terraform/providers, distinct concurrent backend prefixes, exact image self-link, no startup drift и no secret material in plans.
 - **Готово когда:** CI/local test receipt exit `0` связан release code commit.
 
-### N097 — Провести IAM/network/cost audit
+### N097 — Провести итоговый IAM/network/cost audit
 
-- **Действие:** сузить worker IAM с общего `${gcs_prefix}/` до exact run prefix, проверить roles/firewall/network/static addresses/quotas и обновить measured ETA/cost.
+- **Действие:** повторить pre-apply gate N072 после teardown: проверить actual IAM/firewall/network/static addresses/quotas/billing и удалить временные grants/resources.
 - **Код/инфра/аккаунт:** GCP scoped credentials, foundation outputs, Cloud Billing/Compute read-only views.
 - **Проверка:** sibling-run/state access denied, p50/p95 network/SSD receipt, no public secrets/orphan IP/VM/SSD/policy, estimate-vs-actual per run.
 - **Готово когда:** security/cost audit receipt green либо explicit non-expensive retained foundation list.
 
-### N098 — Обновить watchdog и честный status после cleanup
+### N098 — Обновить watchdog и предварительный честный status после cleanup
 
-- **Действие:** pipeline watchdog проверяет terminal receipts/readbacks вместо старых active runs; status пересобирается из seals.
+- **Действие:** pipeline watchdog проверяет terminal receipts/readbacks вместо старых active runs; status пересобирается из seals, но до N099 остаётся `training_ready=false`.
 - **Код/инфра/аккаунт:** launchd dispatchers, `report_training_data_status.py`, status config и `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`.
 - **Проверка:** two fresh 30-minute reports, no retry of terminal/deterministic runs, no overlapping token addition.
-- **Готово когда:** current status перечисляет exact ready valid/trained по четырём lanes и все blockers resolved.
+- **Готово когда:** preliminary current status перечисляет exact valid/trained по четырём lanes, blockers resolved и явно ждёт final completion audit N099.
 
 ### N099 — Выполнить requirement-by-requirement completion audit
 
 - **Действие:** сопоставить W001–W100/N001–N098 с authoritative receipts/tests/readbacks и отметить missing/contradicted evidence.
 - **Код/инфра/аккаунт:** этот документ, release manifest, Git/GCP/GCS/Nebius/test evidence.
 - **Проверка:** ни одно требование не закрывается intent, partial store, narrow verifier, pre-publication seal или отсутствием ошибки; transition N090→N099 проверяется отдельно.
-- **Готово когда:** все explicit requirements доказаны; только тогда final release receipt получает `training_ready=true`.
+- **Готово когда:** все explicit requirements доказаны и отдельный immutable final completion receipt получает `training_ready=true`; при любом missing/contradicted evidence флаг остаётся false.
 
 ### N100 — Передать training owner финальный immutable handoff
 
-- **Действие:** выдать название release, GCS/Nebius exact pointers, manifest/seal/restore/smoke/destroy receipts и restoration command contract.
-- **Код/инфра/аккаунт:** signed/content-addressed handoff document и changelog в Git.
-- **Проверка:** независимый consumer по одному handoff восстанавливает inventory и подтверждает artifact-set SHA без локальных Mac paths.
-- **Готово когда:** handoff accepted, docs/code commits pushed, worktrees clean, active corpus goal можно закрыть по полному evidence.
+- **Действие:** после N099 заново сгенерировать final status из completion receipt, затем выдать название release, GCS/Nebius exact pointers, manifest/seal/restore/smoke/destroy receipts и restoration command contract.
+- **Код/инфра/аккаунт:** `scripts/report_training_data_status.py`, signed/content-addressed handoff document и changelog в Git.
+- **Проверка:** final status SHA связан N099; независимый consumer по одному handoff восстанавливает inventory и подтверждает artifact-set SHA без локальных Mac paths.
+- **Готово когда:** post-audit status показывает `training_ready=true`, handoff accepted, docs/code commits pushed, worktrees clean и active corpus goal закрывается по полному evidence.
 
 ---
 
 ## Критический путь
 
 ```text
-local cwd/restart fix -> exact source residual -> source composition/dedup
+durable local-runtime verification -> exact source residual -> source composition/dedup
   -> source 1K–64K seal -> exact GitHub/GitLab membership
-  -> PR/MR 1K–64K seals -> CASE5 cloud smoke -> CI production seal
+  -> PR/MR 1K–64K seals -> CI terminal freeze/union/dedup/GCS input
+  -> CASE5 smoke -> Terraform/IAM pre-apply gates -> CI production seal
   -> 4×7 integration -> GCS/Nebius readback -> loader smoke
-  -> destroy transient compute -> final completion audit/handoff
+  -> destroy transient compute -> final completion audit
+  -> post-audit status -> immutable handoff
 ```
 
 Главная неопределённость по времени — deterministic parser repair и CI CASE5 reducer/export, а не сам факт наличия дополнительных VM. Добавление workers ускоряет только runnable assignments; оно не превращает exit `2`, непроверенный membership или staged CAS в готовые training artifacts.
