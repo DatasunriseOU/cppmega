@@ -18,6 +18,18 @@ from scripts.gcp_isolated_worker_rollout import (
 )
 
 
+def test_worker_startup_installs_python_venv_runtime() -> None:
+    startup = (
+        Path(__file__).parents[1]
+        / "infra/gcp_corpus_pool/workers/startup.sh.tftpl"
+    ).read_text(encoding="utf-8")
+    install_stanza = startup.split(
+        "apt-get install -y --no-install-recommends \\\n", maxsplit=1
+    )[1].split("\n\n", maxsplit=1)[0]
+
+    assert "python3-venv" in install_stanza.split()
+
+
 def _spec():
     return build_rollout_spec(
         bucket="natural-bison-491019-t9-cppmega-corpus",
