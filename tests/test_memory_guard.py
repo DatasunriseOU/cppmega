@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,35 @@ def test_current_rss_continues_after_probe_failure() -> None:
 def test_current_rss_fails_closed_when_all_probes_are_unavailable() -> None:
     with pytest.raises(RuntimeError, match="current RSS is unavailable"):
         memory_guard.current_rss_bytes(probes=(lambda: None,))
+
+
+def test_default_current_rss_probe_works_on_this_host() -> None:
+    """Live process must report a positive current RSS via default probes."""
+    rss = memory_guard.current_rss_bytes()
+    assert isinstance(rss, int)
+    assert rss > 0
+
+
+def test_darwin_task_info_probe_returns_positive_rss_on_macos() -> None:
+    if sys.platform != "darwin":
+        pytest.skip("Darwin-only probe")
+    rss = memory_guard._current_rss_darwin_task_info_bytes()
+    assert rss is not None
+    assert rss > 0
+
+
+def test_ps_probe_retries_do_not_invent_values_on_total_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"n": 0}
+
+    def boom(*_a, **_k):
+        calls["n"] += 1
+        raise OSError("fork failed")
+
+    monkeypatch.setattr(memory_guard.subprocess, "run", boom)
+    assert memory_guard._current_rss_ps_bytes() is None
+    assert calls["n"] == 3
 
 
 def test_embedded_data_apis_accept_explicit_unbounded_fixture_budget(

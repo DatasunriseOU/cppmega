@@ -52,25 +52,127 @@ def _current_rss_psutil_bytes() -> int | None:
         return None
 
 
-def _current_rss_ps_bytes() -> int | None:
-    """Return current RSS from the portable Unix ``ps`` utility."""
-    if os.name == "nt":
+def _current_rss_darwin_task_info_bytes() -> int | None:
+    """Current RSS via mach task_info (no subprocess fork).
+
+    Under heavy macro-scan / memory pressure, forking ``ps`` can fail with
+    ENOMEM or hit short subprocess timeouts. Darwin exposes live resident_size
+    through task_info without allocating a child process.
+    """
+    if sys.platform != "darwin":
         return None
     try:
-        result = subprocess.run(
-            ["ps", "-o", "rss=", "-p", str(os.getpid())],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2.0,
-        )
-        if result.returncode != 0:
+        import ctypes
+        import ctypes.util
+
+        class _TimeValue(ctypes.Structure):
+            _fields_ = [
+                ("seconds", ctypes.c_int),
+                ("microseconds", ctypes.c_int),
+            ]
+
+        class _MachTaskBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time", _TimeValue),
+                ("system_time", _TimeValue),
+                ("policy", ctypes.c_int),
+                ("suspend_count", ctypes.c_int),
+            ]
+
+        libc_name = ctypes.util.find_library("c")
+        if not libc_name:
             return None
-        # ps reports RSS in KiB on macOS and the BSDs.
-        rss_kib = int(result.stdout.strip().splitlines()[0])
-        return rss_kib * 1024 if rss_kib > 0 else None
-    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        mach_task_self = libc.mach_task_self
+        mach_task_self.restype = ctypes.c_uint
+        task_info = libc.task_info
+        task_info.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        task_info.restype = ctypes.c_int
+
+        info = _MachTaskBasicInfo()
+        count = ctypes.c_uint(
+            ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_uint)
+        )
+        # MACH_TASK_BASIC_INFO == 20; KERN_SUCCESS == 0
+        kr = task_info(mach_task_self(), 20, ctypes.byref(info), ctypes.byref(count))
+        if kr != 0:
+            return None
+        rss = int(info.resident_size)
+        return rss if rss > 0 else None
+    except (AttributeError, OSError, TypeError, ValueError):
         return None
+
+
+def _current_rss_ps_bytes() -> int | None:
+    """Return current RSS from the portable Unix ``ps`` utility.
+
+    Retries briefly: under load, a single 2s ``ps`` call can time out or fail
+    to fork even when the process is healthy. Still returns None on total
+    failure so the caller fails closed rather than inventing an RSS value.
+    """
+    if os.name == "nt":
+        return None
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(os.getpid())],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+            if result.returncode != 0:
+                last_err = None
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            lines = [ln for ln in result.stdout.strip().splitlines() if ln.strip()]
+            if not lines:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            # ps reports RSS in KiB on macOS and the BSDs.
+            rss_kib = int(lines[0].strip())
+            if rss_kib > 0:
+                return rss_kib * 1024
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as exc:
+            last_err = exc
+            time.sleep(0.05 * (attempt + 1))
+    if last_err is not None and "ps" not in _WARNED_PROBE_FAILURES:
+        # one-shot diagnostic; still return None (fail closed upstream)
+        _WARNED_PROBE_FAILURES.add("ps")
+        print(
+            f"WARNING: RSS probe _current_rss_ps_bytes exhausted retries: "
+            f"{type(last_err).__name__}: {last_err}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return None
+
+
+def _default_rss_probes() -> tuple[Callable[[], int | None], ...]:
+    """Platform-ordered live RSS probes (no historical ru_maxrss)."""
+    if sys.platform == "darwin":
+        # Prefer no-fork Darwin task_info first: macro-scan can exhaust fork budget.
+        return (
+            _current_rss_darwin_task_info_bytes,
+            _current_rss_psutil_bytes,
+            _current_rss_ps_bytes,
+            _current_rss_procfs_bytes,
+        )
+    return (
+        _current_rss_procfs_bytes,
+        _current_rss_psutil_bytes,
+        _current_rss_ps_bytes,
+        _current_rss_darwin_task_info_bytes,
+    )
 
 
 def current_rss_bytes(
@@ -85,11 +187,7 @@ def current_rss_bytes(
     an earlier transient peak. Require a live current-RSS probe instead of
     silently falling back to the historical high-water value.
     """
-    active_probes = tuple(probes) if probes is not None else (
-        _current_rss_procfs_bytes,
-        _current_rss_psutil_bytes,
-        _current_rss_ps_bytes,
-    )
+    active_probes = tuple(probes) if probes is not None else _default_rss_probes()
     for probe in active_probes:
         probe_name = getattr(probe, "__name__", repr(probe))
         try:
