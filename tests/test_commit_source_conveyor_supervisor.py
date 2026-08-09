@@ -117,6 +117,26 @@ def test_commit_upgrade_flags_require_fixed_audit_timestamp(tmp_path: Path) -> N
     assert args.code_revision_upgrade_authorized_at == "2026-08-09T10:00:00Z"
 
 
+@pytest.mark.parametrize(
+    ("execution_code_revision", "execution_repository_root"),
+    [
+        ("b" * 40, None),
+        (None, Path("execution-repo")),
+    ],
+)
+def test_execution_root_requires_revision_and_root_together(
+    tmp_path: Path,
+    execution_code_revision: str | None,
+    execution_repository_root: Path | None,
+) -> None:
+    with pytest.raises(RuntimeError, match="must be provided together"):
+        commit_supervisor._execution_root(
+            tmp_path / "recorded-repo",
+            execution_code_revision=execution_code_revision,
+            execution_repository_root=execution_repository_root,
+        )
+
+
 def test_commit_build_command_reuses_state_roots_and_emits_upgrade_flags(
     tmp_path: Path,
 ) -> None:
@@ -1071,6 +1091,7 @@ def test_commit_chain_accepts_useful_partial_nonzero_repair(
     result = commit_supervisor.load_terminal_code_run_chain(
         base_root,
         (partial_root, final_root),
+        execution_repository_root=repo,
         execution_code_revision="b" * 40,
         allowed_historical_code_revisions={"a" * 40},
     )

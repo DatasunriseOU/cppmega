@@ -259,8 +259,13 @@ def _execution_root(
     execution_code_revision: str | None,
     execution_repository_root: Path | None,
 ) -> Path:
-    if execution_code_revision is None or execution_repository_root is None:
+    if (execution_code_revision is None) != (execution_repository_root is None):
+        raise RuntimeError(
+            "execution code revision and repository root must be provided together"
+        )
+    if execution_code_revision is None:
         return recorded_root
+    assert execution_repository_root is not None
     root = execution_repository_root.expanduser()
     if root.is_symlink():
         raise RuntimeError(f"execution repository root must not be a symlink: {root}")
