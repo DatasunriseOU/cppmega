@@ -38,6 +38,33 @@ def test_source_archive_argument_configures_both_streaming_producers(
         conveyor.src.TARBALL = original_commit_archive
 
 
+def test_revision_upgrade_cli_requires_exact_complete_authorization() -> None:
+    with pytest.raises(SystemExit, match="provided together"):
+        conveyor.parse_args(
+            ["--allow-code-revision-upgrade-from", "a" * 40]
+        )
+    with pytest.raises(SystemExit, match="authorized-at"):
+        conveyor.parse_args(
+            [
+                "--allow-code-revision-upgrade-from",
+                "a" * 40,
+                "--code-revision-upgrade-reason",
+                "repair extractor behavior",
+            ]
+        )
+    args = conveyor.parse_args(
+        [
+            "--allow-code-revision-upgrade-from",
+            "a" * 40,
+            "--code-revision-upgrade-reason",
+            "repair extractor behavior",
+            "--code-revision-upgrade-authorized-at",
+            "2026-08-09T10:00:00Z",
+        ]
+    )
+    assert args.allow_code_revision_upgrade_from == "a" * 40
+
+
 @pytest.mark.parametrize("dedup_near", (True, False))
 def test_adaptive_code_retry_preserves_configured_dedup_policy(
     tmp_path: Path,
@@ -158,6 +185,110 @@ def test_manifest_identity_rejects_changed_indexer_dependency_closure(
         match="manifest code revision mismatch",
     ):
         manifest.bind_code_revision(conveyor.capture_code_revision(source_repo))
+
+
+def test_manifest_code_revision_upgrade_is_exact_one_time_and_atomic(
+    source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "conveyor" / "_done.json"
+    manifest = conveyor.ConcurrentManifest.load(manifest_path)
+    previous = conveyor.capture_code_revision(source_repo)
+    manifest.bind_code_revision(previous)
+    manifest.mark_done("project::r0", {"rows": 2})
+    manifest.mark_failed("project::r500", "extract", "checkpointed failure")
+
+    worker = source_repo / "scripts" / "worker.py"
+    worker.write_text("VALUE = 2\n", encoding="utf-8")
+    _git(source_repo, "add", str(worker.relative_to(source_repo)))
+    _git(source_repo, "commit", "-q", "-m", "revision upgrade")
+    destination = conveyor.capture_code_revision(source_repo)
+
+    with pytest.raises(
+        conveyor.CodeRevisionMismatchError,
+        match="exact manifest Git commit",
+    ):
+        manifest.authorize_code_revision_upgrade(
+            destination,
+            allow_from_git_commit="0" * 40,
+            reason="repair extractor behavior",
+            authorized_at="2026-08-09T10:00:00Z",
+        )
+    with pytest.raises(ValueError, match="reason"):
+        manifest.authorize_code_revision_upgrade(
+            destination,
+            allow_from_git_commit=previous["git_commit"],
+            reason="",
+            authorized_at="2026-08-09T10:00:00Z",
+        )
+
+    upgrade = manifest.authorize_code_revision_upgrade(
+        destination,
+        allow_from_git_commit=previous["git_commit"],
+        reason="repair extractor behavior",
+        authorized_at="2026-08-09T10:00:00Z",
+    )
+    assert upgrade["from"] == previous
+    assert upgrade["to"] == destination
+    assert upgrade["reason"] == "repair extractor behavior"
+
+    reloaded = conveyor.ConcurrentManifest.load(manifest_path)
+    assert reloaded.code_revision == destination
+    assert reloaded.code_revision_upgrade == upgrade
+    assert reloaded.done == {"project::r0": {"rows": 2}}
+    assert reloaded.failed == {
+        "project::r500": {"stage": "extract", "detail": "checkpointed failure", "ts": reloaded.failed["project::r500"]["ts"]}
+    }
+    completion = conveyor.write_source_completion_receipt(
+        tmp_path / "completion.json",
+        manifest=reloaded,
+        streams="commits",
+        source_repo_list_reverified_at_finish=True,
+        interrupted=False,
+    )
+    assert completion["code_revision_upgrade"] == upgrade
+
+    with pytest.raises(
+        conveyor.CodeRevisionMismatchError,
+        match="already contains",
+    ):
+        third = dict(destination)
+        third["git_commit"] = "f" * 40
+        manifest.authorize_code_revision_upgrade(
+            third,
+            allow_from_git_commit=destination["git_commit"],
+            reason="second migration",
+            authorized_at="2026-08-09T10:01:00Z",
+        )
+
+
+def test_manifest_code_revision_upgrade_retry_requires_same_audit_record(
+    source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manifest = conveyor.ConcurrentManifest.load(tmp_path / "_done.json")
+    previous = conveyor.capture_code_revision(source_repo)
+    manifest.bind_code_revision(previous)
+    manifest.mark_done("project::code", {"rows": 1})
+    worker = source_repo / "scripts" / "worker.py"
+    worker.write_text("VALUE = 2\n", encoding="utf-8")
+    _git(source_repo, "add", str(worker.relative_to(source_repo)))
+    _git(source_repo, "commit", "-q", "-m", "revision upgrade retry")
+    destination = conveyor.capture_code_revision(source_repo)
+    kwargs = {
+        "allow_from_git_commit": previous["git_commit"],
+        "reason": "resume after supervisor interruption",
+        "authorized_at": "2026-08-09T10:00:00Z",
+    }
+    first = manifest.authorize_code_revision_upgrade(destination, **kwargs)
+    assert manifest.authorize_code_revision_upgrade(destination, **kwargs) == first
+    with pytest.raises(conveyor.CodeRevisionMismatchError, match="does not match"):
+        manifest.authorize_code_revision_upgrade(
+            destination,
+            allow_from_git_commit=previous["git_commit"],
+            reason="different reason",
+            authorized_at=kwargs["authorized_at"],
+        )
 
 
 def test_code_revision_ignores_generated_outputs_but_rejects_source_drift(
@@ -786,6 +917,7 @@ def test_source_completion_receipt_is_bounded_and_binds_manifest_bytes(
     assert receipt["failed_unit_count"] == 0
     assert receipt["non_code_done_unit_count"] == 0
     assert receipt["code_revision"] == revision
+    assert receipt["code_revision_upgrade"] is None
     assert receipt["source_repo_list"] == source_binding
     assert receipt["manifest"] == {
         "path": str(manifest_path.resolve()),

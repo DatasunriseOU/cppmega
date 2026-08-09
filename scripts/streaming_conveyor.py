@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import UTC, datetime
 import fcntl
 import hashlib
 import json
@@ -133,6 +134,7 @@ DEFAULT_MIN_RETRY_RANGE_SIZE = 25
 DEFAULT_RANGE_TARGET_BYTES = 32 * 1024 * 1024
 DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
 DEFAULT_MIN_FREE_DISK_GB = 50.0
+CODE_REVISION_UPGRADE_SCHEMA = "cppmega.conveyor_code_revision_upgrade_v1"
 
 CODE_REVISION_SCHEMA_VERSION = 2
 CODE_REVISION_PRODUCER_ROLE = "canonical_source_conveyor"
@@ -581,6 +583,108 @@ def _code_revision_identity(receipt: dict) -> tuple:
             "manifest code revision receipt is missing: " + ", ".join(missing)
         )
     return tuple(receipt[key] for key in required)
+
+
+def _canonical_utc_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value
+    ) is None:
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=UTC
+        )
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+
+
+def _code_revision_upgrade_record(
+    *,
+    previous: dict,
+    destination: dict,
+    reason: str,
+    authorized_at: str,
+) -> dict:
+    if _code_revision_identity(previous) == _code_revision_identity(destination):
+        raise CodeRevisionMismatchError(
+            "code revision upgrade must change the revision binding"
+        )
+    if (
+        not isinstance(reason, str)
+        or not 1 <= len(reason) <= 200
+        or any(ord(char) < 32 or ord(char) == 127 for char in reason)
+    ):
+        raise ValueError(
+            "code revision upgrade reason must be 1-200 printable characters"
+        )
+    if not _canonical_utc_timestamp(authorized_at):
+        raise ValueError("code revision upgrade authorization time is invalid")
+    return {
+        "schema": CODE_REVISION_UPGRADE_SCHEMA,
+        "from": json.loads(json.dumps(previous)),
+        "to": json.loads(json.dumps(destination)),
+        "reason": reason,
+        "authorized_at": authorized_at,
+    }
+
+
+def _validate_code_revision_upgrade_record(value: object) -> dict:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "from",
+        "to",
+        "reason",
+        "authorized_at",
+    }:
+        raise CodeRevisionMismatchError("code revision upgrade record is malformed")
+    if value.get("schema") != CODE_REVISION_UPGRADE_SCHEMA:
+        raise CodeRevisionMismatchError(
+            "code revision upgrade record schema is unsupported"
+        )
+    previous = value.get("from")
+    destination = value.get("to")
+    if not isinstance(previous, dict) or not isinstance(destination, dict):
+        raise CodeRevisionMismatchError(
+            "code revision upgrade record revisions are malformed"
+        )
+    try:
+        record = _code_revision_upgrade_record(
+            previous=previous,
+            destination=destination,
+            reason=value.get("reason")
+            if isinstance(value.get("reason"), str)
+            else "",
+            authorized_at=value.get("authorized_at")
+            if isinstance(value.get("authorized_at"), str)
+            else "",
+        )
+    except (CodeRevisionMismatchError, ValueError) as exc:
+        raise CodeRevisionMismatchError(
+            "code revision upgrade record is malformed"
+        ) from exc
+    if record != dict(value):
+        raise CodeRevisionMismatchError(
+            "code revision upgrade record is not canonical"
+        )
+    return record
+
+
+def _validate_manifest_code_revision_upgrade(state: Mapping[str, object]) -> None:
+    """Validate the optional historical revision migration binding."""
+
+    upgrade = state.get("code_revision_upgrade")
+    if upgrade is None:
+        return
+    record = _validate_code_revision_upgrade_record(upgrade)
+    revision = state.get("code_revision")
+    if not isinstance(revision, dict) or (
+        _code_revision_identity(revision)
+        != _code_revision_identity(record["to"])
+    ):
+        raise CodeRevisionMismatchError(
+            "code revision upgrade destination does not match manifest binding"
+        )
 
 
 def _dirty_component_names(snapshot: dict) -> list[str]:
@@ -2136,6 +2240,7 @@ class ConcurrentManifest(Manifest):
         done: dict | None = None,
         failed: dict | None = None,
         code_revision: dict | None = None,
+        code_revision_upgrade: dict | None = None,
         pr_completion: dict | None = None,
         source_repo_list: dict | None = None,
     ):
@@ -2145,6 +2250,11 @@ class ConcurrentManifest(Manifest):
         self.failed = dict(failed or {})
         self.code_revision = (
             json.loads(json.dumps(code_revision)) if code_revision is not None else None
+        )
+        self.code_revision_upgrade = (
+            json.loads(json.dumps(code_revision_upgrade))
+            if code_revision_upgrade is not None
+            else None
         )
         self.pr_completion = (
             json.loads(json.dumps(pr_completion)) if pr_completion is not None else None
@@ -2162,32 +2272,54 @@ class ConcurrentManifest(Manifest):
         if not path.exists():
             return cls(path=path)
         blob = json.loads(path.read_text())
-        return cls(
+        manifest = cls(
             path=path,
             done=blob.get("done", {}),
             failed=blob.get("failed", {}),
             code_revision=blob.get("code_revision"),
+            code_revision_upgrade=blob.get("code_revision_upgrade"),
             pr_completion=blob.get("pr_completion"),
             source_repo_list=blob.get("source_repo_list"),
         )
+        manifest._validate_state(
+            {
+                "done": manifest.done,
+                "failed": manifest.failed,
+                "code_revision": manifest.code_revision,
+                "code_revision_upgrade": manifest.code_revision_upgrade,
+                "pr_completion": manifest.pr_completion,
+                "source_repo_list": manifest.source_repo_list,
+            }
+        )
+        return manifest
+
+    @staticmethod
+    def _validate_state(state: Mapping[str, object]) -> None:
+        _validate_manifest_code_revision_upgrade(state)
 
     def _read_disk(self) -> dict:
         if self.path.exists():
             blob = json.loads(self.path.read_text())
-            return {
+            state = {
                 "done": blob.get("done", {}),
                 "failed": blob.get("failed", {}),
                 "code_revision": blob.get("code_revision"),
+                "code_revision_upgrade": blob.get("code_revision_upgrade"),
                 "pr_completion": blob.get("pr_completion"),
                 "source_repo_list": blob.get("source_repo_list"),
             }
-        return {
+            self._validate_state(state)
+            return state
+        state = {
             "done": {},
             "failed": {},
             "code_revision": None,
+            "code_revision_upgrade": None,
             "pr_completion": None,
             "source_repo_list": None,
         }
+        self._validate_state(state)
+        return state
 
     def _atomic_replace(self, done: dict, failed: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2196,6 +2328,11 @@ class ConcurrentManifest(Manifest):
             self,
             "_pending_code_revision",
             self.code_revision,
+        )
+        code_revision_upgrade = getattr(
+            self,
+            "_pending_code_revision_upgrade",
+            self.code_revision_upgrade,
         )
         pr_completion = getattr(
             self,
@@ -2210,6 +2347,8 @@ class ConcurrentManifest(Manifest):
         payload = {"done": done, "failed": failed}
         if code_revision is not None:
             payload["code_revision"] = code_revision
+        if code_revision_upgrade is not None:
+            payload["code_revision_upgrade"] = code_revision_upgrade
         if pr_completion is not None:
             payload["pr_completion"] = pr_completion
         if source_repo_list is not None:
@@ -2231,17 +2370,20 @@ class ConcurrentManifest(Manifest):
                 state = self._read_disk()
                 apply_change(state)
                 self._pending_code_revision = state["code_revision"]
+                self._pending_code_revision_upgrade = state["code_revision_upgrade"]
                 self._pending_pr_completion = state["pr_completion"]
                 self._pending_source_repo_list = state["source_repo_list"]
                 try:
                     self._atomic_replace(state["done"], state["failed"])
                 finally:
                     del self._pending_code_revision
+                    del self._pending_code_revision_upgrade
                     del self._pending_pr_completion
                     del self._pending_source_repo_list
                 self.done = state["done"]
                 self.failed = state["failed"]
                 self.code_revision = state["code_revision"]
+                self.code_revision_upgrade = state["code_revision_upgrade"]
                 self.pr_completion = state["pr_completion"]
                 self.source_repo_list = state["source_repo_list"]
             finally:
@@ -2325,6 +2467,75 @@ class ConcurrentManifest(Manifest):
                 )
 
         self._merge_under_lock(apply)
+
+    def authorize_code_revision_upgrade(
+        self,
+        receipt: dict,
+        *,
+        allow_from_git_commit: str | None,
+        reason: str | None,
+        authorized_at: str,
+    ) -> dict:
+        """Record one explicit revision migration while preserving all work."""
+
+        requested_identity = _code_revision_identity(receipt)
+
+        def apply(state: dict) -> None:
+            existing = state["code_revision"]
+            if existing is None:
+                raise CodeRevisionMismatchError(
+                    "code revision upgrade requires an existing manifest binding"
+                )
+            existing_identity = _code_revision_identity(existing)
+            if existing_identity == requested_identity:
+                existing_upgrade = state.get("code_revision_upgrade")
+                if not isinstance(existing_upgrade, dict):
+                    raise CodeRevisionMismatchError(
+                        "code revision upgrade authorization is unnecessary for "
+                        "this manifest; resume without upgrade flags"
+                    )
+                record = _validate_code_revision_upgrade_record(existing_upgrade)
+                if (
+                    record["from"].get("git_commit") != allow_from_git_commit
+                    or record["reason"] != reason
+                    or record["authorized_at"] != authorized_at
+                ):
+                    raise CodeRevisionMismatchError(
+                        "code revision upgrade authorization does not match the "
+                        "already persisted migration"
+                    )
+                return
+            if (
+                not isinstance(allow_from_git_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", allow_from_git_commit) is None
+                or allow_from_git_commit != existing.get("git_commit")
+            ):
+                raise CodeRevisionMismatchError(
+                    "explicit code revision upgrade authorization must name the "
+                    "exact manifest Git commit"
+                )
+            if state.get("code_revision_upgrade") is not None:
+                raise CodeRevisionMismatchError(
+                    "manifest already contains a code revision upgrade"
+                )
+            upgrade = _code_revision_upgrade_record(
+                previous=existing,
+                destination=receipt,
+                reason=reason if reason is not None else "",
+                authorized_at=authorized_at,
+            )
+            if not state["done"] and not state["failed"]:
+                raise CodeRevisionMismatchError(
+                    "code revision upgrade requires existing work receipts"
+                )
+            state["code_revision"] = json.loads(json.dumps(receipt))
+            state["code_revision_upgrade"] = upgrade
+
+        self._merge_under_lock(apply)
+        persisted = self._read_disk().get("code_revision_upgrade")
+        if not isinstance(persisted, dict):
+            raise CodeRevisionMismatchError("code revision upgrade was not persisted")
+        return _validate_code_revision_upgrade_record(persisted)
 
     def bind_pr_completion(self, binding: dict) -> None:
         """Atomically bind every commit receipt to one verified PR snapshot."""
@@ -2449,6 +2660,7 @@ def write_source_completion_receipt(
             ).encode("ascii")
         ),
         "code_revision": state["code_revision"],
+        "code_revision_upgrade": state["code_revision_upgrade"],
         "source_repo_list": state["source_repo_list"],
         "source_repo_list_reverified_at_finish": (
             source_repo_list_reverified_at_finish
@@ -4508,6 +4720,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Required exact 40-character Git commit for a production run. "
              "The executable source/config worktree must also be clean.",
     )
+    p.add_argument(
+        "--allow-code-revision-upgrade-from",
+        default=None,
+        help="Authorize one resume-only migration from this exact prior Git "
+             "commit recorded in the conveyor manifest.",
+    )
+    p.add_argument(
+        "--code-revision-upgrade-reason",
+        default=None,
+        help="Printable 1-200 character audit reason for a code revision upgrade.",
+    )
+    p.add_argument(
+        "--code-revision-upgrade-authorized-at",
+        default=None,
+        help="Canonical UTC authorization timestamp (YYYY-MM-DDTHH:MM:SSZ). "
+             "Required with --allow-code-revision-upgrade-from so a retry keeps "
+             "the same immutable launch binding.",
+    )
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--keep-temp", action="store_true")
     p.add_argument("--retain-partial-work", action="store_true",
@@ -4693,7 +4923,46 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-reservation-ledger", action="store_true",
                    help="Disable active-unit reservations. Intended only for "
                         "controlled tests.")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    upgrade_from = args.allow_code_revision_upgrade_from
+    upgrade_reason = args.code_revision_upgrade_reason
+    upgrade_authorized_at = args.code_revision_upgrade_authorized_at
+    if (upgrade_from is None) != (upgrade_reason is None):
+        raise SystemExit(
+            "--allow-code-revision-upgrade-from and "
+            "--code-revision-upgrade-reason must be provided together"
+        )
+    if upgrade_from is not None:
+        if re.fullmatch(r"[0-9a-f]{40}", upgrade_from) is None:
+            raise SystemExit(
+                "--allow-code-revision-upgrade-from must be an exact lowercase "
+                "40-character Git commit"
+            )
+        if upgrade_authorized_at is None:
+            raise SystemExit(
+                "--code-revision-upgrade-authorized-at is required for a "
+                "controlled code revision upgrade"
+            )
+        if not _canonical_utc_timestamp(upgrade_authorized_at):
+            raise SystemExit(
+                "--code-revision-upgrade-authorized-at must be canonical UTC "
+                "YYYY-MM-DDTHH:MM:SSZ"
+            )
+        if (
+            not isinstance(upgrade_reason, str)
+            or not 1 <= len(upgrade_reason) <= 200
+            or any(ord(char) < 32 or ord(char) == 127 for char in upgrade_reason)
+        ):
+            raise SystemExit(
+                "--code-revision-upgrade-reason must be 1-200 printable "
+                "characters"
+            )
+    elif upgrade_authorized_at is not None:
+        raise SystemExit(
+            "--code-revision-upgrade-authorized-at requires "
+            "--allow-code-revision-upgrade-from"
+        )
+    return args
 
 
 def main(argv: list[str]) -> int:
@@ -4995,6 +5264,7 @@ def main(argv: list[str]) -> int:
     # CONVEYOR_MANIFEST; ConcurrentManifest merges + flocks every write so they
     # cannot clobber each other's resume/accounting keys (H4 fix).
     manifest = ConcurrentManifest.load(CONVEYOR_MANIFEST)
+    code_revision_upgrade = None
     try:
         if source_repo_binding is None and (
             manifest.done
@@ -5005,11 +5275,34 @@ def main(argv: list[str]) -> int:
                 "existing conveyor manifest cannot be resumed without the "
                 "canonical --repo-list needed to revalidate its source binding"
             )
-        manifest.bind_code_revision(revision_guard.receipt)
-        if source_repo_binding is not None:
-            manifest.bind_source_repo_list(source_repo_binding)
-        if pr_completion_binding is not None:
-            manifest.bind_pr_completion(pr_completion_binding)
+        if args.allow_code_revision_upgrade_from is not None:
+            # Bind immutable input identities before changing the revision so a
+            # mismatched source/PR snapshot cannot leave a partially migrated
+            # manifest behind.
+            if source_repo_binding is not None:
+                manifest.bind_source_repo_list(source_repo_binding)
+            if pr_completion_binding is not None:
+                manifest.bind_pr_completion(pr_completion_binding)
+            code_revision_upgrade = manifest.authorize_code_revision_upgrade(
+                revision_guard.receipt,
+                allow_from_git_commit=args.allow_code_revision_upgrade_from,
+                reason=args.code_revision_upgrade_reason,
+                authorized_at=args.code_revision_upgrade_authorized_at,
+            )
+            _log(
+                "Code revision upgrade: authorized one-time migration "
+                f"{code_revision_upgrade['from']['git_commit']} -> "
+                f"{code_revision_upgrade['to']['git_commit']} "
+                f"at {code_revision_upgrade['authorized_at']}"
+            )
+        else:
+            manifest.bind_code_revision(revision_guard.receipt)
+            if source_repo_binding is not None:
+                manifest.bind_source_repo_list(source_repo_binding)
+            if pr_completion_binding is not None:
+                manifest.bind_pr_completion(pr_completion_binding)
+        if code_revision_upgrade is None:
+            code_revision_upgrade = manifest.code_revision_upgrade
         child_guard_path = install_code_revision_child_guard(
             revision_guard,
             CONVEYOR_ROOT,
@@ -5047,6 +5340,7 @@ def main(argv: list[str]) -> int:
     progress.emit(
         "run_started",
         code_revision=revision_guard.receipt,
+        code_revision_upgrade=code_revision_upgrade,
         source_repo_list=source_repo_binding,
         pr_completion=pr_completion_binding,
         code_revision_child_guard=str(child_guard_path),
@@ -5194,6 +5488,7 @@ def main(argv: list[str]) -> int:
                 "source_cache_report": report,
                 "manifest": str(CONVEYOR_MANIFEST),
                 "code_revision": revision_guard.receipt,
+                "code_revision_upgrade": code_revision_upgrade,
                 "source_repo_list": source_repo_binding,
                 "source_repo_list_reverified_at_finish": (
                     source_repo_list_reverified
@@ -5545,6 +5840,7 @@ def main(argv: list[str]) -> int:
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
         "code_revision": revision_guard.receipt,
+        "code_revision_upgrade": code_revision_upgrade,
         "source_repo_list": source_repo_binding,
         "source_repo_list_reverified_at_finish": (
             source_repo_list_reverified_at_finish
