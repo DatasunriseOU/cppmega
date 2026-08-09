@@ -10168,28 +10168,54 @@ def dedup_root_functions(
         index.functions.items(),
         key=lambda kv: (kv[1].file or "", kv[1].line or 0, kv[0]),
     )
+    # Heartbeats keep conveyor stall monitors from killing long global-dedup
+    # passes (large repos can spend >30m here with no other log lines).
+    total_defs = sum(
+        1 for _k, func in items if func.is_definition and func.text
+    )
+    processed_defs = 0
+    last_heartbeat = time.monotonic()
+    heartbeat_every_s = 60.0
+    heartbeat_every_n = 5000
     for symbol_key, func in items:
         if not (func.is_definition and func.text):
             continue
+        processed_defs += 1
         token_ids = tok.encode(func.text)
         if store is not None:
             if store.seen_exact_tokens(token_ids):
                 dropped_exact += 1
                 dropped_roots.add(symbol_key)
-                continue
-            if near and store.seen_near_tokens(token_ids):
+            elif near and store.seen_near_tokens(token_ids):
                 dropped_near += 1
                 dropped_roots.add(symbol_key)
-                continue
+            else:
+                kept_roots += 1
         else:
             _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
             h = _sha1_tokens(token_ids)
             if h in seen_local:
                 dropped_exact += 1
                 dropped_roots.add(symbol_key)
-                continue
-            seen_local.add(h)
-        kept_roots += 1
+            else:
+                seen_local.add(h)
+                kept_roots += 1
+        now = time.monotonic()
+        if (
+            processed_defs == 1
+            or processed_defs % heartbeat_every_n == 0
+            or now - last_heartbeat >= heartbeat_every_s
+            or processed_defs == total_defs
+        ):
+            print(
+                f"  Function-level dedup heartbeat: "
+                f"{processed_defs}/{total_defs} defs "
+                f"kept={kept_roots} dropped_exact={dropped_exact} "
+                f"dropped_near={dropped_near}",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_heartbeat = now
 
     if store is not None:
         store.commit()
