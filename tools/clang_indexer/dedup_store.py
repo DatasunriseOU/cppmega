@@ -1034,33 +1034,18 @@ class DedupStore:
         stage_db_path: str | None = None,
     ) -> None:
         if stage_db_path is not None:
-            if not os.path.exists(stage_db_path):
-                return
-            conn = sqlite3.connect(
-                stage_db_path,
-                timeout=cls.SQLITE_TIMEOUT_SECONDS,
-            )
-            try:
-                conn.execute(f"PRAGMA busy_timeout={cls.SQLITE_BUSY_TIMEOUT_MS}")
-                for table in (
-                    "lsh_stage",
-                    "minhash_stage",
-                    "exact_stage",
-                    "chunk_claims_stage",
-                    "dedup_stages",
-                ):
-                    try:
-                        conn.execute(
-                            f"DELETE FROM {table} WHERE stage_id=?",
-                            (stage_id,),
-                        )
-                    except sqlite3.OperationalError as exc:
-                        if "no such table" in str(exc).lower():
-                            continue
-                        raise
-                conn.commit()
-            finally:
-                conn.close()
+            # A local stage DB contains only provisional claims. Its producer
+            # can be force-stopped after a semantic-stall timeout, and its
+            # MEMORY journal / synchronous=OFF settings intentionally make it
+            # non-durable. Cleanup must therefore never reopen it: an
+            # interrupted stage can be malformed, but it is safe to discard.
+            # The global DB is read-only to the stage producer and is not
+            # touched on this path.
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                try:
+                    Path(f"{stage_db_path}{suffix}").unlink()
+                except FileNotFoundError:
+                    pass
             return
         store = cls(db_path, near=False)
         try:
