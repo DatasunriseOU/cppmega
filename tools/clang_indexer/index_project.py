@@ -3248,9 +3248,10 @@ def parse_translation_unit(
         source=f"parse_translation_unit({filepath})",
     )
     try:
-        source, _source_bytes, source_encoding = _read_source_file(filepath)
+        source, source_bytes, source_encoding = _read_source_file(filepath)
     except OSError:
         return functions, typedefs
+    _preflight_libclang_sequence_checker_stack(source_bytes)
 
     tu = _load_translation_unit_with_include_recovery(
         filepath,
@@ -5181,8 +5182,34 @@ def _is_indexer_ast_visitor_recursion_error(exc: BaseException) -> bool:
     return False
 
 
+# Clang's SequenceChecker recursively visits comma-expression nodes while a
+# translation unit is loading. Large generated initializers can exceed the
+# fixed native parser thread stack before libclang can return an exception.
+# Keep those byte-exact sources on the existing lossless lexical path instead.
+MAX_LIBCLANG_SOURCE_COMMAS = 32_768
+
+
+class _LibclangSequenceCheckerStackHazard(RuntimeError):
+    """A source shape known to terminate libclang before it can raise."""
+
+
+def _preflight_libclang_sequence_checker_stack(source_bytes: bytes) -> None:
+    """Preflight the native parser's recursive comma-expression failure mode."""
+
+    search_from = 0
+    for _comma_count in range(MAX_LIBCLANG_SOURCE_COMMAS + 1):
+        comma_offset = source_bytes.find(b",", search_from)
+        if comma_offset < 0:
+            return
+        search_from = comma_offset + 1
+    raise _LibclangSequenceCheckerStackHazard(
+        "source exceeds the bounded native comma-expression budget: "
+        f"commas>{MAX_LIBCLANG_SOURCE_COMMAS}"
+    )
+
+
 def _cpp_lexical_fallback_reason(exc: BaseException) -> str | None:
-    """Classify only native TU-load and bounded AST-recursion failures."""
+    """Classify only bounded parser failures with lossless recovery."""
 
     if _has_translation_unit_load_error(exc):
         return "translation_unit_load_error"
@@ -5190,6 +5217,8 @@ def _cpp_lexical_fallback_reason(exc: BaseException) -> str | None:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, _LibclangSequenceCheckerStackHazard):
+            return "libclang_sequence_checker_stack_hazard"
         if _is_indexer_ast_visitor_recursion_error(current):
             return "ast_recursion_error"
         current = current.__cause__ or current.__context__
@@ -10876,10 +10905,10 @@ def _record_cpp_lexical_fallback(
     """Authorize a lossless lexical fallback for one bounded parser failure.
 
     Deliberately narrow: a bad/ambiguous compiler context must still fail loud,
-    as must every exception other than TranslationUnitLoadError or
-    RecursionError from AST extraction.  The returned path is project-relative
-    and the receipt binds the exact source bytes that the later lexical emitter
-    must reproduce.
+    as must every exception other than TranslationUnitLoadError, a bounded
+    native parser stack hazard, or RecursionError from AST extraction. The
+    returned path is project-relative and the receipt binds the exact source
+    bytes that the later lexical emitter must reproduce.
     """
 
     normalized_args = list(map(str, compile_args))
@@ -11055,6 +11084,7 @@ def emit_cpp_lexical_fallback_documents(
         fallback_reason = str(record.get("fallback_reason") or "")
         if fallback_reason not in {
             "translation_unit_load_error",
+            "libclang_sequence_checker_stack_hazard",
             "ast_recursion_error",
         }:
             raise RuntimeError(
@@ -11438,7 +11468,8 @@ def _parse_recovery_summary(
         "policy": (
             "retry_missing_includes_with_header_matched_project_local_dirs_"
             "only_without_compile_command_then_lossless_cpp_lexical_fallback_"
-            "only_for_translation_unit_load_or_ast_recursion_error_"
+            "only_for_translation_unit_load_native_sequence_checker_stack_"
+            "hazard_or_ast_recursion_error_"
             "with_sane_compile_args"
         ),
         "attempted_file_count": len(normalized),

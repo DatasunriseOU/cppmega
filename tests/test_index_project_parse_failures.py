@@ -228,6 +228,94 @@ def test_sane_translation_unit_load_error_uses_bound_lossless_lexical_fallback(
     assert summary["unresolved_file_count"] == 0
 
 
+def test_comma_heavy_source_avoids_native_stack_overflow_losslessly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    class FakeIndex:
+        @staticmethod
+        def create() -> object:
+            return object()
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda: None)
+    monkeypatch.setattr(index_project, "Index", FakeIndex)
+    monkeypatch.setattr(
+        index_project,
+        "_load_translation_unit_with_include_recovery",
+        lambda *_args, **_kwargs: pytest.fail("native parser must not run"),
+    )
+    source = tmp_path / "large_initializer.cpp"
+    source_text = (
+        "void preserve_generated_data() { constexpr int values[] = {"
+        + "0," * (index_project.MAX_LIBCLANG_SOURCE_COMMAS + 1)
+        + "0}; }\n"
+    )
+    source.write_text(source_text, encoding="utf-8")
+    compile_args = ["-std=c++20", "-fsyntax-only", "-Wno-everything"]
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            compile_args,
+            str(tmp_path),
+            "fixture/native-stack-hazard",
+        )
+    )
+
+    assert parsed_count == 1
+    assert payload["functions"] == []
+    assert payload["typedefs"] == []
+    assert payload["lexical_fallback_files"] == [source.name]
+    assert payload["parse_recovery_records"][0]["fallback_reason"] == (
+        "libclang_sequence_checker_stack_hazard"
+    )
+    documents = index_project.emit_cpp_lexical_fallback_documents(
+        payload["lexical_fallback_files"],
+        index=index_project.ProjectIndex(),
+        project_dir=str(tmp_path),
+        project_id="fixture/native-stack-hazard",
+        compile_db={},
+        default_args=compile_args,
+        default_build_info=None,
+        parse_recovery_records=payload["parse_recovery_records"],
+        enriched=False,
+    )
+
+    assert "".join(documents) == source_text
+
+
+def test_comma_stack_preflight_stops_after_crossing_bound() -> None:
+    from tools.clang_indexer import index_project
+
+    class BoundedBytes(bytes):
+        final_search_offset: int | None = None
+
+        def find(
+            self,
+            sub: bytes,
+            start: int = 0,
+            end: int | None = None,
+        ) -> int:
+            if end is not None:
+                raise AssertionError("preflight must not request an unbounded tail slice")
+            self.final_search_offset = start
+            return super().find(sub, start)
+
+    bounded_prefix = b"," * (index_project.MAX_LIBCLANG_SOURCE_COMMAS + 1)
+    source = BoundedBytes(bounded_prefix + b"tail-that-must-not-be-scanned")
+
+    with pytest.raises(
+        index_project._LibclangSequenceCheckerStackHazard,
+        match=rf"commas>{index_project.MAX_LIBCLANG_SOURCE_COMMAS}",
+    ):
+        index_project._preflight_libclang_sequence_checker_stack(source)
+
+    assert source.final_search_offset == len(bounded_prefix) - 1
+
+
 def test_gcc_case_label_ast_recursion_uses_bound_lossless_lexical_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
