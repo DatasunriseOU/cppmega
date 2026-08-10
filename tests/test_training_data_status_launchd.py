@@ -10,9 +10,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PLIST_PATH = REPO_ROOT / "configs/launchd/ai.cppmega.training-data-status.plist"
 EXPECTED_RUNTIME = Path(
     "/Volumes/external/cppmega_data/worktrees/"
-    "cppmega-training-status-runtime-33b56231-20260809"
+    "cppmega-training-status-runtime-a9145509-20260810"
 )
-EXPECTED_REVISION = "33b5623126d4b355b8f02ed811938eae4a9108f3"
+EXPECTED_REVISION = "a91455098f2a1a82f863ce64e98d237b9e930177"
 
 
 def test_training_status_launchd_uses_exact_pinned_runtime() -> None:
