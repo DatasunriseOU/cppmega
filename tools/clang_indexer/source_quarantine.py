@@ -74,6 +74,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_diagnostic_fixture",
         "clang_escaped_newline_nul_preprocessor_diagnostic",
     ),
+    (
+        "deliberate_parser_regression_fixture",
+        "cmake_escaped_newline_nul_syntax_fixture",
+    ),
     ("generated_binary_blob", "utf16le_generated_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
@@ -393,6 +397,17 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared truncated_utf32le_bom but "
                 "the payload is not exactly the three-byte UTF-32LE BOM prefix"
+            )
+        return
+
+    if entry.detected_format == "cmake_escaped_newline_nul_syntax_fixture":
+        payload = path.read_bytes()
+        expected = b"A(" + (b"A" * 52) + b"\\\0\n(" + (b"A" * 54) + b"\n"
+        if payload != expected:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "cmake_escaped_newline_nul_syntax_fixture but the exact "
+                "two-line escaped-newline/NUL parser-test shape is absent"
             )
         return
 

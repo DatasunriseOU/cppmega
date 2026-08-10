@@ -48,6 +48,9 @@ RELATIVE_PLUMHALL_D412 = (
 RELATIVE_NUL_FF_BLOB = "unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
 RELATIVE_TRUNCATED_UTF32BE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake"
 RELATIVE_TRUNCATED_UTF32LE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake"
+RELATIVE_CMAKE_NULL_AFTER_BACKSLASH = (
+    "Tests/RunCMake/Syntax/NullAfterBackslash.cmake"
+)
 RELATIVE_BIG5_SHELL_HEREDOC = (
     "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1"
 )
@@ -259,6 +262,10 @@ def _truncated_utf32be_bom_bytes() -> bytes:
 
 def _truncated_utf32le_bom_bytes() -> bytes:
     return b"\xff\xfe\x00"
+
+
+def _cmake_null_after_backslash_bytes() -> bytes:
+    return b"A(" + (b"A" * 52) + b"\\\0\n(" + (b"A" * 54) + b"\n"
 
 
 def _big5_shell_heredoc_bytes() -> bytes:
@@ -757,6 +764,54 @@ def test_truncated_utf32le_bom_quarantine_rejects_other_payload(
 
     policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
     with pytest.raises(SourceQuarantineError, match="exactly the three-byte"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
+
+
+def test_exact_quarantine_filters_cmake_null_after_backslash_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = _cmake_null_after_backslash_bytes()
+    candidate = tmp_path / RELATIVE_CMAKE_NULL_AFTER_BACKSLASH
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_parser_regression_fixture",
+        detected_format="cmake_escaped_newline_nul_syntax_fixture",
+        relative_path=RELATIVE_CMAKE_NULL_AFTER_BACKSLASH,
+        reason="CMake escaped-newline/NUL syntax fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["entries"][0]["detected_format"] == (
+        "cmake_escaped_newline_nul_syntax_fixture"
+    )
+
+
+def test_cmake_null_after_backslash_quarantine_rejects_other_nul_payload(
+    tmp_path: Path,
+) -> None:
+    payload = b"message(\\\0\nSTATUS forged)\n"
+    candidate = tmp_path / RELATIVE_CMAKE_NULL_AFTER_BACKSLASH
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_parser_regression_fixture",
+        detected_format="cmake_escaped_newline_nul_syntax_fixture",
+        relative_path=RELATIVE_CMAKE_NULL_AFTER_BACKSLASH,
+        reason="forged CMake escaped-newline/NUL syntax fixture",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="exact two-line"):
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
@@ -1659,7 +1714,7 @@ def test_checked_in_intel_newline_nul_manifest_matches_reference_fixture() -> No
     )
 
 
-def test_checked_in_cmake_truncated_bom_manifest_matches_archive_receipt() -> None:
+def test_checked_in_cmake_syntax_manifest_matches_archive_evidence() -> None:
     manifest = json.loads(
         (
             Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
@@ -1675,18 +1730,25 @@ def test_checked_in_cmake_truncated_bom_manifest_matches_archive_receipt() -> No
         RELATIVE_TRUNCATED_UTF32BE_BOM: (
             _truncated_utf32be_bom_bytes(),
             "truncated_utf32be_bom",
+            "mislabeled_non_cpp",
         ),
         RELATIVE_TRUNCATED_UTF32LE_BOM: (
             _truncated_utf32le_bom_bytes(),
             "truncated_utf32le_bom",
+            "mislabeled_non_cpp",
+        ),
+        RELATIVE_CMAKE_NULL_AFTER_BACKSLASH: (
+            _cmake_null_after_backslash_bytes(),
+            "cmake_escaped_newline_nul_syntax_fixture",
+            "deliberate_parser_regression_fixture",
         ),
     }
     assert {entry["relative_path"] for entry in entries} == set(expected)
     for entry in entries:
-        payload, detected_format = expected[entry["relative_path"]]
-        assert entry["size_bytes"] == len(payload) == 3
+        payload, detected_format, classification = expected[entry["relative_path"]]
+        assert entry["size_bytes"] == len(payload)
         assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
-        assert entry["classification"] == "mislabeled_non_cpp"
+        assert entry["classification"] == classification
         assert entry["detected_format"] == detected_format
 
 
@@ -2204,6 +2266,40 @@ def test_process_project_quarantines_clickhouse_binary_sql_before_domain_discove
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["quarantined_count"] == 1
     assert receipt["entries"][0]["relative_path"] == RELATIVE_CLICKHOUSE_BINARY_SQL
+
+
+def test_process_project_quarantines_cmake_nul_before_all_domain_routes(
+    tmp_path: Path,
+) -> None:
+    payload = _cmake_null_after_backslash_bytes()
+    candidate = tmp_path / RELATIVE_CMAKE_NULL_AFTER_BACKSLASH
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    receipt_path = tmp_path / "receipts/source.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_parser_regression_fixture",
+        detected_format="cmake_escaped_newline_nul_syntax_fixture",
+        relative_path=RELATIVE_CMAKE_NULL_AFTER_BACKSLASH,
+        reason="CMake escaped-newline/NUL syntax fixture",
+    )
+
+    documents = ip.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id=PROJECT_ID,
+        source_quarantine_manifest=str(manifest),
+        source_quarantine_receipt=str(receipt_path),
+    )
+
+    assert documents == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["relative_path"] == (
+        RELATIVE_CMAKE_NULL_AFTER_BACKSLASH
+    )
 
 
 def test_utf16le_source_text_format_accepts_bom_comment_header(tmp_path):

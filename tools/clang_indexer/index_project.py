@@ -11693,7 +11693,14 @@ def process_project(
         _configure_libclang()
 
     # Discover build/compilation files (ADDITIVE; emitted as 'build' docs).
-    build_files = find_build_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    build_files = [
+        (filepath, build_kind)
+        for filepath, build_kind in find_build_files(
+            project_dir,
+            extra_exclude_dirs=extra_exclude_dirs,
+        )
+        if os.path.abspath(filepath) not in quarantined_paths
+    ]
     print(f"  Found {len(build_files)} build/compilation files", file=sys.stderr)
     shell_files = find_shell_files(
         project_dir,
