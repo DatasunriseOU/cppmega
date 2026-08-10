@@ -1,6 +1,6 @@
 # Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
 
-Дата среза evidence: `2026-08-10`; последний fail-closed GCP CASE5 audit: `2026-08-10T08:44:13Z`; последний оперативный refresh: `2026-08-10T08:44:13Z`
+Дата среза evidence: `2026-08-10`; последний fail-closed GCP CASE5 audit: `2026-08-10T08:44:13Z`; последний live training-status refresh, использованный в отчёте: `2026-08-10T10:15:37Z`
 
 Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`
 
@@ -17,13 +17,13 @@
 ## Оперативный срез на момент factual refresh
 
 - Новый общий four-lane release ещё не готов к обучению: `training_ready=false`. Исторический source-only bundle 1K–16K не переносит свой legacy `release_ready` на новый scope.
-- `origin/main` на момент последней проверки — `f2ec1c804ce0716ef47ac5fd51a333c2e2aa77c6`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить. Более новый `main` не даёт права менять revision уже активного writer.
-- Локальный source residual жив с одним writer: `6 done`, `5 failed`, `208,478,056` cumulative valid tokens после последнего завершённого unit; сейчас индексируется `xbox_leak_may_2020`. В failed ledger находятся `apple-security`, `intel-llvm-dpcpp`, `src`, `webkit` и `windows_10_shared_source_kit`; terminal conveyor/root receipts отсутствуют, поэтому это residual progress, а не закрытые 501/501.
-- Два CI fetcher физически продвигаются в раздельных stores. На срезе `2026-08-10T08:42Z` old store имел `140,315,105,457`, new store — `243,215,038,185` exact unique payload tokens; их арифметическая сумма `383,530,143,642` остаётся только store-local upper bound и не является global union, packed valid/trained или training tokens. Frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
+- `origin/main` на момент последней проверки — `a5b1b8422c064eee3966222807d370bdfa4d5efa`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить. Более новый `main` не даёт права менять revision уже активного writer.
+- Локальный source residual жив с одним supervisor PID `68027`: в mutable ledger на `2026-08-10T09:59:57Z` было `7 done` и `8 failed`; после `xbox_leak_may_2020` writer перешёл к `unix-history`, `threadx`, `cmake`, затем запустил `linux`. Текущий failed set: `apple-security`, `cmake`, `intel-llvm-dpcpp`, `src`, `threadx`, `webkit`, `windows_10_shared_source_kit`, `xbox_leak_may_2020`. Terminal conveyor/root receipts отсутствуют, поэтому это residual progress, а не закрытые 501/501; mutable `_done.json` не является terminal receipt.
+- Два CI fetcher физически продвигаются в раздельных stores. На live status-срезе `2026-08-10T10:15:37Z` old store имел `141,910,266,104`, new store — `246,259,744,657` exact unique payload tokens; их арифметическая сумма `388,170,010,761` остаётся только store-local upper bound и не является global union, packed valid/trained или training tokens. В очередях оставались соответственно `17,199` и `107,109` pending attempts, `discovery_eof=false`; frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
 - Fail-closed one-shot CASE5 audit подтвердил обе VM `RUNNING`. Для `.003`: state `running_without_heartbeat`, `3` partial output objects, `192,150,324` bytes, terminal receipts отсутствуют. Для `.004`: state `running`, fresh heartbeat `sequence=206`, generation `1786351338729044`, `8` partial output objects, `933,456,196` bytes, terminal receipts отсутствуют. Для обеих `cleanup_authorized=false`, `retry_eligible=false`, `training_ready=false`; partial objects не являются completion evidence и VM пока уничтожать нельзя.
-- Новый `scripts/gcp_cloud_lane_run_monitor.py` в worktree `cppmega-case5-gcp-watchdog-20260809` проверяет exact-generation receipts, topology, terminal output publications и pure-429 taxonomy fail-closed; related suite подтверждён как `53 passed`. Код, тест и portable allowlist пока не закоммичены, monitor не подключён к 30-минутному launchd loop и потому не объявляется deployed.
+- Новый `scripts/gcp_cloud_lane_run_monitor.py` в worktree `cppmega-case5-gcp-watchdog-20260809` проверяет exact-generation receipts, topology, terminal output publications и pure-429 taxonomy fail-closed. Код, тест и portable allowlist зафиксированы commit `f167b32284b4726091ea9ef086b0283b76fb3e5b`; повторная расширенная проверка дала `55 passed`, `py_compile` green, Pyright `0 errors`, `git diff --check` green. Worktree clean, но branch пока `ahead 1, behind 1` относительно `origin/main`, не pushed и monitor не подключён к 30-минутному launchd loop, поэтому он ещё не deployed.
 - GitHub PR store остаётся verified: `2,794,562` PR из `460` repos, `33,388` gaps закрыты, unresolved `0`; production training Parquet всё ещё `0`, потому что exact primary membership/materialization не завершены. GitLab v2 сохранил inventory sidecars и `2` primary Eigen records, после чего deterministic остановился на Mesa discussions HTTP `401`; completion receipt и training Parquet отсутствуют, automatic retry запрещён до host-scoped `read_api` repair.
-- Live training-status updater сломан отдельно от данных: LaunchAgent всё ещё указывает на удалённый temporary worktree, имеет last exit `2`, а `current.md/current.json` stale с `2026-08-08T23:11:36Z`. Fix branch содержит commits `33b56231` и `a9145509`, clean detached runtime подготовлен, но финальный двухфайловый pin ещё не закоммичен/не установлен; до переключения launchd этот status нельзя выдавать за свежий live ledger.
+- Live training-status updater восстановлен: LaunchAgent работает с PID `93951` из durable runtime `/Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-a9145509-20260810`, exact expected revision `a91455098f2a1a82f863ce64e98d237b9e930177` и cadence `300` секунд. На проверке `runs=2`, heartbeat `stale=false`, а `current.md/current.json/heartbeat.json` обновлены в `2026-08-10T10:15:37Z`; source completion остаётся честно stale. Fix branch заканчивается commit `e35be00f7b4da4550b126d03d881e96252d6e825`, pushed; PR `#139` OPEN, MERGEABLE/CLEAN, все GitHub CI/CodeQL checks SUCCESS. Live pin нельзя удалять или переключать до merge и отдельного deployment readback.
 - CASE5 heartbeat/429 hardening уже landed в `main`: implementation commit `306179407570f97d4d7a571a447e95e0e9d05aed`, merge PR `#133` — `a65db87ca4e95de7b8a3eb1949786dac813d8d83`. Focused suite `25 passed`, related CASE5/cloud suite `116 passed`, Pyright `0 errors`; `py_compile`, `bash -n`, `shellcheck`, Terraform fmt/validate/tests, CodeQL и GitHub CI прошли. Следующий runtime обязан pin exact landed revision; merge сам по себе не завершает текущие `.003/.004`.
 - Source-worker taxonomy «retry только при чисто подтверждённом HTTP 429» завершена: implementation `9d8a2a78168987d42d5c658e3a02bdc013c51616`, PR `#135`, merge `52472d831a6a2191f36b6f363f7d4057e844c4aa`, входит в текущий `origin/main`. Focused suite `27 passed`, related source/scheduler/cloud suite `189 passed`, changed-test Pyright `0 errors`; production `source_worker.py` всё ещё имеет `17` ранее существовавших Pyright errors и не объявляется полностью Pyright-clean. Pure 429 может дать bounded retry/exit `75`; mixed 429+deterministic, 401/403, 408/5xx, parser/contract/network defects дают exit `2` без automatic retry.
 - GCP source runs дают полезные assignment completions, но terminal slot/run receipts всё ещё отсутствуют. Широкий Terraform destroy запрещён: сначала worker-by-worker Local SSD diagnostics, exact backend lineage/serial и instance-only plan.
@@ -666,7 +666,7 @@
 
 ## Часть II. Что уже сделано и подтверждено — 50 пунктов
 
-Срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md` сгенерирован `2026-08-08T23:11:36Z`, internal status SHA-256 `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`. Он является главным источником текущих token totals. Для GitHub/GitLab/GCP используются отдельные receipts, названные в пунктах ниже.
+Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, использованный для factual refresh, сгенерирован `2026-08-10T10:15:37Z`: physical file SHA-256 `c36c9c9abf73b44f146ffdde84559e818276b0424f3d9b07a2cc2f142e652e9f`, internal status SHA-256 `2491b9a29d7904c6fc908ca70a3cb1bfb80a316dcb755edc237ae6ee8480158a`. Это главный источник текущих physical/token totals, но live counters считаются timestamp-bound evidence, а не terminal receipts. Для GitHub/GitLab/GCP используются отдельные receipts, названные в пунктах ниже.
 
 ### Код распределённого runtime и infrastructure-as-code
 
@@ -688,11 +688,11 @@
 - **Доказательство:** `infra/gcp_corpus_pool/workers/`.
 - **Честная граница:** resource names принимают run ID, но `lane-workers.backend.hcl.example` всё ещё имеет общий `terraform/lane-workers`; production обязан генерировать unique backend prefix и доказывать отсутствие старых VM отдельным readback/destroy receipt.
 
-### D004 — Receipt-bound GCP source monitor реализован
+### D004 — Receipt-bound GCP source/cloud monitors реализованы
 
-- **Сделано:** monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts.
-- **Доказательство:** pushed branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`; live monitor SHA-256 `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064`, loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`, а pushed monitor-stack branch заканчивается `24a43b46`.
-- **Честная граница:** `ba417173` pushed, но ещё не landed в `origin/main`; исторические `56 passed` и `452` секунды не имеют отдельного immutable test/log receipt и не используются здесь как доказательство. Сам monitor parser defects не исправляет.
+- **Сделано:** source monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts. Отдельный cloud-lane monitor проверяет topology, exact object generations, heartbeat/completion/failure publications, output inventory, cleanup gate и pure-429 retry contract.
+- **Доказательство:** source branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`; live source-monitor SHA-256 `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064`, loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`. Cloud-lane monitor commit `f167b32284b4726091ea9ef086b0283b76fb3e5b` имеет clean worktree; expanded related suite `55 passed`, `py_compile` green, Pyright `0 errors`, `git diff --check` green.
+- **Честная граница:** cloud-lane commit пока не pushed/landed и branch `ahead 1, behind 1`; CASE5 configs ещё не включены в live 30-минутный loop. Реализованный monitor не равен deployed monitor и сам parser defects не исправляет.
 
 ### D005 — Dynamic source work stealing реализован
 
@@ -764,50 +764,50 @@
 
 ### D016 — Честный machine-readable training status выпускается
 
-- **Сделано:** status раздельно показывает live source, sealed Megatron, GitHub PR, GitLab MR и CI.
-- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`; SHA-256 физического файла `ba53cc59027be172f97d86e3e950f9ac39a558eb2cbb798f283ba2c1f8321999`, а записанный внутри status digest — `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`. Эти два digest относятся к разным уровням и не подменяют друг друга.
-- **Честная граница:** это immutable срез `2026-08-08T23:11:36Z`, а не live dashboard; его heartbeat позднее был `stale=true`. Срез прямо сохраняет `release ready=false` для новых live/PR/MR/CI lanes.
+- **Сделано:** status раздельно показывает live source, sealed Megatron, GitHub PR, GitLab MR и CI; updater снова работает каждые 300 секунд из durable exact runtime и не требует существования удалённого temporary worktree.
+- **Доказательство:** LaunchAgent command pin `a91455098f2a1a82f863ce64e98d237b9e930177`, runtime `/Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-a9145509-20260810`, PID `93951`, `runs=2`; срез `2026-08-10T10:15:37Z` имеет physical SHA-256 `c36c9c9abf73b44f146ffdde84559e818276b0424f3d9b07a2cc2f142e652e9f`, internal status SHA-256 `2491b9a29d7904c6fc908ca70a3cb1bfb80a316dcb755edc237ae6ee8480158a`, heartbeat `stale=false`. Fix commit `e35be00f7b4da4550b126d03d881e96252d6e825` pushed в PR `#139`; PR mergeable/clean, GitHub checks green.
+- **Честная граница:** PR `#139` ещё OPEN; updater честно помечает source completion stale и сохраняет `release_ready=false` для новых live/PR/MR/CI lanes. Исторический sealed source-only bundle не переносит свой `release_ready=true` на новый four-lane scope.
 
 ### D017 — Live source Parquet 1K физически существует
 
-- **Сделано:** учтено 440 файлов, 3,085,794 rows, 3,054,269,011 valid и 3,038,224,353 trained tokens.
-- **Доказательство:** physical inventory root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`, inventory SHA-256 `bddee557f4ffd6070f70d4e95fc32087f68d94b71e1bb4e48d69c1e3890f3802`.
+- **Сделано:** на status-срезе `2026-08-10T10:15:37Z` учтено 444 файла, 3,208,207 rows, 3,175,983,339 valid и 3,159,298,982 trained tokens.
+- **Доказательство:** physical inventory root `/Volumes/external/cppmega_data/source_full501_7f55ff0c12d88bb835fea9a68b8ba9d90522ddd5/reindexed`, inventory SHA-256 `2e8bc64399edc2f9efa3805e338afaf6b2db9e993695cf59486417f9f56c80cd`.
 - **Честная граница:** bucket `packed_unsealed`, а completion totals расходятся с physical Parquet.
 
 ### D018 — Live source Parquet 2K физически существует
 
-- **Сделано:** учтено 438 файлов, 449,658 rows, 640,701,360 valid и 640,251,702 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
+- **Сделано:** учтено 443 файла, 470,086 rows, 669,822,296 valid и 669,352,210 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `2e8bc643…c80cd`.
 - **Честная граница:** данные входят в незавершённый overlapping live snapshot.
 
 ### D019 — Live source Parquet 4K физически существует
 
-- **Сделано:** учтено 435 файлов, 221,983 rows, 627,003,170 valid и 626,781,187 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
+- **Сделано:** учтено 440 файлов, 231,836 rows, 654,826,938 valid и 654,595,102 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `2e8bc643…c80cd`.
 - **Честная граница:** global composition/dedup/seal ещё не закрыты.
 
 ### D020 — Live source Parquet 8K физически существует
 
-- **Сделано:** учтено 437 файлов, 97,963 rows, 552,562,497 valid и 552,464,534 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
+- **Сделано:** учтено 441 файл, 102,556 rows, 578,489,841 valid и 578,387,285 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `2e8bc643…c80cd`.
 - **Честная граница:** наличие rows не доказывает terminal repository coverage.
 
 ### D021 — Live source Parquet 16K физически существует
 
-- **Сделано:** учтено 428 файлов, 100,016 rows, 1,415,781,331 valid и 1,415,681,315 trained tokens.
-- **Доказательство:** тот же physical inventory/root с SHA-256 `bddee557…f3802`.
+- **Сделано:** учтено 432 файла, 105,934 rows, 1,502,391,092 valid и 1,502,285,158 trained tokens.
+- **Доказательство:** тот же physical inventory/root с SHA-256 `2e8bc643…c80cd`.
 - **Честная граница:** 32K/64K в этом live root ещё не материализованы.
 
 ### D022 — Live source token accounting посчитан
 
-- **Сделано:** physical inventory фиксирует 2,178 файлов, 3,955,414 rows, 6,290,317,369 valid и 6,273,403,091 trained tokens без сложения с overlapping sealed snapshot.
-- **Доказательство:** сумма пяти physical bucket tables; inventory SHA-256 `bddee557f4ffd6070f70d4e95fc32087f68d94b71e1bb4e48d69c1e3890f3802`.
+- **Сделано:** physical inventory фиксирует 2,200 файлов, 4,118,619 rows, 17,594,769 source documents, 6,581,513,506 valid и 6,563,918,737 trained tokens без сложения с overlapping sealed snapshot.
+- **Доказательство:** сумма пяти physical bucket tables; inventory SHA-256 `2e8bc64399edc2f9efa3805e338afaf6b2db9e993695cf59486417f9f56c80cd`.
 - **Честная граница:** totals относятся к `packed_unsealed`, не к release-ready corpus.
 
-### D023 — Source documents разложены по восьми категориям
+### D023 — Source documents разложены по девяти категориям
 
-- **Сделано:** посчитаны bash, build, headers, C/C++ source, diagnostics, Python auxiliary, shell other и SQL.
-- **Доказательство:** physical category inventory: bash `14,377`, build `116,555`, headers `13,073,135`, C/C++ source `3,570,482`, diagnostics `10,126`, Python auxiliary `102,813`, shell other `17,197`, SQL `9,593`.
+- **Сделано:** посчитаны bash, build, headers, C/C++ source, diagnostics, exact excluded-other, Python auxiliary, shell other и SQL.
+- **Доказательство:** physical category inventory: bash `15,113`, build `128,364`, headers `13,577,801`, C/C++ source `3,723,475`, diagnostics `11,870`, excluded-other `2,665`, Python auxiliary `106,518`, shell other `18,434`, SQL `10,529`.
 - **Честная граница:** status отмечает, что Python auxiliary пока смешан с main rows.
 
 ### D024 — Source blockers не скрыты
@@ -936,8 +936,8 @@
 
 ### D044 — CI live CAS имеет измеренный store-local upper bound
 
-- **Сделано:** immutable training-status slice фиксирует `295,701,087,270` exact unique payload tokens как сумму store-local counters двух live stores.
-- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, generated `2026-08-08T23:11:36Z`, internal status SHA-256 `91f31aa2dad1b07d649d5348481cc76a6a920411729c00a5d5fb6f5806100581`.
+- **Сделано:** timestamp-bound training-status slice фиксирует `388,170,010,761` exact unique payload tokens как сумму store-local counters двух live stores: `141,910,266,104` old и `246,259,744,657` new.
+- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, generated `2026-08-10T10:15:37Z`, internal status SHA-256 `2491b9a29d7904c6fc908ca70a3cb1bfb80a316dcb755edc237ae6ee8480158a`; оба progress receipts на момент среза были fresh.
 - **Честная граница:** это store-local upper bound, не global union/dedup и не training tokens.
 
 ### D045 — Frozen CASE5 threshold snapshot сохранён
@@ -954,13 +954,13 @@
 
 ### D047 — 30-минутный pipeline watchdog установлен и исполняется
 
-- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`, 275 runs и last exit `0`; loop выполняет все четыре GCP source scans и считает cadence от начала цикла.
+- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`; на последней проверке было 305 runs и last exit `0`. Loop выполняет все четыре GCP source scans и считает cadence от начала цикла.
 - **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, `launchctl print`, live loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`; лог содержит последовательные полные cycles, в том числе `358s` и `411s`.
-- **Честная граница:** launchd `state=not running` между interval invocations нормален; mutable run count не является immutable pipeline completion receipt.
+- **Честная граница:** launchd `state=not running` между interval invocations нормален; CASE5 `.003/.004` ещё не подключены к loop через новый cloud-lane monitor, а mutable run count не является immutable pipeline completion receipt.
 
 ### D048 — Codex 429 watchdog установлен
 
-- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`, 43 runs и last exit `0`; последний подтверждённый scan нашёл `0` pure-429 candidates.
+- **Сделано:** отдельный launchd label использует `StartInterval=1800`, `RunAtLoad=true`; на последней проверке было 72 runs и last exit `0`; последний подтверждённый scan не давал права повторять deterministic failures.
 - **Доказательство:** `com.codex.multi-429-watchdog.plist`, `launchctl print`, script SHA-256 `6a6f03a2621283b95ba59a19d755512324d49993aa03efd569e7c3f7a4ae5c2d`.
 - **Честная граница:** watchdog повторяет controller session; он не даёт права retry deterministic parser assignment.
 
@@ -984,10 +984,10 @@
 
 ### N001 — Заморозить новый общий runtime checkpoint
 
-- **Действие:** hash текущих `_done.json`, launch/repair contracts, live status, local locks и GCP monitor reports без остановки writers.
-- **Код/инфра/аккаунт:** source root в `/Volumes/external/cppmega_data`, `scripts/report_training_data_status.py`, read-only GCS через scoped operator identity.
-- **Проверка:** stat-before/hash/stat-after; mutable file получает отдельную observed-version запись, а не ложный stable hash.
-- **Готово когда:** `N001-runtime-checkpoint.json` перечисляет local/GCP/PR/MR/CI evidence и везде сохраняет `training_ready=false`.
+- **Действие:** hash текущих `_done.json`, launch/repair contracts, live status, local locks и GCP monitor reports без остановки writers; перепроверить зелёный merge gate PR `#139`, merge updater fix и сохранить уже работающий durable runtime до post-merge readback.
+- **Код/инфра/аккаунт:** source root в `/Volumes/external/cppmega_data`, `scripts/report_training_data_status.py`, branch `fix/training-status-updater-pinned-runtime-20260809`, read-only GCS через scoped operator identity.
+- **Проверка:** stat-before/hash/stat-after; mutable file получает отдельную observed-version запись, а не ложный stable hash. PR head должен оставаться `e35be00f7b4da4550b126d03d881e96252d6e825`, checks SUCCESS; два status cycles после merge должны сохранить exact runtime revision `a9145509…`, heartbeat fresh и один reporter PID.
+- **Готово когда:** `N001-runtime-checkpoint.json` перечисляет local/GCP/PR/MR/CI evidence, PR `#139` landed, live reporter не откатился к удалённому cwd и везде сохраняется `training_ready=false`.
 
 ### N002 — Зафиксировать уже восстановленный durable runtime pin
 
@@ -1073,12 +1073,12 @@
 - **Проверка:** accepted+excluded равно local scope; active/unresolved/duplicate accepted равны нулю.
 - **Готово когда:** terminal local composition input receipt опубликован atomically.
 
-### N014 — Повторно проверить оба 30-минутных watchdog
+### N014 — Land/deploy cloud-lane monitor и повторно проверить оба 30-минутных watchdog
 
-- **Действие:** проверить live monitor SHA `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064` и loop SHA `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`; перезапускать launchd controller только при drift/failure и без второго writer.
-- **Код/инфра/аккаунт:** `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/pipeline-watchdog-loop.sh`, pinned worktree `cppmega-gcp-source-assignment-heartbeat-monitor-live-20260806`, два plists и report roots.
-- **Проверка:** `sh -n`, exact file hash, один controller PID; два consecutive reports ≤35 минут; recovery не запускает exit `1/2`, а controlled transient `75/429` создаёт новый attempt.
-- **Готово когда:** watchdog health receipt связывает plist/script/config hashes и два новых полных cycle timestamps.
+- **Действие:** безопасно reconcile commit `f167b32284b4726091ea9ef086b0283b76fb3e5b` с current `origin/main`, push/PR/CI/merge; создать stable detached runtime и подключить CASE5 `.003/.004` configs к существующему loop через overlap lock. Перезапускать launchd controller только при drift/failure и без второго writer.
+- **Код/инфра/аккаунт:** worktree `/Volumes/external/cppmega_data/worktrees/cppmega-case5-gcp-watchdog-20260809`, `scripts/gcp_cloud_lane_run_monitor.py`, `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/pipeline-watchdog-loop.sh`, configs/reports в `/Volumes/external/cppmega_data/gcp_cloud_lane_run_monitor_20260810`, source-monitor pinned worktree, два plists; GCP вызовы только через `nanochat-automation@natural-bison-491019-t9.iam.gserviceaccount.com` command-scoped override.
+- **Проверка:** expanded related pytest suite, `py_compile`, Pyright, `git diff --check`, `sh -n`, exact code/config hashes, один controller PID и два consecutive reports ≤35 минут. Exit `75` разрешает retry только вместе с `report.retry_eligible=true`; exit `2`, stale/mixed/partial failure не запускают command. Monitor никогда автоматически не уничтожает VM.
+- **Готово когда:** landed exact monitor SHA и config SHA входят в watchdog health receipt, `.003/.004` появляются в двух новых полных cycles, overlap отсутствует, `cleanup_authorized=false` сохраняется до terminal readback.
 
 ### N015 — Снять свежий GCP repair `.001` inventory scoped identity
 
@@ -1697,7 +1697,8 @@
 ## Критический путь
 
 ```text
-durable local-runtime verification -> exact source residual -> source composition/dedup
+status-updater merge + cloud-monitor deploy -> durable local-runtime verification
+  -> exact source residual -> source composition/dedup
   -> source 1K–64K seal -> exact GitHub/GitLab membership
   -> PR/MR 1K–64K seals -> CI terminal freeze/union/dedup/GCS input
   -> CASE5 smoke -> Terraform/IAM pre-apply gates -> CI production seal
