@@ -59,6 +59,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "gcc_c_flexible_array_union_initializer_regression",
     ),
     (
+        "compiler_regression_fixture",
+        "plumhall_c_date_time_libclang_hang",
+    ),
+    (
         "binary_protocol_test_fixture",
         "clickhouse_dollar_quoted_binary_sql",
     ),
@@ -1090,6 +1094,39 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared asn1_der_x509_certificate_pair "
                 f"but the DER structure is invalid: {exc}"
             ) from exc
+        return
+
+
+    if entry.detected_format == "plumhall_c_date_time_libclang_hang":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared plumhall_c_date_time_libclang_hang "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        # Exact Plum Hall 4.12 date/time conformance fixture: pinned libclang
+        # enters a non-terminating parse spin in Parser::isTypeSpecifierQualifier
+        # (observed multi-hour hang on a 4KB file under corpus.local/xbox_leak_may_2020).
+        required_substrings = (
+            "Plum Hall Validation Suite for C",
+            '#include <time.h>',
+            'Filename = "d412.c"',
+            "void d4_12()",
+            "#define SKIP412",
+            "4.12 - Date and time",
+        )
+        if (
+            path.suffix.casefold() != ".c"
+            or any(s not in decoded for s in required_substrings)
+            or decoded.count('#include <time.h>') < 1
+            or "struct tm" not in decoded
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared plumhall_c_date_time_libclang_hang "
+                "but the Plum Hall 4.12 date/time fixture contract is incomplete or ambiguous"
+            )
         return
 
     raise SourceQuarantineError(

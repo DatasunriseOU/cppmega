@@ -72,6 +72,9 @@ CHECKPOINT_SCHEMA_VERSION = 1
 EXTRACTION_CONTRACT_VERSION = 3
 DEFAULT_CHECKPOINT_COMMITS = 250
 CHECKPOINT_SUFFIX = ".extract-checkpoint"
+_LEGACY_GITLINK_BLOB_OPERATIONS = frozenset(
+    {"old_blob_size", "old_blob", "new_blob_size", "new_blob"}
+)
 
 
 class CheckpointCorruptionError(RuntimeError):
@@ -1362,6 +1365,84 @@ class RepoExtractionCheckpoint:
                 for row in rows:
                     handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
 
+    def retire_legacy_gitlink_bad_units(self, repo_path: str) -> int:
+        """Remove only stale blob-read failures now proven to be gitlinks.
+
+        Older checkpoints could try ``cat-file`` on mode-160000 entries before
+        the raw-diff gitlink filter was applied.  Resume must not clear a bad
+        unit merely because the new extractor would skip its path: the current
+        repository has to prove that the exact commit/path (or first parent for
+        an ``old_*`` read) is still a gitlink.  Any missing, malformed, or
+        unverifiable tree entry remains in the fail-closed ledger.
+        """
+
+        rows = self.conn.execute(
+            "SELECT unit_key, commit_hash, filepath, operation FROM bad_units "
+            "ORDER BY first_seen, unit_key"
+        ).fetchall()
+        retired_keys: list[str] = []
+        for row in rows:
+            filepath = row["filepath"]
+            operation = str(row["operation"])
+            commit_hash = str(row["commit_hash"])
+            if (
+                not isinstance(filepath, str)
+                or not filepath
+                or operation not in _LEGACY_GITLINK_BLOB_OPERATIONS
+            ):
+                continue
+            try:
+                treeish = commit_hash
+                if operation.startswith("old_"):
+                    treeish = _first_parent_or_empty_tree(repo_path, commit_hash)
+                entry = run_git_unit(
+                    repo_path,
+                    [
+                        "ls-tree",
+                        "-z",
+                        treeish,
+                        "--",
+                        f":(top,literal){filepath}",
+                    ],
+                    commit_hash=commit_hash,
+                    filepath=filepath,
+                    operation="verify_legacy_gitlink_bad_unit",
+                    timeout=30,
+                )
+            except UnitExtractionError:
+                continue
+
+            fields = [field for field in entry.split("\0") if field]
+            if len(fields) != 1 or "\t" not in fields[0]:
+                continue
+            metadata, returned_path = fields[0].split("\t", 1)
+            metadata_fields = metadata.split()
+            if (
+                returned_path == filepath
+                and len(metadata_fields) == 3
+                and metadata_fields[0] == "160000"
+                and metadata_fields[1] == "commit"
+            ):
+                retired_keys.append(str(row["unit_key"]))
+
+        if not retired_keys:
+            return 0
+
+        placeholders = ",".join("?" for _ in retired_keys)
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"DELETE FROM bad_units WHERE unit_key IN ({placeholders})",
+                    retired_keys,
+                )
+            self._export_bad_units()
+        except BaseException:
+            # The SQLite table is canonical.  Rebuild its derived JSON ledger
+            # after a failed delete/export path before propagating the error.
+            self._export_bad_units()
+            raise
+        return len(retired_keys)
+
     def bad_unit_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM bad_units").fetchone()[0])
 
@@ -1697,6 +1778,14 @@ def extract_repo_to_checkpoint(
         raise ValueError("bad-unit-policy=fail requires --max-bad-units=0")
     if bad_unit_policy == "quarantine" and max_bad_units <= 0:
         raise ValueError("bad-unit-policy=quarantine requires --max-bad-units > 0")
+
+    retired_gitlinks = checkpoint.retire_legacy_gitlink_bad_units(repo_path)
+    if retired_gitlinks:
+        print(
+            f"  [{checkpoint.source['repo']}] Retired {retired_gitlinks:,} "
+            "legacy gitlink bad-unit ledger entr"
+            f"{'y' if retired_gitlinks == 1 else 'ies'}"
+        )
 
     existing_bad_units = checkpoint.bad_unit_count()
     allowed_bad_units = 0 if bad_unit_policy == "fail" else max_bad_units

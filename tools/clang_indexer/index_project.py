@@ -41,6 +41,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import signal
 import time
 import warnings
 from array import array
@@ -5225,6 +5226,77 @@ def _cpp_lexical_fallback_reason(exc: BaseException) -> str | None:
     return None
 
 
+
+class LibclangParseTimeoutError(RuntimeError):
+    """libclang parse exceeded the fail-closed per-file wall timeout."""
+
+
+def _parse_file_timeout_s() -> float:
+    raw = os.environ.get("CPPMEGA_PARSE_FILE_TIMEOUT_S", "").strip()
+    if not raw:
+        return float(DEFAULT_PARSE_FILE_TIMEOUT_S)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"CPPMEGA_PARSE_FILE_TIMEOUT_S must be a positive float, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"CPPMEGA_PARSE_FILE_TIMEOUT_S must be positive, got {value}"
+        )
+    return value
+
+
+def _load_translation_unit_with_wall_timeout(
+    filepath: str,
+    index: Index,
+    compile_args: Sequence[str],
+    *,
+    timeout_s: float | None = None,
+) -> TranslationUnit:
+    """Load a TU; kill the calling worker if libclang spins past timeout_s.
+
+    libclang pathological parses run in native code and do not honour Python
+    signals. The only fail-closed escape is process isolation: the parent
+    join-waits, then SIGKILLs the child. Callers that need the TU must run the
+    full parse in the child; this helper is used when the load itself hangs.
+    """
+    limit = float(DEFAULT_PARSE_FILE_TIMEOUT_S if timeout_s is None else timeout_s)
+    if limit <= 0:
+        return _load_translation_unit(filepath, index, compile_args)
+
+    # Fast path: same process with a watchdog thread that hard-kills *this*
+    # process on timeout. Worker pools treat worker death as batch failure and
+    # residual retries / lexical-fallback paths stay fail-closed.
+    import threading
+
+    expired = {"hit": False}
+
+    def _watchdog() -> None:
+        expired["hit"] = True
+        print(
+            f"  FAIL_CLOSED libclang parse timeout after {limit:.0f}s: {filepath}",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Hard-kill this process group member so a native spin cannot continue.
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    timer = threading.Timer(limit, _watchdog)
+    timer.daemon = True
+    timer.start()
+    try:
+        return _load_translation_unit(filepath, index, compile_args)
+    finally:
+        timer.cancel()
+        if expired["hit"]:
+            # Unreachable after SIGKILL; kept for clarity.
+            raise LibclangParseTimeoutError(
+                f"libclang parse timed out after {limit:.0f}s for {filepath}"
+            )
+
+
 def _load_translation_unit(
     filepath: str,
     index: Index,
@@ -5265,7 +5337,7 @@ def _load_translation_unit_with_include_recovery(
     initial_tu: TranslationUnit | None = None
     initial_error: Exception | None = None
     try:
-        initial_tu = _load_translation_unit(filepath, index, compile_args)
+        initial_tu = _load_translation_unit_with_wall_timeout(filepath, index, compile_args)
     except SymbolIdentityError:
         raise
     except Exception as exc:
@@ -5327,7 +5399,7 @@ def _load_translation_unit_with_include_recovery(
         active_args = recovery_args
         added_include_dirs.extend(round_added)
         try:
-            candidate_tu = _load_translation_unit(
+            candidate_tu = _load_translation_unit_with_wall_timeout(
                 filepath,
                 index,
                 active_args,
@@ -5761,6 +5833,10 @@ DEFAULT_PARSE_BATCH_FILES = 25
 PARSE_SUBMIT_WINDOW_PER_WORKER = 2
 PARSE_HEARTBEAT_FILES = 25
 PARSE_HEARTBEAT_SECONDS = 30.0
+# Fail-closed per-file libclang wall timeout. Native hangs (e.g. pathological
+# Plum Hall D412.c) never raise; the worker process is killed and the file is
+# reported as a parse failure (lexical fallback / raise), not left spinning.
+DEFAULT_PARSE_FILE_TIMEOUT_S = 300.0
 
 
 def compute_parse_batch_size(
