@@ -20,6 +20,15 @@
       "reason": "CMake encoding regression fixture containing only a truncated UTF-32LE BOM prefix"
     },
     {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/NullAfterBackslash.cmake",
+      "size_bytes": 113,
+      "sha256": "02f5ed469f69885167a071a94593a0a41247d448b17e35553b37794f526cd3d8",
+      "classification": "deliberate_parser_regression_fixture",
+      "detected_format": "cmake_escaped_newline_nul_syntax_fixture",
+      "reason": "CMake list-file lexer regression fixture intentionally places a NUL byte after a backslash before newline"
+    },
+    {
       "project_id": "corpus.local/Xbox_Live_Source",
       "relative_path": "Xbox Live Source/XONLINE_MAIN/public/ext/sdk/vs10rtm/SDK/bin/isvtier5appsignsdk.cc",
       "size_bytes": 21234,
