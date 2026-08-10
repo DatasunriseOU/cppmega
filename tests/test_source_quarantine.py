@@ -218,22 +218,18 @@ def _certificate_pair_bytes(*, wrapper_tag: int = 0xA1) -> bytes:
     return _der(0x30, _der(wrapper_tag, certificate))
 
 
-def _mixed_utf8_utf16le_c_array_bytes(*, byte_count: int = 1024) -> bytes:
-    prefix = (
-        b"/* Copyright (c) 2026 Eclipse ThreadX contributors */\n"
-        b"/* SPDX-License-Identifier: MIT */\n\n"
-    )
+def _utf16le_generated_c_array_bytes(*, byte_count: int = 1024) -> bytes:
     byte_literals = ", ".join(f"0x{value % 256:02X}" for value in range(byte_count))
     generated = (
-        "/* \n\n"
-        "   Input ELF file: sample_threadx_module.axf\n\n"
-        "   Output C Array file: module_code.c\n\n"
-        "*/\n\n"
-        "__align(4096) unsigned char  module_code[] = {\n"
-        "/* Address  Contents */\n"
-        f"/* 0x00000000 */ {byte_literals}}};\n"
+        "/* \r\n"
+        "   Input ELF file: sample_threadx_module.axf\r\n"
+        "   Output C Array file: module_code.c\r\n"
+        "*/\r\n\r\n"
+        "__align(4096) unsigned char  module_code[] = {\r\n"
+        "/* Address  Contents */\r\n"
+        f"/* 0x00000000 */ {byte_literals}}};\r\n"
     ).encode("utf-16le")
-    return prefix + generated
+    return b"\xff\xfe" + generated
 
 
 def _self_executing_zip_bytes() -> bytes:
@@ -1288,10 +1284,10 @@ def test_collection_quarantine_rejects_incomplete_or_drifted_set(
         policy.filter_candidates(tmp_path, [str(candidate)])
 
 
-def test_exact_quarantine_filters_mixed_utf16_generated_binary_blob(
+def test_exact_quarantine_filters_utf16le_generated_binary_blob(
     tmp_path: Path,
 ) -> None:
-    payload = _mixed_utf8_utf16le_c_array_bytes()
+    payload = _utf16le_generated_c_array_bytes()
     candidate = tmp_path / RELATIVE_GENERATED_BLOB
     candidate.parent.mkdir(parents=True)
     candidate.write_bytes(payload)
@@ -1300,7 +1296,7 @@ def test_exact_quarantine_filters_mixed_utf16_generated_binary_blob(
         manifest,
         payload,
         classification="generated_binary_blob",
-        detected_format="mixed_utf8_utf16le_c_array",
+        detected_format="utf16le_generated_c_array",
         relative_path=RELATIVE_GENERATED_BLOB,
         reason="generated binary blob fixture",
     )
@@ -1456,7 +1452,7 @@ def test_executable_archive_quarantine_rejects_invalid_zip(
 def test_generated_binary_blob_quarantine_rejects_small_c_array(
     tmp_path: Path,
 ) -> None:
-    payload = _mixed_utf8_utf16le_c_array_bytes(byte_count=16)
+    payload = _utf16le_generated_c_array_bytes(byte_count=16)
     candidate = tmp_path / RELATIVE_GENERATED_BLOB
     candidate.parent.mkdir(parents=True)
     candidate.write_bytes(payload)
@@ -1465,7 +1461,7 @@ def test_generated_binary_blob_quarantine_rejects_small_c_array(
         manifest,
         payload,
         classification="generated_binary_blob",
-        detected_format="mixed_utf8_utf16le_c_array",
+        detected_format="utf16le_generated_c_array",
         relative_path=RELATIVE_GENERATED_BLOB,
         reason="forged generated binary blob",
     )
@@ -1774,10 +1770,10 @@ def test_checked_in_threadx_generated_blob_manifest_matches_frozen_receipt() -> 
 
     assert entry["size_bytes"] == 60766
     assert entry["sha256"] == (
-        "521e056f7c839d8c4af115f7822e1f6fc484824f9292c2473f32bd9487e63c74"
+        "303a817f33b086755103778421c37b3aa716e5d49c95c2a9a2d9a6f31cafcd9c"
     )
     assert entry["classification"] == "generated_binary_blob"
-    assert entry["detected_format"] == "mixed_utf8_utf16le_c_array"
+    assert entry["detected_format"] == "utf16le_generated_c_array"
 
 
 def test_checked_in_clickhouse_binary_sql_manifest_matches_diagnosis_receipts() -> None:
@@ -2336,4 +2332,3 @@ def test_plumhall_d412_contract_rejects_incomplete_fixture(tmp_path: Path) -> No
     )
     with pytest.raises(SourceQuarantineError, match="Plum Hall 4.12"):
         _verify_detected_format(path, entry)
-

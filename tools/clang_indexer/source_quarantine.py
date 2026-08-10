@@ -74,7 +74,7 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_diagnostic_fixture",
         "clang_escaped_newline_nul_preprocessor_diagnostic",
     ),
-    ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
+    ("generated_binary_blob", "utf16le_generated_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "utf16le_source_text"),
@@ -775,27 +775,20 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             )
         return
 
-    if entry.detected_format == "mixed_utf8_utf16le_c_array":
+    if entry.detected_format == "utf16le_generated_c_array":
         payload = path.read_bytes()
-        marker = "/* \n\n   Input ELF file:".encode("utf-16le")
-        boundary = payload.find(marker)
-        if boundary <= 0:
+        if not payload.startswith(b"\xff\xfe"):
             raise SourceQuarantineError(
-                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
-                "but the UTF-16LE generated-array header is absent"
+                f"{entry.relative_path}: declared utf16le_generated_c_array "
+                "but the UTF-16LE BOM is absent"
             )
         try:
-            prefix = payload[:boundary].decode("utf-8")
-            generated = payload[boundary:].decode("utf-16le")
+            generated = payload[2:].decode("utf-16le")
         except UnicodeDecodeError as exc:
             raise SourceQuarantineError(
-                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
-                f"but an encoded section is invalid: {exc}"
+                f"{entry.relative_path}: declared utf16le_generated_c_array "
+                f"but the encoded source is invalid: {exc}"
             ) from exc
-        required_prefix = (
-            "Eclipse ThreadX contributors",
-            "SPDX-License-Identifier: MIT",
-        )
         required_generated = (
             "Input ELF file:",
             "Output C Array file:",
@@ -807,14 +800,13 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             generated,
         )
         if (
-            not all(marker in prefix for marker in required_prefix)
-            or not all(marker in generated for marker in required_generated)
+            not all(marker in generated for marker in required_generated)
             or len(byte_literals) < 1024
             or "\x00" in generated
             or not generated.rstrip().endswith("};")
         ):
             raise SourceQuarantineError(
-                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                f"{entry.relative_path}: declared utf16le_generated_c_array "
                 "but the generated binary-array contract is incomplete"
             )
         return
