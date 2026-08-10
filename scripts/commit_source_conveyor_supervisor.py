@@ -118,8 +118,6 @@ def _validate_resume_state_root(
         raise RuntimeError(f"resume state root is not a directory: {root}")
     launch_path = root / "launch_receipt.json"
     exit_path = root / "exit_receipt.json"
-    manifest_path = root / "conveyor" / "_done.json"
-    completion_path = root / "conveyor" / "completion_receipt.json"
     launch, launch_sha256 = source_supervisor._read_json_snapshot(
         launch_path,
         label="resume state launch receipt",
@@ -130,23 +128,6 @@ def _validate_resume_state_root(
     if not isinstance(command, list) or "commits" not in command:
         raise RuntimeError("resume state launch is not bound to the commit stream")
     outputs = _object(launch.get("outputs"), label="resume state outputs")
-    if (
-        Path(
-            _text(
-                outputs.get("conveyor_manifest"),
-                label="resume state output manifest",
-            )
-        ).resolve()
-        != manifest_path.resolve()
-        or Path(
-            _text(
-                outputs.get("completion_receipt"),
-                label="resume state output completion",
-            )
-        ).resolve()
-        != completion_path.resolve()
-    ):
-        raise RuntimeError("resume state output paths drifted")
     binding = _object(launch.get("run_binding"), label="resume state run binding")
     binding_sha256 = source_supervisor._require_sha256(
         launch.get("run_binding_sha256"),
@@ -154,6 +135,32 @@ def _validate_resume_state_root(
     )
     if source_supervisor._canonical_sha256(binding) != binding_sha256:
         raise RuntimeError("resume state run binding digest drifted")
+    manifest_path = _plain_file(
+        Path(
+            _text(
+                outputs.get("conveyor_manifest"),
+                label="resume state output manifest",
+            )
+        ),
+        label="resume state output manifest",
+    )
+    completion_path = Path(
+        _text(
+            outputs.get("completion_receipt"),
+            label="resume state output completion",
+        )
+    ).expanduser()
+    state_root = manifest_path.parent.parent
+    expected_manifest_path = state_root / "conveyor" / "_done.json"
+    expected_completion_path = state_root / "conveyor" / "completion_receipt.json"
+    recorded_state_root = outputs.get("state_root")
+    if recorded_state_root is not None and (
+        Path(
+            _text(recorded_state_root, label="resume state output root")
+        ).expanduser().resolve()
+        != state_root
+    ):
+        raise RuntimeError("resume state output root drifted")
     exit_receipt = source_supervisor._read_json(
         exit_path,
         label="resume state exit receipt",
@@ -168,17 +175,22 @@ def _validate_resume_state_root(
         label="resume state done manifest binding",
     )
     if (
-        Path(_text(done_binding.get("path"), label="resume state manifest path")).resolve()
-        != manifest_path.resolve()
-        or done_binding.get("sha256") != source_supervisor._sha256_file(manifest_path)
+        manifest_path.resolve() != expected_manifest_path
+        or completion_path.resolve() != expected_completion_path
+        or Path(
+            _text(done_binding.get("path"), label="resume state manifest path")
+        ).resolve()
+        != expected_manifest_path
+        or done_binding.get("sha256")
+        != source_supervisor._sha256_file(expected_manifest_path)
     ):
         raise RuntimeError("resume state manifest binding drifted")
     _assert_lock_available(root / "launch.lock", label="resume supervisor lock")
     _assert_lock_available(
-        root / "conveyor" / "locks" / "commits.lock",
+        state_root / "conveyor" / "locks" / "commits.lock",
         label="resume commit stream lock",
     )
-    manifest = conveyor.ConcurrentManifest.load(manifest_path)
+    manifest = conveyor.ConcurrentManifest.load(expected_manifest_path)
     if not manifest.done and not manifest.failed:
         raise RuntimeError("resume state has no checkpointed commit work")
     manifest_revision = _object(
@@ -212,14 +224,15 @@ def _validate_resume_state_root(
         if completion.get("status") == "success" and not manifest.failed:
             raise RuntimeError("resume state is already complete")
     return {
-        "root": root,
+        "root": state_root,
+        "receipt_root": root,
         "launch": launch,
         "launch_sha256": launch_sha256,
         "exit": exit_receipt,
         "exit_sha256": source_supervisor._sha256_file(exit_path),
-        "manifest_path": manifest_path,
-        "completion_path": completion_path,
-        "manifest_sha256": source_supervisor._sha256_file(manifest_path),
+        "manifest_path": expected_manifest_path,
+        "completion_path": expected_completion_path,
+        "manifest_sha256": source_supervisor._sha256_file(expected_manifest_path),
     }
 
 
@@ -1113,13 +1126,16 @@ def build_command(
     args: argparse.Namespace,
     code_run: Mapping[str, Any],
     pr_inputs: Mapping[str, object],
+    *,
+    state_root: Path | None = None,
 ) -> list[str]:
     run_root = Path(args.run_root).expanduser().resolve()
-    state_root = (
-        Path(args.resume_from_run_root).expanduser().resolve()
-        if args.resume_from_run_root
-        else run_root
-    )
+    if state_root is None:
+        state_root = (
+            Path(args.resume_from_run_root).expanduser().resolve()
+            if args.resume_from_run_root
+            else run_root
+        )
     execution_code_revision = (
         args.expected_code_revision
         or _object(code_run["launch"], label="code launch")["code_revision"]
@@ -1291,12 +1307,12 @@ def _run(args: argparse.Namespace) -> int:
         resume_state = None
         state_root = run_root
         if args.resume_from_run_root is not None:
-            state_root = Path(args.resume_from_run_root).expanduser().resolve()
             resume_state = _validate_resume_state_root(
-                state_root,
+                Path(args.resume_from_run_root),
                 expected_revision=execution_code_revision,
                 allow_from=args.allow_code_revision_upgrade_from,
             )
+            state_root = resume_state["root"]
         historical_revisions = {base_code_revision}
         if repair_run_roots:
             repair_run_roots = _validate_repair_run_roots(repair_run_roots)
@@ -1376,7 +1392,12 @@ def _run(args: argparse.Namespace) -> int:
             pr_repo_list=Path(args.pr_repo_list),
             completion_receipt=Path(args.pr_completion_receipt),
         )
-        command = build_command(args, code_run, pr_inputs)
+        command = build_command(
+            args,
+            code_run,
+            pr_inputs,
+            state_root=state_root,
+        )
         repair_root_binding = {
             "launched": [str(root) for root in repair_run_roots],
             "pending": [str(root) for root in pending_repair_run_roots],
@@ -1389,6 +1410,7 @@ def _run(args: argparse.Namespace) -> int:
             "resume_state": (
                 {
                     "root": str(state_root),
+                    "receipt_root": str(resume_state["receipt_root"]),
                     "launch_sha256": resume_state["launch_sha256"],
                     "exit_sha256": resume_state["exit_sha256"],
                 }

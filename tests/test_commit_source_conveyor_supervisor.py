@@ -189,6 +189,7 @@ def test_commit_build_command_reuses_state_roots_and_emits_upgrade_flags(
     assert command[command.index("--conveyor-root") + 1] == str(
         state_root / "conveyor"
     )
+
     assert command[command.index("--work-parent-dir") + 1] == str(
         state_root / "work-parent"
     )
@@ -775,6 +776,8 @@ def test_resume_state_root_binds_old_manifest_and_rejects_wrong_source(
         expected_revision="b" * 40,
         allow_from="a" * 40,
     )
+    assert state["root"] == old_root.resolve()
+    assert state["receipt_root"] == old_root.resolve()
     assert state["manifest_path"] == manifest_path
     with pytest.raises(RuntimeError, match="authorized source"):
         commit_supervisor._validate_resume_state_root(
@@ -790,6 +793,120 @@ def test_resume_state_root_binds_old_manifest_and_rejects_wrong_source(
             allow_from="a" * 40,
         )
     assert not commit_lock.exists()
+
+
+def test_resume_state_follows_interrupted_supervisor_to_external_state_root(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "durable-state"
+    manifest_path = state_root / "conveyor" / "_done.json"
+    completion_path = state_root / "conveyor" / "completion_receipt.json"
+    (state_root / "conveyor" / "locks").mkdir(parents=True)
+    (state_root / "conveyor" / "locks" / "commits.lock").touch()
+    source_supervisor._atomic_json(
+        manifest_path,
+        {
+            "code_revision": {"git_commit": "b" * 40},
+            "done": {"project::r0": {"rows": 1}},
+            "failed": {"project::commits": {"stage": "extract"}},
+        },
+    )
+
+    receipt_root = tmp_path / "interrupted-supervisor"
+    receipt_root.mkdir()
+    (receipt_root / "launch.lock").touch()
+    launch_path = receipt_root / "launch_receipt.json"
+    binding = {
+        "schema": source_supervisor.RUN_BINDING_SCHEMA,
+        "streams": "commits",
+    }
+    source_supervisor._atomic_json(
+        launch_path,
+        {
+            "schema": source_supervisor.LAUNCH_SCHEMA,
+            "status": "running",
+            "code_revision": "b" * 40,
+            "command": ["python", "streaming_conveyor.py", "--streams", "commits"],
+            "run_binding": binding,
+            "run_binding_sha256": source_supervisor._canonical_sha256(binding),
+            "outputs": {
+                "state_root": str(state_root),
+                "conveyor_manifest": str(manifest_path),
+                "completion_receipt": str(completion_path),
+            },
+        },
+    )
+    source_supervisor.write_exit_receipt(
+        receipt_root / "exit_receipt.json",
+        launch_path=launch_path,
+        code_revision="b" * 40,
+        return_code=130,
+        manifest_path=manifest_path,
+        completion_path=completion_path,
+    )
+
+    state = commit_supervisor._validate_resume_state_root(
+        receipt_root,
+        expected_revision="c" * 40,
+        allow_from="b" * 40,
+    )
+
+    assert state["root"] == state_root.resolve()
+    assert state["receipt_root"] == receipt_root.resolve()
+    assert state["manifest_path"] == manifest_path
+
+    args = commit_supervisor.parse_args(
+        [
+            "--code-run-root",
+            str(tmp_path / "code"),
+            "--run-root",
+            str(tmp_path / "new-supervisor"),
+            "--resume-from-run-root",
+            str(receipt_root),
+            "--pr-store",
+            str(tmp_path / "prs.sqlite"),
+            "--pr-repo-list",
+            str(tmp_path / "pr-repos.json"),
+            "--pr-completion-receipt",
+            str(tmp_path / "completion.json"),
+        ]
+    )
+    command = commit_supervisor.build_command(
+        args,
+        {
+            "launch": {"code_revision": "b" * 40},
+            "inputs": {
+                "archive": {"resolved_path": "/data/archive.tar.zst"},
+                "repo_list": {"path": "/data/source-repos.json"},
+                "source_quarantine_manifest": {"path": "/data/quarantine.json"},
+                "python": {"path": "/venv/bin/python"},
+            },
+            "target_lengths": (1024,),
+            "code_output_root": "/data/code",
+            "commit_output_root": "/data/commits",
+            "dedup_db": "/data/dedup.sqlite",
+        },
+        {
+            "repo_list": {"path": "/data/pr-repos.json"},
+            "store": {"path": "/data/prs.sqlite"},
+            "completion": {"path": "/data/pr-completion.json"},
+        },
+        state_root=state["root"],
+    )
+    assert command[command.index("--conveyor-root") + 1] == str(
+        state_root / "conveyor"
+    )
+
+    manifest_path.unlink()
+    with pytest.raises(
+        RuntimeError,
+        match="resume state output manifest is missing",
+    ):
+        commit_supervisor._validate_resume_state_root(
+            receipt_root,
+            expected_revision="c" * 40,
+            allow_from="b" * 40,
+        )
 
 
 def test_commit_pr_inputs_reject_store_mutation_and_wal(tmp_path: Path) -> None:
