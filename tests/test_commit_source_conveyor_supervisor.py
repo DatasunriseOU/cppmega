@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -323,6 +324,267 @@ def test_commit_run_waits_for_terminal_repair_before_starting_child(
 
     assert commit_supervisor._run(args) == 17
     assert events == ["terminal", "child"]
+
+
+def test_commit_run_starts_before_pending_repair_launch_and_waits_for_full_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code_root = tmp_path / "code-run"
+    launched_repair_root = tmp_path / "launched-repair-run"
+    pending_repair_root = tmp_path / "pending-repair-run"
+    run_root = tmp_path / "commit-run"
+    repository_root = tmp_path / "repo"
+    for path in (
+        code_root,
+        launched_repair_root,
+        pending_repair_root,
+        repository_root,
+    ):
+        path.mkdir()
+    _write_json(
+        launched_repair_root / "launch_receipt.json",
+        {"code_revision": "a" * 40},
+    )
+
+    args = commit_supervisor.parse_args(
+        [
+            "--code-run-root",
+            str(code_root),
+            "--code-repair-run-root",
+            str(launched_repair_root),
+            "--pending-code-repair-run-root",
+            str(pending_repair_root),
+            "--run-root",
+            str(run_root),
+            "--pr-store",
+            str(tmp_path / "prs.sqlite"),
+            "--pr-repo-list",
+            str(tmp_path / "pr-repos.json"),
+            "--pr-completion-receipt",
+            str(tmp_path / "pr-completion.json"),
+            "--minimum-free-bytes",
+            "0",
+        ]
+    )
+    identity = {"run_root": str(code_root), "launch_sha256": "1" * 64}
+    initial_code_run = {
+        "repair_required": True,
+        "identity": identity,
+        "inputs": {"repo_list": {"path": str(tmp_path / "source-repos.json")}},
+        "producer_root": repository_root,
+        "code_output_root": tmp_path / "code-output",
+        "commit_output_root": tmp_path / "commit-output",
+        "dedup_db": tmp_path / "dedup.sqlite",
+        "target_lengths": (1024,),
+        "repositories": ("owner/project",),
+    }
+    terminal_code_run = {
+        **initial_code_run,
+        "repair_required": False,
+        "identities": [
+            identity,
+            {"run_root": str(launched_repair_root), "launch_sha256": "2" * 64},
+            {"run_root": str(pending_repair_root), "launch_sha256": "3" * 64},
+        ],
+        "repair_runs": [],
+    }
+    pr_inputs = {
+        "completion_binding": {"receipt_sha256": "4" * 64},
+        "repo_list": {"path": str(tmp_path / "pr-repos.json")},
+        "store": {"path": str(tmp_path / "prs.sqlite")},
+        "completion": {"path": str(tmp_path / "pr-completion.json")},
+    }
+    events: list[str] = []
+    history_roots: list[tuple[Path, ...]] = []
+
+    monkeypatch.setattr(
+        commit_supervisor,
+        "_recorded_code_revision",
+        lambda *args, **kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "load_commit_source_run",
+        lambda *args, **kwargs: initial_code_run,
+    )
+
+    def historical_revisions(
+        _base: Path,
+        roots: tuple[Path, ...],
+    ) -> set[str]:
+        history_roots.append(tuple(roots))
+        assert pending_repair_root.resolve() not in roots
+        return {"a" * 40}
+
+    monkeypatch.setattr(
+        commit_supervisor,
+        "_historical_code_revisions",
+        historical_revisions,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "validate_pr_inputs",
+        lambda **kwargs: (
+            pr_inputs,
+            [],
+            (
+                Path(args.pr_store),
+                Path(args.pr_repo_list),
+                Path(args.pr_completion_receipt),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "build_command",
+        lambda *args, **kwargs: ["commit-child"],
+    )
+    monkeypatch.setattr(
+        source_supervisor,
+        "build_child_environment",
+        lambda *args, **kwargs: {},
+    )
+
+    def run_child(*args: object, **kwargs: object) -> int:
+        assert events == []
+        assert not (pending_repair_root / "launch_receipt.json").exists()
+        launch = json.loads(
+            (run_root / "launch_receipt.json").read_text(encoding="utf-8")
+        )
+        expected_binding = {
+            "launched": [str(launched_repair_root.resolve())],
+            "pending": [str(pending_repair_root.resolve())],
+            "ordered": [
+                str(launched_repair_root.resolve()),
+                str(pending_repair_root.resolve()),
+            ],
+        }
+        assert launch["source_code_repair_roots"] == expected_binding
+        assert launch["run_binding"]["source_code_repair_roots"] == expected_binding
+        events.append("child")
+        return 0
+
+    monkeypatch.setattr(source_supervisor, "run_supervised_child", run_child)
+
+    def wait_for_terminal(
+        _base: Path,
+        roots: tuple[Path, ...],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        assert events == ["child"]
+        assert roots == (
+            launched_repair_root.resolve(),
+            pending_repair_root.resolve(),
+        )
+        events.append("terminal")
+        return terminal_code_run
+
+    monkeypatch.setattr(
+        commit_supervisor,
+        "wait_for_terminal_code_run",
+        wait_for_terminal,
+    )
+    monkeypatch.setattr(
+        conveyor,
+        "revalidate_pr_completion_binding",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        conveyor.ConcurrentManifest,
+        "load",
+        lambda *args, **kwargs: SimpleNamespace(code_revision_upgrade=None),
+    )
+    monkeypatch.setattr(
+        source_supervisor,
+        "write_exit_receipt",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "verify_global_dedup_store",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "_write_composition_plan",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "load_source_composition",
+        lambda *args, **kwargs: SimpleNamespace(receipt={"coverage": {}}),
+    )
+    monkeypatch.setattr(
+        commit_supervisor,
+        "build_packed_source_inventory_receipt",
+        lambda *args, **kwargs: {},
+    )
+
+    assert commit_supervisor._run(args) == 0
+    assert events == ["child", "terminal"]
+    assert history_roots == [
+        (launched_repair_root.resolve(),),
+        (launched_repair_root.resolve(),),
+    ]
+
+
+def test_pending_repair_roots_reject_duplicates_and_cross_list_reuse(
+    tmp_path: Path,
+) -> None:
+    common = [
+        "--code-run-root",
+        str(tmp_path / "code"),
+        "--run-root",
+        str(tmp_path / "commit"),
+        "--pr-store",
+        str(tmp_path / "prs.sqlite"),
+        "--pr-repo-list",
+        str(tmp_path / "pr-repos.json"),
+        "--pr-completion-receipt",
+        str(tmp_path / "completion.json"),
+    ]
+    pending = tmp_path / "pending"
+    with pytest.raises(SystemExit, match="pending.*must be unique"):
+        commit_supervisor.parse_args(
+            [
+                *common,
+                "--pending-code-repair-run-root",
+                str(pending),
+                "--pending-code-repair-run-root",
+                str(pending),
+            ]
+        )
+    with pytest.raises(SystemExit, match="must be disjoint"):
+        commit_supervisor.parse_args(
+            [
+                *common,
+                "--code-repair-run-root",
+                str(pending),
+                "--pending-code-repair-run-root",
+                str(pending),
+            ]
+        )
+
+
+def test_pending_repair_root_must_be_existing_plain_directory(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    symlink = tmp_path / "pending-link"
+    symlink.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="pending code repair.*symlink"):
+        commit_supervisor._validate_repair_run_roots(
+            (symlink,),
+            label="pending code repair",
+        )
+    with pytest.raises(RuntimeError, match="pending code repair.*does not exist"):
+        commit_supervisor._validate_repair_run_roots(
+            (tmp_path / "missing",),
+            label="pending code repair",
+        )
 
 
 def test_commit_upgrade_uses_live_quarantine_binding(
@@ -923,6 +1185,58 @@ def test_commit_waits_for_later_repair_after_partial_nonzero_exit(
     )
 
     assert result is expected
+
+
+def test_commit_waits_for_pending_launch_before_strict_chain_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_root = tmp_path / "base"
+    pending_root = tmp_path / "pending"
+    base_root.mkdir()
+    pending_root.mkdir()
+    base_revision = "a" * 40
+    pending_revision = "b" * 40
+    seeded_revision = "c" * 40
+    execution_revision = "d" * 40
+    _write_json(
+        base_root / "launch_receipt.json",
+        {"code_revision": base_revision},
+    )
+    expected = {"status": "complete"}
+    events: list[str] = []
+
+    def finish_launch(_seconds: float) -> None:
+        assert events == []
+        _write_json(
+            pending_root / "launch_receipt.json",
+            {"code_revision": pending_revision},
+        )
+        events.append("launch")
+
+    def load_chain(*args: object, **kwargs: object) -> dict[str, str]:
+        assert events == ["launch"]
+        assert kwargs["allowed_historical_code_revisions"] == {
+            base_revision,
+            pending_revision,
+            seeded_revision,
+        }
+        events.append("validated")
+        return expected
+
+    monkeypatch.setattr(commit_supervisor, "load_terminal_code_run", load_chain)
+    result = commit_supervisor.wait_for_terminal_code_run(
+        base_root,
+        (pending_root,),
+        poll_seconds=0.01,
+        sleeper=finish_launch,
+        execution_repository_root=tmp_path,
+        execution_code_revision=execution_revision,
+        allowed_historical_code_revisions={seeded_revision},
+    )
+
+    assert result is expected
+    assert events == ["launch", "validated"]
 
 
 def test_commit_chain_accepts_useful_partial_nonzero_repair(
