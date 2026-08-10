@@ -1,6 +1,6 @@
 # Распределённая подготовка корпуса cppmega: замысел, подтверждённый прогресс и план завершения — 250 пунктов
 
-Дата среза evidence: `2026-08-10`; последний fail-closed GCP CASE5 audit: `2026-08-10T08:44:13Z`; последний live training-status refresh, использованный в отчёте: `2026-08-10T10:15:37Z`
+Дата среза evidence: `2026-08-10`; последний полный deployed watchdog cycle с GCP CASE5 audit: `2026-08-10T11:57:34Z`; последний live training-status refresh, использованный в отчёте: `2026-08-10T11:46:53Z`
 
 Рабочая ветка документа: `docs/distributed-prep-150-runbook-20260808`
 
@@ -17,13 +17,13 @@
 ## Оперативный срез на момент factual refresh
 
 - Новый общий four-lane release ещё не готов к обучению: `training_ready=false`. Исторический source-only bundle 1K–16K не переносит свой legacy `release_ready` на новый scope.
-- `origin/main` на момент последней проверки — `a5b1b8422c064eee3966222807d370bdfa4d5efa`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить. Более новый `main` не даёт права менять revision уже активного writer.
+- `origin/main` на момент последней проверки — `b9df4b0e61f715929a8560cb69cc144bd13d2df8`; локальный source residual writer продолжает работу из pin `00373dfc`, поэтому его detached worktree и output root нельзя переключать или чистить. Более новый `main` не даёт права менять revision уже активного writer.
 - Локальный source residual жив с одним supervisor PID `68027`: в mutable ledger на `2026-08-10T09:59:57Z` было `7 done` и `8 failed`; после `xbox_leak_may_2020` writer перешёл к `unix-history`, `threadx`, `cmake`, затем запустил `linux`. Текущий failed set: `apple-security`, `cmake`, `intel-llvm-dpcpp`, `src`, `threadx`, `webkit`, `windows_10_shared_source_kit`, `xbox_leak_may_2020`. Terminal conveyor/root receipts отсутствуют, поэтому это residual progress, а не закрытые 501/501; mutable `_done.json` не является terminal receipt.
-- Два CI fetcher физически продвигаются в раздельных stores. На live status-срезе `2026-08-10T10:15:37Z` old store имел `141,910,266,104`, new store — `246,259,744,657` exact unique payload tokens; их арифметическая сумма `388,170,010,761` остаётся только store-local upper bound и не является global union, packed valid/trained или training tokens. В очередях оставались соответственно `17,199` и `107,109` pending attempts, `discovery_eof=false`; frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
-- Fail-closed one-shot CASE5 audit подтвердил обе VM `RUNNING`. Для `.003`: state `running_without_heartbeat`, `3` partial output objects, `192,150,324` bytes, terminal receipts отсутствуют. Для `.004`: state `running`, fresh heartbeat `sequence=206`, generation `1786351338729044`, `8` partial output objects, `933,456,196` bytes, terminal receipts отсутствуют. Для обеих `cleanup_authorized=false`, `retry_eligible=false`, `training_ready=false`; partial objects не являются completion evidence и VM пока уничтожать нельзя.
-- Новый `scripts/gcp_cloud_lane_run_monitor.py` в worktree `cppmega-case5-gcp-watchdog-20260809` проверяет exact-generation receipts, topology, terminal output publications и pure-429 taxonomy fail-closed. Код, тест и portable allowlist зафиксированы commit `f167b32284b4726091ea9ef086b0283b76fb3e5b`; повторная расширенная проверка дала `55 passed`, `py_compile` green, Pyright `0 errors`, `git diff --check` green. Worktree clean, но branch пока `ahead 1, behind 1` относительно `origin/main`, не pushed и monitor не подключён к 30-минутному launchd loop, поэтому он ещё не deployed.
+- Два CI fetcher физически продвигаются в раздельных stores. На live status-срезе `2026-08-10T11:46:53Z` old store имел `143,006,786,202`, new store — `248,141,219,058` exact unique payload tokens; их арифметическая сумма `391,148,005,260` остаётся только store-local upper bound и не является global union, packed valid/trained или training tokens. В очередях оставались соответственно `16,409` и `106,695` pending attempts, `discovery_eof=false`; frozen CASE5 snapshot остаётся `61,311,228,208` exact store-local tokens и `training_ready=false`.
+- Первый полный production cycle уже deployed CASE5-monitor подтвердил обе VM `RUNNING`. Для `.003`: state `running_without_heartbeat`, `6` partial output objects, `509,496,346` bytes, terminal receipts отсутствуют. Для `.004`: state `running`, fresh heartbeat `sequence=244`, `14` partial output objects, `1,319,208,652` bytes, terminal receipts отсутствуют. Для обеих `cleanup_authorized=false`, `retry_eligible=false`, `training_ready=false`; partial objects не являются completion evidence и VM пока уничтожать нельзя.
+- `scripts/gcp_cloud_lane_run_monitor.py` landed через PR `#141`: implementation commit `f167b32284b4726091ea9ef086b0283b76fb3e5b`, merge `b9df4b0e61f715929a8560cb69cc144bd13d2df8`. Проверки: `61 passed`, `py_compile` green, Pyright `0 errors/warnings`, `git diff --check` green и GitHub checks `6/6` SUCCESS. Stable detached runtime `/Volumes/external/cppmega_data/worktrees/cppmega-cloud-lane-monitor-runtime-b9df4b0e-20260810` имеет monitor SHA-256 `98c07f13fb9f4205b616eefb0947eefeebcb919e28e118bfe638b870bd0bc0d2`; 30-минутный loop с SHA-256 `b7e9a17085e624b9cc4210362fc3ec72f2d35162e4cabf8d8e7dd0981784aaa5` работает в tmux одним PID `65497` и включает `.003/.004` через overlap lock.
 - GitHub PR store остаётся verified: `2,794,562` PR из `460` repos, `33,388` gaps закрыты, unresolved `0`; production training Parquet всё ещё `0`, потому что exact primary membership/materialization не завершены. GitLab v2 сохранил inventory sidecars и `2` primary Eigen records, после чего deterministic остановился на Mesa discussions HTTP `401`; completion receipt и training Parquet отсутствуют, automatic retry запрещён до host-scoped `read_api` repair.
-- Live training-status updater восстановлен: LaunchAgent работает с PID `93951` из durable runtime `/Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-a9145509-20260810`, exact expected revision `a91455098f2a1a82f863ce64e98d237b9e930177` и cadence `300` секунд. На проверке `runs=2`, heartbeat `stale=false`, а `current.md/current.json/heartbeat.json` обновлены в `2026-08-10T10:15:37Z`; source completion остаётся честно stale. Fix branch заканчивается commit `e35be00f7b4da4550b126d03d881e96252d6e825`, pushed; PR `#139` OPEN, MERGEABLE/CLEAN, все GitHub CI/CodeQL checks SUCCESS. Live pin нельзя удалять или переключать до merge и отдельного deployment readback.
+- Live training-status updater восстановлен: LaunchAgent работает с PID `93951` из durable runtime `/Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-a9145509-20260810`, exact expected revision `a91455098f2a1a82f863ce64e98d237b9e930177` и cadence `300` секунд. `current.md/current.json` обновлены в `2026-08-10T11:46:53Z`, heartbeat продолжил обновляться; source completion остаётся честно stale. Fix commit `e35be00f7b4da4550b126d03d881e96252d6e825` landed через PR `#139`, merge `02fc1e57a0b3b60ab9daa0c7dd64ad69583e6d0a`, GitHub checks `6/6` SUCCESS. Live runtime pin сохраняется до отдельного deployment retirement/readback.
 - CASE5 heartbeat/429 hardening уже landed в `main`: implementation commit `306179407570f97d4d7a571a447e95e0e9d05aed`, merge PR `#133` — `a65db87ca4e95de7b8a3eb1949786dac813d8d83`. Focused suite `25 passed`, related CASE5/cloud suite `116 passed`, Pyright `0 errors`; `py_compile`, `bash -n`, `shellcheck`, Terraform fmt/validate/tests, CodeQL и GitHub CI прошли. Следующий runtime обязан pin exact landed revision; merge сам по себе не завершает текущие `.003/.004`.
 - Source-worker taxonomy «retry только при чисто подтверждённом HTTP 429» завершена: implementation `9d8a2a78168987d42d5c658e3a02bdc013c51616`, PR `#135`, merge `52472d831a6a2191f36b6f363f7d4057e844c4aa`, входит в текущий `origin/main`. Focused suite `27 passed`, related source/scheduler/cloud suite `189 passed`, changed-test Pyright `0 errors`; production `source_worker.py` всё ещё имеет `17` ранее существовавших Pyright errors и не объявляется полностью Pyright-clean. Pure 429 может дать bounded retry/exit `75`; mixed 429+deterministic, 401/403, 408/5xx, parser/contract/network defects дают exit `2` без automatic retry.
 - GCP source runs дают полезные assignment completions, но terminal slot/run receipts всё ещё отсутствуют. Широкий Terraform destroy запрещён: сначала worker-by-worker Local SSD diagnostics, exact backend lineage/serial и instance-only plan.
@@ -666,7 +666,7 @@
 
 ## Часть II. Что уже сделано и подтверждено — 50 пунктов
 
-Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, использованный для factual refresh, сгенерирован `2026-08-10T10:15:37Z`: physical file SHA-256 `c36c9c9abf73b44f146ffdde84559e818276b0424f3d9b07a2cc2f142e652e9f`, internal status SHA-256 `2491b9a29d7904c6fc908ca70a3cb1bfb80a316dcb755edc237ae6ee8480158a`. Это главный источник текущих physical/token totals, но live counters считаются timestamp-bound evidence, а не terminal receipts. Для GitHub/GitLab/GCP используются отдельные receipts, названные в пунктах ниже.
+Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, использованный для factual refresh, сгенерирован `2026-08-10T11:46:53Z`: physical file SHA-256 `86f3d34c8aa4cb9f9f94dc824fb28fe385b186879894d1af86a8d024bad13ee9`, internal status SHA-256 `3e069d635c1de9714fdfa06c537be1a4c991154d32f384a34b71c4ba4e8a8134`. Это главный источник текущих physical/token totals, но live counters считаются timestamp-bound evidence, а не terminal receipts. Для GitHub/GitLab/GCP используются отдельные receipts, названные в пунктах ниже.
 
 ### Код распределённого runtime и infrastructure-as-code
 
@@ -691,8 +691,8 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 ### D004 — Receipt-bound GCP source/cloud monitors реализованы
 
 - **Сделано:** source monitor считает claims, heartbeats, outcomes и assignment receipts; commit `ba417173` добавил attempt-scoped failure receipts, UUID/URI binding и совместимость с legacy receipts. Отдельный cloud-lane monitor проверяет topology, exact object generations, heartbeat/completion/failure publications, output inventory, cleanup gate и pure-429 retry contract.
-- **Доказательство:** source branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`; live source-monitor SHA-256 `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064`, loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`. Cloud-lane monitor commit `f167b32284b4726091ea9ef086b0283b76fb3e5b` имеет clean worktree; expanded related suite `55 passed`, `py_compile` green, Pyright `0 errors`, `git diff --check` green.
-- **Честная граница:** cloud-lane commit пока не pushed/landed и branch `ahead 1, behind 1`; CASE5 configs ещё не включены в live 30-минутный loop. Реализованный monitor не равен deployed monitor и сам parser defects не исправляет.
+- **Доказательство:** source branch `fix/gcp-monitor-attempt-scoped-failures-20260809`, commit `ba417173`; live source-monitor SHA-256 `c5e38447ffc321965380170e0cdfd30b98191c2956bcf00afa35ae31c319a064`. Cloud-lane monitor commit `f167b32284b4726091ea9ef086b0283b76fb3e5b` landed через PR `#141`, merge/main `b9df4b0e61f715929a8560cb69cc144bd13d2df8`; `61 passed`, `py_compile` green, Pyright `0 errors/warnings`, `git diff --check` green и GitHub `6/6` SUCCESS. Deployed monitor/loop SHA-256: `98c07f13fb9f4205b616eefb0947eefeebcb919e28e118bfe638b870bd0bc0d2`/`b7e9a17085e624b9cc4210362fc3ec72f2d35162e4cabf8d8e7dd0981784aaa5`.
+- **Честная граница:** один полный deployed CASE5 cycle доказан, но immutable health receipt с двумя последовательными cycles ещё не выпущен. Deployed monitor сам parser defects не исправляет и не делает partial outputs training-ready.
 
 ### D005 — Dynamic source work stealing реализован
 
@@ -765,8 +765,8 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 ### D016 — Честный machine-readable training status выпускается
 
 - **Сделано:** status раздельно показывает live source, sealed Megatron, GitHub PR, GitLab MR и CI; updater снова работает каждые 300 секунд из durable exact runtime и не требует существования удалённого temporary worktree.
-- **Доказательство:** LaunchAgent command pin `a91455098f2a1a82f863ce64e98d237b9e930177`, runtime `/Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-a9145509-20260810`, PID `93951`, `runs=2`; срез `2026-08-10T10:15:37Z` имеет physical SHA-256 `c36c9c9abf73b44f146ffdde84559e818276b0424f3d9b07a2cc2f142e652e9f`, internal status SHA-256 `2491b9a29d7904c6fc908ca70a3cb1bfb80a316dcb755edc237ae6ee8480158a`, heartbeat `stale=false`. Fix commit `e35be00f7b4da4550b126d03d881e96252d6e825` pushed в PR `#139`; PR mergeable/clean, GitHub checks green.
-- **Честная граница:** PR `#139` ещё OPEN; updater честно помечает source completion stale и сохраняет `release_ready=false` для новых live/PR/MR/CI lanes. Исторический sealed source-only bundle не переносит свой `release_ready=true` на новый four-lane scope.
+- **Доказательство:** LaunchAgent command pin `a91455098f2a1a82f863ce64e98d237b9e930177`, runtime `/Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-a9145509-20260810`, PID `93951`; срез `2026-08-10T11:46:53Z` имеет physical SHA-256 `86f3d34c8aa4cb9f9f94dc824fb28fe385b186879894d1af86a8d024bad13ee9`, internal status SHA-256 `3e069d635c1de9714fdfa06c537be1a4c991154d32f384a34b71c4ba4e8a8134`. Fix commit `e35be00f7b4da4550b126d03d881e96252d6e825` landed через PR `#139`, merge `02fc1e57a0b3b60ab9daa0c7dd64ad69583e6d0a`; GitHub `6/6` checks SUCCESS.
+- **Честная граница:** updater честно помечает source completion stale и сохраняет `release_ready=false` для новых live/PR/MR/CI lanes. Исторический sealed source-only bundle не переносит свой `release_ready=true` на новый four-lane scope.
 
 ### D017 — Live source Parquet 1K физически существует
 
@@ -936,8 +936,8 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 
 ### D044 — CI live CAS имеет измеренный store-local upper bound
 
-- **Сделано:** timestamp-bound training-status slice фиксирует `388,170,010,761` exact unique payload tokens как сумму store-local counters двух live stores: `141,910,266,104` old и `246,259,744,657` new.
-- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, generated `2026-08-10T10:15:37Z`, internal status SHA-256 `2491b9a29d7904c6fc908ca70a3cb1bfb80a316dcb755edc237ae6ee8480158a`; оба progress receipts на момент среза были fresh.
+- **Сделано:** timestamp-bound training-status slice фиксирует `391,148,005,260` exact unique payload tokens как сумму store-local counters двух live stores: `143,006,786,202` old и `248,141,219,058` new.
+- **Доказательство:** `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/current.md`, generated `2026-08-10T11:46:53Z`, internal status SHA-256 `3e069d635c1de9714fdfa06c537be1a4c991154d32f384a34b71c4ba4e8a8134`; оба progress receipts на момент среза были fresh.
 - **Честная граница:** это store-local upper bound, не global union/dedup и не training tokens.
 
 ### D045 — Frozen CASE5 threshold snapshot сохранён
@@ -954,9 +954,9 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 
 ### D047 — 30-минутный pipeline watchdog установлен и исполняется
 
-- **Сделано:** launchd label имеет `StartInterval=1800`, `RunAtLoad=true`; на последней проверке было 305 runs и last exit `0`. Loop выполняет все четыре GCP source scans и считает cadence от начала цикла.
-- **Доказательство:** `com.datasunrise.cppmega-pipeline-watchdog.plist`, `launchctl print`, live loop SHA-256 `c080f6ac0cd4e091511f5b9ba7371f75314719c74fd16fd8ad3a2b2936ba777e`; лог содержит последовательные полные cycles, в том числе `358s` и `411s`.
-- **Честная граница:** launchd `state=not running` между interval invocations нормален; CASE5 `.003/.004` ещё не подключены к loop через новый cloud-lane monitor, а mutable run count не является immutable pipeline completion receipt.
+- **Сделано:** loop выполняет все GCP source scans и CASE5 `.003/.004`, считает 30-минутную cadence от начала цикла, защищён `shlock` от overlap и запрещает retry без self-digested `failed_confirmed_429`/exit `75`. Он работает одним процессом в tmux session `cppmega_pipeline_watchdog`.
+- **Доказательство:** live loop PID `65497`, SHA-256 `b7e9a17085e624b9cc4210362fc3ec72f2d35162e4cabf8d8e7dd0981784aaa5`; первый полный production cycle `2026-08-10T11:49:25Z–11:57:34Z` завершился за `489s`, `.003/.004` дали monitor exit `0`, overlap lock удалён.
+- **Честная граница:** нужен второй последовательный полный cycle и immutable deployment/health receipt; mutable loop log и partial CASE5 objects не являются pipeline completion receipt.
 
 ### D048 — Codex 429 watchdog установлен
 
@@ -972,9 +972,9 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 
 ### D050 — Четыре GCP source run сведены immutable historical read-only audit
 
-- **Сделано:** audit связал `.004=111 success/371 unclaimed/0 VM`, `.005=409 success/54 deterministic/19 current/6 fresh/16 VM`, новый `.001=46 success/2 deterministic/32 current/32 fresh/16 VM`, repair `.001=14 success/26 deterministic/8 current/8 fresh/4 VM`; any-run union покрывает 423 проекта, 59 пока не покрыты ни одним run.
-- **Доказательство:** `/Volumes/external/cppmega_data/gcp_source_multi_run_audit_20260809/evidence/read-only-audit-20260809T005342Z/audit.md`, SHA-256 `76f157c7a625560bdcbc4141a5b13b57f27e57b4e0955bb1caeaa2e537babc5a`, и соседний immutable evidence receipt.
-- **Честная граница:** это точный historical срез `2026-08-09T00:53:42Z`, а не live count. Ни один run на этом срезе не имеет terminal slot/run receipts или reducer seal; перечисленные VM нельзя считать завершёнными, а любой cleanup допустим только после worker-local SSD diagnostics и state-aware Terraform plan.
+- **Сделано:** fresh generation-pinned audit связал `.004=111 success/371 unclaimed/0 VM`, old `.005=410 success/54 terminal/18 current/2 fresh/16 VM`, new `.001=403 success/34 terminal/27 current/26 fresh/18 unclaimed/16 VM`, repair `.001=19 success/30 terminal/5 current/4 fresh/4 VM`; any-run union покрывает 431 проект, 51 пока не покрыт ни одним run, preferred new+repair composition закрывает 403 и оставляет residual 79.
+- **Доказательство:** `/Volumes/external/cppmega_data/gcp_source_multi_run_audit_20260809/evidence/read-only-audit-20260810T114717Z/audit.md`, SHA-256 `35ad19be7e7e8a40c6284fa145220368de9f751fe050183a4b1fcb42fbff5d7a`; `audit.json` SHA-256 `77ebc85721dffb2ed615bc2f47d66ae66ec3c8e7c32dcff34a7161c30de800b4`, evidence receipt SHA-256 `ecf0385a1f902a8a75a87d6bd8152f13a6704c4c4d22c2b8a9b1d56545c029f8`.
+- **Честная граница:** это точный read-only срез `2026-08-10T11:47:17Z`, а не live count. Ни один run на этом срезе не имеет terminal slot/run receipts или reducer seal; broad cleanup запрещён, а worker mutation допустима только по audit classification и отдельному receipt.
 
 ---
 
@@ -982,12 +982,12 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 
 ### Немедленное восстановление и завершение source lane (`code` + `commits` routes)
 
-### N001 — Заморозить новый общий runtime checkpoint
+### N001 — Выпустить новый общий runtime checkpoint после landed updater
 
-- **Действие:** hash текущих `_done.json`, launch/repair contracts, live status, local locks и GCP monitor reports без остановки writers; перепроверить зелёный merge gate PR `#139`, merge updater fix и сохранить уже работающий durable runtime до post-merge readback.
+- **Действие:** hash текущих `_done.json`, launch/repair contracts, live status, local locks и GCP monitor reports без остановки writers; связать уже landed PR `#139`/merge `02fc1e57` с post-merge readback и сохранить работающий durable runtime до формального retirement.
 - **Код/инфра/аккаунт:** source root в `/Volumes/external/cppmega_data`, `scripts/report_training_data_status.py`, branch `fix/training-status-updater-pinned-runtime-20260809`, read-only GCS через scoped operator identity.
-- **Проверка:** stat-before/hash/stat-after; mutable file получает отдельную observed-version запись, а не ложный stable hash. PR head должен оставаться `e35be00f7b4da4550b126d03d881e96252d6e825`, checks SUCCESS; два status cycles после merge должны сохранить exact runtime revision `a9145509…`, heartbeat fresh и один reporter PID.
-- **Готово когда:** `N001-runtime-checkpoint.json` перечисляет local/GCP/PR/MR/CI evidence, PR `#139` landed, live reporter не откатился к удалённому cwd и везде сохраняется `training_ready=false`.
+- **Проверка:** stat-before/hash/stat-after; mutable file получает отдельную observed-version запись, а не ложный stable hash. Merge должен оставаться `02fc1e57…`, два status cycles после merge — сохранить exact runtime revision `a9145509…`, fresh heartbeat и один reporter PID.
+- **Готово когда:** `N001-runtime-checkpoint.json` перечисляет local/GCP/PR/MR/CI evidence, связывает landed updater с post-merge runtime и везде сохраняет `training_ready=false`.
 
 ### N002 — Зафиксировать уже восстановленный durable runtime pin
 
@@ -1073,9 +1073,9 @@ Live срез `/Volumes/external/sources/cppmega.mlx/outputs/training_data_statu
 - **Проверка:** accepted+excluded равно local scope; active/unresolved/duplicate accepted равны нулю.
 - **Готово когда:** terminal local composition input receipt опубликован atomically.
 
-### N014 — Land/deploy cloud-lane monitor и повторно проверить оба 30-минутных watchdog
+### N014 — Запечатать deployed cloud-lane monitor двумя 30-минутными cycles
 
-- **Действие:** безопасно reconcile commit `f167b32284b4726091ea9ef086b0283b76fb3e5b` с current `origin/main`, push/PR/CI/merge; создать stable detached runtime и подключить CASE5 `.003/.004` configs к существующему loop через overlap lock. Перезапускать launchd controller только при drift/failure и без второго writer.
+- **Действие:** сохранить уже landed PR `#141`/merge `b9df4b0e`, stable detached runtime и подключённые CASE5 `.003/.004`; дождаться второго полного cycle без рестарта живого controller и выпустить immutable deployment/health receipt с обоими cycle timestamps и report hashes.
 - **Код/инфра/аккаунт:** worktree `/Volumes/external/cppmega_data/worktrees/cppmega-case5-gcp-watchdog-20260809`, `scripts/gcp_cloud_lane_run_monitor.py`, `/Users/dave/Library/Application Support/CppMega/pipeline-watchdog/pipeline-watchdog-loop.sh`, configs/reports в `/Volumes/external/cppmega_data/gcp_cloud_lane_run_monitor_20260810`, source-monitor pinned worktree, два plists; GCP вызовы только через `nanochat-automation@natural-bison-491019-t9.iam.gserviceaccount.com` command-scoped override.
 - **Проверка:** expanded related pytest suite, `py_compile`, Pyright, `git diff --check`, `sh -n`, exact code/config hashes, один controller PID и два consecutive reports ≤35 минут. Exit `75` разрешает retry только вместе с `report.retry_eligible=true`; exit `2`, stale/mixed/partial failure не запускают command. Monitor никогда автоматически не уничтожает VM.
 - **Готово когда:** landed exact monitor SHA и config SHA входят в watchdog health receipt, `.003/.004` появляются в двух новых полных cycles, overlap отсутствует, `cleanup_authorized=false` сохраняется до terminal readback.
