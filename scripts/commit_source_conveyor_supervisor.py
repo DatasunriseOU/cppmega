@@ -284,6 +284,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Targeted code-repair run root (repeatable, ordered).",
     )
+    parser.add_argument(
+        "--pending-code-repair-run-root",
+        action="append",
+        default=[],
+        help="Pre-created targeted code-repair run root whose launch may appear "
+        "while commit extraction runs (repeatable, ordered after launched repairs).",
+    )
     parser.add_argument("--run-root", required=True)
     parser.add_argument(
         "--resume-from-run-root",
@@ -329,7 +336,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--repair-poll-seconds",
         type=float,
         default=DEFAULT_REPAIR_POLL_SECONDS,
-        help="Seconds between terminal repair receipt checks before commit extraction.",
+        help="Seconds between terminal repair receipt checks before final composition.",
     )
     return parser
 
@@ -393,11 +400,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         == Path(args.run_root).expanduser().resolve()
     ):
         raise SystemExit("--run-root must be separate from --code-run-root")
-    roots = [
+    repair_roots = [
         Path(value).expanduser().resolve() for value in args.code_repair_run_root
     ]
-    if len(roots) != len(set(roots)):
+    pending_repair_roots = [
+        Path(value).expanduser().resolve()
+        for value in args.pending_code_repair_run_root
+    ]
+    if len(repair_roots) != len(set(repair_roots)):
         raise SystemExit("--code-repair-run-root values must be unique")
+    if len(pending_repair_roots) != len(set(pending_repair_roots)):
+        raise SystemExit(
+            "--pending-code-repair-run-root values must be unique"
+        )
+    if set(repair_roots) & set(pending_repair_roots):
+        raise SystemExit(
+            "launched and pending code repair run roots must be disjoint"
+        )
+    roots = [*repair_roots, *pending_repair_roots]
     reserved = {
         Path(args.code_run_root).expanduser().resolve(),
         Path(args.run_root).expanduser().resolve(),
@@ -706,6 +726,8 @@ def _repair_exit_receipt_path(root: Path) -> Path:
 
 def _validate_repair_run_roots(
     repair_run_roots: Sequence[Path],
+    *,
+    label: str = "code repair",
 ) -> tuple[Path, ...]:
     """Validate repair root configuration before any long-running child starts."""
 
@@ -714,17 +736,17 @@ def _validate_repair_run_roots(
         root = raw_root.expanduser()
         if root.is_symlink():
             raise RuntimeError(
-                f"code repair {index} run root must not be a symlink: {root}"
+                f"{label} {index} run root must not be a symlink: {root}"
             )
         try:
             root = root.resolve(strict=True)
         except OSError as exc:
             raise RuntimeError(
-                f"code repair {index} run root does not exist: {root}"
+                f"{label} {index} run root does not exist: {root}"
             ) from exc
         if not root.is_dir():
             raise RuntimeError(
-                f"code repair {index} run root is not a directory: {root}"
+                f"{label} {index} run root is not a directory: {root}"
             )
         validated.append(root)
     return tuple(validated)
@@ -749,12 +771,19 @@ def wait_for_terminal_code_run(
     repair_run_roots = _validate_repair_run_roots(repair_run_roots)
     while True:
         try:
+            live_historical_revisions = set(
+                allowed_historical_code_revisions or set()
+            )
+            if execution_code_revision is not None:
+                live_historical_revisions.update(
+                    _historical_code_revisions(code_run_root, repair_run_roots)
+                )
             return load_terminal_code_run(
                 code_run_root,
                 repair_run_roots=repair_run_roots,
                 execution_repository_root=execution_repository_root,
                 execution_code_revision=execution_code_revision,
-                allowed_historical_code_revisions=allowed_historical_code_revisions,
+                allowed_historical_code_revisions=live_historical_revisions,
             )
         except Exception:  # noqa: BLE001 - receipts may be mid-write
             exit_codes = [
@@ -1235,6 +1264,9 @@ def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("commit conveyor supervisor is already running") from exc
 
         repair_run_roots = tuple(Path(value) for value in args.code_repair_run_root)
+        pending_repair_run_roots = tuple(
+            Path(value) for value in args.pending_code_repair_run_root
+        )
         code_run_root = Path(args.code_run_root).expanduser().resolve()
         base_code_revision = _recorded_code_revision(
             code_run_root,
@@ -1271,6 +1303,15 @@ def _run(args: argparse.Namespace) -> int:
             historical_revisions.update(
                 _historical_code_revisions(code_run_root, repair_run_roots)
             )
+        if pending_repair_run_roots:
+            pending_repair_run_roots = _validate_repair_run_roots(
+                pending_repair_run_roots,
+                label="pending code repair",
+            )
+        all_repair_run_roots = (
+            *repair_run_roots,
+            *pending_repair_run_roots,
+        )
         code_run = load_commit_source_run(
             code_run_root,
             execution_repository_root=execution_repository_root,
@@ -1281,7 +1322,7 @@ def _run(args: argparse.Namespace) -> int:
             ),
             allowed_historical_code_revisions=historical_revisions,
         )
-        if not code_run.get("repair_required") and repair_run_roots:
+        if not code_run.get("repair_required") and all_repair_run_roots:
             raise RuntimeError(
                 "code repair run roots are only valid for a failed base code run"
             )
@@ -1292,7 +1333,7 @@ def _run(args: argparse.Namespace) -> int:
             )
         repair_required = bool(code_run.get("repair_required"))
         initial_identity = code_run["identity"]
-        if repair_required:
+        if repair_required and not pending_repair_run_roots:
             current_code_run = wait_for_terminal_code_run(
                 code_run_root,
                 repair_run_roots,
@@ -1301,6 +1342,8 @@ def _run(args: argparse.Namespace) -> int:
                 execution_code_revision=execution_validation_revision,
                 allowed_historical_code_revisions=historical_revisions,
             )
+        elif repair_required:
+            current_code_run = code_run
         else:
             current_code_run = load_terminal_code_run(
                 code_run_root,
@@ -1334,6 +1377,11 @@ def _run(args: argparse.Namespace) -> int:
             completion_receipt=Path(args.pr_completion_receipt),
         )
         command = build_command(args, code_run, pr_inputs)
+        repair_root_binding = {
+            "launched": [str(root) for root in repair_run_roots],
+            "pending": [str(root) for root in pending_repair_run_roots],
+            "ordered": [str(root) for root in all_repair_run_roots],
+        }
         run_binding = {
             "schema": source_supervisor.RUN_BINDING_SCHEMA,
             "streams": "commits",
@@ -1358,6 +1406,7 @@ def _run(args: argparse.Namespace) -> int:
             ),
             "source_code_run": code_run["identity"],
             "source_code_runs": code_run.get("identities", [code_run["identity"]]),
+            "source_code_repair_roots": repair_root_binding,
             "pr_completion": pr_inputs["completion_binding"],
             "command": command,
         }
@@ -1380,6 +1429,7 @@ def _run(args: argparse.Namespace) -> int:
             },
             "source_code_run": code_run["identity"],
             "source_code_runs": code_run.get("identities", [code_run["identity"]]),
+            "source_code_repair_roots": repair_root_binding,
             "inputs": code_run["inputs"],
             "pr_inputs": pr_inputs,
             "outputs": {
@@ -1443,7 +1493,7 @@ def _run(args: argparse.Namespace) -> int:
             if repair_required:
                 current_code_run = wait_for_terminal_code_run(
                     code_run_root,
-                    repair_run_roots,
+                    all_repair_run_roots,
                     poll_seconds=args.repair_poll_seconds,
                     execution_repository_root=execution_repository_root,
                     execution_code_revision=execution_validation_revision,

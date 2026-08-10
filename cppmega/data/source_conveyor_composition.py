@@ -394,6 +394,50 @@ def _code_run_identity(value: object, *, where: str) -> dict[str, str]:
     }
 
 
+def _code_repair_root_binding(value: object, *, where: str) -> dict[str, list[str]]:
+    binding = _require_mapping(value, where=where)
+    _require_exact_fields(
+        binding,
+        {"launched", "pending", "ordered"},
+        where=where,
+    )
+    roots: dict[str, list[str]] = {}
+    for state in ("launched", "pending", "ordered"):
+        raw_paths = binding[state]
+        if not isinstance(raw_paths, list):
+            raise TypeError(f"{where}.{state} must be a list")
+        resolved_paths: list[str] = []
+        for index, raw_path in enumerate(raw_paths):
+            if not isinstance(raw_path, str) or not raw_path:
+                raise ValueError(
+                    f"{where}.{state}[{index}] must be a non-empty path"
+                )
+            path = Path(raw_path).expanduser()
+            if path.is_symlink():
+                raise ValueError(
+                    f"{where}.{state}[{index}] must not be a symlink: {path}"
+                )
+            try:
+                path = path.resolve(strict=True)
+            except OSError as exc:
+                raise ValueError(
+                    f"{where}.{state}[{index}] does not exist: {path}"
+                ) from exc
+            if not path.is_dir():
+                raise ValueError(
+                    f"{where}.{state}[{index}] is not a directory: {path}"
+                )
+            resolved_paths.append(str(path))
+        if len(resolved_paths) != len(set(resolved_paths)):
+            raise ValueError(f"{where}.{state} contains duplicate paths")
+        roots[state] = resolved_paths
+    if set(roots["launched"]) & set(roots["pending"]):
+        raise ValueError(f"{where} launched and pending roots overlap")
+    if roots["ordered"] != [*roots["launched"], *roots["pending"]]:
+        raise ValueError(f"{where}.ordered does not preserve root state order")
+    return roots
+
+
 def _unit_repo(unit: str) -> str:
     repo, separator, suffix = unit.rpartition("::")
     if not separator or not repo or not suffix:
@@ -1214,12 +1258,34 @@ def _load_run(
             source_code_runs = [source_code_run]
         elif source_code_run != source_code_runs[0]:
             raise ValueError(f"{run_id} source code run bindings drifted")
+    source_code_repair_roots: dict[str, list[str]] | None = None
+    raw_source_code_repair_roots = launch.get("source_code_repair_roots")
+    if raw_source_code_repair_roots is not None:
+        source_code_repair_roots = _code_repair_root_binding(
+            raw_source_code_repair_roots,
+            where=f"{run_id} source code repair roots",
+        )
+        run_binding = _require_mapping(
+            launch.get("run_binding"), where=f"{run_id} run binding"
+        )
+        run_binding_sha256 = _require_sha256(
+            launch.get("run_binding_sha256"),
+            where=f"{run_id} run binding sha256",
+        )
+        if _canonical_sha256(run_binding) != run_binding_sha256:
+            raise ValueError(f"{run_id} run binding digest drifted")
+        if run_binding.get("source_code_repair_roots") != raw_source_code_repair_roots:
+            raise ValueError(f"{run_id} source code repair root bindings drifted")
     command = launch.get("command")
     if not isinstance(command, list) or not command:
         raise ValueError(f"{run_id} launch command is missing")
     streams = _single_option(command, "--streams")
     if streams not in {"code", "commits", "both"}:
         raise ValueError(f"{run_id} launch streams are invalid")
+    if source_code_repair_roots is not None and streams != "commits":
+        raise ValueError(
+            f"{run_id} code repair root binding is only valid for commits"
+        )
     if "--no-near-dedup" in command:
         raise ValueError(f"{run_id} launch explicitly disabled near dedup")
     expected_revision = _single_option(command, "--expected-code-revision")
@@ -1532,6 +1598,8 @@ def _load_run(
         portable["repair_base_code_run"] = repair_base_code_run
     if source_code_runs is not None:
         portable["source_code_runs"] = source_code_runs
+    if source_code_repair_roots is not None:
+        portable["source_code_repair_roots"] = source_code_repair_roots
     files = {
         "launch": launch_path,
         "exit": exit_path,
@@ -1567,6 +1635,7 @@ def _load_run(
             "failed": failed,
             "repair_base_code_run": repair_base_code_run,
             "source_code_runs": source_code_runs,
+            "source_code_repair_roots": source_code_repair_roots,
         },
     )
 
@@ -1718,12 +1787,27 @@ def load_source_composition(
             for portable, details in zip(run_receipts, run_details, strict=True)
             if details["streams"] in {"code", "both"}
         ]
+        code_repair_roots = [
+            str(files["launch"].parent)
+            for files, details in zip(run_files, run_details, strict=True)
+            if details["streams"] in {"code", "both"}
+            and details["repair_base_code_run"] is not None
+        ]
         for portable, details in zip(run_receipts, run_details, strict=True):
             if details["streams"] != "commits":
                 continue
             if details["source_code_runs"] != code_run_identities:
                 raise ValueError(
                     f"{portable['run_id']} does not bind every composed code run"
+                )
+            repair_root_binding = details["source_code_repair_roots"]
+            if (
+                repair_root_binding is not None
+                and repair_root_binding["ordered"] != code_repair_roots
+            ):
+                raise ValueError(
+                    f"{portable['run_id']} does not bind every composed code "
+                    "repair root"
                 )
     if any(not files for files in combined_allowlist.values()):
         missing = [

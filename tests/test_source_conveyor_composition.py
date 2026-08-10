@@ -1435,6 +1435,64 @@ def test_source_composition_rejects_commit_missing_repair_identity(
         )
 
 
+def test_source_composition_binds_commit_to_ordered_repair_roots(
+    tmp_path: Path,
+) -> None:
+    plan_path, code_root, commit_root = _composition_fixture(tmp_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    base, repair, commit = plan["runs"]
+    launch_path = Path(commit["launch_receipt"])
+    exit_path = Path(commit["exit_receipt"])
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    repair_root = str(Path(repair["launch_receipt"]).parent.resolve())
+    repair_root_binding = {
+        "launched": [],
+        "pending": [repair_root],
+        "ordered": [repair_root],
+    }
+    launch["source_code_repair_roots"] = repair_root_binding
+    launch["run_binding"] = {
+        "source_code_repair_roots": repair_root_binding,
+    }
+    launch["run_binding_sha256"] = _canonical_sha256(launch["run_binding"])
+    _write_json(launch_path, launch)
+    exit_receipt = json.loads(exit_path.read_text(encoding="utf-8"))
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=_BUCKETS,
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+    commit_receipt = composition.receipt["runs"][-1]
+    assert commit_receipt["source_code_repair_roots"] == repair_root_binding
+
+    base_root = str(Path(base["launch_receipt"]).parent.resolve())
+    drifted_binding = {
+        "launched": [],
+        "pending": [base_root],
+        "ordered": [base_root],
+    }
+    launch["source_code_repair_roots"] = drifted_binding
+    launch["run_binding"] = {
+        "source_code_repair_roots": drifted_binding,
+    }
+    launch["run_binding_sha256"] = _canonical_sha256(launch["run_binding"])
+    _write_json(launch_path, launch)
+    exit_receipt["launch_receipt_sha256"] = _sha256(launch_path)
+    _write_json(exit_path, exit_receipt)
+
+    with pytest.raises(ValueError, match="bind every composed code repair root"):
+        load_source_composition(
+            plan_path,
+            buckets=_BUCKETS,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+
+
 def test_source_composition_rejects_drifted_singular_code_run_binding(
     tmp_path: Path,
 ) -> None:
