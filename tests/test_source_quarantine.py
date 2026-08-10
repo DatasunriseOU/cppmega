@@ -41,6 +41,10 @@ RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
 RELATIVE_CLICKHOUSE_BINARY_SQL = "tests/queries/0_stateless/binary_fixture.sql"
 RELATIVE_GCC_PR119001 = "gcc/testsuite/gcc.dg/pr119001-1.c"
+RELATIVE_PLUMHALL_D412 = (
+    "xbox_leak_may_2020/xbox trunk/xbox/private/test/crttests/test/"
+    "conformance/c_plumhall/D412.c"
+)
 RELATIVE_NUL_FF_BLOB = "unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
 RELATIVE_TRUNCATED_UTF32BE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake"
 RELATIVE_TRUNCATED_UTF32LE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake"
@@ -2250,3 +2254,86 @@ def test_utf16le_source_text_rejects_missing_bom(tmp_path):
     )
     with pytest.raises(SourceQuarantineError, match="UTF-16LE BOM"):
         _verify_detected_format(path, entry)
+
+def _plumhall_d412_fixture_bytes() -> bytes:
+    return (
+        b"/* The Plum Hall Validation Suite for C\n"
+        b" * Unpublished copyright (c) 1986-1990, Chiron Systems Inc and Plum Hall Inc.\n"
+        b" */\n"
+        b"#define LIB_TEST 1\n"
+        b'#include "defs.h"\n'
+        b"#if !ANSI\n"
+        b"#define SKIP412 1 /* This file is almost irrelevant for non-ANSI */\n"
+        b"#endif\n"
+        b"#ifndef SKIP412\n"
+        b"/*\n"
+        b" * 4.12 - Date and time\n"
+        b" */\n"
+        b"#include <time.h>\n"
+        b"#include <limits.h>\n"
+        b"#include <string.h>\n"
+        b"struct tm tm1, tm2, *ptm;\n"
+        b"static time_t time_t1, time_t2, time_t3;\n"
+        b"static void d4_12_1();\n"
+        b"static void d4_12_2();\n"
+        b"static void d4_12_3();\n"
+        b"void d4_12()\n"
+        b"{\n"
+        b'Filename = "d412.c";\n'
+        b"d4_12_1();\n"
+        b"d4_12_2();\n"
+        b"d4_12_3();\n"
+        b"}\n"
+        b"#endif\n"
+    )
+
+
+def test_exact_quarantine_filters_plumhall_d412_libclang_hang_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = _plumhall_d412_fixture_bytes()
+    candidate = tmp_path / RELATIVE_PLUMHALL_D412
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="compiler_regression_fixture",
+        detected_format="plumhall_c_date_time_libclang_hang",
+        relative_path=RELATIVE_PLUMHALL_D412,
+        reason="Plum Hall D412 hangs the pinned libclang parser",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["classification"] == "compiler_regression_fixture"
+    assert receipt["entries"][0]["detected_format"] == (
+        "plumhall_c_date_time_libclang_hang"
+    )
+
+
+def test_plumhall_d412_contract_rejects_incomplete_fixture(tmp_path: Path) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "D412.c"
+    path.write_text("int main(void) { return 0; }\n", encoding="ascii")
+    entry = SourceQuarantineEntry(
+        project_id=PROJECT_ID,
+        relative_path="D412.c",
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="plumhall_c_date_time_libclang_hang",
+        reason="negative test",
+    )
+    with pytest.raises(SourceQuarantineError, match="Plum Hall 4.12"):
+        _verify_detected_format(path, entry)
+

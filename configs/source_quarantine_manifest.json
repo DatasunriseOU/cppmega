@@ -261,6 +261,15 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "nul_ff_binary_blob",
       "reason": "Pinned archive header that is a pure 0x00/0xff binary blob under a .h suffix"
+    },
+    {
+      "project_id": "corpus.local/xbox_leak_may_2020",
+      "relative_path": "xbox_leak_may_2020/xbox trunk/xbox/private/test/crttests/test/conformance/c_plumhall/D412.c",
+      "size_bytes": 4312,
+      "sha256": "724842fdcdc29483f414f3741f22634212eaf3c42a71181f5324ae30abcf9a34",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "plumhall_c_date_time_libclang_hang",
+      "reason": "Plum Hall C 4.12 date/time conformance fixture deterministically hangs the pinned libclang parser (Parser::isTypeSpecifierQualifier spin) for multi-hour wall time on a 4KB source"
     }
   ],
   "collections": [
