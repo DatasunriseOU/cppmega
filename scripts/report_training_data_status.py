@@ -18,6 +18,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -73,6 +74,60 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def verify_runtime_checkout(
+    checkout: Path,
+    expected_code_revision: str,
+) -> dict[str, str]:
+    """Fail closed unless the reporter runs from the exact clean checkout."""
+    if re.fullmatch(r"[0-9a-f]{40}", expected_code_revision) is None:
+        raise ValueError(
+            "expected code revision must be an exact lowercase 40-character "
+            "Git commit"
+        )
+    checkout = checkout.resolve(strict=True)
+    if not checkout.is_dir():
+        raise ValueError(f"runtime checkout is not a directory: {checkout}")
+
+    def git(*arguments: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(checkout), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "git is required to verify the reporter runtime"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip()
+            raise RuntimeError(
+                f"runtime checkout Git verification failed: {detail}"
+            ) from exc
+        return result.stdout.strip()
+
+    observed_root = Path(git("rev-parse", "--show-toplevel")).resolve(strict=True)
+    if observed_root != checkout:
+        raise RuntimeError(
+            f"reporter runtime root mismatch: expected {checkout}, "
+            f"observed {observed_root}"
+        )
+    observed_revision = git("rev-parse", "HEAD")
+    if observed_revision != expected_code_revision:
+        raise RuntimeError(
+            "reporter runtime revision mismatch: "
+            f"expected {expected_code_revision}, observed {observed_revision}"
+        )
+    dirty = git("status", "--porcelain=v1", "--untracked-files=all")
+    if dirty:
+        raise RuntimeError("reporter runtime checkout must be clean")
+    return {
+        "checkout": str(checkout),
+        "code_revision": observed_revision,
+    }
 
 
 def _verify_file_binding(
@@ -2151,13 +2206,15 @@ def _has_status_summary_shape(status: object) -> bool:
     datasets = status.get("datasets")
     if not isinstance(datasets, Mapping):
         return False
-    return {
+    common = {
         "live_source",
         "sealed_megatron",
         "validation_bundle",
-        "pr_mr",
         "ci",
-    }.issubset(datasets)
+    }
+    return common.issubset(datasets) and (
+        "pr_mr" in datasets or "github_pr" in datasets
+    )
 
 
 def _numeric_delta(current: object, previous: object) -> object:
@@ -2246,6 +2303,13 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument(
+        "--expected-code-revision",
+        help=(
+            "Require this reporter to execute from an exact clean Git checkout "
+            "at the supplied 40-character revision."
+        ),
+    )
+    parser.add_argument(
         "--watch-seconds",
         type=float,
         default=0.0,
@@ -2267,6 +2331,14 @@ def main() -> int:
         parser.error("--watch-seconds must be non-negative")
     if args.stale_minutes <= 0:
         parser.error("--stale-minutes must be positive")
+    if args.expected_code_revision is not None:
+        try:
+            verify_runtime_checkout(
+                Path(__file__).resolve().parents[1],
+                args.expected_code_revision,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
 
     config = _read_json(args.config)
     _validate_config(config)

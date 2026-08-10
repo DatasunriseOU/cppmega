@@ -38,9 +38,12 @@ For a continuously refreshed local ledger:
 
 The output is atomic and durable on `/Volumes/external`; nothing is written to
 `/tmp`. A changelog row is appended only when the semantic status SHA changes.
-The checked-in
-`configs/launchd/ai.cppmega.training-data-status.plist` runs this command every
-five minutes as a macOS LaunchAgent and restarts it after an unexpected exit.
+The checked-in `configs/launchd/ai.cppmega.training-data-status.plist` runs from
+the exact clean worktree and Git revision named in its command. The reporter
+fails closed if that revision drifts or the runtime worktree becomes dirty. The
+LaunchAgent refreshes every five minutes and restarts after an unexpected exit;
+updating the reporter therefore requires creating a new pinned runtime worktree
+and updating both absolute paths and `--expected-code-revision` in the plist.
 
 ## Counting Rules
 
