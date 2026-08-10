@@ -9,7 +9,7 @@
   <array>
     <string>/bin/zsh</string>
     <string>-c</string>
-    <string>exec /Volumes/external/sources/.venvs/cppmega.source/bin/python /Volumes/external/sources/cppmega/scripts/report_training_data_status.py --config /Volumes/external/sources/cppmega/configs/training_data_status.json --jobs 4 --watch-seconds 300</string>
+    <string>exec /Volumes/external/sources/.venvs/cppmega.source/bin/python /Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-33b56231-20260809/scripts/report_training_data_status.py --config /Volumes/external/cppmega_data/worktrees/cppmega-training-status-runtime-33b56231-20260809/configs/training_data_status.json --expected-code-revision 33b5623126d4b355b8f02ed811938eae4a9108f3 --jobs 4 --watch-seconds 300</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

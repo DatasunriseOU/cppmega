@@ -2206,13 +2206,15 @@ def _has_status_summary_shape(status: object) -> bool:
     datasets = status.get("datasets")
     if not isinstance(datasets, Mapping):
         return False
-    return {
+    common = {
         "live_source",
         "sealed_megatron",
         "validation_bundle",
-        "pr_mr",
         "ci",
-    }.issubset(datasets)
+    }
+    return common.issubset(datasets) and (
+        "pr_mr" in datasets or "github_pr" in datasets
+    )
 
 
 def _numeric_delta(current: object, previous: object) -> object:

@@ -61,6 +61,8 @@ _PORTABLE_TEST_ALLOWLIST = frozenset(
         "tests/test_restore_megatron_bundle_from_nebius_s3.py",
         "tests/test_route_packed_source_docs.py",
         "tests/test_gcp_isolated_worker_rollout.py",
+        "tests/test_report_training_data_status.py",
+        "tests/test_training_data_status_launchd.py",
         "tests/test_source_slot_scheduler.py",
         "tests/test_source_work_queue.py",
         "tests/test_distributed_source_prep.py",
