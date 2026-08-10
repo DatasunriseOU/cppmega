@@ -189,6 +189,7 @@ def test_commit_build_command_reuses_state_roots_and_emits_upgrade_flags(
     assert command[command.index("--conveyor-root") + 1] == str(
         state_root / "conveyor"
     )
+
     assert command[command.index("--work-parent-dir") + 1] == str(
         state_root / "work-parent"
     )
@@ -895,6 +896,17 @@ def test_resume_state_follows_interrupted_supervisor_to_external_state_root(
     assert command[command.index("--conveyor-root") + 1] == str(
         state_root / "conveyor"
     )
+
+    manifest_path.unlink()
+    with pytest.raises(
+        RuntimeError,
+        match="resume state output manifest is missing",
+    ):
+        commit_supervisor._validate_resume_state_root(
+            receipt_root,
+            expected_revision="c" * 40,
+            allow_from="b" * 40,
+        )
 
 
 def test_commit_pr_inputs_reject_store_mutation_and_wal(tmp_path: Path) -> None:

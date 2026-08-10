@@ -135,19 +135,22 @@ def _validate_resume_state_root(
     )
     if source_supervisor._canonical_sha256(binding) != binding_sha256:
         raise RuntimeError("resume state run binding digest drifted")
-    manifest_path = Path(
-        _text(
-            outputs.get("conveyor_manifest"),
-            label="resume state output manifest",
-        )
-    ).expanduser()
+    manifest_path = _plain_file(
+        Path(
+            _text(
+                outputs.get("conveyor_manifest"),
+                label="resume state output manifest",
+            )
+        ),
+        label="resume state output manifest",
+    )
     completion_path = Path(
         _text(
             outputs.get("completion_receipt"),
             label="resume state output completion",
         )
     ).expanduser()
-    state_root = manifest_path.parent.parent.resolve(strict=True)
+    state_root = manifest_path.parent.parent
     expected_manifest_path = state_root / "conveyor" / "_done.json"
     expected_completion_path = state_root / "conveyor" / "completion_receipt.json"
     recorded_state_root = outputs.get("state_root")
