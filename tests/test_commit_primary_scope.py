@@ -9,6 +9,9 @@ import pytest
 
 from cppmega.data.commit_scope import classify_primary_commit_path
 from scripts.nanochat_data.extract_git_history import (
+    RepoExtractionCheckpoint,
+    _repo_source_context,
+    extract_repo_to_checkpoint,
     get_commit_diffs,
     get_commit_file_changes,
     get_commit_list,
@@ -316,6 +319,170 @@ def test_extractor_ignores_gitlink_changes_without_reading_submodule_blob(
         for change in delete_changes
     }
     assert {change["new_filepath"] for change in delete_changes} == {"main.cpp"}
+
+
+def _insert_checkpoint_bad_unit(
+    checkpoint: RepoExtractionCheckpoint,
+    *,
+    unit_key: str,
+    commit_hash: str,
+    filepath: str,
+    operation: str = "new_blob_size",
+) -> None:
+    with checkpoint.conn:
+        checkpoint.conn.execute(
+            """
+            INSERT INTO bad_units(
+                unit_key, repo, repo_path, commit_hash, filepath, operation,
+                error_type, error, chunk_index, first_seen, last_seen, attempts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1)
+            """,
+            (
+                unit_key,
+                checkpoint.source["repo"],
+                checkpoint.source["repo_path"],
+                commit_hash,
+                filepath,
+                operation,
+                "GitCommandError",
+                "legacy cat-file failure",
+                "2026-08-09T00:00:00+0000",
+                "2026-08-09T00:00:00+0000",
+            ),
+        )
+    checkpoint._export_bad_units()
+
+
+def _legacy_gitlink_checkpoint_fixture(
+    tmp_path: Path,
+) -> tuple[Path, str, dict]:
+    repo = tmp_path / "legacy-gitlink-repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Scope Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "config",
+            "user.email",
+            "scope@example.invalid",
+        ],
+        check=True,
+    )
+    (repo / "main.cpp").write_text(
+        "int main_value() { return 123456; }\n" * 3,
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "main.cpp"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000," + "a" * 40 + ",gtest",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "add gitlink"],
+        check=True,
+    )
+    gitlink_commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source = _repo_source_context(
+        str(repo),
+        max_commits=0,
+        repo_name="tests/legacy-gitlink",
+        notes="off",
+    )
+    return repo, gitlink_commit, source
+
+
+def test_checkpoint_resume_retires_proven_legacy_gitlink_bad_unit(
+    tmp_path: Path,
+) -> None:
+    repo, gitlink_commit, source = _legacy_gitlink_checkpoint_fixture(tmp_path)
+    with RepoExtractionCheckpoint(
+        tmp_path / "checkpoint",
+        source=source,
+        checkpoint_commits=250,
+    ) as checkpoint:
+        _insert_checkpoint_bad_unit(
+            checkpoint,
+            unit_key="a" * 64,
+            commit_hash=gitlink_commit,
+            filepath="gtest",
+        )
+
+        extract_repo_to_checkpoint(
+            str(repo),
+            checkpoint,
+            memory_limit_gb=1.0,
+            bad_unit_policy="fail",
+            max_bad_units=0,
+        )
+
+        assert checkpoint.bad_unit_count() == 0
+        assert checkpoint.bad_units_path.read_text(encoding="utf-8") == ""
+
+
+def test_checkpoint_resume_keeps_non_gitlink_bad_unit_fail_closed(
+    tmp_path: Path,
+) -> None:
+    repo, gitlink_commit, source = _legacy_gitlink_checkpoint_fixture(tmp_path)
+    with RepoExtractionCheckpoint(
+        tmp_path / "checkpoint",
+        source=source,
+        checkpoint_commits=250,
+    ) as checkpoint:
+        _insert_checkpoint_bad_unit(
+            checkpoint,
+            unit_key="a" * 64,
+            commit_hash=gitlink_commit,
+            filepath="gtest",
+        )
+        _insert_checkpoint_bad_unit(
+            checkpoint,
+            unit_key="f" * 64,
+            commit_hash=gitlink_commit,
+            filepath="main.cpp",
+        )
+
+        with pytest.raises(RuntimeError, match="already contains 1 distinct bad unit"):
+            extract_repo_to_checkpoint(
+                str(repo),
+                checkpoint,
+                memory_limit_gb=1.0,
+                bad_unit_policy="fail",
+                max_bad_units=0,
+            )
+
+        remaining = checkpoint.conn.execute(
+            "SELECT unit_key, filepath FROM bad_units"
+        ).fetchall()
+        assert [tuple(row) for row in remaining] == [("f" * 64, "main.cpp")]
+        ledger = [
+            json.loads(line)
+            for line in checkpoint.bad_units_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        assert [(row["unit_key"], row["filepath"]) for row in ledger] == [
+            ("f" * 64, "main.cpp")
+        ]
 
 
 @pytest.mark.native_toolchain
