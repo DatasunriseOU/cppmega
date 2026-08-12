@@ -1325,6 +1325,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <security_cdsa_utilities/context.h>",
                 "context - manage CSSM",
             ),
+            "clNssUtils.h": (
+                "#define _CL_NSS_UTILS_H_",
+                '#include <security_asn1/SecNssCoder.h>',
+                '#include <Security/cssm.h>',
+                '#include "DecodedCert.h"',
+                "class ArenaAllocator : public Security::Allocator",
+                "clNssUtils.h - support for libnssasn1-based ASN1 encode/decode",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         if (

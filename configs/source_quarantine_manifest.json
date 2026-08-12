@@ -396,6 +396,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security cssmcontext.h FAIL_CLOSED libclang parse timeout 300s then BrokenProcessPool on 3920-es after SSDLSession quarantine (MacOSX.sdk present)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_x509_cl/lib/clNssUtils.h",
+      "size_bytes": 7839,
+      "sha256": "8d0721fdd1c110348b0a30a311b5d9cd1fb9ff31f0a8393036032b29e8ff83c0",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security clNssUtils.h FAIL_CLOSED libclang parse timeout 300s after SSDLSession+cssmcontext quarantine (cdc6-sec)"
     }
   ],
   "collections": [
