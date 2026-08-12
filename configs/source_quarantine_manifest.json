@@ -441,6 +441,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security kcdatabase.h FAIL_CLOSED libclang parse timeout 300s after SDContext quarantine (10a1-sec, MacOSX.sdk present)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/child.h",
+      "size_bytes": 2323,
+      "sha256": "1de728985e0d23863a14ed43031ef2df6e9c840b872741a36a713fce615e34f5",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security child.h FAIL_CLOSED libclang parse timeout 300s after kcdatabase quarantine (8273-sec, MacOSX.sdk present)"
     }
   ],
   "collections": [

@@ -1381,13 +1381,25 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <securityd_client/ss_types.h>",
                 "class KeychainDatabase",
             ),
+            "child.h": (
+                "#ifndef _CHILD_H_",
+                "#define _CHILD_H_",
+                "child - track a single child process and its belongings",
+                "#include <security_utilities/mach++.h>",
+                "#include <security_utilities/unixchild.h>",
+                "class ServerChild : public UnixPlusPlus::Child",
+                "Apple Computer, Inc.",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
+        apple_copyright = (
+            "Apple Inc." in decoded or "Apple Computer, Inc." in decoded
+        )
         if (
             path.suffix.casefold() != ".h"
             or required_substrings is None
             or any(s not in decoded for s in required_substrings)
-            or "Apple Inc." not in decoded
+            or not apple_copyright
         ):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared {entry.detected_format} but the "
