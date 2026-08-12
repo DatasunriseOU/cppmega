@@ -511,6 +511,7 @@ def _build_worker_command(
     resources: Mapping[str, int | float],
     quarantine_projection_mode: str,
     job: Mapping[str, object] | None = None,
+    macos_sdk: Path | None = None,
 ) -> list[str]:
     command = [
         str(python),
@@ -536,6 +537,8 @@ def _build_worker_command(
     ]
     if job is not None:
         command.extend(["--assignment-sha256", str(job["assignment_sha256"])])
+    if macos_sdk is not None:
+        command.extend(["--macos-sdk", str(macos_sdk)])
     return command
 
 
@@ -944,6 +947,7 @@ def _start_dynamic_assignment(
     lease: AssignmentLease,
     resources: Mapping[str, int | float],
     quarantine_projection_mode: str,
+    macos_sdk: Path | None = None,
 ) -> dict[str, object]:
     attempt_root = executor["attempt_root"]
     repo_root = executor["repo_root"]
@@ -972,6 +976,7 @@ def _start_dynamic_assignment(
         resources=resources,
         quarantine_projection_mode=quarantine_projection_mode,
         job=job,
+        macos_sdk=macos_sdk,
     )
     environment = os.environ.copy()
     environment.update(
@@ -1082,6 +1087,7 @@ def _run_dynamic_source_scheduler(
     claim_heartbeat_seconds: int,
     max_claim_attempts: int,
     quarantine_projection_mode: str,
+    macos_sdk: Path | None = None,
 ) -> dict[str, object]:
     """Continuously refill VM-local slots from the global immutable queue."""
 
@@ -1249,6 +1255,7 @@ def _run_dynamic_source_scheduler(
                                 lease=lease,
                                 resources=resources,
                                 quarantine_projection_mode=quarantine_projection_mode,
+                                macos_sdk=macos_sdk,
                             )
                         )
                         active_assignments.add(str(lease.job["assignment_sha256"]))
@@ -1365,6 +1372,7 @@ def run_source_slot_scheduler(
     claim_heartbeat_seconds: int = 120,
     max_claim_attempts: int = 100,
     quarantine_projection_mode: str = QUARANTINE_PROJECTION_MODE_OFF,
+    macos_sdk: Path | None = None,
 ) -> dict[str, object]:
     """Run all slots owned by one VM and publish exact completion receipts."""
 
@@ -1437,6 +1445,7 @@ def run_source_slot_scheduler(
                 claim_heartbeat_seconds=claim_heartbeat_seconds,
                 max_claim_attempts=max_claim_attempts,
                 quarantine_projection_mode=quarantine_projection_mode,
+                macos_sdk=macos_sdk,
             )
         resumed: list[str] = []
         completed: list[str] = []
@@ -1488,6 +1497,7 @@ def run_source_slot_scheduler(
                     python=python.resolve(),
                     resources=resources,
                     quarantine_projection_mode=quarantine_projection_mode,
+                    macos_sdk=macos_sdk,
                 )
                 environment = os.environ.copy()
                 environment.update(
@@ -1635,8 +1645,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
         "--quarantine-projection-mode",
         default=QUARANTINE_PROJECTION_MODE_OFF,
     )
+    parser.add_argument(
+        "--macos-sdk",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit absolute macOS SDK root forwarded to each source worker "
+            "for projects with macOS .xcconfig evidence."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
+        macos_sdk = args.macos_sdk.resolve() if args.macos_sdk is not None else None
         run_source_slot_scheduler(
             manifest_path=args.manifest,
             manifest_file_sha256=args.manifest_file_sha256,
@@ -1661,6 +1681,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             claim_heartbeat_seconds=args.claim_heartbeat_seconds,
             max_claim_attempts=args.max_claim_attempts,
             quarantine_projection_mode=args.quarantine_projection_mode,
+            macos_sdk=macos_sdk,
         )
     except TransientTransportError as exc:
         parser.exit(75, f"distributed source slot scheduler transient failure: {exc}\n")

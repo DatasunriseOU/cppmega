@@ -1625,6 +1625,7 @@ def _run_indexer(
     parse_workers: int,
     memory_limit_gb: float,
     max_tokens: int,
+    macos_sdk: Path | None = None,
 ) -> dict[str, object]:
     # No --tokenizer-path and no --dedup-db: both per-repo and global claims are
     # intentionally disabled.  The central reducer owns the first primary-copy
@@ -1652,6 +1653,10 @@ def _run_indexer(
         "--source-quarantine-receipt",
         str(quarantine_receipt),
     ]
+    if macos_sdk is not None:
+        # Explicit only — no ambient SDK discovery.  Required for projects with
+        # macOS .xcconfig evidence (e.g. apple-oss-distributions/Security).
+        command.extend(("--macos-sdk", str(macos_sdk)))
     run_checked(command, capture_output=False)
     if not raw_output.is_file() or raw_output.stat().st_size == 0:
         raise ContractError("indexer did not produce a non-empty enriched JSONL")
@@ -1670,6 +1675,7 @@ def _run_indexer(
         "excluded_directories": ["__pycache__", "node_modules", "build", ".git"],
         "dedup_applied": False,
         "tokenizer_passed_to_indexer": False,
+        "macos_sdk_passed_to_indexer": macos_sdk is not None,
         "raw_output_sha256": sha256_file(raw_output),
         "quarantine_receipt_sha256": sha256_file(quarantine_receipt),
     }
@@ -2363,6 +2369,7 @@ def run_source_worker(
     max_tokens: int | None = None,
     assignment_sha256: str | None = None,
     quarantine_projection_mode: str = QUARANTINE_PROJECTION_MODE_OFF,
+    macos_sdk: Path | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Run one selected assignment or every assignment owned by a worker."""
 
@@ -2461,6 +2468,7 @@ def run_source_worker(
                 parse_workers=parse_workers,
                 memory_limit_gb=memory_limit_gb,
                 max_tokens=max_tokens,
+                macos_sdk=macos_sdk,
             )
             validated_quarantine = validate_quarantine_receipt_file(
                 quarantine_receipt,
@@ -2651,8 +2659,20 @@ def _main(argv: Sequence[str] | None = None) -> int:
         choices=sorted(_QUARANTINE_PROJECTION_MODES),
         default=QUARANTINE_PROJECTION_MODE_OFF,
     )
+    parser.add_argument(
+        "--macos-sdk",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit absolute macOS SDK root for projects whose .xcconfig "
+            "evidence requires a macOS build context. No ambient discovery."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
+        macos_sdk = args.macos_sdk.resolve() if args.macos_sdk is not None else None
+        if macos_sdk is not None and not macos_sdk.is_dir():
+            raise ContractError(f"--macos-sdk is not a directory: {macos_sdk}")
         manifest, raw_sha256 = load_source_manifest(args.manifest)
         run_source_worker(
             manifest,
@@ -2677,6 +2697,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             assignment_sha256=args.assignment_sha256,
             quarantine_projection_mode=args.quarantine_projection_mode,
+            macos_sdk=macos_sdk,
         )
     except TransientTransportError as exc:
         parser.exit(75, f"distributed source worker transient transport failure: {exc}\n")

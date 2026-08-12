@@ -100,6 +100,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_encoding_regression_fixture",
         "git_shortlog_invalid_utf8_shell",
     ),
+    (
+        "deliberate_encoding_regression_fixture",
+        "invalid_utf8_and_windows1252_domain_blob",
+    ),
 }
 
 
@@ -1158,6 +1162,48 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared git_shortlog_invalid_utf8_shell "
                 "but the shell fixture is valid UTF-8"
+            )
+        return
+
+    if entry.detected_format == "invalid_utf8_and_windows1252_domain_blob":
+        # Erlang re_SUITE_data/testoutput* (and similar): domain text fixtures
+        # that are neither valid UTF-8 nor valid Windows-1252, so the indexer
+        # fail-closes before parse.  No NULs; mostly ASCII with sparse high bytes.
+        payload = path.read_bytes()
+        if not payload or b"\x00" in payload:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "invalid_utf8_and_windows1252_domain_blob but the payload is "
+                "empty or contains NULs"
+            )
+        high = sum(1 for byte in payload if byte >= 0x80)
+        if high < 1:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "invalid_utf8_and_windows1252_domain_blob but the payload has "
+                "no high bytes"
+            )
+        if high / len(payload) > 0.05:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "invalid_utf8_and_windows1252_domain_blob but the payload is "
+                "not mostly ASCII"
+            )
+        utf8_failed = False
+        try:
+            payload.decode("utf-8")
+        except UnicodeDecodeError:
+            utf8_failed = True
+        cp1252_failed = False
+        try:
+            payload.decode("cp1252")
+        except UnicodeDecodeError:
+            cp1252_failed = True
+        if not utf8_failed or not cp1252_failed:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "invalid_utf8_and_windows1252_domain_blob but the payload is "
+                "valid as UTF-8 or Windows-1252"
             )
         return
 

@@ -191,6 +191,42 @@
       "reason": "Frozen ThreadX generated C byte array embedding a module ELF; ASCII C-comment header then UTF-16LE body without leading BOM (size/sha rebound 60766->61551; format verified as hybrid shape)"
     },
     {
+      "project_id": "erlang/otp",
+      "relative_path": "lib/stdlib/test/re_SUITE_data/testoutput1",
+      "size_bytes": 174339,
+      "sha256": "13fa8b29010df52e0e84b6b234f22be4eadc7b51557179c8b48af71b457923b5",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "invalid_utf8_and_windows1252_domain_blob",
+      "reason": "Erlang re_SUITE_data/testoutput1 is domain test text that is neither valid UTF-8 nor Windows-1252 (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "erlang/otp",
+      "relative_path": "lib/stdlib/test/re_SUITE_data/testoutput10",
+      "size_bytes": 53985,
+      "sha256": "0420b964e562aebffb11436c11e120b62d14f0b44eee6b8136d211c6e5226b0e",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "invalid_utf8_and_windows1252_domain_blob",
+      "reason": "Erlang re_SUITE_data/testoutput10 is domain test text that is neither valid UTF-8 nor Windows-1252 (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "erlang/otp",
+      "relative_path": "lib/stdlib/test/re_SUITE_data/testoutput5",
+      "size_bytes": 180444,
+      "sha256": "173a73b030f7404ea5a07c88dae17b705e88e01a3cce1835caf27acd5dcdd18c",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "invalid_utf8_and_windows1252_domain_blob",
+      "reason": "Erlang re_SUITE_data/testoutput5 is domain test text that is neither valid UTF-8 nor Windows-1252 (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "erlang/otp",
+      "relative_path": "lib/stdlib/test/re_SUITE_data/testoutput8",
+      "size_bytes": 120659,
+      "sha256": "af08ab29a3df1be9fcf5e573e23bebcf75b80bd2c63be385477d46e736f3d382",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "invalid_utf8_and_windows1252_domain_blob",
+      "reason": "Erlang re_SUITE_data/testoutput8 is domain test text that is neither valid UTF-8 nor Windows-1252 (GCP residual eee7 exit-2)"
+    },
+    {
       "project_id": "gcc-mirror/gcc",
       "relative_path": "gcc/testsuite/gcc.dg/pr119001-1.c",
       "size_bytes": 867,
