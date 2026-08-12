@@ -1390,6 +1390,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class ServerChild : public UnixPlusPlus::Child",
                 "Apple Computer, Inc.",
             ),
+            "SSKey.h": (
+                "#define _H_SSKEY_",
+                "SSKey.h - CSP-wide SSKey base class",
+                "#include <security_cdsa_plugin/CSPsession.h>",
+                '#include "SSDatabase.h"',
+                "#include <securityd_client/ssclient.h>",
+                "class SSKey : public ReferencedKey",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
