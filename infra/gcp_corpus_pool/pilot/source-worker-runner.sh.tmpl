@@ -261,26 +261,63 @@ zstd -dc -- "$overlay" | tar -xf - -C "$repo_root" --no-same-owner
 export PYTHONDONTWRITEBYTECODE=1
 export GIT_OPTIONAL_LOCKS=0
 scheduler_receipt="$receipt_root/$worker_name.slot-scheduler.json"
-python3 "$repo_root/scripts/distributed_data_prep/source_slot_scheduler.py" \
-  --manifest "$manifest" \
-  --manifest-file-sha256 "$MANIFEST_SHA256" \
-  --run-root "$RUN_ROOT" \
-  --bundle "$bundle" \
-  --overlay "$overlay" \
-  --stage-root "$STAGE_ROOT" \
-  --scheduler-receipt "$scheduler_receipt" \
-  --physical-worker-index "$worker_index" \
-  --physical-worker-count "$(jq -er '.worker_count' "$WORKER_CONFIG")" \
-  --slots-per-worker "$slots_per_worker" \
-  --parse-workers-per-slot "$parse_workers_per_slot" \
-  --memory-limit-gb-per-slot "$memory_limit_gb_per_slot" \
-  --cpu-budget-vcpus "$cpu_budget_vcpus" \
-  --memory-budget-gb "$memory_budget_gb" \
-  --python /usr/bin/python3 \
-  --source-worker "$repo_root/scripts/distributed_data_prep/source_worker.py" \
-  --dynamic-queue \
-  --quarantine-projection-mode pinned_source_tree_v1 \
+
+# Optional macOS SDK for Apple OSS projects (e.g. Security).
+# Presence contract (fail-closed when declared):
+#   $RUN_ROOT/bootstrap/MacOSX.sdk.sha256  -> single line hex digest
+#   $RUN_ROOT/bootstrap/<sha>.MacOSX.sdk.tar.zst  -> archive extracting to MacOSX.sdk/
+# If the sha256 marker is absent, SDK is skipped. If present, materialize or exit 2.
+macos_sdk_path=""
+sdk_sha_marker="$input_root/MacOSX.sdk.sha256"
+sdk_sha_rc=0
+gcs_read_exact "$RUN_ROOT/bootstrap/MacOSX.sdk.sha256" "$sdk_sha_marker" || sdk_sha_rc=$?
+if (( sdk_sha_rc == 0 )); then
+  macos_sdk_sha256="$(tr -d '[:space:]' <"$sdk_sha_marker")"
+  if [[ ! "$macos_sdk_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "invalid MacOSX.sdk.sha256 content: $macos_sdk_sha256" >&2
+    exit 2
+  fi
+  sdk_archive="$input_root/${macos_sdk_sha256}.MacOSX.sdk.tar.zst"
+  gcs_read_exact "$RUN_ROOT/bootstrap/${macos_sdk_sha256}.MacOSX.sdk.tar.zst" "$sdk_archive"
+  printf '%s  %s\n' "$macos_sdk_sha256" "$sdk_archive" | sha256sum --check --strict
+  macos_sdk_path="$input_root/MacOSX.sdk"
+  rm -rf -- "$macos_sdk_path"
+  zstd -dc -- "$sdk_archive" | tar -xf - -C "$input_root" --no-same-owner
+  if [[ ! -d "$macos_sdk_path" ]]; then
+    echo "MacOSX.sdk archive did not materialize $macos_sdk_path" >&2
+    exit 2
+  fi
+elif (( sdk_sha_rc != 1 )); then
+  # 1 = not found (skip); anything else is hard transport/auth failure
+  exit "$sdk_sha_rc"
+fi
+
+scheduler_cmd=(
+  python3 "$repo_root/scripts/distributed_data_prep/source_slot_scheduler.py"
+  --manifest "$manifest"
+  --manifest-file-sha256 "$MANIFEST_SHA256"
+  --run-root "$RUN_ROOT"
+  --bundle "$bundle"
+  --overlay "$overlay"
+  --stage-root "$STAGE_ROOT"
+  --scheduler-receipt "$scheduler_receipt"
+  --physical-worker-index "$worker_index"
+  --physical-worker-count "$(jq -er '.worker_count' "$WORKER_CONFIG")"
+  --slots-per-worker "$slots_per_worker"
+  --parse-workers-per-slot "$parse_workers_per_slot"
+  --memory-limit-gb-per-slot "$memory_limit_gb_per_slot"
+  --cpu-budget-vcpus "$cpu_budget_vcpus"
+  --memory-budget-gb "$memory_budget_gb"
+  --python /usr/bin/python3
+  --source-worker "$repo_root/scripts/distributed_data_prep/source_worker.py"
+  --dynamic-queue
+  --quarantine-projection-mode pinned_source_tree_v1
   --scheduler-instance "$worker_name.$BOOT_ID"
+)
+if [[ -n "$macos_sdk_path" ]]; then
+  scheduler_cmd+=(--macos-sdk "$macos_sdk_path")
+fi
+"${scheduler_cmd[@]}"
 
 receipt_count="$(jq -er '.source_receipt_count' "$scheduler_receipt")"
 slot_count="$(jq -er '.slots_per_worker' "$scheduler_receipt")"
