@@ -353,6 +353,15 @@
       "reason": "Plan 9 PC code page table contains embedded NUL bytes and is not valid C source (GCP residual eee7 exit-2)"
     },
     {
+      "project_id": "plan9foundation/plan9",
+      "relative_path": "sys/lib/astar/a100p.cp",
+      "size_bytes": 21984,
+      "sha256": "6d35f6b2da15023e646cc6deb1aeac947b19aef74084f93aee31c6ec411b63d4",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "binary_blob_with_embedded_nul",
+      "reason": "Plan 9 astar duplicate of a100p.cp code page (byte-identical to sys/src/9/pc/a100p.cp); fail16 residual exit-2 after PC copy quarantined"
+    },
+    {
       "project_id": "python/cpython",
       "relative_path": "Lib/test/archivetestdata/exe_with_z64",
       "size_bytes": 978,

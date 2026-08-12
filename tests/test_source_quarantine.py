@@ -2569,3 +2569,54 @@ def test_apple_security_cssmcontext_libclang_timeout_accepts_header(
         reason="Security cssmcontext.h libclang hang",
     )
     _verify_detected_format(path, entry)
+
+
+def test_plan9_astar_a100p_binary_blob_accepts_fixture(tmp_path: Path) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "a100p.cp"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "a100p.cp"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="plan9foundation/plan9",
+        relative_path="sys/lib/astar/a100p.cp",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="mislabeled_non_cpp",
+        detected_format="binary_blob_with_embedded_nul",
+        reason="Plan 9 astar a100p.cp code page",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_plan9_astar_a100p_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "a100p.cp"
+    path.write_bytes(b"not-a-code-page\n")
+    entry = SourceQuarantineEntry(
+        project_id="plan9foundation/plan9",
+        relative_path="sys/lib/astar/a100p.cp",
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="mislabeled_non_cpp",
+        detected_format="binary_blob_with_embedded_nul",
+        reason="negative test",
+    )
+    with pytest.raises(SourceQuarantineError, match="binary_blob_with_embedded_nul"):
+        _verify_detected_format(path, entry)
