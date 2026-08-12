@@ -468,6 +468,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security kckey.h FAIL_CLOSED libclang parse timeout 300s after SSKey quarantine (044c-sec, MacOSX.sdk present, knobs 2/64)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_cspdl/lib/SSDatabase.h",
+      "size_bytes": 6878,
+      "sha256": "167c86b76fc34b3698c42e5251082633c5e7b421951ea27245b75f20395e97ec",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security SSDatabase.h FAIL_CLOSED libclang parse timeout 300s after kckey quarantine (f688-sec, MacOSX.sdk present, knobs 1/56)"
     }
   ],
   "collections": [

@@ -1407,6 +1407,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class KeychainKey : public LocalKey, public SecurityServerAcl",
                 "Apple Computer, Inc.",
             ),
+            "SSDatabase.h": (
+                "#define _H_SSDATABASE_",
+                "SSDatabase.h - Security Server database object",
+                "#include <security_cdsa_client/dlclient.h>",
+                "#include <securityd_client/ssclient.h>",
+                "class SSDatabaseImpl : public CssmClient::DbImpl",
+                "class SSDatabase : public CssmClient::Db",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
