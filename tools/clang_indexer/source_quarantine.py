@@ -63,6 +63,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "plumhall_c_date_time_libclang_hang",
     ),
     (
+        "compiler_regression_fixture",
+        "apple_security_ssdl_session_libclang_hang",
+    ),
+    (
         "binary_protocol_test_fixture",
         "clickhouse_dollar_quoted_binary_sql",
     ),
@@ -1281,6 +1285,43 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared plumhall_c_date_time_libclang_hang "
                 "but the Plum Hall 4.12 date/time fixture contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "apple_security_ssdl_session_libclang_hang":
+        # Apple Security SSDLSession.h (CSP/DL plugin session): pinned libclang
+        # hits FAIL_CLOSED parse timeout (300s) then BrokenProcessPool on GCP r10
+        # even with an explicit MacOSX.sdk. Identity-checked, not skipped loosely.
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "apple_security_ssdl_session_libclang_hang but the header is not "
+                f"UTF-8: {exc}"
+            ) from exc
+        required_substrings = (
+            "#ifndef _H_SSDLSESSION",
+            "#define _H_SSDLSESSION",
+            "class SSDLSession : public DLPluginSession",
+            '#include <security_cdsa_plugin/DLsession.h>',
+            "SSCSPDLSession &mSSCSPDLSession",
+            "SecurityServer::ClientSession &clientSession()",
+        )
+        # Identity uses entry.relative_path basename so unit tests can stage the
+        # payload under a temporary path while still verifying the real header.
+        expected_name = Path(entry.relative_path).name
+        if (
+            path.suffix.casefold() != ".h"
+            or expected_name != "SSDLSession.h"
+            or any(s not in decoded for s in required_substrings)
+            or "Apple Inc." not in decoded
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "apple_security_ssdl_session_libclang_hang but the Apple Security "
+                "SSDLSession header contract is incomplete or ambiguous"
             )
         return
 

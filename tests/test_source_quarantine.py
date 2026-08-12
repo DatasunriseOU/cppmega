@@ -2458,3 +2458,85 @@ def test_plumhall_d412_contract_rejects_incomplete_fixture(tmp_path: Path) -> No
     )
     with pytest.raises(SourceQuarantineError, match="Plum Hall 4.12"):
         _verify_detected_format(path, entry)
+
+
+def test_invalid_utf8_and_windows1252_domain_blob_accepts_old_pcre1_testoutput1(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "erlang_old_pcre1_testoutput1"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "testoutput1"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="erlang/otp",
+        relative_path="lib/stdlib/test/re_SUITE_data/old_pcre1/testoutput1",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="deliberate_encoding_regression_fixture",
+        detected_format="invalid_utf8_and_windows1252_domain_blob",
+        reason="old_pcre1 dual-encoding regression fixture",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_ssdl_session_libclang_hang_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "SSDLSession.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "SSDLSession.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path="OSX/libsecurity_apple_cspdl/lib/SSDLSession.h",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_ssdl_session_libclang_hang",
+        reason="Security SSDLSession.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_ssdl_session_contract_rejects_unrelated_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "SSDLSession.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path="OSX/libsecurity_apple_cspdl/lib/SSDLSession.h",
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_ssdl_session_libclang_hang",
+        reason="negative test",
+    )
+    with pytest.raises(SourceQuarantineError, match="SSDLSession header contract"):
+        _verify_detected_format(path, entry)

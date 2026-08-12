@@ -227,6 +227,15 @@
       "reason": "Erlang re_SUITE_data/testoutput8 is domain test text that is neither valid UTF-8 nor Windows-1252 (GCP residual eee7 exit-2)"
     },
     {
+      "project_id": "erlang/otp",
+      "relative_path": "lib/stdlib/test/re_SUITE_data/old_pcre1/testoutput1",
+      "size_bytes": 135436,
+      "sha256": "954925f3320821ab2d9680be4a1b9594a8b5436e8731c815a3422a4471a8ae37",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "invalid_utf8_and_windows1252_domain_blob",
+      "reason": "Erlang re_SUITE_data/old_pcre1/testoutput1 is a PCRE1 regression domain fixture neither valid UTF-8 nor Windows-1252 (r10 residual exit-2 after root testoutput* quarantine)"
+    },
+    {
       "project_id": "gcc-mirror/gcc",
       "relative_path": "gcc/testsuite/gcc.dg/pr119001-1.c",
       "size_bytes": 867,
@@ -369,6 +378,15 @@
       "classification": "generated_executable_archive",
       "detected_format": "posix_shell_appended_zip",
       "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_cspdl/lib/SSDLSession.h",
+      "size_bytes": 8378,
+      "sha256": "5052556ea227d186b7bcf8ba4da39ea45739e635804538b831b793d1d73aab64",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_ssdl_session_libclang_hang",
+      "reason": "Pinned Apple Security SSDLSession.h deterministically times out the corpus libclang parse (FAIL_CLOSED 300s then BrokenProcessPool on r10 with MacOSX.sdk)"
     }
   ],
   "collections": [
