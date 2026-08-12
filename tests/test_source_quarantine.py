@@ -3202,3 +3202,95 @@ def test_apple_security_sscontext_contract_rejects_unrelated_standin(
         SourceQuarantineError, match="Apple Security libclang-timeout header contract"
     ):
         _verify_detected_format(path, entry)
+
+
+RELATIVE_DYLDCACHE_H = "OSX/include/security_utilities/dyldcache.h"
+DYLDCACHE_SIZE = 5792
+DYLDCACHE_SHA256 = (
+    "d3fdddc450250300a28662c106c873c95980bfa55c6c33c32ea933a8ae86dc1c"
+)
+
+
+def test_apple_security_dyldcache_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "dyldcache.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "dyldcache.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DYLDCACHE_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security dyldcache.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_dyldcache_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "dyldcache.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DYLDCACHE_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_dyldcache_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "dyldcache.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == DYLDCACHE_SIZE
+    assert hashlib.sha256(payload).hexdigest() == DYLDCACHE_SHA256
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_DYLDCACHE_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == DYLDCACHE_SIZE
+    assert entry["sha256"] == DYLDCACHE_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"

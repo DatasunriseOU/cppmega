@@ -1441,6 +1441,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <securityd_client/ssclient.h>",
                 "class SSContext : public CSPFullPluginSession::CSPContext",
             ),
+            "dyldcache.h": (
+                "#ifndef _H_DYLDCACHE",
+                "#define _H_DYLDCACHE",
+                "dyldcache - access layer to the DYLD Shared Library Cache file",
+                "#include <security_utilities/unix++.h>",
+                '#include "dyld_cache_format.h"',
+                "class DYLDCache : public UnixPlusPlus::AutoFileDesc",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

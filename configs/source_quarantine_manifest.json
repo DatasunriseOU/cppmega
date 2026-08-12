@@ -495,6 +495,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security SSContext.h FAIL_CLOSED libclang parse timeout 300s after SSDatabase quarantine (e8fa-sec, MacOSX.sdk present, knobs 2/60)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/include/security_utilities/dyldcache.h",
+      "size_bytes": 5792,
+      "sha256": "d3fdddc450250300a28662c106c873c95980bfa55c6c33c32ea933a8ae86dc1c",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security dyldcache.h FAIL_CLOSED libclang parse timeout 300s after SSContext quarantine (abec-sec, MacOSX.sdk present, knobs 1/52)"
     }
   ],
   "collections": [
