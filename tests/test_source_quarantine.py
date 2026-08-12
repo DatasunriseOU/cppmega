@@ -2675,3 +2675,92 @@ def test_apple_security_sdcontext_contract_rejects_unrelated_standin(
         SourceQuarantineError, match="Apple Security libclang-timeout header contract"
     ):
         _verify_detected_format(path, entry)
+
+
+RELATIVE_GCC_ENCODING_ISSUES_BYTES = (
+    "gcc/testsuite/gcc.dg/encoding-issues-bytes.c"
+)
+
+
+def test_gcc_encoding_issues_bytes_accepts_fixture(tmp_path: Path) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "encoding-issues-bytes.c"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "encoding-issues-bytes.c"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="gcc-mirror/gcc",
+        relative_path=RELATIVE_GCC_ENCODING_ISSUES_BYTES,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="gcc_embedded_nul_diagnostic",
+        reason="GCC encoding-issues-bytes.c diagnostic fixture",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_gcc_encoding_issues_bytes_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "encoding-issues-bytes.c"
+    path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="gcc-mirror/gcc",
+        relative_path=RELATIVE_GCC_ENCODING_ISSUES_BYTES,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="gcc_embedded_nul_diagnostic",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="gcc_embedded_nul_diagnostic"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_gcc_encoding_issues_bytes_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "encoding-issues-bytes.c"
+    )
+    payload = fixture.read_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["relative_path"] == RELATIVE_GCC_ENCODING_ISSUES_BYTES
+    )
+    assert len(payload) == 595
+    assert hashlib.sha256(payload).hexdigest() == (
+        "c1cd6c749b597a7547c374a348f1ea2af12a22af94ccdb93c7204713b142dcc3"
+    )
+    assert payload.count(b"\x00") == 1
+    assert payload.count(b"\x80") == 1
+    assert entry["project_id"] == "gcc-mirror/gcc"
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
+    assert entry["detected_format"] == "gcc_embedded_nul_diagnostic"

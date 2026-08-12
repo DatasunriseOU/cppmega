@@ -80,6 +80,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ),
     (
         "deliberate_compiler_diagnostic_fixture",
+        "gcc_embedded_nul_diagnostic",
+    ),
+    (
+        "deliberate_compiler_diagnostic_fixture",
         "clang_escaped_newline_nul_preprocessor_diagnostic",
     ),
     (
@@ -490,6 +494,34 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                     f"{entry.relative_path}: declared binary_blob_with_embedded_nul "
                     "but the payload looks like plain text with NULs"
                 )
+        return
+
+    if entry.detected_format == "gcc_embedded_nul_diagnostic":
+        payload = path.read_bytes()
+        expected_name = Path(entry.relative_path).name
+        required_snippets = (
+            b'dg-options "-fdiagnostics-show-caret -fdiagnostics-escape-format=bytes"',
+            b'dg-warning "null character\\\\(s\\\\) ignored"',
+            b"Stray UTF-8 trailing byte:",
+            b"stray '.200' in program",
+            b"unknown escape sequence",
+            b"dg-begin-multiline-output",
+        )
+        if (
+            expected_name != "encoding-issues-bytes.c"
+            or path.suffix.casefold() != ".c"
+            or entry.relative_path != "gcc/testsuite/gcc.dg/encoding-issues-bytes.c"
+            or payload.count(b"\x00") != 1
+            or payload.count(b"\x80") != 1
+            or payload.count(b"\x01") != 1
+            or any(snippet not in payload for snippet in required_snippets)
+            or payload.count(b"dg-begin-multiline-output") != 3
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared gcc_embedded_nul_diagnostic "
+                "but the GCC encoding-issues-bytes DejaGNU contract is "
+                "incomplete or ambiguous"
+            )
         return
 
     if entry.detected_format == "clang_embedded_nul_diagnostic":

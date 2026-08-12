@@ -245,6 +245,15 @@
       "reason": "GCC PR119001 regression fixture deterministically crashes the pinned libclang parser"
     },
     {
+      "project_id": "gcc-mirror/gcc",
+      "relative_path": "gcc/testsuite/gcc.dg/encoding-issues-bytes.c",
+      "size_bytes": 595,
+      "sha256": "c1cd6c749b597a7547c374a348f1ea2af12a22af94ccdb93c7204713b142dcc3",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "gcc_embedded_nul_diagnostic",
+      "reason": "GCC encoding-issues-bytes.c DejaGNU fixture embeds a NUL plus a stray 0x80 diagnostic byte (fail16 residual exit-2 after PR119001 quarantine)"
+    },
+    {
       "project_id": "git/git",
       "relative_path": "t/t4201-shortlog.sh",
       "size_bytes": 11480,
