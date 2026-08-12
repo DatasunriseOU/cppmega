@@ -2620,3 +2620,58 @@ def test_plan9_astar_a100p_contract_rejects_unrelated_standin(
     )
     with pytest.raises(SourceQuarantineError, match="binary_blob_with_embedded_nul"):
         _verify_detected_format(path, entry)
+
+
+def test_apple_security_sdcontext_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "SDContext.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "SDContext.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path="OSX/libsecurity_sd_cspdl/lib/SDContext.h",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security SDContext.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_sdcontext_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "SDContext.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path="OSX/libsecurity_sd_cspdl/lib/SDContext.h",
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)

@@ -1333,6 +1333,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class ArenaAllocator : public Security::Allocator",
                 "clNssUtils.h - support for libnssasn1-based ASN1 encode/decode",
             ),
+            "SDContext.h": (
+                "#ifndef _H_SD_CONTEXT",
+                "#define _H_SD_CONTEXT",
+                "SDContext.h - Security Server contexts",
+                "#include <security_cdsa_plugin/CSPsession.h>",
+                "#include <securityd_client/ssclient.h>",
+                "class SDCSPSession",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         if (

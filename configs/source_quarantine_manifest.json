@@ -414,6 +414,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security clNssUtils.h FAIL_CLOSED libclang parse timeout 300s after SSDLSession+cssmcontext quarantine (cdc6-sec)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_sd_cspdl/lib/SDContext.h",
+      "size_bytes": 5218,
+      "sha256": "14f1fef27817e6041e536650cf34637583eb559ada34029f5409d12f2f72ae18",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security SDContext.h FAIL_CLOSED libclang parse timeout 300s after SSDL+cssm+clNssUtils quarantine (e6b4-sec, MacOSX.sdk present)"
     }
   ],
   "collections": [
