@@ -78,11 +78,20 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_parser_regression_fixture",
         "cmake_escaped_newline_nul_syntax_fixture",
     ),
+    (
+        "deliberate_parser_regression_fixture",
+        "cmake_null_terminated_argument_fixture",
+    ),
+    (
+        "deliberate_compiler_diagnostic_fixture",
+        "clang_embedded_nul_in_literal",
+    ),
     ("generated_binary_blob", "utf16le_generated_c_array"),
     ("generated_executable_archive", "posix_shell_appended_zip"),
     ("mislabeled_non_cpp", "xml_utf16le"),
     ("mislabeled_non_cpp", "utf16le_source_text"),
     ("mislabeled_non_cpp", "nul_ff_binary_blob"),
+    ("mislabeled_non_cpp", "binary_blob_with_embedded_nul"),
     ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
     ("mislabeled_non_cpp", "truncated_utf32be_bom"),
     ("mislabeled_non_cpp", "truncated_utf32le_bom"),
@@ -409,6 +418,66 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "cmake_escaped_newline_nul_syntax_fixture but the exact "
                 "two-line escaped-newline/NUL parser-test shape is absent"
             )
+        return
+
+    if entry.detected_format == "cmake_null_terminated_argument_fixture":
+        payload = path.read_bytes()
+        expected = (
+            b"LIST(APPEND foo TEST\x000000000000000000000000000 )\n"
+            b"CMAKE_HOST_SYSTEM_INFORMATION(RESULT bar QUERY HOSTNAME)\n"
+        )
+        if payload != expected:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared "
+                "cmake_null_terminated_argument_fixture but the exact "
+                "LIST(APPEND)/NUL argument fixture shape is absent"
+            )
+        return
+
+    if entry.detected_format == "clang_embedded_nul_in_literal":
+        payload = path.read_bytes()
+        if payload.count(b"\0") < 1:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_in_literal "
+                "but the fixture contains no NUL bytes"
+            )
+        try:
+            # Decode allowing NULs by replacing for structural checks.
+            decoded = payload.replace(b"\0", b"").decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_in_literal "
+                f"but non-ASCII payload outside NULs: {exc}"
+            ) from exc
+        required_snippets = (
+            "RUN: %clang_cc1",
+            "null character",
+            "expected-warning",
+        )
+        if any(snippet not in decoded for snippet in required_snippets):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared clang_embedded_nul_in_literal "
+                "but the literal-NUL diagnostic contract is incomplete"
+            )
+        return
+
+    if entry.detected_format == "binary_blob_with_embedded_nul":
+        payload = path.read_bytes()
+        if not payload or b"\0" not in payload:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared binary_blob_with_embedded_nul "
+                "but the payload is empty or has no embedded NUL bytes"
+            )
+        # Reject pure text UTF-8 without high-bit bytes — this format is for
+        # non-source binary tables (e.g. Plan 9 code pages).
+        if b"\0" in payload and all(32 <= b < 127 or b in (9, 10, 13, 0) for b in payload):
+            # still OK if mostly printable with NULs; require at least one
+            # high-bit or control-class non-text byte besides NUL/tab/lf/cr.
+            if not any(b >= 128 or b < 9 for b in payload if b != 0):
+                raise SourceQuarantineError(
+                    f"{entry.relative_path}: declared binary_blob_with_embedded_nul "
+                    "but the payload looks like plain text with NULs"
+                )
         return
 
     if entry.detected_format == "clang_embedded_nul_diagnostic":

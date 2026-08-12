@@ -112,11 +112,11 @@
     {
       "project_id": "eclipse-threadx/threadx",
       "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
-      "size_bytes": 60766,
-      "sha256": "303a817f33b086755103778421c37b3aa716e5d49c95c2a9a2d9a6f31cafcd9c",
+      "size_bytes": 61551,
+      "sha256": "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294",
       "classification": "generated_binary_blob",
       "detected_format": "utf16le_generated_c_array",
-      "reason": "Frozen ThreadX UTF-16LE generated C byte array embedding a module ELF"
+      "reason": "Frozen ThreadX UTF-16LE generated C byte array embedding a module ELF [rebound size/sha after GCP residual size mismatch 60766->61551]"
     },
     {
       "project_id": "NetBSD/src",
@@ -279,6 +279,51 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "plumhall_c_date_time_libclang_hang",
       "reason": "Plum Hall C 4.12 date/time conformance fixture deterministically hangs the pinned libclang parser (Parser::isTypeSpecifierQualifier spin) for multi-hour wall time on a 4KB source"
+    },
+    {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/NullTerminatedArgument.cmake",
+      "size_bytes": 106,
+      "sha256": "95d45df3fed3f75b284edfc38eef980c725faadd13f4342057eb05e222552e93",
+      "classification": "deliberate_parser_regression_fixture",
+      "detected_format": "cmake_null_terminated_argument_fixture",
+      "reason": "CMake list-file lexer regression fixture intentionally embeds a NUL byte (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "intel/llvm",
+      "relative_path": "clang/test/Lexer/null-character-in-literal.c",
+      "size_bytes": 924,
+      "sha256": "009160c9be76fd35778e4e9af933a3c978ee3c7d913eefb0aca26128e7b7f9c6",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_in_literal",
+      "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "llvm/llvm-project",
+      "relative_path": "clang/test/Lexer/null-character-in-literal.c",
+      "size_bytes": 924,
+      "sha256": "009160c9be76fd35778e4e9af933a3c978ee3c7d913eefb0aca26128e7b7f9c6",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_in_literal",
+      "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (same path as intel/llvm; GCP residual eee7)"
+    },
+    {
+      "project_id": "ROCm/llvm-project",
+      "relative_path": "clang/test/Lexer/null-character-in-literal.c",
+      "size_bytes": 924,
+      "sha256": "009160c9be76fd35778e4e9af933a3c978ee3c7d913eefb0aca26128e7b7f9c6",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_in_literal",
+      "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (ROCm llvm fork; GCP residual eee7)"
+    },
+    {
+      "project_id": "plan9foundation/plan9",
+      "relative_path": "sys/src/9/pc/a100p.cp",
+      "size_bytes": 21984,
+      "sha256": "6d35f6b2da15023e646cc6deb1aeac947b19aef74084f93aee31c6ec411b63d4",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "binary_blob_with_embedded_nul",
+      "reason": "Plan 9 PC code page table contains embedded NUL bytes and is not valid C source (GCP residual eee7 exit-2)"
     }
   ],
   "collections": [

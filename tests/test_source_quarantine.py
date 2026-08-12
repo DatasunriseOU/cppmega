@@ -35,6 +35,7 @@ RELATIVE_PARSER_CRASH_FIXTURE = (
 )
 RELATIVE_NUL_DIAGNOSTIC_FIXTURE = "clang/test/Misc/diag-null-bytes-in-line.cpp"
 RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE = "clang/test/Lexer/newline-nul.c"
+RELATIVE_NUL_IN_LITERAL_FIXTURE = "clang/test/Lexer/null-character-in-literal.c"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
@@ -50,6 +51,9 @@ RELATIVE_TRUNCATED_UTF32BE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cma
 RELATIVE_TRUNCATED_UTF32LE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake"
 RELATIVE_CMAKE_NULL_AFTER_BACKSLASH = (
     "Tests/RunCMake/Syntax/NullAfterBackslash.cmake"
+)
+RELATIVE_CMAKE_NULL_TERMINATED_ARGUMENT = (
+    "Tests/RunCMake/Syntax/NullTerminatedArgument.cmake"
 )
 RELATIVE_BIG5_SHELL_HEREDOC = (
     "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1"
@@ -266,6 +270,21 @@ def _truncated_utf32le_bom_bytes() -> bytes:
 
 def _cmake_null_after_backslash_bytes() -> bytes:
     return b"A(" + (b"A" * 52) + b"\\\0\n(" + (b"A" * 54) + b"\n"
+
+
+def _cmake_null_terminated_argument_bytes() -> bytes:
+    return (
+        b"LIST(APPEND foo TEST\x000000000000000000000000000 )\n"
+        b"CMAKE_HOST_SYSTEM_INFORMATION(RESULT bar QUERY HOSTNAME)\n"
+    )
+
+
+def _clang_null_character_in_literal_bytes() -> bytes:
+    # Exact tip fixture used by residual eee7 (intel/llvm + llvm-project).
+    return (
+        Path(__file__).parent
+        / "fixtures/source_quarantine/null-character-in-literal.c"
+    ).read_bytes()
 
 
 def _big5_shell_heredoc_bytes() -> bytes:
@@ -1742,6 +1761,11 @@ def test_checked_in_cmake_syntax_manifest_matches_archive_evidence() -> None:
             "cmake_escaped_newline_nul_syntax_fixture",
             "deliberate_parser_regression_fixture",
         ),
+        RELATIVE_CMAKE_NULL_TERMINATED_ARGUMENT: (
+            _cmake_null_terminated_argument_bytes(),
+            "cmake_null_terminated_argument_fixture",
+            "deliberate_parser_regression_fixture",
+        ),
     }
     assert {entry["relative_path"] for entry in entries} == set(expected)
     for entry in entries:
@@ -1830,9 +1854,10 @@ def test_checked_in_threadx_generated_blob_manifest_matches_frozen_receipt() -> 
         if item["project_id"] == "eclipse-threadx/threadx"
     )
 
-    assert entry["size_bytes"] == 60766
+    # Rebound after GCP residual eee7 size mismatch (60766 -> 61551 on tip commit).
+    assert entry["size_bytes"] == 61551
     assert entry["sha256"] == (
-        "303a817f33b086755103778421c37b3aa716e5d49c95c2a9a2d9a6f31cafcd9c"
+        "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294"
     )
     assert entry["classification"] == "generated_binary_blob"
     assert entry["detected_format"] == "utf16le_generated_c_array"
@@ -2182,6 +2207,10 @@ def test_process_project_quarantines_clang_embedded_nul_diagnostic(
     newline_candidate = tmp_path / RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE
     newline_candidate.parent.mkdir(parents=True)
     newline_candidate.write_bytes(newline_payload)
+    literal_payload = _clang_null_character_in_literal_bytes()
+    literal_candidate = tmp_path / RELATIVE_NUL_IN_LITERAL_FIXTURE
+    literal_candidate.parent.mkdir(parents=True, exist_ok=True)
+    literal_candidate.write_bytes(literal_payload)
     manifest = Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
     receipt_path = tmp_path / "receipts/source.json"
 
@@ -2197,10 +2226,11 @@ def test_process_project_quarantines_clang_embedded_nul_diagnostic(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["project_id"] == "intel/llvm"
     assert receipt["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
-    assert receipt["quarantined_count"] == 2
+    assert receipt["quarantined_count"] == 3
     assert {entry["relative_path"] for entry in receipt["entries"]} == {
         RELATIVE_NUL_DIAGNOSTIC_FIXTURE,
         RELATIVE_NEWLINE_NUL_DIAGNOSTIC_FIXTURE,
+        RELATIVE_NUL_IN_LITERAL_FIXTURE,
     }
 
 
