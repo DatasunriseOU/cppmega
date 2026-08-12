@@ -1373,6 +1373,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <securityd_client/ssclient.h>",
                 "class SDCSPSession",
             ),
+            "kcdatabase.h": (
+                "#ifndef _H_KCDATABASE",
+                "#define _H_KCDATABASE",
+                "kcdatabase - software database container implementation",
+                '#include "localdatabase.h"',
+                "#include <securityd_client/ss_types.h>",
+                "class KeychainDatabase",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         if (

@@ -2764,3 +2764,61 @@ def test_checked_in_gcc_encoding_issues_bytes_manifest_matches_pinned_fixture() 
     assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
     assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
     assert entry["detected_format"] == "gcc_embedded_nul_diagnostic"
+
+
+RELATIVE_KCDATABASE = "securityd/src/kcdatabase.h"
+
+
+def test_apple_security_kcdatabase_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "kcdatabase.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "kcdatabase.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_KCDATABASE,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security kcdatabase.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_kcdatabase_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "kcdatabase.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_KCDATABASE,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
