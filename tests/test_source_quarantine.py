@@ -2538,5 +2538,34 @@ def test_apple_security_ssdl_session_contract_rejects_unrelated_header(
         detected_format="apple_security_ssdl_session_libclang_hang",
         reason="negative test",
     )
-    with pytest.raises(SourceQuarantineError, match="SSDLSession header contract"):
+    with pytest.raises(SourceQuarantineError, match="Apple Security libclang-timeout header contract"):
         _verify_detected_format(path, entry)
+
+
+def test_apple_security_cssmcontext_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "cssmcontext.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "cssmcontext.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path="OSX/libsecurity_cssm/lib/cssmcontext.h",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security cssmcontext.h libclang hang",
+    )
+    _verify_detected_format(path, entry)

@@ -385,8 +385,17 @@
       "size_bytes": 8378,
       "sha256": "5052556ea227d186b7bcf8ba4da39ea45739e635804538b831b793d1d73aab64",
       "classification": "compiler_regression_fixture",
-      "detected_format": "apple_security_ssdl_session_libclang_hang",
-      "reason": "Pinned Apple Security SSDLSession.h deterministically times out the corpus libclang parse (FAIL_CLOSED 300s then BrokenProcessPool on r10 with MacOSX.sdk)"
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security SSDLSession.h FAIL_CLOSED libclang parse timeout 300s then BrokenProcessPool on r10/3920-es with MacOSX.sdk"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_cssm/lib/cssmcontext.h",
+      "size_bytes": 4387,
+      "sha256": "2a7b3056e9c86fb1ea221cf29b4a5dc62509f39c3cbf428b0988d2f51d78c10a",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security cssmcontext.h FAIL_CLOSED libclang parse timeout 300s then BrokenProcessPool on 3920-es after SSDLSession quarantine (MacOSX.sdk present)"
     }
   ],
   "collections": [

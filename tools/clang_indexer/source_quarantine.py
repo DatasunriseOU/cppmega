@@ -67,6 +67,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "apple_security_ssdl_session_libclang_hang",
     ),
     (
+        "compiler_regression_fixture",
+        "apple_security_libclang_timeout_header",
+    ),
+    (
         "binary_protocol_test_fixture",
         "clickhouse_dollar_quoted_binary_sql",
     ),
@@ -1288,40 +1292,51 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             )
         return
 
-    if entry.detected_format == "apple_security_ssdl_session_libclang_hang":
-        # Apple Security SSDLSession.h (CSP/DL plugin session): pinned libclang
-        # hits FAIL_CLOSED parse timeout (300s) then BrokenProcessPool on GCP r10
-        # even with an explicit MacOSX.sdk. Identity-checked, not skipped loosely.
+    if entry.detected_format in {
+        "apple_security_ssdl_session_libclang_hang",
+        "apple_security_libclang_timeout_header",
+    }:
+        # Apple Security headers that deterministically hit FAIL_CLOSED libclang
+        # parse timeout (300s) then BrokenProcessPool on GCP even with MacOSX.sdk.
+        # Per-basename content contracts keep the quarantine identity-checked.
         payload = path.read_bytes()
         try:
             decoded = payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise SourceQuarantineError(
-                f"{entry.relative_path}: declared "
-                "apple_security_ssdl_session_libclang_hang but the header is not "
-                f"UTF-8: {exc}"
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                f"header is not UTF-8: {exc}"
             ) from exc
-        required_substrings = (
-            "#ifndef _H_SSDLSESSION",
-            "#define _H_SSDLSESSION",
-            "class SSDLSession : public DLPluginSession",
-            '#include <security_cdsa_plugin/DLsession.h>',
-            "SSCSPDLSession &mSSCSPDLSession",
-            "SecurityServer::ClientSession &clientSession()",
-        )
-        # Identity uses entry.relative_path basename so unit tests can stage the
-        # payload under a temporary path while still verifying the real header.
         expected_name = Path(entry.relative_path).name
+        header_contracts: dict[str, tuple[str, ...]] = {
+            "SSDLSession.h": (
+                "#ifndef _H_SSDLSESSION",
+                "#define _H_SSDLSESSION",
+                "class SSDLSession : public DLPluginSession",
+                "#include <security_cdsa_plugin/DLsession.h>",
+                "SSCSPDLSession &mSSCSPDLSession",
+                "SecurityServer::ClientSession &clientSession()",
+            ),
+            "cssmcontext.h": (
+                "#ifndef _H_CSSMCONTEXT",
+                "#define _H_CSSMCONTEXT",
+                '#include "cssmint.h"',
+                '#include "cspattachment.h"',
+                "#include <security_cdsa_utilities/context.h>",
+                "context - manage CSSM",
+            ),
+        }
+        required_substrings = header_contracts.get(expected_name)
         if (
             path.suffix.casefold() != ".h"
-            or expected_name != "SSDLSession.h"
+            or required_substrings is None
             or any(s not in decoded for s in required_substrings)
             or "Apple Inc." not in decoded
         ):
             raise SourceQuarantineError(
-                f"{entry.relative_path}: declared "
-                "apple_security_ssdl_session_libclang_hang but the Apple Security "
-                "SSDLSession header contract is incomplete or ambiguous"
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "Apple Security libclang-timeout header contract is incomplete or "
+                "ambiguous"
             )
         return
 
