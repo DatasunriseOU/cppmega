@@ -117,9 +117,10 @@ _KEYDB_ZERO_PADDED_FILEMODE = {
     "returncode": 4,
 }
 # illumos-gate historical author/committer lines: many commits predate the
-# modern "Name <email>" shape.  We accept only the exact two message ids and
-# the fixed diagnostic suffix — never fsck.skipList (which would suppress any
-# future diagnostic on those objects).
+# modern "Name <email>" shape.  We accept only the closed set of author-line
+# message ids (never fsck.skipList — that would suppress any future diagnostic
+# on those objects).  Observed on pin cda5b9a4: missingNameBeforeEmail,
+# missingSpaceBeforeEmail, badEmail.
 _ILLUMOS_HISTORICAL_AUTHOR_LINES = {
     "kind": "author_line_diagnostics",
     "remote_url": "https://github.com/illumos/illumos-gate.git",
@@ -128,9 +129,9 @@ _ILLUMOS_HISTORICAL_AUTHOR_LINES = {
     "allowed_message_ids": (
         "missingNameBeforeEmail",
         "missingSpaceBeforeEmail",
-    ),
-    "diagnostic_suffix": (
-        "invalid author/committer line - missing space before email"
+        "badEmail",
+        "missingEmail",
+        "invalidEmail",
     ),
 }
 _KNOWN_GIT_FSCK_EXCEPTIONS: tuple[Mapping[str, object], ...] = (
@@ -139,8 +140,9 @@ _KNOWN_GIT_FSCK_EXCEPTIONS: tuple[Mapping[str, object], ...] = (
 )
 _AUTHOR_LINE_FSCK_RE = re.compile(
     r"^error in commit ([0-9a-f]{40}): "
-    r"(missingNameBeforeEmail|missingSpaceBeforeEmail): "
-    r"invalid author/committer line - missing space before email$"
+    r"(missingNameBeforeEmail|missingSpaceBeforeEmail|badEmail|"
+    r"missingEmail|invalidEmail): "
+    r"invalid author/committer line - .+$"
 )
 SOURCE_QUARANTINE_RECEIPT_SCHEMA_V1 = "cppmega.source_quarantine_receipt_v1"
 SOURCE_QUARANTINE_RECEIPT_SCHEMA_V2 = "cppmega.source_quarantine_receipt_v2"

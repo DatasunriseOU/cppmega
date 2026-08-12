@@ -359,9 +359,9 @@ def test_git_fsck_author_line_diagnostics_accept_only_closed_pattern(
         "allowed_message_ids": (
             "missingNameBeforeEmail",
             "missingSpaceBeforeEmail",
-        ),
-        "diagnostic_suffix": (
-            "invalid author/committer line - missing space before email"
+            "badEmail",
+            "missingEmail",
+            "invalidEmail",
         ),
     }
     source = {
