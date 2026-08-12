@@ -1398,6 +1398,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <securityd_client/ssclient.h>",
                 "class SSKey : public ReferencedKey",
             ),
+            "kckey.h": (
+                "#ifndef _H_KCKEY",
+                "#define _H_KCKEY",
+                "key - representation of SecurityServer key objects",
+                '#include "localkey.h"',
+                "#include <security_cdsa_client/keyclient.h>",
+                "class KeychainKey : public LocalKey, public SecurityServerAcl",
+                "Apple Computer, Inc.",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

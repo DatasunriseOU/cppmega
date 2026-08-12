@@ -459,6 +459,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security SSKey.h FAIL_CLOSED libclang parse timeout 300s after child.h quarantine (73ac-sec, MacOSX.sdk present, knobs 1/64)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/kckey.h",
+      "size_bytes": 2779,
+      "sha256": "bbf4c73193ecbb26ace3ff2555e6702f3542a1b5ba260dde2cc787bf295c8953",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security kckey.h FAIL_CLOSED libclang parse timeout 300s after SSKey quarantine (044c-sec, MacOSX.sdk present, knobs 2/64)"
     }
   ],
   "collections": [
