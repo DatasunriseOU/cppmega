@@ -320,6 +320,105 @@ def test_git_fsck_exception_receipt_is_pinned_and_tamper_evident() -> None:
         validate_git_fsck_snapshot(source, snapshot)
 
 
+def test_git_fsck_author_line_diagnostics_accept_only_closed_pattern(
+    tmp_path: Path,
+) -> None:
+    """Multi-line historical author diagnostics: exact pattern, no skipList."""
+
+    mirror = tmp_path / "author.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    blob_id = _write_loose_git_object(mirror, "blob", b"int main(){return 0;}\n")
+    # Use a non-zero-padded mode so fsck only reports the author-line diagnostics.
+    tree_payload = b"100644 main.c\0" + bytes.fromhex(blob_id)
+    tree_id = _write_loose_git_object(mirror, "tree", tree_payload)
+    # Deliberately invalid author line (missing space before email) — the same
+    # class of historical illumos-gate diagnostics.
+    commit_payload = (
+        f"tree {tree_id}\n"
+        "author BadName<bad@example.test> 0 +0000\n"
+        "committer BadName<bad@example.test> 0 +0000\n"
+        "\nbad-author\n"
+    ).encode("ascii")
+    commit_id = _write_loose_git_object(mirror, "commit", commit_payload)
+    subprocess.run(
+        ["git", f"--git-dir={mirror}", "update-ref", "refs/heads/main", commit_id],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    policy = {
+        "kind": "author_line_diagnostics",
+        "remote_url": "https://example.test/author-history.git",
+        "expected_commit": commit_id,
+        "checkout_tree": tree_id,
+        "allowed_message_ids": (
+            "missingNameBeforeEmail",
+            "missingSpaceBeforeEmail",
+        ),
+        "diagnostic_suffix": (
+            "invalid author/committer line - missing space before email"
+        ),
+    }
+    source = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": commit_id,
+        "expected_tree": tree_id,
+    }
+    fsck = subprocess.run(
+        ["git", f"--git-dir={mirror}", "fsck", "--full", "--strict"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fsck.returncode != 0
+    assert "missingSpaceBeforeEmail" in fsck.stderr or "missingNameBeforeEmail" in fsck.stderr
+
+    receipt = _accept_known_git_fsck_diagnostic(
+        source,
+        tree_id,
+        mirror,
+        fsck,
+        known_exception=policy,
+    )
+    assert receipt["status"] == "accepted_known_historical_author_line_diagnostics"
+    assert receipt["diagnostic_count"] >= 1
+    assert receipt["stderr_sha256"] == hashlib.sha256(
+        fsck.stderr.encode("utf-8")
+    ).hexdigest()
+
+    snapshot = {
+        "kind": "git_mirror",
+        "remote_url": policy["remote_url"],
+        "expected_commit": commit_id,
+        "resolved_commit": commit_id,
+        "tree": tree_id,
+        "fsck": receipt,
+    }
+    validate_git_fsck_snapshot(source, snapshot, known_exception=policy)
+
+    # Reject any non-author diagnostic mixed into stderr.
+    polluted = subprocess.CompletedProcess(
+        fsck.args,
+        fsck.returncode,
+        fsck.stdout,
+        fsck.stderr + f"error in tree {tree_id}: zeroPaddedFilemode: contains zero-padded file modes\n",
+    )
+    with pytest.raises(ContractError, match="non-author historical diagnostic"):
+        _accept_known_git_fsck_diagnostic(
+            source,
+            tree_id,
+            mirror,
+            polluted,
+            known_exception=policy,
+        )
+
+
 def test_candidate_canonicalization_is_independent_of_emission_order(
     tmp_path: Path,
 ) -> None:

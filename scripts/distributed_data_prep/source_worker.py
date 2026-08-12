@@ -98,6 +98,7 @@ GIT_FSCK_RECEIPT_SCHEMA = "cppmega.git_fsck_receipt_v1"
 _GIT_FSCK_COMMAND = ("git", "fsck", "--full", "--strict")
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _KEYDB_ZERO_PADDED_FILEMODE = {
+    "kind": "single_object_diagnostic",
     "remote_url": "https://github.com/Snapchat/KeyDB.git",
     "expected_commit": "603ebb27fb82a27fb98b0feb6749b0f7661a1c4b",
     "checkout_tree": "f5269110f16e1833586e15dd59dde6255c8cc787",
@@ -115,6 +116,32 @@ _KEYDB_ZERO_PADDED_FILEMODE = {
     ),
     "returncode": 4,
 }
+# illumos-gate historical author/committer lines: many commits predate the
+# modern "Name <email>" shape.  We accept only the exact two message ids and
+# the fixed diagnostic suffix — never fsck.skipList (which would suppress any
+# future diagnostic on those objects).
+_ILLUMOS_HISTORICAL_AUTHOR_LINES = {
+    "kind": "author_line_diagnostics",
+    "remote_url": "https://github.com/illumos/illumos-gate.git",
+    "expected_commit": "cda5b9a49f77a86a151a20cdde0e948a49b37160",
+    "checkout_tree": "3095a1c33836c5953276defc02979e1e1816f5e6",
+    "allowed_message_ids": (
+        "missingNameBeforeEmail",
+        "missingSpaceBeforeEmail",
+    ),
+    "diagnostic_suffix": (
+        "invalid author/committer line - missing space before email"
+    ),
+}
+_KNOWN_GIT_FSCK_EXCEPTIONS: tuple[Mapping[str, object], ...] = (
+    _KEYDB_ZERO_PADDED_FILEMODE,
+    _ILLUMOS_HISTORICAL_AUTHOR_LINES,
+)
+_AUTHOR_LINE_FSCK_RE = re.compile(
+    r"^error in commit ([0-9a-f]{40}): "
+    r"(missingNameBeforeEmail|missingSpaceBeforeEmail): "
+    r"invalid author/committer line - missing space before email$"
+)
 SOURCE_QUARANTINE_RECEIPT_SCHEMA_V1 = "cppmega.source_quarantine_receipt_v1"
 SOURCE_QUARANTINE_RECEIPT_SCHEMA_V2 = "cppmega.source_quarantine_receipt_v2"
 SOURCE_TREE_ENTRY_EXCLUSIONS_SCHEMA = "cppmega.source_tree_entry_exclusions_v1"
@@ -803,13 +830,25 @@ def _git(git_dir: Path, *args: str) -> str:
 def _git_fsck_exception_for_source(
     source: Mapping[str, object],
     *,
-    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+    known_exceptions: tuple[Mapping[str, object], ...] = _KNOWN_GIT_FSCK_EXCEPTIONS,
+    known_exception: Mapping[str, object] | None = None,
 ) -> Mapping[str, object] | None:
-    if (
-        source.get("remote_url") == known_exception["remote_url"]
-        and source.get("expected_commit") == known_exception["expected_commit"]
-    ):
-        return known_exception
+    """Return the pinned fsck exception policy for this source, if any.
+
+    ``known_exception`` remains for unit tests that inject a single synthetic
+    policy; production callers use the closed registry.
+    """
+
+    if known_exception is not None:
+        candidates: tuple[Mapping[str, object], ...] = (known_exception,)
+    else:
+        candidates = known_exceptions
+    for policy in candidates:
+        if (
+            source.get("remote_url") == policy["remote_url"]
+            and source.get("expected_commit") == policy["expected_commit"]
+        ):
+            return policy
     return None
 
 
@@ -817,10 +856,12 @@ def _matching_git_fsck_exception(
     source: Mapping[str, object],
     checkout_tree: str,
     *,
-    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+    known_exceptions: tuple[Mapping[str, object], ...] = _KNOWN_GIT_FSCK_EXCEPTIONS,
+    known_exception: Mapping[str, object] | None = None,
 ) -> Mapping[str, object] | None:
     policy = _git_fsck_exception_for_source(
         source,
+        known_exceptions=known_exceptions,
         known_exception=known_exception,
     )
     if policy is not None and checkout_tree == policy["checkout_tree"]:
@@ -830,7 +871,51 @@ def _matching_git_fsck_exception(
 
 def _expected_git_fsck_exception_receipt(
     known_exception: Mapping[str, object],
+    *,
+    fsck: subprocess.CompletedProcess[str] | None = None,
 ) -> dict[str, object]:
+    kind = str(known_exception.get("kind") or "single_object_diagnostic")
+    if kind == "author_line_diagnostics":
+        if fsck is None:
+            raise ContractError(
+                "author_line_diagnostics fsck receipt requires observed fsck output"
+            )
+        lines = [line for line in fsck.stderr.splitlines() if line]
+        diagnostics = []
+        for line in lines:
+            match = _AUTHOR_LINE_FSCK_RE.fullmatch(line)
+            if match is None:
+                raise ContractError(
+                    "author_line_diagnostics receipt saw non-author fsck line: "
+                    f"{line!r}"
+                )
+            diagnostics.append(
+                {
+                    "message_id": match.group(2),
+                    "diagnostic": line,
+                    "object_id": match.group(1),
+                    "object_type": "commit",
+                }
+            )
+        # Preserve emission order so stderr_sha256(fsck.stderr) matches
+        # join(diagnostic + "\n" for diagnostic in diagnostics).
+        return {
+            "schema": GIT_FSCK_RECEIPT_SCHEMA,
+            "status": "accepted_known_historical_author_line_diagnostics",
+            "command": list(_GIT_FSCK_COMMAND),
+            "returncode": int(fsck.returncode),
+            "stdout_sha256": _EMPTY_SHA256,
+            "stderr_sha256": hashlib.sha256(fsck.stderr.encode("utf-8")).hexdigest(),
+            "source_binding": {
+                "remote_url": str(known_exception["remote_url"]),
+                "expected_commit": str(known_exception["expected_commit"]),
+                "checkout_tree": str(known_exception["checkout_tree"]),
+            },
+            "allowed_message_ids": list(known_exception["allowed_message_ids"]),
+            "diagnostic_count": len(diagnostics),
+            "diagnostics": diagnostics,
+        }
+
     diagnostic = str(known_exception["diagnostic"])
     return {
         "schema": GIT_FSCK_RECEIPT_SCHEMA,
@@ -862,20 +947,88 @@ def _expected_git_fsck_exception_receipt(
     }
 
 
+def _accept_author_line_git_fsck_diagnostics(
+    policy: Mapping[str, object],
+    mirror: Path,
+    fsck: subprocess.CompletedProcess[str],
+) -> dict[str, object]:
+    """Accept multi-line historical author/committer diagnostics for one pin.
+
+    Every stderr line must match the closed author-line pattern; stdout must be
+    empty; returncode must be non-zero.  No ``fsck.skipList``.
+    """
+
+    if fsck.returncode == 0:
+        raise ContractError(
+            "author_line_diagnostics policy requires a failing git fsck returncode"
+        )
+    if fsck.stdout != "":
+        raise ContractError(
+            "author_line_diagnostics policy requires empty git fsck stdout: "
+            f"{fsck.stdout[-4000:]!r}"
+        )
+    lines = [line for line in fsck.stderr.splitlines() if line]
+    if not lines:
+        raise ContractError("author_line_diagnostics policy saw empty git fsck stderr")
+    allowed = frozenset(str(item) for item in policy["allowed_message_ids"])
+    commit_ids: list[str] = []
+    for line in lines:
+        match = _AUTHOR_LINE_FSCK_RE.fullmatch(line)
+        if match is None:
+            raise ContractError(
+                "full mirror git fsck emitted a non-author historical diagnostic: "
+                f"{line!r}"
+            )
+        if match.group(2) not in allowed:
+            raise ContractError(
+                "full mirror git fsck emitted an unlisted author message id: "
+                f"{match.group(2)!r}"
+            )
+        commit_ids.append(match.group(1))
+    # Every reported commit must resolve in the mirror and be an ancestor of the
+    # pinned tip (or the tip itself).  This binds the diagnostics to the pin
+    # without skipList.
+    tip = str(policy["expected_commit"])
+    for commit_id in commit_ids:
+        if _git(mirror, "rev-parse", f"{commit_id}^{{commit}}") != commit_id:
+            raise ContractError(
+                f"author_line_diagnostics commit is missing from mirror: {commit_id}"
+            )
+        ancestry = subprocess.run(
+            [
+                "git",
+                f"--git-dir={mirror}",
+                "merge-base",
+                "--is-ancestor",
+                commit_id,
+                tip,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ancestry.returncode != 0 or ancestry.stdout or ancestry.stderr:
+            raise ContractError(
+                "author_line_diagnostics commit is not bound to the pinned "
+                f"commit ancestry: {commit_id}"
+            )
+    return _expected_git_fsck_exception_receipt(policy, fsck=fsck)
+
+
 def _accept_known_git_fsck_diagnostic(
     source: Mapping[str, object],
     checkout_tree: str,
     mirror: Path,
     fsck: subprocess.CompletedProcess[str],
     *,
-    known_exception: Mapping[str, object] = _KEYDB_ZERO_PADDED_FILEMODE,
+    known_exception: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Accept one byte-verified historical diagnostic for one pinned source.
+    """Accept a byte-verified historical fsck diagnostic for one pinned source.
 
-    The unmodified strict fsck command must emit exactly the known line and no
-    other output.  We deliberately do not use ``fsck.skipList``: that setting
-    would suppress every diagnostic attached to the listed object rather than
-    proving that only the independently verified diagnostic was observed.
+    Single-object policies require the exact known stderr line plus object
+    payload binding.  Author-line policies require every stderr line to match
+    the closed author-line pattern and that each commit is in the pin ancestry.
+    We deliberately do not use ``fsck.skipList``.
     """
 
     policy = _matching_git_fsck_exception(
@@ -885,6 +1038,10 @@ def _accept_known_git_fsck_diagnostic(
     )
     if policy is None:
         raise ContractError(f"full mirror failed git fsck: {fsck.stderr[-8000:]}")
+    kind = str(policy.get("kind") or "single_object_diagnostic")
+    if kind == "author_line_diagnostics":
+        return _accept_author_line_git_fsck_diagnostics(policy, mirror, fsck)
+
     expected_receipt = _expected_git_fsck_exception_receipt(policy)
     expected_stderr = str(policy["diagnostic"]) + "\n"
     if (
@@ -948,12 +1105,15 @@ def _accept_known_git_fsck_diagnostic(
 
 
 def validate_git_fsck_snapshot(
-    source: Mapping[str, object], source_snapshot: Mapping[str, object]
+    source: Mapping[str, object],
+    source_snapshot: Mapping[str, object],
+    *,
+    known_exception: Mapping[str, object] | None = None,
 ) -> None:
-    """Validate normal fsck success or the one exact historical exception."""
+    """Validate normal fsck success or a known historical exception receipt."""
 
     checkout_tree = str(source_snapshot.get("tree", ""))
-    policy = _git_fsck_exception_for_source(source)
+    policy = _git_fsck_exception_for_source(source, known_exception=known_exception)
     fsck = source_snapshot.get("fsck")
     if policy is None:
         if fsck != "ok":
@@ -963,6 +1123,65 @@ def validate_git_fsck_snapshot(
         raise ContractError("Git source snapshot known fsck checkout tree drifted")
     if not isinstance(fsck, Mapping):
         raise ContractError("Git source snapshot omitted known fsck diagnostic evidence")
+    kind = str(policy.get("kind") or "single_object_diagnostic")
+    if kind == "author_line_diagnostics":
+        # Receipt is observation-bound (stderr_sha256 + diagnostic list).  Re-check
+        # structural invariants without needing the original process object.
+        if fsck.get("status") != "accepted_known_historical_author_line_diagnostics":
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        if fsck.get("schema") != GIT_FSCK_RECEIPT_SCHEMA:
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        if list(fsck.get("command") or []) != list(_GIT_FSCK_COMMAND):
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        binding = fsck.get("source_binding")
+        if not isinstance(binding, Mapping):
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        if (
+            binding.get("remote_url") != policy["remote_url"]
+            or binding.get("expected_commit") != policy["expected_commit"]
+            or binding.get("checkout_tree") != policy["checkout_tree"]
+        ):
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        allowed = list(policy["allowed_message_ids"])
+        if list(fsck.get("allowed_message_ids") or []) != allowed:
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        diagnostics = fsck.get("diagnostics")
+        if not isinstance(diagnostics, list) or not diagnostics:
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        if int(fsck.get("diagnostic_count") or 0) != len(diagnostics):
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        for item in diagnostics:
+            if not isinstance(item, Mapping):
+                raise ContractError("Git source snapshot known fsck evidence drifted")
+            diagnostic = str(item.get("diagnostic") or "")
+            match = _AUTHOR_LINE_FSCK_RE.fullmatch(diagnostic)
+            if match is None or match.group(2) not in set(allowed):
+                raise ContractError("Git source snapshot known fsck evidence drifted")
+            if (
+                item.get("message_id") != match.group(2)
+                or item.get("object_id") != match.group(1)
+                or item.get("object_type") != "commit"
+            ):
+                raise ContractError("Git source snapshot known fsck evidence drifted")
+        emission_stderr = "".join(
+            str(item["diagnostic"]) + "\n" for item in diagnostics
+        )
+        # git may terminate stderr without a trailing newline; accept both shapes.
+        candidates = (
+            emission_stderr,
+            emission_stderr.rstrip("\n"),
+            emission_stderr if emission_stderr.endswith("\n") else emission_stderr + "\n",
+        )
+        if fsck.get("stderr_sha256") not in {
+            hashlib.sha256(text.encode("utf-8")).hexdigest() for text in candidates
+        }:
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        if fsck.get("stdout_sha256") != _EMPTY_SHA256:
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        if not isinstance(fsck.get("returncode"), int) or int(fsck["returncode"]) == 0:
+            raise ContractError("Git source snapshot known fsck evidence drifted")
+        return
+
     expected = _expected_git_fsck_exception_receipt(policy)
     if canonical_json_bytes(fsck) != canonical_json_bytes(expected):
         raise ContractError("Git source snapshot known fsck evidence drifted")

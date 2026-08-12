@@ -2,177 +2,6 @@
   "schema": "cppmega.source_quarantine_manifest_v2",
   "entries": [
     {
-      "project_id": "Kitware/CMake",
-      "relative_path": "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake",
-      "size_bytes": 3,
-      "sha256": "91147ecbd5b9324a18f381688ca3b992bdc0a7b920f99f5732eb9d5f4245f727",
-      "classification": "mislabeled_non_cpp",
-      "detected_format": "truncated_utf32be_bom",
-      "reason": "CMake encoding regression fixture containing only a truncated UTF-32BE BOM prefix"
-    },
-    {
-      "project_id": "Kitware/CMake",
-      "relative_path": "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake",
-      "size_bytes": 3,
-      "sha256": "ba778c0261008c8f71ae4061ad0162ffcbe63b52c91f89f236738131d1217ec7",
-      "classification": "mislabeled_non_cpp",
-      "detected_format": "truncated_utf32le_bom",
-      "reason": "CMake encoding regression fixture containing only a truncated UTF-32LE BOM prefix"
-    },
-    {
-      "project_id": "Kitware/CMake",
-      "relative_path": "Tests/RunCMake/Syntax/NullAfterBackslash.cmake",
-      "size_bytes": 113,
-      "sha256": "02f5ed469f69885167a071a94593a0a41247d448b17e35553b37794f526cd3d8",
-      "classification": "deliberate_parser_regression_fixture",
-      "detected_format": "cmake_escaped_newline_nul_syntax_fixture",
-      "reason": "CMake list-file lexer regression fixture intentionally places a NUL byte after a backslash before newline"
-    },
-    {
-      "project_id": "corpus.local/Xbox_Live_Source",
-      "relative_path": "Xbox Live Source/XONLINE_MAIN/public/ext/sdk/vs10rtm/SDK/bin/isvtier5appsignsdk.cc",
-      "size_bytes": 21234,
-      "sha256": "d7f4a8c02356872f622eea62337980ec36e0a5ed0ec9371d0cd6513ec34ed703",
-      "classification": "mislabeled_non_cpp",
-      "detected_format": "xml_utf16le",
-      "reason": "UTF-16LE XML license document stored under a .cc suffix"
-    },
-    {
-      "project_id": "google/filament",
-      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Parser/crash-report.c",
-      "size_bytes": 271,
-      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
-      "classification": "deliberate_compiler_crash_fixture",
-      "detected_format": "clang_debug_crash_pragma",
-      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
-    },
-    {
-      "project_id": "google/filament",
-      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Index/crash-recovery.c",
-      "size_bytes": 344,
-      "sha256": "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727",
-      "classification": "deliberate_compiler_crash_fixture",
-      "detected_format": "clang_debug_crash_pragma",
-      "reason": "Clang index regression fixture deliberately invokes #pragma clang __debug crash"
-    },
-    {
-      "project_id": "google/filament",
-      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Index/Inputs/crash-recovery-code-complete-remap.c",
-      "size_bytes": 398,
-      "sha256": "4170335b0ad9450e204fcf9625e6d7f506f84308b10857b7b57eb37973b66590",
-      "classification": "deliberate_compiler_crash_fixture",
-      "detected_format": "clang_debug_crash_pragma",
-      "reason": "Clang code-completion crash-recovery fixture deliberately invokes #pragma clang __debug crash"
-    },
-    {
-      "project_id": "gcc-mirror/gcc",
-      "relative_path": "gcc/testsuite/gcc.dg/pr119001-1.c",
-      "size_bytes": 867,
-      "sha256": "a01d63621d40ce04f9d95341d6a3931d38da7168eace62765970d8f4f382c178",
-      "classification": "compiler_regression_fixture",
-      "detected_format": "gcc_c_flexible_array_union_initializer_regression",
-      "reason": "GCC PR119001 regression fixture deterministically crashes the pinned libclang parser"
-    },
-    {
-      "project_id": "microsoft/DirectXShaderCompiler",
-      "relative_path": "tools/clang/test/Parser/crash-report.c",
-      "size_bytes": 271,
-      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
-      "classification": "deliberate_compiler_crash_fixture",
-      "detected_format": "clang_debug_crash_pragma",
-      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
-    },
-    {
-      "project_id": "Stichting-MINIX-Research-Foundation/minix",
-      "relative_path": "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c",
-      "size_bytes": 700,
-      "sha256": "e970a5aab931388aa671bf2589426acfcd2ebdcf60c70342cfd500086d697131",
-      "classification": "deliberate_compiler_crash_fixture",
-      "detected_format": "clang_debug_parser_crash_pragma",
-      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug parser_crash"
-    },
-    {
-      "project_id": "intel/llvm",
-      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
-      "size_bytes": 398,
-      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
-      "classification": "deliberate_compiler_diagnostic_fixture",
-      "detected_format": "clang_embedded_nul_diagnostic",
-      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token"
-    },
-    {
-      "project_id": "intel/llvm",
-      "relative_path": "clang/test/Lexer/newline-nul.c",
-      "size_bytes": 332,
-      "sha256": "11548a466e2e5eb0a686cf422f7872ea94f616fe43f4bdb9311a0f1764391474",
-      "classification": "deliberate_compiler_diagnostic_fixture",
-      "detected_format": "clang_escaped_newline_nul_preprocessor_diagnostic",
-      "reason": "Clang lexer regression fixture intentionally places a NUL byte after an escaped newline inside a preprocessing directive"
-    },
-    {
-      "project_id": "eclipse-threadx/threadx",
-      "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
-      "size_bytes": 61551,
-      "sha256": "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294",
-      "classification": "generated_binary_blob",
-      "detected_format": "utf16le_generated_c_array",
-      "reason": "Frozen ThreadX UTF-16LE generated C byte array embedding a module ELF [rebound size/sha after GCP residual size mismatch 60766->61551]"
-    },
-    {
-      "project_id": "NetBSD/src",
-      "relative_path": "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1",
-      "size_bytes": 1155,
-      "sha256": "5c9ee72b8cd727c9d975c1bc5e8e725e2835235c2b094f2f82eeb8c066473737",
-      "classification": "mislabeled_non_cpp",
-      "detected_format": "big5_shell_heredoc",
-      "reason": "GNU gettext BIG5 conversion shell test with an encoded PO heredoc and no source extension"
-    },
-    {
-      "project_id": "autotools-mirror/gettext",
-      "relative_path": "gettext-tools/tests/msgconv-1",
-      "size_bytes": 1001,
-      "sha256": "7bb62b1cdbfe9df2082e11fd3fe2251ee847f569a1531472f5fa757eb485de7a",
-      "classification": "mislabeled_non_cpp",
-      "detected_format": "big5_shell_heredoc",
-      "reason": "GNU gettext BIG5 conversion shell test with encoded PO heredocs and no source extension"
-    },
-    {
-      "project_id": "git/git",
-      "relative_path": "t/t4201-shortlog.sh",
-      "size_bytes": 11480,
-      "sha256": "017c37e96a1bf295be7436f35ff9da9b42f7baa40220e353e3414dfca6af11dd",
-      "classification": "deliberate_encoding_regression_fixture",
-      "detected_format": "git_shortlog_invalid_utf8_shell",
-      "reason": "Git shortlog regression fixture deliberately embeds impossible UTF-8 leading bytes in expected shell-test output"
-    },
-    {
-      "project_id": "python/cpython",
-      "relative_path": "Lib/test/archivetestdata/exe_with_zip",
-      "size_bytes": 990,
-      "sha256": "2f27f5c9108936a693fd496565e5c5050b5c62cfbb61d1d5da9d97c89533d637",
-      "classification": "generated_executable_archive",
-      "detected_format": "posix_shell_appended_zip",
-      "reason": "CPython executable ZIP test fixture with a UTF-8 Bash prefix and appended archive"
-    },
-    {
-      "project_id": "python/cpython",
-      "relative_path": "Lib/test/archivetestdata/exe_with_z64",
-      "size_bytes": 978,
-      "sha256": "b1a8382acacce4022b02daa25b293ddfc1dc6ce6a3ddb8b3d95b517592c5a428",
-      "classification": "generated_executable_archive",
-      "detected_format": "posix_shell_appended_zip",
-      "reason": "CPython executable ZIP64 test fixture with a UTF-8 Bash prefix and appended archive"
-    },
-    {
-      "project_id": "questdb/questdb",
-      "relative_path": "core/src/main/bin/linux-x86-64/jfrconv",
-      "size_bytes": 125326,
-      "sha256": "1806e97395e39bd37386eb3ef4ad0a2e83fe9a70b6a05e6779d542684342def4",
-      "classification": "generated_executable_archive",
-      "detected_format": "posix_shell_appended_zip",
-      "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
-    },
-    {
       "project_id": "ClickHouse/ClickHouse",
       "relative_path": "tests/queries/0_stateless/02683_native_too_large_size.sql",
       "size_bytes": 5742,
@@ -218,13 +47,67 @@
       "reason": "ClickHouse Native-format fuzz regression fixture with a dollar-quoted binary protocol payload"
     },
     {
-      "project_id": "llvm/llvm-project",
-      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
-      "size_bytes": 398,
-      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/CommandLine/cmake_depends/test_UTF-16LE.h",
+      "size_bytes": 59,
+      "sha256": "1e8d87862af23c4c96e5e928a0e49d2d64497eb5676a80ea033d15d2a63adca7",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "utf16le_source_text",
+      "reason": "CMake cmake_depends regression fixture is UTF-16LE source text (GCP fail16 residual after NUL fixtures quarantined)"
+    },
+    {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake",
+      "size_bytes": 3,
+      "sha256": "91147ecbd5b9324a18f381688ca3b992bdc0a7b920f99f5732eb9d5f4245f727",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "truncated_utf32be_bom",
+      "reason": "CMake encoding regression fixture containing only a truncated UTF-32BE BOM prefix"
+    },
+    {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-LE.cmake",
+      "size_bytes": 3,
+      "sha256": "ba778c0261008c8f71ae4061ad0162ffcbe63b52c91f89f236738131d1217ec7",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "truncated_utf32le_bom",
+      "reason": "CMake encoding regression fixture containing only a truncated UTF-32LE BOM prefix"
+    },
+    {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/NullAfterBackslash.cmake",
+      "size_bytes": 113,
+      "sha256": "02f5ed469f69885167a071a94593a0a41247d448b17e35553b37794f526cd3d8",
+      "classification": "deliberate_parser_regression_fixture",
+      "detected_format": "cmake_escaped_newline_nul_syntax_fixture",
+      "reason": "CMake list-file lexer regression fixture intentionally places a NUL byte after a backslash before newline"
+    },
+    {
+      "project_id": "Kitware/CMake",
+      "relative_path": "Tests/RunCMake/Syntax/NullTerminatedArgument.cmake",
+      "size_bytes": 106,
+      "sha256": "95d45df3fed3f75b284edfc38eef980c725faadd13f4342057eb05e222552e93",
+      "classification": "deliberate_parser_regression_fixture",
+      "detected_format": "cmake_null_terminated_argument_fixture",
+      "reason": "CMake list-file lexer regression fixture intentionally embeds a NUL byte (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "NetBSD/src",
+      "relative_path": "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1",
+      "size_bytes": 1155,
+      "sha256": "5c9ee72b8cd727c9d975c1bc5e8e725e2835235c2b094f2f82eeb8c066473737",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "big5_shell_heredoc",
+      "reason": "GNU gettext BIG5 conversion shell test with an encoded PO heredoc and no source extension"
+    },
+    {
+      "project_id": "ROCm/llvm-project",
+      "relative_path": "clang/test/Lexer/null-character-in-literal.c",
+      "size_bytes": 924,
+      "sha256": "009160c9be76fd35778e4e9af933a3c978ee3c7d913eefb0aca26128e7b7f9c6",
       "classification": "deliberate_compiler_diagnostic_fixture",
-      "detected_format": "clang_embedded_nul_diagnostic",
-      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token (same fixture as intel/llvm)"
+      "detected_format": "clang_embedded_nul_in_literal",
+      "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (ROCm llvm fork; GCP residual eee7)"
     },
     {
       "project_id": "ROCm/llvm-project",
@@ -236,6 +119,24 @@
       "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token (same fixture as intel/llvm)"
     },
     {
+      "project_id": "Stichting-MINIX-Research-Foundation/minix",
+      "relative_path": "external/bsd/llvm/dist/clang/test/Driver/crash report spaces.c",
+      "size_bytes": 700,
+      "sha256": "e970a5aab931388aa671bf2589426acfcd2ebdcf60c70342cfd500086d697131",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_parser_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug parser_crash"
+    },
+    {
+      "project_id": "autotools-mirror/gettext",
+      "relative_path": "gettext-tools/tests/msgconv-1",
+      "size_bytes": 1001,
+      "sha256": "7bb62b1cdbfe9df2082e11fd3fe2251ee847f569a1531472f5fa757eb485de7a",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "big5_shell_heredoc",
+      "reason": "GNU gettext BIG5 conversion shell test with encoded PO heredocs and no source extension"
+    },
+    {
       "project_id": "cnr-isti-vclab/meshlab",
       "relative_path": "unsupported/plugins_experimental/edit_panosample/resource.h",
       "size_bytes": 904,
@@ -245,13 +146,13 @@
       "reason": "UTF-16LE C/C++ header mislabeled as source; contains embedded NULs (github tip hash; rebind if archive pin differs)"
     },
     {
-      "project_id": "mlpack/mlpack",
-      "relative_path": "doc/examples/sample-ml-app/sample-ml-app/stdafx.h",
-      "size_bytes": 1140,
-      "sha256": "e46c61caa08acfb05e5a813718aa820046629f447ff07686eca3986dde72347b",
+      "project_id": "corpus.local/Xbox_Live_Source",
+      "relative_path": "Xbox Live Source/XONLINE_MAIN/public/ext/sdk/vs10rtm/SDK/bin/isvtier5appsignsdk.cc",
+      "size_bytes": 21234,
+      "sha256": "d7f4a8c02356872f622eea62337980ec36e0a5ed0ec9371d0cd6513ec34ed703",
       "classification": "mislabeled_non_cpp",
-      "detected_format": "utf16le_source_text",
-      "reason": "UTF-16LE C/C++ header mislabeled as source; contains embedded NULs (github tip hash; rebind if archive pin differs)"
+      "detected_format": "xml_utf16le",
+      "reason": "UTF-16LE XML license document stored under a .cc suffix"
     },
     {
       "project_id": "corpus.local/windows_10_shared_source_kit",
@@ -281,13 +182,67 @@
       "reason": "Plum Hall C 4.12 date/time conformance fixture deterministically hangs the pinned libclang parser (Parser::isTypeSpecifierQualifier spin) for multi-hour wall time on a 4KB source"
     },
     {
-      "project_id": "Kitware/CMake",
-      "relative_path": "Tests/RunCMake/Syntax/NullTerminatedArgument.cmake",
-      "size_bytes": 106,
-      "sha256": "95d45df3fed3f75b284edfc38eef980c725faadd13f4342057eb05e222552e93",
-      "classification": "deliberate_parser_regression_fixture",
-      "detected_format": "cmake_null_terminated_argument_fixture",
-      "reason": "CMake list-file lexer regression fixture intentionally embeds a NUL byte (GCP residual eee7 exit-2)"
+      "project_id": "eclipse-threadx/threadx",
+      "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
+      "size_bytes": 61551,
+      "sha256": "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294",
+      "classification": "generated_binary_blob",
+      "detected_format": "utf16le_generated_c_array",
+      "reason": "Frozen ThreadX generated C byte array embedding a module ELF; ASCII C-comment header then UTF-16LE body without leading BOM (size/sha rebound 60766->61551; format verified as hybrid shape)"
+    },
+    {
+      "project_id": "gcc-mirror/gcc",
+      "relative_path": "gcc/testsuite/gcc.dg/pr119001-1.c",
+      "size_bytes": 867,
+      "sha256": "a01d63621d40ce04f9d95341d6a3931d38da7168eace62765970d8f4f382c178",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "gcc_c_flexible_array_union_initializer_regression",
+      "reason": "GCC PR119001 regression fixture deterministically crashes the pinned libclang parser"
+    },
+    {
+      "project_id": "git/git",
+      "relative_path": "t/t4201-shortlog.sh",
+      "size_bytes": 11480,
+      "sha256": "017c37e96a1bf295be7436f35ff9da9b42f7baa40220e353e3414dfca6af11dd",
+      "classification": "deliberate_encoding_regression_fixture",
+      "detected_format": "git_shortlog_invalid_utf8_shell",
+      "reason": "Git shortlog regression fixture deliberately embeds impossible UTF-8 leading bytes in expected shell-test output"
+    },
+    {
+      "project_id": "google/filament",
+      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Index/Inputs/crash-recovery-code-complete-remap.c",
+      "size_bytes": 398,
+      "sha256": "4170335b0ad9450e204fcf9625e6d7f506f84308b10857b7b57eb37973b66590",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang code-completion crash-recovery fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "google/filament",
+      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Index/crash-recovery.c",
+      "size_bytes": 344,
+      "sha256": "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang index regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "google/filament",
+      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Parser/crash-report.c",
+      "size_bytes": 271,
+      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "intel/llvm",
+      "relative_path": "clang/test/Lexer/newline-nul.c",
+      "size_bytes": 332,
+      "sha256": "11548a466e2e5eb0a686cf422f7872ea94f616fe43f4bdb9311a0f1764391474",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_escaped_newline_nul_preprocessor_diagnostic",
+      "reason": "Clang lexer regression fixture intentionally places a NUL byte after an escaped newline inside a preprocessing directive"
     },
     {
       "project_id": "intel/llvm",
@@ -299,6 +254,15 @@
       "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (GCP residual eee7 exit-2)"
     },
     {
+      "project_id": "intel/llvm",
+      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
+      "size_bytes": 398,
+      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "clang_embedded_nul_diagnostic",
+      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token"
+    },
+    {
       "project_id": "llvm/llvm-project",
       "relative_path": "clang/test/Lexer/null-character-in-literal.c",
       "size_bytes": 924,
@@ -308,13 +272,31 @@
       "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (same path as intel/llvm; GCP residual eee7)"
     },
     {
-      "project_id": "ROCm/llvm-project",
-      "relative_path": "clang/test/Lexer/null-character-in-literal.c",
-      "size_bytes": 924,
-      "sha256": "009160c9be76fd35778e4e9af933a3c978ee3c7d913eefb0aca26128e7b7f9c6",
+      "project_id": "llvm/llvm-project",
+      "relative_path": "clang/test/Misc/diag-null-bytes-in-line.cpp",
+      "size_bytes": 398,
+      "sha256": "acba383a8c05e95c15d885e06c467d58edf39f5c7f84a0376f86cdb20d40be3a",
       "classification": "deliberate_compiler_diagnostic_fixture",
-      "detected_format": "clang_embedded_nul_in_literal",
-      "reason": "Clang lexer regression fixture intentionally embeds a NUL byte in a string literal (ROCm llvm fork; GCP residual eee7)"
+      "detected_format": "clang_embedded_nul_diagnostic",
+      "reason": "Clang diagnostic regression fixture intentionally embeds a NUL byte in a sizeof token (same fixture as intel/llvm)"
+    },
+    {
+      "project_id": "microsoft/DirectXShaderCompiler",
+      "relative_path": "tools/clang/test/Parser/crash-report.c",
+      "size_bytes": 271,
+      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "mlpack/mlpack",
+      "relative_path": "doc/examples/sample-ml-app/sample-ml-app/stdafx.h",
+      "size_bytes": 1140,
+      "sha256": "e46c61caa08acfb05e5a813718aa820046629f447ff07686eca3986dde72347b",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "utf16le_source_text",
+      "reason": "UTF-16LE C/C++ header mislabeled as source; contains embedded NULs (github tip hash; rebind if archive pin differs)"
     },
     {
       "project_id": "plan9foundation/plan9",
@@ -324,6 +306,33 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "binary_blob_with_embedded_nul",
       "reason": "Plan 9 PC code page table contains embedded NUL bytes and is not valid C source (GCP residual eee7 exit-2)"
+    },
+    {
+      "project_id": "python/cpython",
+      "relative_path": "Lib/test/archivetestdata/exe_with_z64",
+      "size_bytes": 978,
+      "sha256": "b1a8382acacce4022b02daa25b293ddfc1dc6ce6a3ddb8b3d95b517592c5a428",
+      "classification": "generated_executable_archive",
+      "detected_format": "posix_shell_appended_zip",
+      "reason": "CPython executable ZIP64 test fixture with a UTF-8 Bash prefix and appended archive"
+    },
+    {
+      "project_id": "python/cpython",
+      "relative_path": "Lib/test/archivetestdata/exe_with_zip",
+      "size_bytes": 990,
+      "sha256": "2f27f5c9108936a693fd496565e5c5050b5c62cfbb61d1d5da9d97c89533d637",
+      "classification": "generated_executable_archive",
+      "detected_format": "posix_shell_appended_zip",
+      "reason": "CPython executable ZIP test fixture with a UTF-8 Bash prefix and appended archive"
+    },
+    {
+      "project_id": "questdb/questdb",
+      "relative_path": "core/src/main/bin/linux-x86-64/jfrconv",
+      "size_bytes": 125326,
+      "sha256": "1806e97395e39bd37386eb3ef4ad0a2e83fe9a70b6a05e6779d542684342def4",
+      "classification": "generated_executable_archive",
+      "detected_format": "posix_shell_appended_zip",
+      "reason": "Self-executing UTF-8 POSIX shell launcher with an appended JAR archive"
     }
   ],
   "collections": [

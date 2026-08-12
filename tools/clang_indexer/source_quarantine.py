@@ -861,18 +861,51 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
 
     if entry.detected_format == "utf16le_generated_c_array":
         payload = path.read_bytes()
-        if not payload.startswith(b"\xff\xfe"):
-            raise SourceQuarantineError(
-                f"{entry.relative_path}: declared utf16le_generated_c_array "
-                "but the UTF-16LE BOM is absent"
-            )
-        try:
-            generated = payload[2:].decode("utf-16le")
-        except UnicodeDecodeError as exc:
-            raise SourceQuarantineError(
-                f"{entry.relative_path}: declared utf16le_generated_c_array "
-                f"but the encoded source is invalid: {exc}"
-            ) from exc
+        generated: str | None = None
+        if payload.startswith(b"\xff\xfe"):
+            try:
+                generated = payload[2:].decode("utf-16le")
+            except UnicodeDecodeError as exc:
+                raise SourceQuarantineError(
+                    f"{entry.relative_path}: declared utf16le_generated_c_array "
+                    f"but the encoded source is invalid: {exc}"
+                ) from exc
+        else:
+            # ThreadX module_code.c shape: ASCII C-comment header, then a
+            # UTF-16LE generated array body without a leading BOM.
+            utf16_anchor = payload.find(b"I\x00n\x00p\x00u\x00t\x00 \x00E\x00L\x00F")
+            if utf16_anchor < 0:
+                utf16_anchor = payload.find(b"/\x00*\x00 \x00\n\x00\n\x00")
+            if utf16_anchor < 0:
+                raise SourceQuarantineError(
+                    f"{entry.relative_path}: declared utf16le_generated_c_array "
+                    "but neither a UTF-16LE BOM nor a UTF-16LE generated body "
+                    "anchor is present"
+                )
+            # Prefer an even-length trailing slice so utf-16le decoding is exact.
+            start = utf16_anchor
+            if (len(payload) - start) % 2:
+                if start > 0 and (len(payload) - (start - 1)) % 2 == 0:
+                    start = start - 1
+                else:
+                    raise SourceQuarantineError(
+                        f"{entry.relative_path}: declared utf16le_generated_c_array "
+                        "but the UTF-16LE body is not even-length aligned"
+                    )
+            ascii_prefix = payload[:start]
+            if not ascii_prefix.lstrip().startswith((b"/*", b"/****")):
+                raise SourceQuarantineError(
+                    f"{entry.relative_path}: declared utf16le_generated_c_array "
+                    "but the ASCII prefix is not a C comment header"
+                )
+            try:
+                generated = payload[start:].decode("utf-16le")
+            except UnicodeDecodeError as exc:
+                raise SourceQuarantineError(
+                    f"{entry.relative_path}: declared utf16le_generated_c_array "
+                    f"but the UTF-16LE body is invalid: {exc}"
+                ) from exc
+        assert generated is not None
         required_generated = (
             "Input ELF file:",
             "Output C Array file:",
