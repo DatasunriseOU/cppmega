@@ -2766,6 +2766,96 @@ def test_checked_in_gcc_encoding_issues_bytes_manifest_matches_pinned_fixture() 
     assert entry["detected_format"] == "gcc_embedded_nul_diagnostic"
 
 
+RELATIVE_GCC_ENCODING_ISSUES_UNICODE = (
+    "gcc/testsuite/gcc.dg/encoding-issues-unicode.c"
+)
+
+
+def test_gcc_encoding_issues_unicode_accepts_fixture(tmp_path: Path) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "encoding-issues-unicode.c"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "encoding-issues-unicode.c"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="gcc-mirror/gcc",
+        relative_path=RELATIVE_GCC_ENCODING_ISSUES_UNICODE,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="gcc_embedded_nul_diagnostic",
+        reason="GCC encoding-issues-unicode.c diagnostic fixture",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_gcc_encoding_issues_unicode_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "encoding-issues-unicode.c"
+    path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="gcc-mirror/gcc",
+        relative_path=RELATIVE_GCC_ENCODING_ISSUES_UNICODE,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="deliberate_compiler_diagnostic_fixture",
+        detected_format="gcc_embedded_nul_diagnostic",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="gcc_embedded_nul_diagnostic"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_gcc_encoding_issues_unicode_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "encoding-issues-unicode.c"
+    )
+    payload = fixture.read_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["relative_path"] == RELATIVE_GCC_ENCODING_ISSUES_UNICODE
+    )
+    assert len(payload) == 613
+    assert hashlib.sha256(payload).hexdigest() == (
+        "263f7289a5e9fb2eb40e53d0a4e7ab6f4691cc173de5a9f981396195598bc084"
+    )
+    assert payload.count(b"\x00") == 1
+    assert payload.count(b"\x80") == 1
+    assert payload.count(b"\x01") == 1
+    assert entry["project_id"] == "gcc-mirror/gcc"
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_diagnostic_fixture"
+    assert entry["detected_format"] == "gcc_embedded_nul_diagnostic"
+
+
 RELATIVE_KCDATABASE = "securityd/src/kcdatabase.h"
 
 
@@ -3044,6 +3134,64 @@ def test_apple_security_ssdatabase_contract_rejects_unrelated_standin(
     entry = SourceQuarantineEntry(
         project_id="apple-oss-distributions/Security",
         relative_path=RELATIVE_SSDATABASE_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+RELATIVE_SSCONTEXT_H = "OSX/libsecurity_apple_cspdl/lib/SSContext.h"
+
+
+def test_apple_security_sscontext_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "SSContext.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "SSContext.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_SSCONTEXT_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security SSContext.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_sscontext_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "SSContext.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_SSCONTEXT_H,
         size_bytes=path.stat().st_size,
         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         classification="compiler_regression_fixture",

@@ -254,6 +254,15 @@
       "reason": "GCC encoding-issues-bytes.c DejaGNU fixture embeds a NUL plus a stray 0x80 diagnostic byte (fail16 residual exit-2 after PR119001 quarantine)"
     },
     {
+      "project_id": "gcc-mirror/gcc",
+      "relative_path": "gcc/testsuite/gcc.dg/encoding-issues-unicode.c",
+      "size_bytes": 613,
+      "sha256": "263f7289a5e9fb2eb40e53d0a4e7ab6f4691cc173de5a9f981396195598bc084",
+      "classification": "deliberate_compiler_diagnostic_fixture",
+      "detected_format": "gcc_embedded_nul_diagnostic",
+      "reason": "GCC encoding-issues-unicode.c DejaGNU fixture embeds a NUL plus stray 0x80/0x01 diagnostic bytes (648a-gcc residual exit-2 after encoding-issues-bytes quarantine)"
+    },
+    {
       "project_id": "git/git",
       "relative_path": "t/t4201-shortlog.sh",
       "size_bytes": 11480,
@@ -477,6 +486,15 @@
       "classification": "compiler_regression_fixture",
       "detected_format": "apple_security_libclang_timeout_header",
       "reason": "Pinned Apple Security SSDatabase.h FAIL_CLOSED libclang parse timeout 300s after kckey quarantine (f688-sec, MacOSX.sdk present, knobs 1/56)"
+    },
+    {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_cspdl/lib/SSContext.h",
+      "size_bytes": 5119,
+      "sha256": "03a275d4e12e28e66cec3d6cd960862d9482a85c13cb860b3ce6d57f7fd5670f",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security SSContext.h FAIL_CLOSED libclang parse timeout 300s after SSDatabase quarantine (e8fa-sec, MacOSX.sdk present, knobs 2/60)"
     }
   ],
   "collections": [

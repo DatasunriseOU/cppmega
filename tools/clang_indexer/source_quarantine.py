@@ -499,27 +499,45 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
     if entry.detected_format == "gcc_embedded_nul_diagnostic":
         payload = path.read_bytes()
         expected_name = Path(entry.relative_path).name
-        required_snippets = (
-            b'dg-options "-fdiagnostics-show-caret -fdiagnostics-escape-format=bytes"',
-            b'dg-warning "null character\\\\(s\\\\) ignored"',
-            b"Stray UTF-8 trailing byte:",
-            b"stray '.200' in program",
-            b"unknown escape sequence",
-            b"dg-begin-multiline-output",
-        )
+        gcc_nul_contracts: dict[str, tuple[str, tuple[bytes, ...]]] = {
+            "encoding-issues-bytes.c": (
+                "gcc/testsuite/gcc.dg/encoding-issues-bytes.c",
+                (
+                    b'dg-options "-fdiagnostics-show-caret -fdiagnostics-escape-format=bytes"',
+                    b'dg-warning "null character\\\\(s\\\\) ignored"',
+                    b"Stray UTF-8 trailing byte:",
+                    b"stray '.200' in program",
+                    b"unknown escape sequence",
+                    b"dg-begin-multiline-output",
+                ),
+            ),
+            "encoding-issues-unicode.c": (
+                "gcc/testsuite/gcc.dg/encoding-issues-unicode.c",
+                (
+                    b'dg-options "-fdiagnostics-show-caret -fdiagnostics-escape-format=unicode"',
+                    b'dg-warning "null character\\\\(s\\\\) ignored"',
+                    b"Stray UTF-8 trailing byte:",
+                    b"stray '.200' in program",
+                    b"unknown escape sequence",
+                    b"<U+0000>",
+                    b"dg-begin-multiline-output",
+                ),
+            ),
+        }
+        contract = gcc_nul_contracts.get(expected_name)
         if (
-            expected_name != "encoding-issues-bytes.c"
+            contract is None
             or path.suffix.casefold() != ".c"
-            or entry.relative_path != "gcc/testsuite/gcc.dg/encoding-issues-bytes.c"
+            or entry.relative_path != contract[0]
             or payload.count(b"\x00") != 1
             or payload.count(b"\x80") != 1
             or payload.count(b"\x01") != 1
-            or any(snippet not in payload for snippet in required_snippets)
+            or any(snippet not in payload for snippet in contract[1])
             or payload.count(b"dg-begin-multiline-output") != 3
         ):
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared gcc_embedded_nul_diagnostic "
-                "but the GCC encoding-issues-bytes DejaGNU contract is "
+                "but the GCC encoding-issues DejaGNU contract is "
                 "incomplete or ambiguous"
             )
         return
@@ -1414,6 +1432,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <securityd_client/ssclient.h>",
                 "class SSDatabaseImpl : public CssmClient::DbImpl",
                 "class SSDatabase : public CssmClient::Db",
+            ),
+            "SSContext.h": (
+                "#ifndef _H_SS_CONTEXT",
+                "#define _H_SS_CONTEXT",
+                "SSContext.h - Security Server contexts",
+                "#include <security_cdsa_plugin/CSPsession.h>",
+                "#include <securityd_client/ssclient.h>",
+                "class SSContext : public CSPFullPluginSession::CSPContext",
             ),
         }
         required_substrings = header_contracts.get(expected_name)
