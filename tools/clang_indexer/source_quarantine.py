@@ -2054,6 +2054,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class AESKeyGenContext : public AppleCSPContext, private AppleSymmKeyGenContext {",
                 "#endif //_H_AESCSPI",
             ),
+            "bfContext.h": (
+                "#ifndef _BF_CONTEXT_H_",
+                "#define _BF_CONTEXT_H_",
+                "bfContext.h - glue between BlockCrytpor and ssleay Blowfish",
+                "#include <openssl/blowfish_legacy.h>",
+                "class BlowfishContext : public BlockCryptor {",
+                "BF_KEY",
+                "#endif //_BF_CONTEXT_H_",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
