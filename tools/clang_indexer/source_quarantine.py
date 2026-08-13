@@ -1873,6 +1873,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "static Server &active()",
                 "void beginShutdown();",
             ),
+            "token.h": (
+                "#ifndef _H_TOKEN",
+                "#define _H_TOKEN",
+                "token - internal representation of a (single distinct) hardware token",
+                '#include "structure.h"',
+                '#include "tokend.h"',
+                "class Token : public PerGlobal, public virtual TokenAcl, public FaultRelay",
+                "TokenDaemon &tokend();",
+                "void insert(::Reader &slot, RefPointer<TokenDaemon> tokend);",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

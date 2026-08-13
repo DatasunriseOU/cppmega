@@ -731,6 +731,15 @@
       "reason": "Pinned Apple Security server.h FAIL_CLOSED libclang parse timeout 300s after pcscmonitor quarantine (5eff-sec, MacOSX.sdk present, knobs 2/10). Distinct from already-quarantined connection.h, process.h, structure.h, pcscmonitor.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/token.h",
+      "size_bytes": 3663,
+      "sha256": "78d1f5cf0bd4c8546b178ac6d8bef2ea594dc854ea3556fa71a3f52b6a943445",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security token.h FAIL_CLOSED libclang parse timeout 300s after server.h quarantine (4595-sec, MacOSX.sdk present, knobs 1/8). Distinct from already-quarantined tokend.h, tokenkey.h, tokendatabase.h, reader.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
