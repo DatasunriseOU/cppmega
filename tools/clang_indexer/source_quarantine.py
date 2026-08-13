@@ -1598,6 +1598,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class TokenDatabase : public Database",
                 "TokenDaemon &tokend();",
             ),
+            "tokenkey.h": (
+                "#ifndef _H_TOKENKEY",
+                "#define _H_TOKENKEY",
+                "tokenkey - remote reference key on an attached hardware token",
+                '#include "key.h"',
+                '#include "tokenacl.h"',
+                "class TokenKey : public Key, public TokenAcl",
+                "KeyHandle tokenHandle() const",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

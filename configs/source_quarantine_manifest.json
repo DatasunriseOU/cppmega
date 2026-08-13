@@ -605,6 +605,15 @@
       "reason": "Pinned Apple Security tokendatabase.h FAIL_CLOSED libclang parse timeout 300s after BlockCryptor quarantine (d853-sec, MacOSX.sdk present, knobs 2/36). Distinct from already-quarantined securityd/src/tokend.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/tokenkey.h",
+      "size_bytes": 1957,
+      "sha256": "2b40f19d3ed954ef8e3141397be3dbd1b96882e24ee920f702682a73caffae16",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security tokenkey.h FAIL_CLOSED libclang parse timeout 300s after tokendatabase quarantine (2132-sec, MacOSX.sdk present, knobs 1/32). Distinct from already-quarantined key.h/kckey.h/SSKey.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
