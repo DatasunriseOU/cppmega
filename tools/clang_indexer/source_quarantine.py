@@ -1903,6 +1903,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "RC5_32_KEY",
                 "#endif //_RC2_CONTEXT_H_",
             ),
+            "tokenaccess.h": (
+                "#ifndef _H_TOKENACCESS",
+                "#define _H_TOKENACCESS",
+                "tokenaccess - access management to a TokenDatabase's Token's TokenDaemon's tokend",
+                '#include "tokendatabase.h"',
+                '#include "tokenkey.h"',
+                '#include "server.h"',
+                "class Access : public Token::Access {",
+                "#endif //_H_TOKENACCESS",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
