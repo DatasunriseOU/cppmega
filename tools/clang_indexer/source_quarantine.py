@@ -1981,6 +1981,17 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Listener: public RefCount {",
                 "class SharedMemoryListener",
             ),
+            "agentquery.h": (
+                "#ifndef _H_AGENTQUERY",
+                "#define _H_AGENTQUERY",
+                "passphrases - canonical code to obtain passphrases",
+                '#include "kcdatabase.h"',
+                '#include "authhost.h"',
+                '#include "server.h"',
+                "class SecurityAgentXPCConnection",
+                "class SecurityAgentXPCQuery : public SecurityAgentXPCConnection",
+                "#endif //_H_AGENTQUERY",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
