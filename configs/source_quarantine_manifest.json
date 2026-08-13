@@ -785,6 +785,15 @@
       "reason": "Pinned Apple Security RSA_DSA_keys.h FAIL_CLOSED libclang parse timeout 300s after rc4Context quarantine (f76b-sec, MacOSX.sdk present, knobs 2/4). Not UTF-8: exactly one MacRoman NBSP 0xCA at offset 5356. Distinct from already-quarantined DH_keys.h, AppleCSPContext.h, rc4Context.h, rc5Context.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/rc2Context.h",
+      "size_bytes": 1854,
+      "sha256": "981e0a55b74169b7ed46c39320c28df1f6ee2365cdde7f70c22ba82ad194128c",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security rc2Context.h FAIL_CLOSED libclang parse timeout 300s after RSA_DSA_keys quarantine (e1ea-sec, MacOSX.sdk present, knobs 1/2). Distinct from already-quarantined rc4Context.h, rc5Context.h, gladmanContext.h, BlockCryptor.h, desContext.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

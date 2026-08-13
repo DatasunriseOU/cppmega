@@ -1962,6 +1962,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "CCCryptorRef    rc4Key;",
                 "#endif //_RC4_CONTEXT_H_",
             ),
+            "rc2Context.h": (
+                "#ifndef _RC2_CONTEXT_H_",
+                "#define _RC2_CONTEXT_H_",
+                "rc2Context.h - glue between BlockCrytpor and ssleay RC2 implementation",
+                "#include <BlockCryptor.h>",
+                "#include <openssl/rc2_legacy.h>",
+                "class RC2Context : public BlockCryptor {",
+                "RC2_KEY",
+                "#endif //_RC2_CONTEXT_H_",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
