@@ -7464,6 +7464,115 @@ def test_checked_in_apple_security_castcontext_manifest_matches_pinned_fixture()
     assert entry["sha256"] not in {e["sha256"] for e in siblings}
 
 
+RELATIVE_DIGESTCONTEXT_H = "OSX/libsecurity_apple_csp/lib/DigestContext.h"
+DIGESTCONTEXT_H_SIZE = 1713
+DIGESTCONTEXT_H_SHA256 = (
+    "e4fb4e8451ca346680ab7e8f2051e500861e6426917e7b4cf17593d8a4b868ee"
+)
+DIGESTCONTEXT_SIBLING_PATHS = {
+    "OSX/libsecurity_apple_csp/lib/castContext.h",
+    "OSX/libsecurity_apple_csp/lib/bfContext.h",
+    "OSX/libsecurity_apple_csp/lib/aescspi.h",
+    "OSX/libsecurity_apple_csp/lib/AppleCSPContext.h",
+    "OSX/libsecurity_apple_csp/lib/BlockCryptor.h",
+}
+
+
+def test_apple_security_digestcontext_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "DigestContext.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "DigestContext.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DIGESTCONTEXT_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security DigestContext.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_digestcontext_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "DigestContext.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DIGESTCONTEXT_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_digestcontext_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "DigestContext.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == DIGESTCONTEXT_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == DIGESTCONTEXT_H_SHA256
+    assert b"class DigestContext : public AppleCSPContext" in payload
+    assert b"#include <security_cdsa_utilities/digestobject.h>" in payload
+    assert b"#endif\t/* _CRYPTKIT_DIGEST_CONTEXT_H_ */" in payload
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_DIGESTCONTEXT_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == DIGESTCONTEXT_H_SIZE
+    assert entry["sha256"] == DIGESTCONTEXT_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in DIGESTCONTEXT_SIBLING_PATHS
+    ]
+    assert len(siblings) == 5
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_RC4CONTEXT_H = "OSX/libsecurity_apple_csp/lib/rc4Context.h"
 RC4CONTEXT_H_SIZE = 1889
 RC4CONTEXT_H_SHA256 = (

@@ -2072,6 +2072,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "CCCryptorRef",
                 "#endif //_CAST_CONTEXT_H_",
             ),
+            "DigestContext.h": (
+                "#ifndef	_DIGEST_CONTEXT_H_",
+                "#define _DIGEST_CONTEXT_H_",
+                "DigestContext.h",
+                "#include <security_cdsa_utilities/digestobject.h>",
+                "class DigestContext : public AppleCSPContext",
+                "DigestObject",
+                "#endif	/* _CRYPTKIT_DIGEST_CONTEXT_H_ */",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

@@ -884,6 +884,15 @@
       "reason": "Pinned Apple Security castContext.h FAIL_CLOSED libclang parse timeout 300s after bfContext quarantine (502a-sec, MacOSX.sdk present, knobs 1/9). Distinct from already-quarantined bfContext.h, aescspi.h, AppleCSPContext.h, BlockCryptor.h, RSA_asymmetric.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/DigestContext.h",
+      "size_bytes": 1713,
+      "sha256": "e4fb4e8451ca346680ab7e8f2051e500861e6426917e7b4cf17593d8a4b868ee",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security DigestContext.h FAIL_CLOSED libclang parse timeout 300s after castContext quarantine (190e-sec, MacOSX.sdk present, knobs 2/9). Distinct from already-quarantined castContext.h, bfContext.h, aescspi.h, AppleCSPContext.h, BlockCryptor.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
