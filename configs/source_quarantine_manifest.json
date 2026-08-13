@@ -560,6 +560,15 @@
       "reason": "Pinned Apple Security tokend.h FAIL_CLOSED libclang parse timeout 300s after slcrep quarantine (82b7-sec, MacOSX.sdk present, knobs 1/44)"
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_utilities/lib/dyldcache.h",
+      "size_bytes": 5792,
+      "sha256": "d3fdddc450250300a28662c106c873c95980bfa55c6c33c32ea933a8ae86dc1c",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security OSX/libsecurity_utilities/lib/dyldcache.h FAIL_CLOSED libclang parse timeout 300s after tokend quarantine (48b9-sec, MacOSX.sdk present, knobs 2/44). Same bytes as already-quarantined OSX/include/security_utilities/dyldcache.h; projection is path-bound so the include entry did not skip this tree path."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
