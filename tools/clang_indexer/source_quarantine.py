@@ -88,6 +88,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ),
     (
         "compiler_regression_fixture",
+        "antlr_tokenbuffer_hpp_libclang_timeout",
+    ),
+    (
+        "compiler_regression_fixture",
         "glibc_stdio_bug28_libclang_timeout",
     ),
     (
@@ -1495,6 +1499,42 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared {entry.detected_format} but the "
                 "ANTLR CharScanner.hpp contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "antlr_tokenbuffer_hpp_libclang_timeout":
+        payload = path.read_bytes()
+        relative = Path(entry.relative_path).as_posix()
+        if (
+            path.name != "TokenBuffer.hpp"
+            or path.suffix.casefold() != ".hpp"
+            or relative != "OSX/libsecurity_codesigning/antlr2/antlr/TokenBuffer.hpp"
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "path is not OSX/libsecurity_codesigning/antlr2/antlr/TokenBuffer.hpp"
+            )
+        try:
+            decoded = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                f"header is not UTF-8: {exc}"
+            ) from exc
+        required_substrings = (
+            "#ifndef INC_TokenBuffer_hpp__",
+            "#define INC_TokenBuffer_hpp__",
+            "ANTLR Translator Generator",
+            "Terence Parr",
+            "#include <antlr/TokenStream.hpp>",
+            "class ANTLR_API TokenBuffer {",
+            "virtual unsigned int entries() const;",
+            "#endif //INC_TokenBuffer_hpp__",
+        )
+        if any(s not in decoded for s in required_substrings):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "ANTLR TokenBuffer.hpp contract is incomplete or ambiguous"
             )
         return
 

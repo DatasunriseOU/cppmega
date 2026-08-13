@@ -659,6 +659,15 @@
       "reason": "Pinned Security-vendored ANTLR CharScanner.hpp FAIL_CLOSED libclang parse timeout 300s after lib/slcrep.h quarantine (1d55-sec, MacOSX.sdk present, knobs 2/24). ANTLR 2.7.7 header (Terence Parr), not Apple copyright; suffix .hpp; distinct from already-quarantined InputBuffer.hpp and BaseAST.hpp."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_codesigning/antlr2/antlr/TokenBuffer.hpp",
+      "size_bytes": 2895,
+      "sha256": "a697e25fe54e75383d125bf091ec1285da67e69557305e80d8bd6d09ee7bb8d5",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "antlr_tokenbuffer_hpp_libclang_timeout",
+      "reason": "Pinned Security-vendored ANTLR TokenBuffer.hpp FAIL_CLOSED libclang parse timeout 300s after CharScanner.hpp quarantine (8292-sec, MacOSX.sdk present, knobs 1/20). ANTLR 2.7.7 header (Terence Parr), not Apple copyright; suffix .hpp; distinct from already-quarantined InputBuffer.hpp, BaseAST.hpp, and CharScanner.hpp."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
