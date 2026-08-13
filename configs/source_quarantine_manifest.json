@@ -641,6 +641,15 @@
       "reason": "Pinned Apple Security localkey.h FAIL_CLOSED libclang parse timeout 300s after BaseAST.hpp quarantine (5ed7-sec, MacOSX.sdk present, knobs 2/28). Distinct from already-quarantined key.h/kckey.h/SSKey.h/tokenkey.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_codesigning/lib/slcrep.h",
+      "size_bytes": 2766,
+      "sha256": "cf2b7726b5045af854870a010061854498c53484e169be226ce0bbe5b1d6ba33",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security OSX/libsecurity_codesigning/lib/slcrep.h FAIL_CLOSED libclang parse timeout 300s after localkey quarantine (2fdf-sec, MacOSX.sdk present, knobs 1/24). Same bytes as already-quarantined OSX/include/security_codesigning/slcrep.h; projection is path-bound so the include entry did not skip this tree path."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
