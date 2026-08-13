@@ -5751,6 +5751,110 @@ def test_checked_in_apple_security_dh_keys_manifest_matches_pinned_fixture() -> 
     assert entry["sha256"] not in {e["sha256"] for e in siblings}
 
 
+RELATIVE_PCSCMONITOR_H = "securityd/src/pcscmonitor.h"
+PCSCMONITOR_H_SIZE = 2855
+PCSCMONITOR_H_SHA256 = (
+    "88e24d2a61409b167381714d1de998b764bb1dacbca5f1794003e6f07acd34b8"
+)
+PCSCMONITOR_SIBLING_PATHS = {
+    "securityd/src/reader.h",
+    "securityd/src/tokend.h",
+    "securityd/src/process.h",
+}
+
+
+def test_apple_security_pcscmonitor_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "pcscmonitor.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "pcscmonitor.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_PCSCMONITOR_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security pcscmonitor.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_pcscmonitor_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "pcscmonitor.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_PCSCMONITOR_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_pcscmonitor_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "pcscmonitor.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == PCSCMONITOR_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == PCSCMONITOR_H_SHA256
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_PCSCMONITOR_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == PCSCMONITOR_H_SIZE
+    assert entry["sha256"] == PCSCMONITOR_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in PCSCMONITOR_SIBLING_PATHS
+    ]
+    assert len(siblings) == 3
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (

@@ -713,6 +713,15 @@
       "reason": "Pinned Apple Security DH_keys.h FAIL_CLOSED libclang parse timeout 300s after AppleCSPContext quarantine (3d85-sec, MacOSX.sdk present, knobs 2/12). File is not UTF-8: exactly one MacRoman NBSP 0xCA at offset 2825. Distinct from already-quarantined AppleCSPContext.h, BlockCryptor.h, desContext.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/pcscmonitor.h",
+      "size_bytes": 2855,
+      "sha256": "88e24d2a61409b167381714d1de998b764bb1dacbca5f1794003e6f07acd34b8",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security pcscmonitor.h FAIL_CLOSED libclang parse timeout 300s after DH_keys quarantine (840d-sec, MacOSX.sdk present, knobs 1/10). Distinct from already-quarantined reader.h, tokend.h, process.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

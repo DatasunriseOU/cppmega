@@ -1853,6 +1853,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class YarrowContext : public AppleCSPContext",
                 "static void symmetricKeyBits(",
             ),
+            "pcscmonitor.h": (
+                "#ifndef _H_PCSCMONITOR",
+                "#define _H_PCSCMONITOR",
+                "pcscmonitor - use PCSC to monitor smartcard reader/card state for securityd",
+                '#include "server.h"',
+                '#include "tokencache.h"',
+                '#include "reader.h"',
+                "class PCSCMonitor : private Listener, private MachServer::Timer",
+                "void startSoftTokens();",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
