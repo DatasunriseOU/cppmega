@@ -1489,6 +1489,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class AuthHostInstance : public PerSession, public ServerChild",
                 "bool inDarkWake()",
             ),
+            "connection.h": (
+                "#ifndef _H_CONNECTION",
+                "#define _H_CONNECTION",
+                "connection - manage connections to clients",
+                '#include "process.h"',
+                "class Connection : public PerConnection, public Listener::JitterBuffer",
+                "void beginWork(audit_token_t &auditToken)",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

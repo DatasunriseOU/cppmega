@@ -515,6 +515,15 @@
       "reason": "Pinned Apple Security authhost.h FAIL_CLOSED libclang parse timeout 300s after dyldcache quarantine (a218-sec, MacOSX.sdk present, knobs 2/52)"
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/connection.h",
+      "size_bytes": 3852,
+      "sha256": "ec59489c9c405870d7d47a0ff994e056933e439a3849e282504908a05bacfd4d",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security connection.h FAIL_CLOSED libclang parse timeout 300s after authhost quarantine (0e65-sec, MacOSX.sdk present, knobs 1/48)"
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
