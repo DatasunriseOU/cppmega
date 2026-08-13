@@ -1534,6 +1534,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class TokenDaemon",
                 "virtual void relayFault(bool async) = 0",
             ),
+            "process.h": (
+                "#ifndef _H_PROCESS",
+                "#define _H_PROCESS",
+                "process - track a single client process and its belongings",
+                '#include "structure.h"',
+                '#include "session.h"',
+                "class Process : public PerProcess",
+                "void changeSession(Session::SessionId sessionId)",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

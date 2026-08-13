@@ -569,6 +569,15 @@
       "reason": "Pinned Apple Security OSX/libsecurity_utilities/lib/dyldcache.h FAIL_CLOSED libclang parse timeout 300s after tokend quarantine (48b9-sec, MacOSX.sdk present, knobs 2/44). Same bytes as already-quarantined OSX/include/security_utilities/dyldcache.h; projection is path-bound so the include entry did not skip this tree path."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/process.h",
+      "size_bytes": 3878,
+      "sha256": "e135e6ee4c9f9d3328eaec4b80379c505094bb37eae4b5f9c0ae0ba14a9d53d4",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security process.h FAIL_CLOSED libclang parse timeout 300s after lib/dyldcache.h quarantine (33d0-sec, MacOSX.sdk present, knobs 1/40)"
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
