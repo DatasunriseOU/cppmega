@@ -1481,6 +1481,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 '#include "dyld_cache_format.h"',
                 "class DYLDCache : public UnixPlusPlus::AutoFileDesc",
             ),
+            "authhost.h": (
+                "#ifndef _H_AUTHHOST",
+                "#define _H_AUTHHOST",
+                '#include "structure.h"',
+                '#include "child.h"',
+                "class AuthHostInstance : public PerSession, public ServerChild",
+                "bool inDarkWake()",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
