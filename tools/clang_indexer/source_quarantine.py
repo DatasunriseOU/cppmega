@@ -1913,6 +1913,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Access : public Token::Access {",
                 "#endif //_H_TOKENACCESS",
             ),
+            "rc4Context.h": (
+                "#ifndef _RC4_CONTEXT_H_",
+                "#define _RC4_CONTEXT_H_",
+                "rc4Context.h - glue between BlockCrytpor and ssleay RC4 implementation",
+                '#include "AppleCSPContext.h"',
+                "#include <CommonCrypto/CommonCryptor.h>",
+                "class RC4Context : public AppleCSPContext {",
+                "CCCryptorRef    rc4Key;",
+                "#endif //_RC4_CONTEXT_H_",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

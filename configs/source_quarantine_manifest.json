@@ -767,6 +767,15 @@
       "reason": "Pinned Apple Security tokenaccess.h FAIL_CLOSED libclang parse timeout 300s after rc5Context quarantine (cd43-sec, MacOSX.sdk present, knobs 2/6). Distinct from already-quarantined token.h, tokend.h, tokenkey.h, tokendatabase.h, server.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/rc4Context.h",
+      "size_bytes": 1889,
+      "sha256": "beec4bf2e401e9cddc06c4be4828c2be5c88c27d3017ccebcbb69e94bee1c30e",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security rc4Context.h FAIL_CLOSED libclang parse timeout 300s after tokenaccess quarantine (177c-sec, MacOSX.sdk present, knobs 1/4). Distinct from already-quarantined rc5Context.h, gladmanContext.h, AppleCSPContext.h, BlockCryptor.h, desContext.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
