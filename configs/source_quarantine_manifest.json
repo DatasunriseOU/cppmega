@@ -677,6 +677,15 @@
       "reason": "Pinned Apple Security desContext.h FAIL_CLOSED libclang parse timeout 300s after TokenBuffer.hpp quarantine (42a2-sec, MacOSX.sdk present, knobs 2/20). Distinct from already-quarantined BlockCryptor.h, SSContext.h, SDContext.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/tempdatabase.h",
+      "size_bytes": 2350,
+      "sha256": "dc3d63f5de38e2b76e8742408325e89ef175da7f5ed0135fb8ee86bc7085f4f6",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security tempdatabase.h FAIL_CLOSED libclang parse timeout 300s after desContext quarantine (cc61-sec, MacOSX.sdk present, knobs 1/16). Distinct from already-quarantined localdatabase.h and tokendatabase.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

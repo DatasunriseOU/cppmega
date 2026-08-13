@@ -1785,6 +1785,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class DES3Context : public BlockCryptor",
                 "virtual ~DESContext();",
             ),
+            "tempdatabase.h": (
+                "#ifndef _H_TEMPDATABASE",
+                "#define _H_TEMPDATABASE",
+                "tempdatabase - temporary (scratch) storage for keys",
+                '#include "localdatabase.h"',
+                "class TempDatabase : public LocalDatabase",
+                "bool transient() const",
+                "void getSecurePassphrase(const Context &context, string &passphrase)",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
