@@ -4598,6 +4598,107 @@ def test_checked_in_antlr_inputbuffer_hpp_manifest_matches_pinned_fixture() -> N
     assert entry["project_id"] == "apple-oss-distributions/Security"
 
 
+RELATIVE_BASEAST_HPP = "OSX/libsecurity_codesigning/antlr2/antlr/BaseAST.hpp"
+BASEAST_HPP_SIZE = 4658
+BASEAST_HPP_SHA256 = (
+    "76e10e87e01f5d41502a925f37a31c03eaaee47c3f5e4b7c90c2764df1605d79"
+)
+BASEAST_FORMAT = "antlr_baseast_hpp_libclang_timeout"
+
+
+def test_antlr_baseast_hpp_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "BaseAST.hpp"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "BaseAST.hpp"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_BASEAST_HPP,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=BASEAST_FORMAT,
+        reason="Security ANTLR BaseAST.hpp libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_antlr_baseast_hpp_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "BaseAST.hpp"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_BASEAST_HPP,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=BASEAST_FORMAT,
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="ANTLR BaseAST.hpp contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_antlr_baseast_hpp_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "BaseAST.hpp"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == BASEAST_HPP_SIZE
+    assert hashlib.sha256(payload).hexdigest() == BASEAST_HPP_SHA256
+    assert b"Apple Inc." not in payload
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_BASEAST_HPP
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == BASEAST_HPP_SIZE
+    assert entry["sha256"] == BASEAST_HPP_SHA256
+    assert entry["detected_format"] == BASEAST_FORMAT
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    ib = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_INPUTBUFFER_HPP
+    ]
+    assert len(ib) == 1
+    assert ib[0]["sha256"] != entry["sha256"]
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (

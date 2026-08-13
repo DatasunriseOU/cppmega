@@ -623,6 +623,15 @@
       "reason": "Pinned Security-vendored ANTLR InputBuffer.hpp FAIL_CLOSED libclang parse timeout 300s after tokenkey quarantine (c964-sec, MacOSX.sdk present, knobs 2/32). ANTLR 2.7.7 header (Terence Parr), not Apple copyright; suffix .hpp so it cannot use apple_security_libclang_timeout_header."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_codesigning/antlr2/antlr/BaseAST.hpp",
+      "size_bytes": 4658,
+      "sha256": "76e10e87e01f5d41502a925f37a31c03eaaee47c3f5e4b7c90c2764df1605d79",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "antlr_baseast_hpp_libclang_timeout",
+      "reason": "Pinned Security-vendored ANTLR BaseAST.hpp FAIL_CLOSED libclang parse timeout 300s after InputBuffer.hpp quarantine (e42c-sec, MacOSX.sdk present, knobs 1/28). ANTLR 2.7.7 header (Terence Parr), not Apple copyright; suffix .hpp; distinct from already-quarantined InputBuffer.hpp."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
