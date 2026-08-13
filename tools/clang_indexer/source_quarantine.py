@@ -1863,6 +1863,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class PCSCMonitor : private Listener, private MachServer::Timer",
                 "void startSoftTokens();",
             ),
+            "server.h": (
+                "#ifndef _H_SERVER",
+                "#define _H_SERVER",
+                "server - securityd main server object",
+                '#include "structure.h"',
+                '#include "connection.h"',
+                "class Server : public PerGlobal,",
+                "static Server &active()",
+                "void beginShutdown();",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
