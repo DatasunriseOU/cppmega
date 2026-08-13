@@ -1687,6 +1687,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class TokenKey : public Key, public TokenAcl",
                 "KeyHandle tokenHandle() const",
             ),
+            "localkey.h": (
+                "#ifndef _H_LOCALKEY",
+                "#define _H_LOCALKEY",
+                "localkey - Key objects that store a local CSSM key object",
+                '#include "key.h"',
+                "#include <security_cdsa_client/keyclient.h>",
+                "class LocalKey : public Key",
+                "virtual void getKey();",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

@@ -4699,6 +4699,111 @@ def test_checked_in_antlr_baseast_hpp_manifest_matches_pinned_fixture() -> None:
     assert ib[0]["sha256"] != entry["sha256"]
 
 
+RELATIVE_LOCALKEY_H = "securityd/src/localkey.h"
+LOCALKEY_H_SIZE = 4755
+LOCALKEY_H_SHA256 = (
+    "d54ea5e7a90b72f27118591ec98eedf613ae02d246dfdf32c12b3cbabae96c98"
+)
+LOCALKEY_SIBLING_PATHS = {
+    "securityd/src/key.h",
+    "securityd/src/kckey.h",
+    "OSX/libsecurity_apple_cspdl/lib/SSKey.h",
+    "securityd/src/tokenkey.h",
+}
+
+
+def test_apple_security_localkey_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "localkey.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "localkey.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_LOCALKEY_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security localkey.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_localkey_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "localkey.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_LOCALKEY_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_localkey_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "localkey.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == LOCALKEY_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == LOCALKEY_H_SHA256
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_LOCALKEY_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == LOCALKEY_H_SIZE
+    assert entry["sha256"] == LOCALKEY_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in LOCALKEY_SIBLING_PATHS
+    ]
+    assert len(siblings) == 4
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (
