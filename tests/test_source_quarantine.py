@@ -7140,6 +7140,114 @@ def test_checked_in_apple_security_rsa_asymmetric_manifest_matches_pinned_fixtur
     assert entry["sha256"] not in {e["sha256"] for e in siblings}
 
 
+RELATIVE_AESCSPI_H = "OSX/libsecurity_apple_csp/lib/aescspi.h"
+AESCSPI_H_SIZE = 3081
+AESCSPI_H_SHA256 = (
+    "7ca32d42decde633d333081b9e5f285a35e2a2017157dfcee3ef4a467a854ebb"
+)
+AESCSPI_SIBLING_PATHS = {
+    "OSX/libsecurity_apple_csp/lib/RSA_asymmetric.h",
+    "OSX/libsecurity_apple_csp/lib/RSA_DSA_keys.h",
+    "OSX/libsecurity_apple_csp/lib/AppleCSPContext.h",
+    "OSX/libsecurity_apple_csp/lib/BlockCryptor.h",
+    "OSX/libsecurity_apple_csp/lib/DH_keys.h",
+}
+
+
+def test_apple_security_aescspi_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "aescspi.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "aescspi.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_AESCSPI_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security aescspi.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_aescspi_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "aescspi.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_AESCSPI_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_aescspi_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "aescspi.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == AESCSPI_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == AESCSPI_H_SHA256
+    assert b"aescspi.h - AES context class" in payload
+    assert b"class AESContext : public BlockCryptor {" in payload
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_AESCSPI_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == AESCSPI_H_SIZE
+    assert entry["sha256"] == AESCSPI_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in AESCSPI_SIBLING_PATHS
+    ]
+    assert len(siblings) == 5
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_RC4CONTEXT_H = "OSX/libsecurity_apple_csp/lib/rc4Context.h"
 RC4CONTEXT_H_SIZE = 1889
 RC4CONTEXT_H_SHA256 = (

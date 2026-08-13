@@ -2045,6 +2045,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "RSA_CryptContext(AppleCSPSession &session)",
                 "#endif // _RSA_ASYMMETRIC_H_",
             ),
+            "aescspi.h": (
+                "#ifndef _H_AESCSPI",
+                "#define _H_AESCSPI",
+                "aescspi.h - AES context class",
+                '#include "rijndaelApi.h"',
+                "class AESContext : public BlockCryptor {",
+                "class AESKeyGenContext : public AppleCSPContext, private AppleSymmKeyGenContext {",
+                "#endif //_H_AESCSPI",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

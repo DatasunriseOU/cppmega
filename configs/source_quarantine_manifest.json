@@ -857,6 +857,15 @@
       "reason": "Pinned Apple Security RSA_asymmetric.h FAIL_CLOSED libclang parse timeout 300s after database.h quarantine (a775-sec, MacOSX.sdk present, knobs 2/5). Distinct from already-quarantined RSA_DSA_keys.h, AppleCSPContext.h, BlockCryptor.h, DH_keys.h, SignatureContext.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/aescspi.h",
+      "size_bytes": 3081,
+      "sha256": "7ca32d42decde633d333081b9e5f285a35e2a2017157dfcee3ef4a467a854ebb",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security aescspi.h FAIL_CLOSED libclang parse timeout 300s after RSA_asymmetric quarantine (ab81-sec, MacOSX.sdk present, knobs 1/7). Distinct from already-quarantined RSA_asymmetric.h, RSA_DSA_keys.h, AppleCSPContext.h, BlockCryptor.h, DH_keys.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
