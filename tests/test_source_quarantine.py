@@ -3294,3 +3294,95 @@ def test_checked_in_apple_security_dyldcache_manifest_matches_pinned_fixture() -
     assert entry["sha256"] == DYLDCACHE_SHA256
     assert entry["detected_format"] == "apple_security_libclang_timeout_header"
     assert entry["project_id"] == "apple-oss-distributions/Security"
+
+
+RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
+GLIBC_BUG28_SIZE = 1216
+GLIBC_BUG28_SHA256 = (
+    "6cd92333ab2c85a993dd690ccd74cfb8a8014e8160b57feabefb89e2f7e7644b"
+)
+
+
+def test_glibc_stdio_bug28_libclang_timeout_accepts_fixture(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "bug28.c"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "bug28.c"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="sourceware.org/git%2Fglibc",
+        relative_path=RELATIVE_GLIBC_BUG28,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="glibc_stdio_bug28_libclang_timeout",
+        reason="glibc bug28.c libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_glibc_stdio_bug28_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "bug28.c"
+    path.write_text("int main(void) { return 0; }\n", encoding="ascii")
+    entry = SourceQuarantineEntry(
+        project_id="sourceware.org/git%2Fglibc",
+        relative_path=RELATIVE_GLIBC_BUG28,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="glibc_stdio_bug28_libclang_timeout",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="glibc stdio-common/bug28.c contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_glibc_bug28_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "bug28.c"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == GLIBC_BUG28_SIZE
+    assert hashlib.sha256(payload).hexdigest() == GLIBC_BUG28_SHA256
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_GLIBC_BUG28
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == GLIBC_BUG28_SIZE
+    assert entry["sha256"] == GLIBC_BUG28_SHA256
+    assert entry["detected_format"] == "glibc_stdio_bug28_libclang_timeout"
+    assert entry["project_id"] == "sourceware.org/git%2Fglibc"

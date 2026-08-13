@@ -71,6 +71,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "apple_security_libclang_timeout_header",
     ),
     (
+        "compiler_regression_fixture",
+        "glibc_stdio_bug28_libclang_timeout",
+    ),
+    (
         "binary_protocol_test_fixture",
         "clickhouse_dollar_quoted_binary_sql",
     ),
@@ -1339,6 +1343,34 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared plumhall_c_date_time_libclang_hang "
                 "but the Plum Hall 4.12 date/time fixture contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "glibc_stdio_bug28_libclang_timeout":
+        payload = path.read_bytes()
+        try:
+            decoded = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared glibc_stdio_bug28_libclang_timeout "
+                f"but the fixture is not ASCII: {exc}"
+            ) from exc
+        required_substrings = (
+            "do_test (void)",
+            'size_t instances = 16384;',
+            '#define X0 "\\n%1$s\\n"',
+            "#define X14 X12 X12 X12 X12",
+            '#define TRAILER "%%%%%%%%%%%%%%%%%%%%%%%%%%"',
+            '#include "../test-skeleton.c"',
+        )
+        if (
+            path.name != "bug28.c"
+            or Path(entry.relative_path).as_posix() != "stdio-common/bug28.c"
+            or any(s not in decoded for s in required_substrings)
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared glibc_stdio_bug28_libclang_timeout "
+                "but the glibc stdio-common/bug28.c contract is incomplete or ambiguous"
             )
         return
 
