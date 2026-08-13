@@ -1883,6 +1883,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "TokenDaemon &tokend();",
                 "void insert(::Reader &slot, RefPointer<TokenDaemon> tokend);",
             ),
+            "gladmanContext.h": (
+                "#ifndef _H_GLADMAN_CONTEXT",
+                "#define _H_GLADMAN_CONTEXT",
+                "gladmanContext.h - Gladman AES context class",
+                '#include "AppleCSPContext.h"',
+                '#include "BlockCryptor.h"',
+                "class GAESContext : public BlockCryptor {",
+                "void encryptBlock(",
+                "CCCryptorRef",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

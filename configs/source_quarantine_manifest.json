@@ -740,6 +740,15 @@
       "reason": "Pinned Apple Security token.h FAIL_CLOSED libclang parse timeout 300s after server.h quarantine (4595-sec, MacOSX.sdk present, knobs 1/8). Distinct from already-quarantined tokend.h, tokenkey.h, tokendatabase.h, reader.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/gladmanContext.h",
+      "size_bytes": 2750,
+      "sha256": "5783adfe5bd3af0e40b6f77e6fa850c286a277fa0b3483df643dac9494b9bf5b",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security gladmanContext.h FAIL_CLOSED libclang parse timeout 300s after token.h quarantine (6c7e-sec, MacOSX.sdk present, knobs 2/8). Distinct from already-quarantined AppleCSPContext.h, BlockCryptor.h, desContext.h, DH_keys.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
