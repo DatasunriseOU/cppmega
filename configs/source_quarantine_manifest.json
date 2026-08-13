@@ -839,6 +839,15 @@
       "reason": "Pinned Apple Security SignatureContext.h FAIL_CLOSED libclang parse timeout 300s after session quarantine (8646-sec, MacOSX.sdk present, knobs 2/3). Distinct from already-quarantined AppleCSPContext.h, MacContext.h, BlockCryptor.h, rc2Context.h, RSA_DSA_keys.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/database.h",
+      "size_bytes": 8515,
+      "sha256": "8e982492d654680d953a1888ad0043b7b2327e41d2612b43e3b4bb0ddbf73a96",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security database.h FAIL_CLOSED libclang parse timeout 300s after SignatureContext quarantine (72e4-sec, MacOSX.sdk present, knobs 1/5). Distinct from already-quarantined localdatabase.h, tokendatabase.h, tempdatabase.h, kcdatabase.h, structure.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

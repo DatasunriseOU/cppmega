@@ -2023,6 +2023,18 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class SignatureContext : public AppleCSPContext  {",
                 "#endif	/* _SIGNATURE_CONTEXT_H_ */",
             ),
+            "database.h": (
+                "#ifndef _H_DATABASE",
+                "#define _H_DATABASE",
+                "database - abstract database management",
+                '#include "structure.h"',
+                '#include "acls.h"',
+                '#include "dbcrypto.h"',
+                '#include "notifications.h"',
+                "class DbCommon : public PerSession {",
+                "class Database : public PerProcess, public AclSource {",
+                "#endif //_H_DATABASE",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
