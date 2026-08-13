@@ -2035,6 +2035,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Database : public PerProcess, public AclSource {",
                 "#endif //_H_DATABASE",
             ),
+            "RSA_asymmetric.h": (
+                "#ifndef _RSA_ASYMMETRIC_H_",
+                "#define _RSA_ASYMMETRIC_H_",
+                "RSA_asymmetric.h - CSPContext for RSA asymmetric encryption",
+                "#include <openssl/rsa_legacy.h>",
+                "#define RSA_ASYM_PADDING_DEFAULT",
+                "class RSA_CryptContext : public BlockCryptor {",
+                "RSA_CryptContext(AppleCSPSession &session)",
+                "#endif // _RSA_ASYMMETRIC_H_",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

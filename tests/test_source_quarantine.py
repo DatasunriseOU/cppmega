@@ -7032,6 +7032,114 @@ def test_checked_in_apple_security_database_manifest_matches_pinned_fixture() ->
     assert entry["sha256"] not in {e["sha256"] for e in siblings}
 
 
+RELATIVE_RSA_ASYMMETRIC_H = "OSX/libsecurity_apple_csp/lib/RSA_asymmetric.h"
+RSA_ASYMMETRIC_H_SIZE = 2601
+RSA_ASYMMETRIC_H_SHA256 = (
+    "1ed34394fc242a63779e5d2aec9d135dd8a055baaa40752ab2d544df0a7168cd"
+)
+RSA_ASYMMETRIC_SIBLING_PATHS = {
+    "OSX/libsecurity_apple_csp/lib/RSA_DSA_keys.h",
+    "OSX/libsecurity_apple_csp/lib/AppleCSPContext.h",
+    "OSX/libsecurity_apple_csp/lib/BlockCryptor.h",
+    "OSX/libsecurity_apple_csp/lib/DH_keys.h",
+    "OSX/libsecurity_apple_csp/lib/SignatureContext.h",
+}
+
+
+def test_apple_security_rsa_asymmetric_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "RSA_asymmetric.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "RSA_asymmetric.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_RSA_ASYMMETRIC_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security RSA_asymmetric.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_rsa_asymmetric_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "RSA_asymmetric.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_RSA_ASYMMETRIC_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_rsa_asymmetric_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "RSA_asymmetric.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == RSA_ASYMMETRIC_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == RSA_ASYMMETRIC_H_SHA256
+    assert b"RSA_asymmetric.h - CSPContext for RSA asymmetric encryption" in payload
+    assert b"class RSA_CryptContext : public BlockCryptor {" in payload
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_RSA_ASYMMETRIC_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == RSA_ASYMMETRIC_H_SIZE
+    assert entry["sha256"] == RSA_ASYMMETRIC_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in RSA_ASYMMETRIC_SIBLING_PATHS
+    ]
+    assert len(siblings) == 5
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_RC4CONTEXT_H = "OSX/libsecurity_apple_csp/lib/rc4Context.h"
 RC4CONTEXT_H_SIZE = 1889
 RC4CONTEXT_H_SHA256 = (
