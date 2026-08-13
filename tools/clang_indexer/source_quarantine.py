@@ -72,6 +72,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ),
     (
         "compiler_regression_fixture",
+        "apple_security_blockcryptor_macroman_nbsp_libclang_timeout",
+    ),
+    (
+        "compiler_regression_fixture",
         "glibc_stdio_bug28_libclang_timeout",
     ),
     (
@@ -1371,6 +1375,40 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared glibc_stdio_bug28_libclang_timeout "
                 "but the glibc stdio-common/bug28.c contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "apple_security_blockcryptor_macroman_nbsp_libclang_timeout":
+        payload = path.read_bytes()
+        relative = Path(entry.relative_path).as_posix()
+        if (
+            path.name != "BlockCryptor.h"
+            or relative != "OSX/libsecurity_apple_csp/lib/BlockCryptor.h"
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "path is not OSX/libsecurity_apple_csp/lib/BlockCryptor.h"
+            )
+        high_offsets = [i for i, byte in enumerate(payload) if byte >= 0x80]
+        if high_offsets != [4318] or payload[4318] != 0xCA:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "MacRoman NBSP identity is missing (need exactly one 0xCA at offset 4318)"
+            )
+        decoded = payload.decode("latin-1")
+        required_substrings = (
+            "#ifndef\t_BLOCK_CRYPTOR_H_",
+            "#define _BLOCK_CRYPTOR_H_",
+            "BlockCryptor.h - common context for block-oriented encryption algorithms",
+            '#include "AppleCSPContext.h"',
+            "class BlockCryptor : public AppleCSPContext",
+            "BCM_CBC",
+            "Apple Inc.",
+        )
+        if any(s not in decoded for s in required_substrings):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "BlockCryptor.h contract is incomplete or ambiguous"
             )
         return
 

@@ -587,6 +587,15 @@
       "reason": "Pinned Apple Security localdatabase.h FAIL_CLOSED libclang parse timeout 300s after process.h quarantine (cc49-sec, MacOSX.sdk present, knobs 2/40)"
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/BlockCryptor.h",
+      "size_bytes": 6828,
+      "sha256": "e7083bad4d583fbec21a29a0bae6f2264d95ce041df3cc9ae4b5a2a0f78f516f",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_blockcryptor_macroman_nbsp_libclang_timeout",
+      "reason": "Pinned Apple Security BlockCryptor.h FAIL_CLOSED libclang parse timeout 300s after localdatabase quarantine (c0c9-sec, MacOSX.sdk present, knobs 1/36). File is not UTF-8: exactly one MacRoman NBSP 0xCA at offset 4318."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

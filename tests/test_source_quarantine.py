@@ -4127,6 +4127,136 @@ def test_checked_in_apple_security_localdatabase_manifest_matches_pinned_fixture
     assert entry["project_id"] == "apple-oss-distributions/Security"
 
 
+RELATIVE_BLOCKCRYPTOR_H = "OSX/libsecurity_apple_csp/lib/BlockCryptor.h"
+BLOCKCRYPTOR_H_SIZE = 6828
+BLOCKCRYPTOR_H_SHA256 = (
+    "e7083bad4d583fbec21a29a0bae6f2264d95ce041df3cc9ae4b5a2a0f78f516f"
+)
+BLOCKCRYPTOR_FORMAT = (
+    "apple_security_blockcryptor_macroman_nbsp_libclang_timeout"
+)
+
+
+def test_apple_security_blockcryptor_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "BlockCryptor.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "BlockCryptor.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_BLOCKCRYPTOR_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=BLOCKCRYPTOR_FORMAT,
+        reason="Security BlockCryptor.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_blockcryptor_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "BlockCryptor.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_BLOCKCRYPTOR_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=BLOCKCRYPTOR_FORMAT,
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="MacRoman NBSP identity is missing"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_apple_security_blockcryptor_rejects_utf8_nbsp_stripped_copy(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "BlockCryptor.h"
+    )
+    payload = fixture.read_bytes().replace(b"\xca", b" ")
+    path = tmp_path / "BlockCryptor.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_BLOCKCRYPTOR_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=BLOCKCRYPTOR_FORMAT,
+        reason="negative test stripped 0xCA",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="MacRoman NBSP identity is missing"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_blockcryptor_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "BlockCryptor.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == BLOCKCRYPTOR_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == BLOCKCRYPTOR_H_SHA256
+    assert payload.count(b"\xca") == 1
+    assert payload[4318] == 0xCA
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_BLOCKCRYPTOR_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == BLOCKCRYPTOR_H_SIZE
+    assert entry["sha256"] == BLOCKCRYPTOR_H_SHA256
+    assert entry["detected_format"] == BLOCKCRYPTOR_FORMAT
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (
