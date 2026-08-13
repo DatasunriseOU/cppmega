@@ -830,6 +830,15 @@
       "reason": "Pinned Apple Security session.h FAIL_CLOSED libclang parse timeout 300s after MacContext quarantine (8cae-sec, MacOSX.sdk present, knobs 1/3). Distinct from already-quarantined server.h, structure.h, authhost.h, connection.h, agentquery.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/SignatureContext.h",
+      "size_bytes": 2800,
+      "sha256": "b1cc370398a2372ec80369cc7f51192e3984e98a4b5a7c2672b52c7fd8a7cc17",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security SignatureContext.h FAIL_CLOSED libclang parse timeout 300s after session quarantine (8646-sec, MacOSX.sdk present, knobs 2/3). Distinct from already-quarantined AppleCSPContext.h, MacContext.h, BlockCryptor.h, rc2Context.h, RSA_DSA_keys.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

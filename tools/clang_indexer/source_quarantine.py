@@ -2013,6 +2013,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class RootSession : public Session {",
                 "#endif //_H_SESSION",
             ),
+            "SignatureContext.h": (
+                "#ifndef	_SIGNATURE_CONTEXT_H_",
+                "#define _SIGNATURE_CONTEXT_H_",
+                "SignatureContext.h - AppleCSPContext subclass for generic sign/verify",
+                "#include <RawSigner.h>",
+                "#include <security_cdsa_utilities/digestobject.h>",
+                "#include <AppleCSPContext.h>",
+                "class SignatureContext : public AppleCSPContext  {",
+                "#endif	/* _SIGNATURE_CONTEXT_H_ */",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
