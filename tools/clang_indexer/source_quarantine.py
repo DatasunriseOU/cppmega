@@ -84,6 +84,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ),
     (
         "compiler_regression_fixture",
+        "antlr_charscanner_hpp_libclang_timeout",
+    ),
+    (
+        "compiler_regression_fixture",
         "glibc_stdio_bug28_libclang_timeout",
     ),
     (
@@ -1455,6 +1459,42 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared {entry.detected_format} but the "
                 "ANTLR BaseAST.hpp contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "antlr_charscanner_hpp_libclang_timeout":
+        payload = path.read_bytes()
+        relative = Path(entry.relative_path).as_posix()
+        if (
+            path.name != "CharScanner.hpp"
+            or path.suffix.casefold() != ".hpp"
+            or relative != "OSX/libsecurity_codesigning/antlr2/antlr/CharScanner.hpp"
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "path is not OSX/libsecurity_codesigning/antlr2/antlr/CharScanner.hpp"
+            )
+        try:
+            decoded = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                f"header is not UTF-8: {exc}"
+            ) from exc
+        required_substrings = (
+            "#ifndef INC_CharScanner_hpp__",
+            "#define INC_CharScanner_hpp__",
+            "ANTLR Translator Generator",
+            "Terence Parr",
+            "#include <antlr/InputBuffer.hpp>",
+            "class ANTLR_API CharScanner : public TokenStream",
+            "virtual int LA(unsigned int i);",
+            "#endif //INC_CharScanner_hpp__",
+        )
+        if any(s not in decoded for s in required_substrings):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "ANTLR CharScanner.hpp contract is incomplete or ambiguous"
             )
         return
 
