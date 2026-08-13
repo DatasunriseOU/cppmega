@@ -1543,6 +1543,14 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Process : public PerProcess",
                 "void changeSession(Session::SessionId sessionId)",
             ),
+            "localdatabase.h": (
+                "#ifndef _H_LOCALDATABASE",
+                "#define _H_LOCALDATABASE",
+                "localdatabase - locally implemented database using internal CSP cryptography",
+                '#include "database.h"',
+                "class LocalDatabase : public Database",
+                "virtual RefPointer<Key> makeKey(const CssmKey &newKey, uint32 moreAttributes,",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
