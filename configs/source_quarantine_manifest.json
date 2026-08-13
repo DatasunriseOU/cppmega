@@ -614,6 +614,15 @@
       "reason": "Pinned Apple Security tokenkey.h FAIL_CLOSED libclang parse timeout 300s after tokendatabase quarantine (2132-sec, MacOSX.sdk present, knobs 1/32). Distinct from already-quarantined key.h/kckey.h/SSKey.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_codesigning/antlr2/antlr/InputBuffer.hpp",
+      "size_bytes": 3509,
+      "sha256": "334401734869ccc3021d825449448511f7c12a8cfa4bd8d20258e3d440b3455c",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "antlr_inputbuffer_hpp_libclang_timeout",
+      "reason": "Pinned Security-vendored ANTLR InputBuffer.hpp FAIL_CLOSED libclang parse timeout 300s after tokenkey quarantine (c964-sec, MacOSX.sdk present, knobs 2/32). ANTLR 2.7.7 header (Terence Parr), not Apple copyright; suffix .hpp so it cannot use apple_security_libclang_timeout_header."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

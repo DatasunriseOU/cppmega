@@ -4469,6 +4469,135 @@ def test_checked_in_apple_security_tokenkey_manifest_matches_pinned_fixture() ->
     }
 
 
+RELATIVE_INPUTBUFFER_HPP = "OSX/libsecurity_codesigning/antlr2/antlr/InputBuffer.hpp"
+INPUTBUFFER_HPP_SIZE = 3509
+INPUTBUFFER_HPP_SHA256 = (
+    "334401734869ccc3021d825449448511f7c12a8cfa4bd8d20258e3d440b3455c"
+)
+INPUTBUFFER_FORMAT = "antlr_inputbuffer_hpp_libclang_timeout"
+
+
+def test_antlr_inputbuffer_hpp_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "InputBuffer.hpp"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "InputBuffer.hpp"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_INPUTBUFFER_HPP,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=INPUTBUFFER_FORMAT,
+        reason="Security ANTLR InputBuffer.hpp libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_antlr_inputbuffer_hpp_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "InputBuffer.hpp"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_INPUTBUFFER_HPP,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=INPUTBUFFER_FORMAT,
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="ANTLR InputBuffer.hpp contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_antlr_inputbuffer_hpp_rejects_apple_security_header_format(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "InputBuffer.hpp"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "InputBuffer.hpp"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_INPUTBUFFER_HPP,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="wrong format for ANTLR hpp",
+    )
+    with pytest.raises(
+        SourceQuarantineError,
+        match="Apple Security libclang-timeout header contract",
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_antlr_inputbuffer_hpp_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "InputBuffer.hpp"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == INPUTBUFFER_HPP_SIZE
+    assert hashlib.sha256(payload).hexdigest() == INPUTBUFFER_HPP_SHA256
+    assert b"Apple Inc." not in payload
+    assert b"Apple Computer, Inc." not in payload
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_INPUTBUFFER_HPP
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == INPUTBUFFER_HPP_SIZE
+    assert entry["sha256"] == INPUTBUFFER_HPP_SHA256
+    assert entry["detected_format"] == INPUTBUFFER_FORMAT
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (
