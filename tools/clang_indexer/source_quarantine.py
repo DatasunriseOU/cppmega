@@ -1804,6 +1804,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Reader : public PerGlobal",
                 "void insertToken(TokenDaemon *tokend)",
             ),
+            "AppleCSPContext.h": (
+                "#ifndef _H_APPLE_CSP_CONTEXT",
+                "#define _H_APPLE_CSP_CONTEXT",
+                "AppleCSPContext.h - CSP-wide contexts",
+                "#include <security_cdsa_plugin/CSPsession.h>",
+                '#include "BinaryKey.h"',
+                "class AppleCSPContext : public CSPFullPluginSession::CSPContext",
+                "class YarrowContext : public AppleCSPContext",
+                "static void symmetricKeyBits(",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

@@ -695,6 +695,15 @@
       "reason": "Pinned Apple Security reader.h FAIL_CLOSED libclang parse timeout 300s after tempdatabase quarantine (3776-sec, MacOSX.sdk present, knobs 2/16)."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/AppleCSPContext.h",
+      "size_bytes": 5431,
+      "sha256": "da24e598006d8b24efceedecce674e2c809e9574f019b72af50efaff4ac2150e",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security AppleCSPContext.h FAIL_CLOSED libclang parse timeout 300s after reader.h quarantine (c7ea-sec, MacOSX.sdk present, knobs 1/12). Distinct from already-quarantined BlockCryptor.h, SSContext.h, SDContext.h, desContext.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
