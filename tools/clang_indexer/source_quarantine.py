@@ -76,6 +76,10 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
     ),
     (
         "compiler_regression_fixture",
+        "apple_security_dh_keys_macroman_nbsp_libclang_timeout",
+    ),
+    (
+        "compiler_regression_fixture",
         "antlr_inputbuffer_hpp_libclang_timeout",
     ),
     (
@@ -1569,6 +1573,41 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
             raise SourceQuarantineError(
                 f"{entry.relative_path}: declared {entry.detected_format} but the "
                 "BlockCryptor.h contract is incomplete or ambiguous"
+            )
+        return
+
+    if entry.detected_format == "apple_security_dh_keys_macroman_nbsp_libclang_timeout":
+        payload = path.read_bytes()
+        relative = Path(entry.relative_path).as_posix()
+        if (
+            path.name != "DH_keys.h"
+            or relative != "OSX/libsecurity_apple_csp/lib/DH_keys.h"
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "path is not OSX/libsecurity_apple_csp/lib/DH_keys.h"
+            )
+        high_offsets = [i for i, byte in enumerate(payload) if byte >= 0x80]
+        if high_offsets != [2825] or payload[2825] != 0xCA:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "MacRoman NBSP identity is missing (need exactly one 0xCA at offset 2825)"
+            )
+        decoded = payload.decode("latin-1")
+        required_substrings = (
+            "#ifndef\t_DH_KEYS_H_",
+            "#define _DH_KEYS_H_",
+            "DH_keys.h - Diffie-Hellman key pair support",
+            "#include <AppleCSPContext.h>",
+            "class DHBinaryKey : public BinaryKey",
+            "class DHKeyPairGenContext :",
+            "class DHKeyInfoProvider",
+            "Apple Inc.",
+        )
+        if any(s not in decoded for s in required_substrings):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared {entry.detected_format} but the "
+                "DH_keys.h contract is incomplete or ambiguous"
             )
         return
 

@@ -5580,6 +5580,177 @@ def test_checked_in_apple_security_applecspcontext_manifest_matches_pinned_fixtu
     assert entry["sha256"] not in {e["sha256"] for e in siblings}
 
 
+RELATIVE_DH_KEYS_H = "OSX/libsecurity_apple_csp/lib/DH_keys.h"
+DH_KEYS_H_SIZE = 4280
+DH_KEYS_H_SHA256 = (
+    "fda77a2ee6b9821fb8067f830e298f3aa4c473bd5409353fab896bca3e389b96"
+)
+DH_KEYS_FORMAT = "apple_security_dh_keys_macroman_nbsp_libclang_timeout"
+DH_KEYS_SIBLING_PATHS = {
+    "OSX/libsecurity_apple_csp/lib/AppleCSPContext.h",
+    "OSX/libsecurity_apple_csp/lib/BlockCryptor.h",
+    "OSX/libsecurity_apple_csp/lib/desContext.h",
+}
+
+
+def test_apple_security_dh_keys_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "DH_keys.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "DH_keys.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DH_KEYS_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=DH_KEYS_FORMAT,
+        reason="Security DH_keys.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_dh_keys_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "DH_keys.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DH_KEYS_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=DH_KEYS_FORMAT,
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="MacRoman NBSP identity is missing"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_apple_security_dh_keys_rejects_utf8_nbsp_stripped_copy(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "DH_keys.h"
+    )
+    payload = fixture.read_bytes().replace(b"\xca", b" ")
+    path = tmp_path / "DH_keys.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DH_KEYS_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format=DH_KEYS_FORMAT,
+        reason="negative test stripped 0xCA",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="MacRoman NBSP identity is missing"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_apple_security_dh_keys_utf8_header_format_raises(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "DH_keys.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "DH_keys.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_DH_KEYS_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="utf-8 format must reject non-UTF-8 DH_keys.h",
+    )
+    with pytest.raises(SourceQuarantineError, match="header is not UTF-8"):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_dh_keys_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "DH_keys.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == DH_KEYS_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == DH_KEYS_H_SHA256
+    assert payload.count(b"\xca") == 1
+    assert payload[2825] == 0xCA
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_DH_KEYS_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == DH_KEYS_H_SIZE
+    assert entry["sha256"] == DH_KEYS_H_SHA256
+    assert entry["detected_format"] == DH_KEYS_FORMAT
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in DH_KEYS_SIBLING_PATHS
+    ]
+    assert len(siblings) == 3
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (
