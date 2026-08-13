@@ -794,6 +794,15 @@
       "reason": "Pinned Apple Security rc2Context.h FAIL_CLOSED libclang parse timeout 300s after RSA_DSA_keys quarantine (e1ea-sec, MacOSX.sdk present, knobs 1/2). Distinct from already-quarantined rc4Context.h, rc5Context.h, gladmanContext.h, BlockCryptor.h, desContext.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/notifications.h",
+      "size_bytes": 4937,
+      "sha256": "cbb828aa0cf41da04a4a6a0fb57e902cbbe4734bae41a831c6757a6695c7f4bf",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security notifications.h FAIL_CLOSED libclang parse timeout 300s after rc2Context quarantine (8841-sec, MacOSX.sdk present, knobs 2/2). Distinct from already-quarantined token.h, server.h, tokenaccess.h, process.h, connection.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

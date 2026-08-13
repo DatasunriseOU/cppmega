@@ -6384,6 +6384,114 @@ def test_checked_in_apple_security_tokenaccess_manifest_matches_pinned_fixture()
     assert entry["sha256"] not in {e["sha256"] for e in siblings}
 
 
+RELATIVE_NOTIFICATIONS_H = "securityd/src/notifications.h"
+NOTIFICATIONS_H_SIZE = 4937
+NOTIFICATIONS_H_SHA256 = (
+    "cbb828aa0cf41da04a4a6a0fb57e902cbbe4734bae41a831c6757a6695c7f4bf"
+)
+NOTIFICATIONS_SIBLING_PATHS = {
+    "securityd/src/token.h",
+    "securityd/src/server.h",
+    "securityd/src/tokenaccess.h",
+    "securityd/src/process.h",
+    "securityd/src/connection.h",
+}
+
+
+def test_apple_security_notifications_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "notifications.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "notifications.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_NOTIFICATIONS_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security notifications.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_notifications_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "notifications.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_NOTIFICATIONS_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_notifications_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "notifications.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == NOTIFICATIONS_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == NOTIFICATIONS_H_SHA256
+    assert b"#ifndef _H_NOTIFICATIONS" in payload
+    assert b"class Listener: public RefCount" in payload
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_NOTIFICATIONS_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == NOTIFICATIONS_H_SIZE
+    assert entry["sha256"] == NOTIFICATIONS_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+    siblings = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") in NOTIFICATIONS_SIBLING_PATHS
+    ]
+    assert len(siblings) == 5
+    assert entry["sha256"] not in {e["sha256"] for e in siblings}
+
+
 RELATIVE_RC4CONTEXT_H = "OSX/libsecurity_apple_csp/lib/rc4Context.h"
 RC4CONTEXT_H_SIZE = 1889
 RC4CONTEXT_H_SHA256 = (

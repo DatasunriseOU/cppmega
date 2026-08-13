@@ -1972,6 +1972,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "RC2_KEY",
                 "#endif //_RC2_CONTEXT_H_",
             ),
+            "notifications.h": (
+                "#ifndef _H_NOTIFICATIONS",
+                "#define _H_NOTIFICATIONS",
+                "notifications - handling of securityd-gated notification messages",
+                "#include <securityd_client/ssclient.h>",
+                '#include "SharedMemoryCommon.h"',
+                "class Listener: public RefCount {",
+                "class SharedMemoryListener",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
