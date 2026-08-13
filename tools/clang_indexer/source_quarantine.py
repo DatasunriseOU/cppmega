@@ -2002,6 +2002,17 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class MacLegacyContext : public AppleCSPContext  {",
                 "#endif	/* _MAC_CONTEXT_H_ */",
             ),
+            "session.h": (
+                "#ifndef _H_SESSION",
+                "#define _H_SESSION",
+                "session - authentication session domains",
+                '#include "structure.h"',
+                '#include "acls.h"',
+                '#include "authhost.h"',
+                "class Session : public PerSession {",
+                "class RootSession : public Session {",
+                "#endif //_H_SESSION",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
