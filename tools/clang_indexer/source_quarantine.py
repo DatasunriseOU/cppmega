@@ -1589,6 +1589,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class LocalDatabase : public Database",
                 "virtual RefPointer<Key> makeKey(const CssmKey &newKey, uint32 moreAttributes,",
             ),
+            "tokendatabase.h": (
+                "#ifndef _H_TOKENDATABASE",
+                "#define _H_TOKENDATABASE",
+                "tokendatabase - software database container implementation.",
+                '#include "database.h"',
+                '#include "tokenacl.h"',
+                "class TokenDatabase : public Database",
+                "TokenDaemon &tokend();",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
