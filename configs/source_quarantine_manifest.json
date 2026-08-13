@@ -686,6 +686,15 @@
       "reason": "Pinned Apple Security tempdatabase.h FAIL_CLOSED libclang parse timeout 300s after desContext quarantine (cc61-sec, MacOSX.sdk present, knobs 1/16). Distinct from already-quarantined localdatabase.h and tokendatabase.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/reader.h",
+      "size_bytes": 2247,
+      "sha256": "bbb74ca697faa371f44778272931781d230f577ab97f6ccccd4cb648dfc085c7",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security reader.h FAIL_CLOSED libclang parse timeout 300s after tempdatabase quarantine (3776-sec, MacOSX.sdk present, knobs 2/16)."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

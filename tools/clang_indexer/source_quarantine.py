@@ -1794,6 +1794,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "bool transient() const",
                 "void getSecurePassphrase(const Context &context, string &passphrase)",
             ),
+            "reader.h": (
+                "#ifndef _H_READER",
+                "#define _H_READER",
+                "reader - token reader objects",
+                '#include "structure.h"',
+                '#include "token.h"',
+                '#include "tokencache.h"',
+                "class Reader : public PerGlobal",
+                "void insertToken(TokenDaemon *tokend)",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
