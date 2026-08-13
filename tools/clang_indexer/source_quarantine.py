@@ -1515,6 +1515,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class PerConnection;",
                 'Repeat after me: "Everything that matters is a Node."',
             ),
+            "slcrep.h": (
+                "#ifndef _H_SLCREP",
+                "#define _H_SLCREP",
+                "slcrep - DiskRep representing the Mac OS Shared Library Cache",
+                '#include "singlediskrep.h"',
+                '#include "sigblob.h"',
+                "#include <security_utilities/dyldcache.h>",
+                "class DYLDCacheRep : public SingleDiskRep",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

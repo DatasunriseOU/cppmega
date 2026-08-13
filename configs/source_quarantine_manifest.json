@@ -542,6 +542,15 @@
       "reason": "Pinned Apple Security structure.h FAIL_CLOSED libclang parse timeout 300s after key.h quarantine (bfa2-sec, MacOSX.sdk present, knobs 1/60)"
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/include/security_codesigning/slcrep.h",
+      "size_bytes": 2766,
+      "sha256": "cf2b7726b5045af854870a010061854498c53484e169be226ce0bbe5b1d6ba33",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security slcrep.h FAIL_CLOSED libclang parse timeout 300s after structure quarantine (2ede-sec, MacOSX.sdk present, knobs 2/56)"
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
