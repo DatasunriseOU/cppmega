@@ -812,6 +812,15 @@
       "reason": "Pinned Apple Security agentquery.h FAIL_CLOSED libclang parse timeout 300s after notifications quarantine (2c65-sec, MacOSX.sdk present, knobs 1/1). Distinct from already-quarantined notifications.h, authhost.h, server.h, connection.h, kcdatabase.h."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/MacContext.h",
+      "size_bytes": 2808,
+      "sha256": "6dc2cc167d2404899ff4d1597d85822838dd8d397842c234914a934d30c03e19",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security MacContext.h FAIL_CLOSED libclang parse timeout 300s after agentquery quarantine (4a3c-sec, MacOSX.sdk present, knobs 2/1). Distinct from already-quarantined AppleCSPContext.h, BlockCryptor.h, rc2Context.h, rc4Context.h, gladmanContext.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,

@@ -1992,6 +1992,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class SecurityAgentXPCQuery : public SecurityAgentXPCConnection",
                 "#endif //_H_AGENTQUERY",
             ),
+            "MacContext.h": (
+                "#ifndef	_MAC_CONTEXT_H_",
+                "#define _MAC_CONTEXT_H_",
+                "MacContext.h - AppleCSPContext for HMAC{SHA1,MD5}",
+                "#include <AppleCSPContext.h>",
+                "#include <CommonCrypto/CommonHMAC.h>",
+                "class MacContext : public AppleCSPContext  {",
+                "class MacLegacyContext : public AppleCSPContext  {",
+                "#endif	/* _MAC_CONTEXT_H_ */",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
