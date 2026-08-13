@@ -1776,6 +1776,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class LocalKey : public Key",
                 "virtual void getKey();",
             ),
+            "desContext.h": (
+                "#ifndef _DES_CONTEXT_H_",
+                "#define _DES_CONTEXT_H_",
+                "desContext.h - glue between BlockCrytpor and DES/3DES implementations",
+                '#include "BlockCryptor.h"',
+                "class DESContext : public BlockCryptor",
+                "class DES3Context : public BlockCryptor",
+                "virtual ~DESContext();",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

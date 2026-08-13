@@ -668,6 +668,15 @@
       "reason": "Pinned Security-vendored ANTLR TokenBuffer.hpp FAIL_CLOSED libclang parse timeout 300s after CharScanner.hpp quarantine (8292-sec, MacOSX.sdk present, knobs 1/20). ANTLR 2.7.7 header (Terence Parr), not Apple copyright; suffix .hpp; distinct from already-quarantined InputBuffer.hpp, BaseAST.hpp, and CharScanner.hpp."
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "OSX/libsecurity_apple_csp/lib/desContext.h",
+      "size_bytes": 3007,
+      "sha256": "81f0ef1905bc85a74565cb71cc64fb07c138d130955288dd66826967a06e9384",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security desContext.h FAIL_CLOSED libclang parse timeout 300s after TokenBuffer.hpp quarantine (42a2-sec, MacOSX.sdk present, knobs 2/20). Distinct from already-quarantined BlockCryptor.h, SSContext.h, SDContext.h."
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
