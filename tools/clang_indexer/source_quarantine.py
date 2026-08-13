@@ -1524,6 +1524,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "#include <security_utilities/dyldcache.h>",
                 "class DYLDCacheRep : public SingleDiskRep",
             ),
+            "tokend.h": (
+                "#ifndef _H_TOKEND",
+                "#define _H_TOKEND",
+                "tokend - internal tracker for a tokend smartcard driver process",
+                '#include "structure.h"',
+                '#include "child.h"',
+                '#include "tokencache.h"',
+                "class TokenDaemon",
+                "virtual void relayFault(bool async) = 0",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

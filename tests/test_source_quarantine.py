@@ -3756,6 +3756,98 @@ def test_checked_in_apple_security_slcrep_manifest_matches_pinned_fixture() -> N
     assert entry["project_id"] == "apple-oss-distributions/Security"
 
 
+RELATIVE_TOKEND_H = "securityd/src/tokend.h"
+TOKEND_H_SIZE = 4299
+TOKEND_H_SHA256 = (
+    "eebdefb340ff183a9406b5d8785007406f3e1cfe81982631e6034e0f5b78ebab"
+)
+
+
+def test_apple_security_tokend_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "tokend.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "tokend.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_TOKEND_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security tokend.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_tokend_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "tokend.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_TOKEND_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_tokend_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "tokend.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == TOKEND_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == TOKEND_H_SHA256
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_TOKEND_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == TOKEND_H_SIZE
+    assert entry["sha256"] == TOKEND_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (
