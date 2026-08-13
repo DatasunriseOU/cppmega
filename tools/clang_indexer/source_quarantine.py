@@ -2063,6 +2063,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "BF_KEY",
                 "#endif //_BF_CONTEXT_H_",
             ),
+            "castContext.h": (
+                "#ifndef _CAST_CONTEXT_H_",
+                "#define _CAST_CONTEXT_H_",
+                "castContext.h - glue between BlockCrytpor and ssleay CAST-128 (CAST5)",
+                "#include <CommonCrypto/CommonCryptorSPI.h>",
+                "class CastContext : public BlockCryptor {",
+                "CCCryptorRef",
+                "#endif //_CAST_CONTEXT_H_",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
