@@ -3480,6 +3480,98 @@ def test_checked_in_apple_security_connection_manifest_matches_pinned_fixture() 
     assert entry["project_id"] == "apple-oss-distributions/Security"
 
 
+RELATIVE_KEY_H = "securityd/src/key.h"
+KEY_H_SIZE = 3169
+KEY_H_SHA256 = (
+    "d0e1076edcfd9821003cf03d4dd8cbbcb5c0340ae02d9527eb5491f698c960f8"
+)
+
+
+def test_apple_security_key_libclang_timeout_accepts_header(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        _verify_detected_format,
+    )
+
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "key.h"
+    )
+    payload = fixture.read_bytes()
+    path = tmp_path / "key.h"
+    path.write_bytes(payload)
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_KEY_H,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="Security key.h libclang hang",
+    )
+    _verify_detected_format(path, entry)
+
+
+def test_apple_security_key_contract_rejects_unrelated_standin(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.source_quarantine import (
+        SourceQuarantineEntry,
+        SourceQuarantineError,
+        _verify_detected_format,
+    )
+
+    path = tmp_path / "key.h"
+    path.write_text("#pragma once\nclass X {};\n", encoding="utf-8")
+    entry = SourceQuarantineEntry(
+        project_id="apple-oss-distributions/Security",
+        relative_path=RELATIVE_KEY_H,
+        size_bytes=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        classification="compiler_regression_fixture",
+        detected_format="apple_security_libclang_timeout_header",
+        reason="negative test",
+    )
+    with pytest.raises(
+        SourceQuarantineError, match="Apple Security libclang-timeout header contract"
+    ):
+        _verify_detected_format(path, entry)
+
+
+def test_checked_in_apple_security_key_manifest_matches_pinned_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "source_quarantine"
+        / "key.h"
+    )
+    payload = fixture.read_bytes()
+    assert len(payload) == KEY_H_SIZE
+    assert hashlib.sha256(payload).hexdigest() == KEY_H_SHA256
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries = [
+        e
+        for e in manifest["entries"]
+        if e.get("relative_path") == RELATIVE_KEY_H
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["size_bytes"] == KEY_H_SIZE
+    assert entry["sha256"] == KEY_H_SHA256
+    assert entry["detected_format"] == "apple_security_libclang_timeout_header"
+    assert entry["project_id"] == "apple-oss-distributions/Security"
+
+
 RELATIVE_GLIBC_BUG28 = "stdio-common/bug28.c"
 GLIBC_BUG28_SIZE = 1216
 GLIBC_BUG28_SHA256 = (

@@ -1497,6 +1497,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Connection : public PerConnection, public Listener::JitterBuffer",
                 "void beginWork(audit_token_t &auditToken)",
             ),
+            "key.h": (
+                "#ifndef _H_KEY",
+                "#define _H_KEY",
+                "key - representation of securityd key objects",
+                '#include "structure.h"',
+                '#include "database.h"',
+                "class Key : public Database::Subsidiary, public AclSource",
+                "virtual const CssmData &canonicalDigest() = 0",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
