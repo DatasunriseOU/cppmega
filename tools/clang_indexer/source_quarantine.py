@@ -1893,6 +1893,16 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "void encryptBlock(",
                 "CCCryptorRef",
             ),
+            "rc5Context.h": (
+                "#ifndef _RC5_CONTEXT_H_",
+                "#define _RC5_CONTEXT_H_",
+                "rc5Context.h - glue between BlockCrytpor and ssleay RC5 implementation",
+                "#include <BlockCryptor.h>",
+                "#include <openssl/rc5_legacy.h>",
+                "class RC5Context : public BlockCryptor {",
+                "RC5_32_KEY",
+                "#endif //_RC2_CONTEXT_H_",
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (
