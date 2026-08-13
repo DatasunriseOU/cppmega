@@ -1506,6 +1506,15 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 "class Key : public Database::Subsidiary, public AclSource",
                 "virtual const CssmData &canonicalDigest() = 0",
             ),
+            "structure.h": (
+                "#ifndef _H_STRUCTURE",
+                "#define _H_STRUCTURE",
+                "structure - structural framework for securityd objects",
+                "#include <security_utilities/refcount.h>",
+                "#include <security_utilities/mach++.h>",
+                "class PerConnection;",
+                'Repeat after me: "Everything that matters is a Node."',
+            ),
         }
         required_substrings = header_contracts.get(expected_name)
         apple_copyright = (

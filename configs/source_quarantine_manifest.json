@@ -533,6 +533,15 @@
       "reason": "Pinned Apple Security key.h FAIL_CLOSED libclang parse timeout 300s after connection quarantine (213e-sec, MacOSX.sdk present, knobs 2/48)"
     },
     {
+      "project_id": "apple-oss-distributions/Security",
+      "relative_path": "securityd/src/structure.h",
+      "size_bytes": 7630,
+      "sha256": "e4a1e0ee784a3ee50a5a919c14f7aa443396008cae2ec6e9f48a9dcef7d57151",
+      "classification": "compiler_regression_fixture",
+      "detected_format": "apple_security_libclang_timeout_header",
+      "reason": "Pinned Apple Security structure.h FAIL_CLOSED libclang parse timeout 300s after key.h quarantine (bfa2-sec, MacOSX.sdk present, knobs 1/60)"
+    },
+    {
       "project_id": "sourceware.org/git%2Fglibc",
       "relative_path": "stdio-common/bug28.c",
       "size_bytes": 1216,
