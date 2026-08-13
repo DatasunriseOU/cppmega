@@ -753,8 +753,8 @@ def test_supervisor_sanitizes_ambient_macro_overrides(
 
     assert environment["PATH"] == "/usr/bin"
     assert "PYTHONPATH" not in environment
-    assert environment["CPPMEGA_MAX_RETAINED_MACROS"] == "250000"
-    assert environment["CPPMEGA_MAX_MACRO_VISIBILITY_BYTES"] == "262000000"
+    assert environment["CPPMEGA_MAX_RETAINED_MACROS"] == "1000000"
+    assert environment["CPPMEGA_MAX_MACRO_VISIBILITY_BYTES"] == "1073741824"
     assert environment["NANOCHAT_TOKENIZER_PATH"] == str(tmp_path / "tokenizer.json")
 
 
