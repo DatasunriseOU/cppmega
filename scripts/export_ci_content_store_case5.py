@@ -3422,12 +3422,17 @@ def _validate_occurrence_v3(
     )
     if outbound != len(cross_chunk_edges):
         raise ExportError("cross-chunk edge accounting is inconsistent")
-    if count != outbound:
+    if count < outbound:
         raise ExportError(
-            "training sidecar v2 omits non-outbound cross-chunk edge identities"
+            "cross-chunk edge accounting count is below outbound_count"
         )
-    if accounting_sha256 != _sequence_digest(outbound_accounting_records):
-        raise ExportError("cross-chunk edge accounting digest is inconsistent")
+    # Writer (ci_log_sidecars) stores only outbound identities in
+    # cross_chunk_edges, but count = all crossing edges (inbound included).
+    # sha256 is over those omitted inbound records too, so it can be
+    # recomputed here only when count == outbound.
+    if count == outbound:
+        if accounting_sha256 != _sequence_digest(outbound_accounting_records):
+            raise ExportError("cross-chunk edge accounting digest is inconsistent")
     return chunk
 
 
@@ -3908,6 +3913,31 @@ def _write_json(path: Path, value: object) -> None:
 
 def _script_sha256() -> str:
     return _sha256_file(Path(__file__).resolve())
+
+
+def _sanitize_section_title_fields(section: Mapping[str, Any]) -> dict[str, object]:
+    """Keep short titles; fingerprint titles above the 16k metadata scalar cap.
+
+    Same receipt shape as ``workflow.head_commit.message``: never store a
+    truncated title that looks like the real field.
+    """
+
+    output = _project_scalar_fields(section, ("kind",), where="section")
+    title = section.get("title")
+    if title is None:
+        return output
+    if not isinstance(title, str):
+        raise ExportError("section.title must be a string")
+    if len(title) <= 16_384:
+        output["title"] = title
+        return output
+    output["title_char_count"] = len(title)
+    output["title_sha256"] = _bounded_utf8_sha256(
+        title,
+        where="section.title",
+        max_bytes=MAX_STATE_JSON_EVIDENCE_BYTES,
+    )
+    return output
 
 
 def _metadata_scalar(value: object, *, where: str) -> object:
@@ -4890,11 +4920,7 @@ def _representative_metadata_record(
                 ("section_id", "section_ordinal", "step_ordinal"),
                 where="chunk",
             ),
-            **_project_scalar_fields(
-                section,
-                ("kind", "title"),
-                where="section",
-            ),
+            **_sanitize_section_title_fields(section),
         },
         "runner_evidence": runner_evidence,
         "archive": _project_scalar_fields(
@@ -6968,8 +6994,10 @@ def export_store(
                         ),
                         "sha256": "independently recomputed for every accepted record",
                         "fail_closed_boundary": (
-                            "count must equal outbound_count because v2 omits "
-                            "non-outbound edge identities"
+                            "outbound_count must match retained outbound records; "
+                            "count may exceed outbound_count for omitted inbound "
+                            "identities; sha256 is recomputed iff count == "
+                            "outbound_count"
                         ),
                     },
                     "by_family": dict(sorted(graph_by_family.items())),

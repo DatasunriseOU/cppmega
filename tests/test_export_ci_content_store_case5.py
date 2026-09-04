@@ -80,6 +80,7 @@ from scripts.export_ci_content_store_case5 import (
     _project_content,
     _publish_directory_no_replace,
     _sanitize_head_commit,
+    _sanitize_section_title_fields,
     _sequence_digest,
     _smallest_bucket,
     _source_binding_projection_writer,
@@ -1811,6 +1812,17 @@ def test_metadata_ledgers_accept_bounded_records_over_one_mib(
     assert len(_canonical_bytes(representative)) > 1024 * 1024
 
 
+def test_section_title_fingerprint_accepts_more_than_16k_chars() -> None:
+    title = "Compile " + "x" * 16_384
+
+    sanitized = _sanitize_section_title_fields({"kind": "command", "title": title})
+
+    assert sanitized["kind"] == "command"
+    assert sanitized["title_char_count"] == len(title)
+    assert sanitized["title_sha256"] == hashlib.sha256(title.encode("utf-8")).hexdigest()
+    assert "title" not in sanitized
+
+
 def test_head_commit_message_fingerprint_accepts_more_than_16k_chars() -> None:
     message = "large commit message\n" + "\u03bb" * 16_384
 
@@ -2993,8 +3005,8 @@ def test_missing_or_malformed_v2_training_sidecars_fail_closed(
         ]
         expected = "non-local entity endpoint"
     else:
-        training["cross_chunk_edge_accounting"]["count"] = 1
-        expected = "omits non-outbound"
+        training["cross_chunk_edge_accounting"]["outbound_count"] = 1
+        expected = "cross-chunk edge accounting is inconsistent"
 
     with pytest.raises(ExportError, match=expected):
         _validate_occurrence_v3(_occurrence(provenance), content_text=text)
@@ -3026,6 +3038,44 @@ def test_v3_occurrence_rejects_contradictory_workflow_projection() -> None:
     provenance["workflow"]["head_commit"]["id"] = "b" * 40
 
     with pytest.raises(ExportError, match="head_commit.id"):
+        _validate_occurrence_v3(_occurrence(provenance), content_text=text)
+
+
+def test_v2_sidecar_accepts_omitted_inbound_cross_chunk_identities() -> None:
+    text = "ab"
+    provenance = _provenance(
+        text,
+        entities=[
+            _entity(
+                "entity:000000",
+                0,
+                1,
+                domain=DomainKind.BASH,
+                role=int(DomainRoleKind.SOURCE),
+            )
+        ],
+        cross_chunk_edges=[
+            {
+                "edge_id": "edge:cross",
+                "source": "entity:000000",
+                "target": "entity:external",
+                "from_char": 0,
+                "to_member_char": 100,
+                "target_coordinate_space": "canonical_member_chars_v1",
+                "kind": "BUILD_ACTION_INPUT",
+                "kind_id": 23,
+                "family": "build",
+            }
+        ],
+    )
+    accounting = provenance["chunk"]["training_sidecars"]["cross_chunk_edge_accounting"]
+    accounting["count"] = 2
+    accounting["sha256"] = "a" * 64
+
+    _validate_occurrence_v3(_occurrence(provenance), content_text=text)
+
+    accounting["count"] = 0
+    with pytest.raises(ExportError, match="below outbound_count"):
         _validate_occurrence_v3(_occurrence(provenance), content_text=text)
 
 
