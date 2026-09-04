@@ -1832,3 +1832,52 @@ def test_source_composition_requires_pr_reverification_at_finish(
             code_root=code_root,
             commit_root=commit_root,
         )
+
+
+def test_packed_union_composition_binds_existing_parquet_without_claiming_501(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.nanochat_pipeline.packed_rows_schema import NUM_DOCS_COLUMN
+    from cppmega.data.source_conveyor_composition import (
+        PACKED_UNION_BINDING,
+        PACKED_UNION_PLAN_SCHEMA,
+        SOURCE_COMPOSITION_SCHEMA,
+    )
+
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    (code_root / "1024").mkdir(parents=True)
+    (commit_root / "1024").mkdir(parents=True)
+    table = pa.table({"repo": ["eigen"], NUM_DOCS_COLUMN: [1]})
+    pq.write_table(table, code_root / "1024" / "eigen.parquet")
+    pq.write_table(table, commit_root / "1024" / "eigen.parquet")
+    plan_path = tmp_path / "union-plan.json"
+    _write_json(
+        plan_path,
+        {
+            "schema": PACKED_UNION_PLAN_SCHEMA,
+            "status": "partial_code_union",
+            "overlay_501_claimed": False,
+        },
+    )
+
+    composition = load_source_composition(
+        plan_path,
+        buckets=(1024,),
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+    again = load_source_composition(
+        plan_path,
+        buckets=(1024,),
+        code_root=code_root,
+        commit_root=commit_root,
+    )
+
+    assert composition.receipt["schema"] == SOURCE_COMPOSITION_SCHEMA
+    assert again.receipt["dedup"] == composition.receipt["dedup"]
+    assert composition.receipt["status"] == "complete"
+    assert composition.receipt["overlay_501_claimed"] is False
+    assert composition.receipt["binding"] == PACKED_UNION_BINDING
+    assert composition.allowlist[("commits", 1024)]["eigen.parquet"] == 1
+    assert composition.run_files == ()

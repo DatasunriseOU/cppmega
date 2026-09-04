@@ -1765,12 +1765,15 @@ def test_builder_requires_exactly_one_objective_artifact_per_bucket(
 def test_production_objective_target_is_exact_hash_bound_and_enforced() -> None:
     target = builder._load_production_objective_target()
     sample_targets = {
-        "1024": 281580,
-        "2048": 167040,
-        "4096": 95400,
-        "8192": 45540,
-        "16384": 19740,
+        "1024": 3515700,
+        "2048": 1464840,
+        "4096": 585960,
+        "8192": 256320,
+        "16384": 109860,
+        "32768": 36600,
+        "65536": 13740,
     }
+    assert all(int(v) % 60 == 0 for v in sample_targets.values())
     policy = target["materialization"]
 
     assert target["sample_targets"] == sample_targets
@@ -1806,7 +1809,9 @@ def test_production_objective_target_is_exact_hash_bound_and_enforced() -> None:
         "source_snapshot": {"pools": {"objective_seed": {"files": []}}},
     }
     for bucket, samples in zip(
-        builder.DEFAULT_BUCKETS, sample_targets.values(), strict=True
+        tuple(sorted(int(key) for key in sample_targets)),
+        sample_targets.values(),
+        strict=True,
     ):
         contract["totals"]["samples"] = samples  # type: ignore[index]
         snapshot = contract["source_snapshot"]  # type: ignore[assignment]

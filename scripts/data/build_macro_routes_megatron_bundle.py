@@ -115,7 +115,7 @@ PRODUCTION_OBJECTIVE_TARGET_PATH = (
     REPO_ROOT / "configs/production_objective_materialization_target.json"
 )
 PRODUCTION_OBJECTIVE_TARGET_SHA256 = (
-    "e941ee6503533a867151115822729ba8a62cb66645eec11f080d7920cddd981d"
+    "d7a20368818b45780ce31a6217d0c6de77f84db17aa417fdcb9bb36761159904"
 )
 DTYPE_SIZES = {
     "uint8": 1,
@@ -2370,15 +2370,13 @@ def _validate_production_objective_artifacts(
     objective_artifacts: dict[int, Path], buckets: tuple[int, ...]
 ) -> None:
     target = _load_production_objective_target()
-    if (
-        buckets != DEFAULT_BUCKETS
-        or set(objective_artifacts) != set(DEFAULT_BUCKETS)
-    ):
+    expected = tuple(sorted(int(key) for key in target["sample_targets"]))
+    if buckets != expected or set(objective_artifacts) != set(expected):
         raise RuntimeError(
             "production objective artifacts must exactly cover buckets "
-            f"{DEFAULT_BUCKETS}"
+            f"{expected}"
         )
-    for bucket in DEFAULT_BUCKETS:
+    for bucket in expected:
         artifact = load_objective_materialization_artifact(
             objective_artifacts[bucket]
         )
@@ -3218,6 +3216,53 @@ def _stage_source_composition(
     shutil.copy2(composition.plan_path, plan_path)
     if _sha256(plan_path) != str(composition.receipt["plan_sha256"]):
         raise RuntimeError("staged source composition plan drifted")
+
+    if composition.receipt.get("binding") == "packed_union":
+        if composition.receipt.get("overlay_501_claimed") is not False:
+            raise RuntimeError("packed union composition claimed overlay 501")
+        if composition.run_files:
+            raise RuntimeError("packed union composition must not invent conveyor runs")
+        dedup = composition.receipt.get("dedup")
+        if not isinstance(dedup, dict):
+            raise RuntimeError("packed union composition has no dedup receipt")
+        dedup_receipt_path = target_root / "global_dedup_receipt.json"
+        shutil.copy2(composition.dedup_receipt_path, dedup_receipt_path)
+        if _sha256(dedup_receipt_path) != str(dedup["receipt_sha256"]):
+            raise RuntimeError("staged packed-union dedup receipt drifted")
+        verifier = dedup.get("verifier")
+        if not isinstance(verifier, dict):
+            raise RuntimeError("packed union dedup receipt has no verifier binding")
+        verifier_source = REPO_ROOT / str(verifier.get("script"))
+        if (
+            verifier_source.is_symlink()
+            or not verifier_source.is_file()
+            or _sha256(verifier_source) != verifier.get("script_sha256")
+        ):
+            raise RuntimeError("packed union dedup verifier does not match source")
+        verifier_target = target_root / "verify_packed_union_dedup.py"
+        shutil.copy2(verifier_source, verifier_target)
+        return {
+            "schema": str(composition.receipt["schema"]),
+            "receipt": {
+                "path": receipt_path.relative_to(partial_dir).as_posix(),
+                "sha256": _sha256(receipt_path),
+            },
+            "plan": {
+                "path": plan_path.relative_to(partial_dir).as_posix(),
+                "sha256": _sha256(plan_path),
+            },
+            "dedup_receipt": {
+                "path": dedup_receipt_path.relative_to(partial_dir).as_posix(),
+                "sha256": _sha256(dedup_receipt_path),
+            },
+            "dedup_verifier": {
+                "path": verifier_target.relative_to(partial_dir).as_posix(),
+                "sha256": _sha256(verifier_target),
+            },
+            "runs": [],
+            "binding": "packed_union",
+            "overlay_501_claimed": False,
+        }
 
     dedup = composition.receipt.get("dedup")
     if not isinstance(dedup, dict):

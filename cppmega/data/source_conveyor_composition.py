@@ -17,6 +17,10 @@ from typing import Any
 SOURCE_COMPOSITION_PLAN_SCHEMA = "cppmega_source_conveyor_composition_plan_v1"
 SOURCE_COMPOSITION_SCHEMA = "cppmega_source_conveyor_composition_v1"
 PACKED_SOURCE_INVENTORY_SCHEMA = "cppmega_packed_source_inventory_v1"
+PACKED_UNION_PLAN_SCHEMA = "cppmega_packed_source_union_composition_v1"
+PACKED_UNION_DEDUP_SCHEMA = "cppmega_packed_union_dedup_absent_v1"
+PACKED_UNION_BINDING = "packed_union"
+PACKED_UNION_DEDUP_VERIFIER = "scripts/data/verify_packed_union_dedup.py"
 GLOBAL_DEDUP_RECEIPT_SCHEMA = "cppmega_global_dedup_store_receipt_v1"
 _FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 _FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
@@ -1640,6 +1644,130 @@ def _load_run(
     )
 
 
+def _scan_packed_parquet_bucket(root: Path, bucket: int) -> dict[str, int]:
+    """Allowlist parquet files already packed under ``root/bucket``."""
+
+    import pyarrow.parquet as pq
+
+    raw_root = root.expanduser()
+    if raw_root.is_symlink():
+        raise ValueError(f"packed root must not be a symlink: {raw_root}")
+    resolved_root = raw_root.resolve()
+    if not resolved_root.is_dir():
+        raise FileNotFoundError(resolved_root)
+    raw_bucket = raw_root / str(bucket)
+    if not raw_bucket.exists():
+        return {}
+    if raw_bucket.is_symlink():
+        raise ValueError(f"packed bucket must not be a symlink: {raw_bucket}")
+    resolved_bucket = raw_bucket.resolve()
+    try:
+        resolved_bucket.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"packed bucket escapes root: {raw_bucket}") from exc
+    if not resolved_bucket.is_dir():
+        raise ValueError(f"packed bucket is not a directory: {raw_bucket}")
+    allowlist: dict[str, int] = {}
+    for path in sorted(resolved_bucket.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if _ARTIFACT_FILENAME_RE.fullmatch(path.name) is None:
+            continue
+        rows = int(pq.ParquetFile(path).metadata.num_rows)
+        if rows < 1:
+            raise ValueError(f"packed parquet is empty: {path}")
+        allowlist[path.name] = rows
+    return allowlist
+
+
+def _packed_union_dedup_receipt(plan_path: Path) -> Path:
+    path = plan_path.with_name("packed_union_dedup_absent.json")
+    payload = {
+        "schema": PACKED_UNION_DEDUP_SCHEMA,
+        "status": "not_applicable",
+        "reason": (
+            "union of already-packed per-repo parquet; no global conveyor dedup DB"
+        ),
+        "overlay_501_claimed": False,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if path.exists():
+        _raw, existing = _load_json_object(
+            path, where="packed union dedup receipt", max_bytes=_MAX_RECEIPT_BYTES
+        )
+        if existing != payload:
+            raise ValueError(f"packed union dedup receipt drifted: {path}")
+        return path
+    path.write_text(encoded, encoding="utf-8")
+    return path
+
+
+def load_packed_union_composition(
+    plan_path: Path,
+    *,
+    buckets: tuple[int, ...],
+    code_root: Path,
+    commit_root: Path,
+) -> SourceComposition:
+    """Bind already-packed code/commit trees. Does not invent overlay 501."""
+
+    plan_path = _resolve_regular_file(plan_path, where="packed union composition plan")
+    _plan_raw, plan = _load_json_object(
+        plan_path, where="packed union composition plan", max_bytes=_MAX_PLAN_BYTES
+    )
+    if plan.get("schema") != PACKED_UNION_PLAN_SCHEMA:
+        raise ValueError("packed union composition plan schema is unsupported")
+    if plan.get("overlay_501_claimed") is not False:
+        raise ValueError("packed union must not claim overlay 501")
+    if not buckets or buckets != tuple(sorted(set(buckets))) or any(b < 1 for b in buckets):
+        raise ValueError("packed union buckets must be unique, positive, and sorted")
+
+    allowlist: dict[tuple[str, int], dict[str, int]] = {}
+    code_buckets: list[int] = []
+    commit_buckets: list[int] = []
+    for bucket in buckets:
+        code_files = _scan_packed_parquet_bucket(code_root, bucket)
+        commit_files = _scan_packed_parquet_bucket(commit_root, bucket)
+        allowlist[("code", bucket)] = code_files
+        allowlist[("commits", bucket)] = commit_files
+        if code_files:
+            code_buckets.append(bucket)
+        if commit_files:
+            commit_buckets.append(bucket)
+    if not commit_buckets and not code_buckets:
+        raise ValueError("packed union has no parquet in the requested buckets")
+
+    dedup_receipt_path = _packed_union_dedup_receipt(plan_path)
+    verifier = Path(__file__).resolve().parents[2] / PACKED_UNION_DEDUP_VERIFIER
+    if verifier.is_symlink() or not verifier.is_file():
+        raise FileNotFoundError(verifier)
+    receipt = {
+        "schema": SOURCE_COMPOSITION_SCHEMA,
+        "status": "complete",
+        "plan_sha256": _sha256(plan_path),
+        "overlay_501_claimed": False,
+        "binding": PACKED_UNION_BINDING,
+        "buckets": list(buckets),
+        "code_buckets": code_buckets,
+        "commit_buckets": commit_buckets,
+        "dedup": {
+            "receipt_sha256": _sha256(dedup_receipt_path),
+            "verifier": {
+                "script": PACKED_UNION_DEDUP_VERIFIER,
+                "script_sha256": _sha256(verifier),
+            },
+        },
+        "runs": [],
+    }
+    return SourceComposition(
+        allowlist=allowlist,
+        receipt=receipt,
+        plan_path=plan_path,
+        dedup_receipt_path=dedup_receipt_path,
+        run_files=(),
+    )
+
+
 def load_source_composition(
     plan_path: Path,
     *,
@@ -1655,6 +1783,13 @@ def load_source_composition(
     plan_raw, plan = _load_json_object(
         plan_path, where="source composition plan", max_bytes=_MAX_PLAN_BYTES
     )
+    if plan.get("schema") == PACKED_UNION_PLAN_SCHEMA:
+        return load_packed_union_composition(
+            plan_path,
+            buckets=buckets,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
     _require_exact_fields(
         plan,
         {"schema", "runs", "dedup_receipt"},
@@ -2083,10 +2218,13 @@ def build_packed_source_inventory_receipt(
 __all__ = [
     "GLOBAL_DEDUP_RECEIPT_SCHEMA",
     "PACKED_SOURCE_INVENTORY_SCHEMA",
+    "PACKED_UNION_BINDING",
+    "PACKED_UNION_PLAN_SCHEMA",
     "SOURCE_COMPOSITION_PLAN_SCHEMA",
     "SOURCE_COMPOSITION_SCHEMA",
     "SourceComposition",
     "build_packed_source_inventory_receipt",
+    "load_packed_union_composition",
     "load_source_composition",
     "source_composition_receipt_sha256",
 ]
