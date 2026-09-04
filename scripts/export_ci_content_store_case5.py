@@ -3080,12 +3080,17 @@ def _validate_occurrence_v3(
     if not isinstance(head_sha, str) or _GIT_OID_RE.fullmatch(head_sha) is None:
         raise ExportError("provenance.workflow.head_sha is not a Git object ID")
     head_commit = workflow.get("head_commit")
-    head_commit_record = _require_mapping(
-        head_commit,
-        where="provenance.workflow.head_commit",
-    )
-    if head_commit_record.get("id") != head_sha:
-        raise ExportError("provenance workflow head_commit.id disagrees with head_sha")
+    # GitHub WorkflowRun.head_commit is SimpleCommit | null. Fetch-state
+    # keeps null when the API omitted the object; head_sha stays the OID.
+    if head_commit is not None:
+        head_commit_record = _require_mapping(
+            head_commit,
+            where="provenance.workflow.head_commit",
+        )
+        if head_commit_record.get("id") != head_sha:
+            raise ExportError(
+                "provenance workflow head_commit.id disagrees with head_sha"
+            )
     actor = _require_mapping(
         workflow.get("actor"),
         where="provenance.workflow.actor",

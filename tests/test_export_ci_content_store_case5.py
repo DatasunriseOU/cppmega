@@ -3041,6 +3041,23 @@ def test_v3_occurrence_rejects_contradictory_workflow_projection() -> None:
         _validate_occurrence_v3(_occurrence(provenance), content_text=text)
 
 
+def test_v3_occurrence_accepts_null_head_commit_when_head_sha_is_oid() -> None:
+    text = "null head commit"
+    provenance = _provenance(text)
+    provenance["workflow"]["head_commit"] = None
+
+    _validate_occurrence_v3(_occurrence(provenance), content_text=text)
+
+
+def test_v3_occurrence_rejects_string_head_commit() -> None:
+    text = "string head commit"
+    provenance = _provenance(text)
+    provenance["workflow"]["head_commit"] = provenance["workflow"]["head_sha"]
+
+    with pytest.raises(ExportError, match="head_commit must be an object"):
+        _validate_occurrence_v3(_occurrence(provenance), content_text=text)
+
+
 def test_v2_sidecar_accepts_omitted_inbound_cross_chunk_identities() -> None:
     text = "ab"
     provenance = _provenance(
